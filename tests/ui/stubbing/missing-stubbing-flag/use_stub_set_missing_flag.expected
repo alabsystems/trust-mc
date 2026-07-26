@@ -1,0 +1,6 @@
+error: Using the use_stub_set attribute requires activating the unstable `stubbing` feature\
+use_stub_set_missing_flag\
+|\
+| #[kani::use_stub_set(stub_set_without_flag)]\
+| ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\
+|

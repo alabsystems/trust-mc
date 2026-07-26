@@ -1,0 +1,4 @@
+success: legacy version command name appears
+success: legacy verifier product appears
+success: version printed agrees
+success: `(standalone)` appears in version line

@@ -1,0 +1,4 @@
+SUCCESS\
+diagonal join is identity
+FAILURE\
+table read equals row index

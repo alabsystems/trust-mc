@@ -1,0 +1,3 @@
+Checking harness verify::demo_harness...
+Status: SATISFIED\
+Description: "Cover example `demo`"

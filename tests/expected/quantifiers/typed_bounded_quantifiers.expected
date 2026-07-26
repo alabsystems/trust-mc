@@ -1,0 +1,7 @@
+- Status: SUCCESS\
+- Description: "typed forall u64"\
+
+- Status: SUCCESS\
+- Description: "typed exists u64"\
+
+VERIFICATION:- SUCCESSFUL

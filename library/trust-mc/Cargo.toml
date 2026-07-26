@@ -1,0 +1,22 @@
+# Copyright Kani Contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+[package]
+# Package named 'kani' for upstream test compatibility - tests use kani:: paths.
+# The directory is library/trust-mc/ for trust-mc branding.
+name = "kani"
+version = "0.67.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+kani_macros = { path = "../kani_macros" }
+kani_core = { path = "../kani_core" }
+
+[features]
+concrete_playback = []
+no_core=["kani_macros/no_core"]
+
+[lints]
+workspace = true

@@ -1,0 +1,245 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+
+//! Static-local metadata propagation helpers for CHC encoding.
+//!
+//! Split from `codegen_decl_static.rs` to keep the static collection pass under
+//! the file-size limit while preserving the local-to-static propagation logic.
+
+use ay_bindings::{Expr, ExprValue};
+use rustc_public::mir::{Operand, Place, ProjectionElem, Rvalue, StatementKind};
+use rustc_public::ty::{ConstantKind, TyConstKind};
+use tracing::debug;
+
+use super::ChcCtx;
+
+impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    pub(in crate::codegen_ay::chc) fn map_static_local_to_state_idx(
+        &mut self,
+        dest_local: usize,
+        vec_idx: usize,
+    ) {
+        self.ref_resolution.static_ref_to_state_idx.insert(dest_local, vec_idx);
+        self.seed_static_local_metadata(dest_local, vec_idx);
+    }
+
+    fn seed_static_local_metadata(&mut self, dest_local: usize, vec_idx: usize) {
+        if let Some(seed_value) = self.ref_resolution.static_ref_value_seeds.get(&vec_idx).cloned()
+        {
+            self.ref_resolution.const_ref_values.insert(dest_local, seed_value);
+        }
+        if let Some(seed_len) = self.ref_resolution.static_ref_len_seeds.get(&vec_idx).cloned() {
+            self.ref_resolution.subslice_len.insert(dest_local, seed_len);
+        }
+    }
+
+    fn propagate_static_local(
+        &mut self,
+        src_local: usize,
+        dest_local: usize,
+        propagation: &'static str,
+    ) -> bool {
+        if self.ref_resolution.static_ref_to_state_idx.contains_key(&dest_local) {
+            return false;
+        }
+
+        let Some(&vec_idx) = self.ref_resolution.static_ref_to_state_idx.get(&src_local) else {
+            return false;
+        };
+
+        self.map_static_local_to_state_idx(dest_local, vec_idx);
+        debug!(
+            src = src_local,
+            dest = dest_local,
+            vec_idx,
+            propagation,
+            "CHC: propagated static ref"
+        );
+        true
+    }
+
+    fn propagate_projected_static_value(&mut self, place: &Place, dest_local: usize) -> bool {
+        if self.ref_resolution.const_ref_values.contains_key(&dest_local) {
+            return false;
+        }
+        if !matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
+            return false;
+        }
+
+        let Some(value) = self.projected_immutable_static_value(place) else {
+            return false;
+        };
+        if value.sort().bitvec_width() == Some(2 * crate::codegen_ay::types::POINTER_WIDTH) {
+            let len = value.clone().extract(
+                2 * crate::codegen_ay::types::POINTER_WIDTH - 1,
+                crate::codegen_ay::types::POINTER_WIDTH,
+            );
+            self.ref_resolution.subslice_len.insert(dest_local, len);
+        }
+        self.ref_resolution.const_ref_values.insert(dest_local, value);
+        debug!(
+            src = place.local,
+            dest = dest_local,
+            "CHC: propagated projected immutable static value"
+        );
+        true
+    }
+
+    fn projected_immutable_static_value(&self, place: &Place) -> Option<Expr> {
+        let &vec_idx = self.ref_resolution.static_ref_to_state_idx.get(&place.local)?;
+        if self.ref_resolution.mutable_static_state_idxs.contains(&vec_idx) {
+            return None;
+        }
+        let mut current = self.ref_resolution.static_initial_values.get(&vec_idx)?.clone();
+
+        for proj in &place.projection[1..] {
+            let index = match proj {
+                ProjectionElem::Index(index_local) => {
+                    let value = self.unique_constant_usize_assignment(*index_local)?;
+                    Expr::bitvec_const(value as u128, crate::codegen_ay::types::POINTER_WIDTH)
+                }
+                ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
+                    let actual =
+                        if *from_end { min_length.saturating_sub(*offset) } else { *offset };
+                    Expr::bitvec_const(actual as u128, crate::codegen_ay::types::POINTER_WIDTH)
+                }
+                _ => return None,
+            };
+            current = Self::simplify_select_from_static_array(&current, &index)?;
+        }
+
+        Some(current)
+    }
+
+    fn unique_constant_usize_assignment(&self, local: usize) -> Option<usize> {
+        let mut values = Vec::new();
+        for bb_data in &self.body.blocks {
+            for stmt in &bb_data.statements {
+                if let StatementKind::Assign(lhs, rhs) = &stmt.kind
+                    && lhs.projection.is_empty()
+                    && lhs.local == local
+                    && let Rvalue::Use(Operand::Constant(const_op)) = rhs
+                    && let Some(value) = Self::extract_static_const_usize(&const_op.const_)
+                {
+                    values.push(value);
+                }
+            }
+        }
+        values.sort_unstable();
+        values.dedup();
+        match values.as_slice() {
+            [value] => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn extract_static_const_usize(mir_const: &rustc_public::ty::MirConst) -> Option<usize> {
+        if !matches!(
+            mir_const.ty().kind(),
+            rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Uint(_))
+        ) {
+            return None;
+        }
+        match mir_const.kind() {
+            ConstantKind::Allocated(alloc) => alloc.read_uint().ok().map(|value| value as usize),
+            ConstantKind::Ty(ty_const) => match ty_const.kind() {
+                TyConstKind::Value(_, alloc) => alloc.read_uint().ok().map(|value| value as usize),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn simplify_select_from_static_array(array: &Expr, select_index: &Expr) -> Option<Expr> {
+        match array.value() {
+            ExprValue::ConstArray { value, .. } => Some(value.clone()),
+            ExprValue::Store { array: inner, index: store_index, value } => {
+                if select_index == store_index
+                    || Self::bitvec_const_key(select_index) == Self::bitvec_const_key(store_index)
+                {
+                    return Some(value.clone());
+                }
+
+                if Self::bitvec_const_key(select_index).is_some()
+                    && Self::bitvec_const_key(store_index).is_some()
+                {
+                    return Self::simplify_select_from_static_array(inner, select_index);
+                }
+
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn bitvec_const_key(expr: &Expr) -> Option<(num_bigint::BigInt, u32)> {
+        if let ExprValue::BitVecConst { value, width } = expr.value() {
+            Some((value.clone(), *width))
+        } else {
+            None
+        }
+    }
+
+    pub(in crate::codegen_ay::chc) fn propagate_static_ref_state_idxs(&mut self) {
+        if self.ref_resolution.static_ref_to_state_idx.is_empty() {
+            return;
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for bb_data in &self.body.blocks {
+                for stmt in &bb_data.statements {
+                    let StatementKind::Assign(lhs, rhs) = &stmt.kind else {
+                        continue;
+                    };
+
+                    if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rhs
+                        && place.projection.is_empty()
+                    {
+                        changed |=
+                            self.propagate_static_local(place.local, lhs.local, "Copy/Move (#428)");
+                    }
+                    if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rhs
+                        && !place.projection.is_empty()
+                    {
+                        changed |= self.propagate_projected_static_value(place, lhs.local);
+                    }
+
+                    if let Rvalue::CopyForDeref(place) = rhs
+                        && place.projection.is_empty()
+                    {
+                        changed |= self.propagate_static_local(
+                            place.local,
+                            lhs.local,
+                            "CopyForDeref (#1836)",
+                        );
+                    }
+
+                    if let Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) = rhs
+                        && place.projection.is_empty()
+                    {
+                        changed |=
+                            self.propagate_static_local(place.local, lhs.local, "Cast (#428)");
+                    }
+
+                    let reborrow_place = match rhs {
+                        Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => Some(place),
+                        _ => None,
+                    };
+                    if let Some(place) = reborrow_place
+                        && place.projection.len() == 1
+                        && matches!(place.projection.first(), Some(ProjectionElem::Deref))
+                    {
+                        changed |= self.propagate_static_local(
+                            place.local,
+                            lhs.local,
+                            "Ref/AddressOf reborrow (#1836)",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

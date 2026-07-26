@@ -1,0 +1,16 @@
+   1|     | // Copyright Kani Contributors\
+   2|     | // SPDX-License-Identifier: Apache-2.0 OR MIT\
+   3|     | \
+   4|     | //! This test documents a coverage replacement gap: the return in `get` should be\
+   5|     | //! `UNCOVERED`, but the current coverage pipeline reports the whole function as\
+   6|     | //! `COVERED`. Coverage is outside the current 100% replacement claim until this\
+   7|     | //! is fixed; see <https://github.com/model-checking/kani/issues/3441>.\
+   8|     | \
+   9|    1| fn get(s: &[i16], index: usize) -> i16 {\
+  10|    1|     s[index]\
+  11|     | }\
+  12|     | \
+  13|     | #[kani::proof]\
+  14|    1| fn main() {\
+  15|    1|     get(&[7, -83, 19], 15);\
+  16|     | }\

@@ -1,0 +1,20 @@
+# Copyright Kani Contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "examples_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "../src/lib.rs"
+
+[[example]]
+name = "demo"
+path = "../examples/demo.rs"
+
+[[example]]
+name = "alt"
+path = "../examples/alt.rs"
+
+[package.metadata.kani.flags]
+examples=true

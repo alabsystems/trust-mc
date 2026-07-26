@@ -1,0 +1,27 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# Foundation crate for Kani function classification enums and type layout utilities.
+# Extracted from trust-mc-compiler/src/kani_middle/ to enable independent compilation
+# of chc/ and statement/ codegen subcrates.
+# Part of #2997: split codegen_ay into subcrates.
+
+[package]
+name = "trust-mc-kani-types"
+version = "0.67.0"
+edition = "2024"
+description = "Kani function enums and LayoutOf utilities for trust-mc codegen subcrates."
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+strum = { workspace = true }
+strum_macros = { workspace = true }
+tracing = { workspace = true }
+
+[package.metadata.rust-analyzer]
+# This package uses rustc crates.
+rustc_private = true

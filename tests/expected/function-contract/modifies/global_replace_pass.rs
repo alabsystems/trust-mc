@@ -1,0 +1,30 @@
+// Copyright Kani Contributors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// kani-flags: -Zfunction-contracts -Zstubbing
+
+static mut PTR: u32 = 0;
+
+#[kani::modifies(&mut PTR)]
+#[kani::ensures(|result| PTR == src)]
+unsafe fn modify(src: u32) {
+    PTR = src;
+}
+
+#[kani::proof_for_contract(modify)]
+fn modify_harness() {
+    let src = kani::any();
+    unsafe {
+        modify(src);
+    }
+}
+
+#[kani::proof]
+#[kani::stub_verified(modify)]
+fn main() {
+    unsafe {
+        PTR = kani::any();
+        let new = kani::any();
+        modify(new);
+        kani::assert(new == PTR, "replaced");
+    }
+}

@@ -1,0 +1,62 @@
+# Copyright Kani Contributors
+# Modifications Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-mc-compiler"
+version = "0.67.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# cbmc dependency removed - CBMC/CProver removed in issue #563
+ay_bindings = { workspace = true, optional = true }
+ay-dpll = { workspace = true, optional = true }
+ay-frontend = { workspace = true, optional = true }
+trust-mc-codegen-shared = { path = "../trust-mc-codegen-shared" }
+trust-mc-codegen-stubs = { path = "../trust-mc-codegen-stubs" }
+trust-mc-codegen-types = { path = "../trust-mc-codegen-types", optional = true }
+trust-mc-kani-types = { path = "../trust-mc-kani-types" }
+trust-mc-core = { path = "../trust-mc-core", optional = true }
+clap = { workspace = true, features = ["cargo"] }
+indexmap = { version = "2.7.1", features = ["serde"] }
+itertools = "0.14"
+num-bigint = { workspace = true }
+trust-mc-metadata = { path = "../trust-mc-metadata" }
+lazy_static = "1.5.0"
+# num removed - was only used by cprover backend
+quote = "1.0.36"
+regex = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true }
+sha1-checked = "0.10.0"
+# Heap-backed stack growth for deeply recursive Expr rewriters (matches the
+# version ay-bindings uses for its shared fold_expr).
+stacker = "0.1.24"
+strum = { workspace = true }
+strum_macros = { workspace = true }
+syn = { version = "2.0.72", features = ["parsing", "extra-traits"] }
+tracing = { workspace = true, features = ["max_level_trace", "release_max_level_debug"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json", "fmt"] }
+tracing-tree = "0.4.0"
+
+[features]
+# AY is now the only backend - CBMC/CProver removed in issue #563
+default = ['ay']
+ay = ['ay_bindings', 'ay-dpll', 'ay-frontend', 'trust-mc-codegen-types', 'trust-mc-core', 'serde']
+# Compile-backed CHC/statement corpus tests are opt-in so default `cargo test`
+# stays within publish-time smoke-test budgets.
+compiler-corpus-tests = []
+
+[dev-dependencies]
+proptest = "1"
+ay-chc = { workspace = true }
+
+[package.metadata.rust-analyzer]
+# This package uses rustc crates.
+rustc_private = true
+
+[lints]
+workspace = true

@@ -1,0 +1,72 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+# Machine-checked ledger for the repo-local false-PROOF regression corpus.
+# `cargo test -p trust-mc-driver soundness_ledger` fails closed if any listed file,
+# harness, or accepted verdict directive disappears.
+
+[[entry]]
+issues = [129]
+kind = "false-proof"
+file = "tests/ay/soundness_129_fail_expected.rs"
+harnesses = ["test_branch_assigned_wrong_assertion"]
+accepted_verdicts = ["CTREX"]
+notes = "Branch-phi false-proof control. Must stay non-PROOF."
+
+[[entry]]
+issues = [155]
+kind = "false-proof"
+file = "tests/ay/soundness_155_stale_ssa_fail.rs"
+harnesses = [
+  "test_reassigned_before_branch_should_fail",
+  "test_multiple_reassign_before_branch_should_fail",
+  "test_computed_value_before_branch_should_fail",
+  "test_symbolic_reassign_before_branch_should_fail",
+]
+accepted_verdicts = ["CTREX"]
+notes = "Stale SSA path-condition regressions. All listed harnesses must stay non-PROOF."
+
+[[entry]]
+issues = [2055]
+kind = "false-proof"
+file = "tests/ay/soundness_2055_intermediate_read_fail.rs"
+harnesses = [
+  "test_read_then_overwrite_should_fail",
+  "test_multiple_intermediate_reads_should_fail",
+  "test_arithmetic_intermediate_read_should_fail",
+]
+accepted_verdicts = ["CTREX"]
+notes = "Intermediate-read regressions must keep producing a failing verdict."
+
+[[entry]]
+issues = [1032]
+kind = "false-proof"
+file = "tests/ay/memory_safety_uaf_fail.rs"
+harnesses = ["test_heap_use_after_free_should_fail"]
+accepted_verdicts = ["CTREX", "UNKNOWN"]
+notes = "Use-after-free regression harness. CTREX is preferred; UNKNOWN is accepted as fail-closed. Any PROOF is a soundness bug."
+
+[[entry]]
+issues = [4278, 1174]
+kind = "false-proof"
+file = "tests/ay/memory_safety_size_mismatch_fail.rs"
+harnesses = ["test_heap_size_mismatch_should_fail"]
+accepted_verdicts = ["CTREX", "UNKNOWN"]
+notes = "Wrong dealloc-size regression harness. CTREX is preferred; UNKNOWN is accepted as fail-closed. Any PROOF is a soundness bug."
+
+[[entry]]
+issues = [1034]
+kind = "false-proof"
+file = "tests/ay/memory_safety_double_free_fail.rs"
+harnesses = ["test_heap_double_free_should_fail"]
+accepted_verdicts = ["CTREX"]
+notes = "Double-free regression harness. Any PROOF is a soundness bug."
+
+[[entry]]
+issues = [3636, 3728]
+kind = "false-proof"
+file = "tests/ay/realloc_stale_pointer_fail.rs"
+harnesses = ["test_realloc_stale_pointer_should_fail"]
+accepted_verdicts = ["CTREX", "UNKNOWN"]
+notes = "Realloc stale-pointer lineage. Was UNKNOWN, then ERROR at ay 65537dc81; under the CHC lane at ay build.1636 it is FAILED with [AY:CTREX_CAT:Unknown] (ay-chc inconclusive) — fail-closed. Any PROOF is a soundness bug."

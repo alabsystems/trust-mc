@@ -1,0 +1,9 @@
+Checking harness verify::slow_harness...
+Status: SATISFIED\
+Description: "Cover bench `slow`"
+
+Checking harness verify::speed_harness...
+Status: SATISFIED\
+Description: "Cover bench `speed`"
+
+Complete - 2 successfully verified harnesses, 0 failures, 2 total.

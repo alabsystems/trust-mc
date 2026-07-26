@@ -1,0 +1,18 @@
+# Copyright trust-mc Contributors (Kani Contributors for original code)
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[book]
+title = "The trust-mc Rust Verifier"
+description = "Documentation for the trust-mc Rust Verifier"
+authors = ["trust-mc Developers", "Kani Contributors"]
+src = "src"
+language = "en"
+
+[output.html]
+site-url = "/trust-mc/"
+git-repository-url = "https://github.com/alabsystems/trust-mc"
+edit-url-template = "https://github.com/alabsystems/trust-mc/edit/main/guide/{path}"
+
+[output.html.playground]
+runnable = false
+
+[preprocessor.graphviz]

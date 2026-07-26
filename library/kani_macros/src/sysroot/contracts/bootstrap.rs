@@ -1,0 +1,183 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
+// Copyright Kani Contributors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+//! Special way we handle the first time we encounter a contract attribute on a
+//! function.
+
+use proc_macro2::{Ident, Span, TokenStream};
+use quote::quote;
+use syn::{Expr, ItemFn, Stmt};
+
+use super::{ContractConditionsHandler, INTERNAL_RESULT_IDENT, helpers::*};
+
+impl<'a> ContractConditionsHandler<'a> {
+    /// Generate initial contract.
+    ///
+    /// 1. Generating the body for the recursion closure used by contracts.
+    ///    - The recursion closure body will contain the check and replace closure.
+    pub(super) fn handle_untouched(&mut self) {
+        let replace_name = &self.replace_name;
+        let modifies_name = &self.modify_name;
+        let recursion_name = &self.recursion_name;
+        let check_name = &self.check_name;
+        let assert_name = &self.assert_name;
+
+        let replace_closure = self.replace_closure();
+        let check_closure = self.check_closure();
+        let recursion_closure = self.new_recursion_closure(&replace_closure, &check_closure);
+        let assert_closure = self.assert_closure();
+
+        let span = Span::call_site();
+        let replace_ident = Ident::new(&self.replace_name, span);
+        let check_ident = Ident::new(&self.check_name, span);
+        let recursion_ident = Ident::new(&self.recursion_name, span);
+        let assert_ident = Ident::new(&self.assert_name, span);
+
+        // The order of `attrs` and `kanitool::{checked_with,
+        // is_contract_generated}` is important here, because macros are
+        // expanded outside in. This way other contract annotations in `attrs`
+        // sees those attributes and can use them to determine
+        // `function_state`.
+        let ItemFn { attrs, vis, sig, block } = &self.annotated_fn;
+        self.output.extend(quote!(
+            #(#attrs)*
+            #[kanitool::recursion_check = #recursion_name]
+            #[kanitool::checked_with = #check_name]
+            #[kanitool::replaced_with = #replace_name]
+            #[kanitool::asserted_with = #assert_name]
+            #[kanitool::modifies_wrapper = #modifies_name]
+            #vis #sig {
+                // Dummy functions used to force the compiler to annotate Kani's
+                // closures as `FnOnce`. Without this, Rust infers the generated closures as `FnMut`,
+                // preventing us from writing contracts for functions returning mutable references.
+                // See https://github.com/model-checking/kani/issues/3764
+                #[inline(never)]
+                #[kanitool::fn_marker = "kani_force_fn_once"]
+                const fn kani_force_fn_once<T, F: FnOnce() -> T>(f: F) -> F {
+                    f
+                }
+                #[inline(never)]
+                #[kanitool::fn_marker = "kani_force_fn_once_with_args"]
+                const fn kani_force_fn_once_with_args<A, T, F: FnOnce(A) -> T>(f: F) -> F {
+                    f
+                }
+                // Dummy function used to force the compiler to capture the environment.
+                // We cannot call closures inside constant functions.
+                // This function gets replaced by `kani::internal::call_closure`.
+                #[inline(never)]
+                #[kanitool::fn_marker = "kani_register_contract"]
+                const fn kani_register_contract<T, F: FnOnce() -> T>(f: F) -> T {
+                    unreachable!()
+                }
+                // Dummy function that we replace to pick the contract mode.
+                // By default, return ORIGINAL
+                #[inline(never)]
+                #[kanitool::fn_marker = "kani_contract_mode"]
+                const fn kani_contract_mode() -> kani::internal::Mode {
+                    kani::internal::ORIGINAL
+                }
+                let kani_contract_mode = kani_contract_mode();
+                match kani_contract_mode {
+                    kani::internal::RECURSION_CHECK => {
+                        #recursion_closure;
+                        kani_register_contract(#recursion_ident)
+                    }
+                    kani::internal::REPLACE => {
+                        #replace_closure;
+                        kani_register_contract(#replace_ident)
+                    }
+                    kani::internal::SIMPLE_CHECK => {
+                        #check_closure;
+                        kani_register_contract(#check_ident)
+                    }
+                    kani::internal::ASSERT => {
+                        #assert_closure;
+                        kani_register_contract(#assert_ident)
+                    }
+                    _ => #block
+                }
+            }
+        ));
+    }
+
+    /// Handle subsequent contract attributes.
+    ///
+    /// Find the closures added by the initial setup, parse them and expand their body according
+    /// to the attribute being handled.
+    pub(super) fn handle_expanded(&mut self) {
+        let mut annotated_fn = self.annotated_fn.clone();
+        let ItemFn { block, .. } = &mut annotated_fn;
+        let recursion_closure = expect_closure_in_match(&mut block.stmts, "recursion_check");
+        self.expand_recursion(recursion_closure);
+
+        let replace_closure = expect_closure_in_match(&mut block.stmts, "replace");
+        self.expand_replace(replace_closure);
+
+        let check_closure = expect_closure_in_match(&mut block.stmts, "check");
+        self.expand_check(check_closure);
+
+        let assert_closure = expect_closure_in_match(&mut block.stmts, "assert");
+        self.expand_assert(assert_closure);
+
+        self.output.extend(quote!(#annotated_fn));
+    }
+
+    /// Generate the tokens for the recursion closure.
+    fn new_recursion_closure(
+        &self,
+        replace_closure: &TokenStream,
+        check_closure: &TokenStream,
+    ) -> TokenStream {
+        let ItemFn { sig, .. } = self.annotated_fn;
+        let output = &sig.output;
+        let span = Span::call_site();
+        let result = Ident::new(INTERNAL_RESULT_IDENT, span);
+        let replace_ident = Ident::new(&self.replace_name, span);
+        let check_ident = Ident::new(&self.check_name, span);
+        let recursion_ident = Ident::new(&self.recursion_name, span);
+
+        quote!(
+            #[kanitool::is_contract_generated(recursion_check)]
+            #[allow(dead_code, unused_variables, unused_mut)]
+            let mut #recursion_ident = kani_force_fn_once(|| #output
+            {
+                #[kanitool::recursion_tracker]
+                static mut REENTRY: bool = false;
+                if unsafe { REENTRY } {
+                    #replace_closure
+                    #replace_ident()
+                } else {
+                    unsafe { REENTRY = true };
+                    #check_closure
+                    let #result = #check_ident();
+                    unsafe { REENTRY = false };
+                    #result
+                }
+            });
+        )
+    }
+
+    /// Expand an existing recursion closure with the new condition.
+    ///
+    /// Uses `find_if_expr_mut` to traverse nested blocks and find the reentry if expression.
+    /// This handles cases where the if may be wrapped in additional blocks. (#693)
+    fn expand_recursion(&self, closure: &mut Stmt) {
+        let body = closure_body(closure);
+        let stmts = &mut body.block.stmts;
+        let if_reentry = find_if_expr_mut(stmts).expect(
+            "Internal Failure: Expected to find reentry if expression in recursion closure",
+        );
+
+        let replace_closure = expect_closure(&mut if_reentry.then_branch.stmts, "replace");
+        self.expand_replace(replace_closure);
+
+        let else_branch = if_reentry.else_branch.as_mut().unwrap();
+        let Expr::Block(else_block) = else_branch.1.as_mut() else { unreachable!() };
+        let check_closure = expect_closure(&mut else_block.block.stmts, "check");
+        self.expand_check(check_closure);
+    }
+}

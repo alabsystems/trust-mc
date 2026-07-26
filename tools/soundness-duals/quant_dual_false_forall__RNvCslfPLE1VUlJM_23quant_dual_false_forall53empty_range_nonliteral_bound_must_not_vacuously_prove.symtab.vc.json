@@ -1,0 +1,51 @@
+{
+  "version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "mode": "chc",
+  "harness": {
+    "mangled_name": "empty_range_nonliteral_bound_must_not_vacuously_prove",
+    "pretty_name": "empty_range_nonliteral_bound_must_not_vacuously_prove"
+  },
+  "properties": [
+    {
+      "id": {
+        "id": 0,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p0",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 1,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p1",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 2,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p2",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 3,
+        "description": null
+      },
+      "kind": "assertion",
+      "message": "empty-range forall over nondet bound must not prove vacuously",
+      "smt_var": "error_p3",
+      "approximation_dependent": false
+    }
+  ]
+}

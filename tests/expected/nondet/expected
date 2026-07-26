@@ -1,0 +1,10 @@
+SUCCESS\
+attempt to multiply with overflow
+SUCCESS\
+attempt to multiply with overflow
+SUCCESS\
+attempt to subtract with overflow
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+assertion failed: x * x - 2 * x + 1 != 4 || (x == -1 || x == 3)

@@ -1,0 +1,19 @@
+error: failed to resolve `<Wrapper < bool > as Describe>::tag`: unable to find implementation of associated function `Describe::tag` for Wrapper<T>\
+generic_trait_impl_self.rs\
+|\
+| #[kani::stub(<Wrapper<bool> as Describe>::tag, stub_tag)]\
+| ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\
+|\
+   = note: trust-mc does not currently support stubs or function contracts on generic functions in traits.\
+            See https://github.com/model-checking/kani/issues/1997#issuecomment-3134614734 for more information.
+
+error: failed to resolve `<Wrapper < u8 > as Describe>::tag`: unable to find implementation of associated function `Describe::tag` for Wrapper<T>\
+generic_trait_impl_self.rs\
+|\
+| #[kani::stub(<Wrapper<u8> as Describe>::tag, stub_tag)]\
+| ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\
+|\
+   = note: trust-mc does not currently support stubs or function contracts on generic functions in traits.\
+            See https://github.com/model-checking/kani/issues/1997#issuecomment-3134614734 for more information.
+
+error: aborting due to 2 previous errors

@@ -1,0 +1,410 @@
+# Copyright 2026 Andrew Yates
+# Portions derived from Kani (https://github.com/model-checking/kani), Copyright Kani Contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-mc"
+version = "0.67.0"
+edition = "2024"
+description = "A bit-precise model checker for Rust."
+readme = "README.md"
+keywords = ["model-checking", "verification"]
+categories = ["development-tools"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alabsystems/trust-mc"
+documentation = "https://github.com/alabsystems/trust-mc"
+homepage = "https://github.com/alabsystems/trust-mc"
+# N.B. Cargo.* is included automatically:
+include = ["/src", "/build.rs", "/rust-toolchain.toml", "/LICENSE-*", "/README.md", "/CHANGELOG.md"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+home = "0.5"
+libc = "0.2"
+os_info = { version = "3", default-features = false }
+
+[[bin]]
+name = "trust-mc"
+path = "src/bin/trust-mc.rs"
+
+[[bin]]
+name = "cargo-trust-mc"
+path = "src/bin/cargo_trust-mc.rs"
+
+# R2 deletion D-C (two-language spec surface, author ruling 2026-07-13): the
+# legacy `kani` / `cargo-kani` [[bin]] proxies are retired from the installed
+# user surface. The canonical installed names are `trust-mc` / `cargo-trust-mc`
+# only. The cargo-kani *semantics* remain tool-internal: trust-mc-driver still
+# accepts the kani / cargo-kani invocation identities (argv[0] / argv[1]), and
+# tools/kani-domination drives Kani's own corpus through the driver directly
+# (single-file: `trust-mc-driver <file>`; cargo units: `trust-mc-driver
+# trust-mc …`, the `cargo trust-mc` identity), never through installed bins.
+
+[profile.dev]
+# Line-tables-only saves ~20s on trust-mc-compiler (259K LOC) by cutting
+# LLVM debuginfo codegen from 25s to 4s. Backtraces retain file:line.
+# Full variable-level debug info needs crate splitting (#2997).
+# Issue #3000: build time regression from 8s baseline to 32s.
+debug = "line-tables-only"
+# Limit LLVM parallel codegen from default 256 to 2.
+# Reduces per-crate peak memory during LLVM backend passes.
+# Issue #3061: OOM on M2 Max (64GB) when building with full team.
+# Reduced from 4→2 after 4 kernel panics in 3 days (2026-03-01).
+# With jobs=3: 3 crates × 2 codegen units = 6 LLVM threads (was 12).
+codegen-units = 2
+# Avoid running dsymutil on macOS — saves ~2s link time and significant
+# peak memory. Debug symbols remain in individual .o files ("unpacked")
+# which lldb reads directly. Issue #3062: build efficiency on M4.
+split-debuginfo = "unpacked"
+
+# Optimize dependencies (notably the linked ay solver crates, which run hot
+# SAT/SMT inner loops) even in dev builds. Without this, `cargo build-dev`
+# ships an opt-level-0, debug-assertions-on solver inside the driver — a
+# 3-20x wall-clock handicap vs the release bundle users get (measured:
+# core::ub_checks frames dominating solver hot paths; #39 bisect). Workspace
+# members are unaffected (package."*" covers dependencies only), so compiler
+# iteration speed is unchanged after the one-time dependency rebuild.
+[profile.dev.package."*"]
+opt-level = 3
+debug-assertions = false
+
+[profile.release]
+strip = "debuginfo"
+# Default is 16 for release. Limit to 2 for memory safety on M2 Max (#3061).
+codegen-units = 2
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+lto = "off"
+
+# Below is the workspace (vs above is "trust-mc" crate) config:
+
+[workspace]
+members = [
+  "library/trust-mc",
+  "library/std",
+  "tools/compiletest",
+  "tools/build-trust-mc",
+  "tools/trust-mc-cov",
+  "tools/scanner",
+  "tools/compile-timer",
+  # NOTE: tools/kani-domination is deliberately NOT a member — it is a standalone
+  # stable-Rust CLI (its own workspace) that drives the trust-mc verifier as a
+  # subprocess, so building it needs no nightly / rustc-dev / rust-src and no
+  # git-dep resolution. Build it with `cd tools/kani-domination && cargo build`.
+  "trust-mc-driver",
+  "trust-mc-replay",
+  "trust-mc-compiler",
+  "trust-mc-codegen-types",
+  "trust-mc-codegen-shared",
+  "trust-mc-codegen-stubs",
+  "trust-mc-kani-types",
+  "trust-mc-metadata",
+  "trust-mc-core",
+  "library/kani_core",
+  "trust-mc-trust-vc-ingest",
+  "trust-mc-trust-bmc",
+]
+
+# This indicates what package to e.g. build with 'cargo build' without --workspace
+default-members = [
+  ".",
+  "trust-mc-driver",
+  "trust-mc-compiler",
+]
+
+exclude = [
+  "build",
+  "target",
+  "proofs",
+  # Standalone reachability lint (own [workspace]); builds on stable, must not
+  # pull rustc-dev into the main build. See tools/main-thread-purity/.
+  "tools/main-thread-purity",
+  # dependency tests have their own workspace
+  "tests/kani-dependency-test/dependency3",
+  # cargo kani tests should also have their own workspace
+  "tests/cargo-kani",
+  "tests/perf",
+  "tests/cargo-ui",
+  "tests/slow",
+  "tests/std-checks",
+  "tests/script-based-pre",
+  "tests/script-based-pre/build-cache-bin/target/new_dep",
+  "tests/script-based-pre/build-cache-dirty/target/new_dep",
+  "tests/script-based-pre/verify_std_cmd/tmp_dir/target/kani_verify_std",
+  "tests/script-based-pre/kani_lib_dep",
+  "tests/script-based-pre/no_codegen",
+  "tests/script-based-pre/no_codegen_error",
+]
+
+[workspace.lints.clippy]
+# Baseline lint groups
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Allow common verification-code patterns
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+return_self_not_must_use = "allow"
+needless_raw_string_hashes = "allow"
+should_implement_trait = "allow"
+result_unit_err = "allow"
+implicit_hasher = "allow"
+match_wild_err_arm = "allow"
+elidable_lifetime_names = "allow"
+uninlined_format_args = "allow"
+cast_lossless = "allow"
+manual_is_multiple_of = "allow"
+unnecessary_map_or = "allow"
+items_after_statements = "allow"
+match_same_arms = "allow"
+doc_markdown = "allow"
+
+# Documentation - allow verbose doc paragraphs (common in verification code)
+too_long_first_doc_paragraph = "allow"
+
+# Verification-specific suppressions: these are false positives in codegen context
+# Methods use &self for API consistency within impl blocks (not all methods access self)
+unused_self = "allow"
+# Codegen functions are inherently complex due to MIR/SMT translation
+too_many_lines = "allow"
+# Variable names like val/vals, idx/idxs are clear in context
+similar_names = "allow"
+# Many verification functions consume args for builder patterns
+needless_pass_by_value = "allow"
+# Controlled numeric casts are pervasive in bitvector width translation
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# Style preferences that don't improve verification code clarity
+if_not_else = "allow"
+unnested_or_patterns = "allow"
+unreadable_literal = "allow"
+# let...else syntax: match is often clearer in codegen dispatch chains
+manual_let_else = "allow"
+# Wildcard match on single-variant remainder: used intentionally for forward
+# compatibility with external enums (rustc_public types may gain variants)
+match_wildcard_for_single_variants = "allow"
+# for_each is acceptable for side-effecting iteration in codegen
+needless_for_each = "allow"
+# usize→f64 casts acceptable in metrics/reporting code
+cast_precision_loss = "allow"
+# &Option<T> used in codegen dispatch signatures for consistency
+ref_option = "allow"
+# Default::default() is equally clear to Type::default()
+default_trait_access = "allow"
+# if chains vs match: both acceptable in codegen pattern matching
+single_match_else = "allow"
+collapsible_if = "allow"
+manual_map = "allow"
+# Map+unwrap patterns are clear in context
+map_unwrap_or = "allow"
+# Format string patterns
+format_push_string = "allow"
+# Collect is sometimes needed for side effects or type conversion
+needless_collect = "allow"
+# Continue expressions sometimes used for clarity in complex loops
+needless_continue = "allow"
+# Bool assertions in tests
+bool_assert_comparison = "allow"
+# if-chain vs match: both acceptable patterns in codegen
+if_then_some_else_none = "allow"
+manual_is_variant_and = "allow"
+# Codegen functions sometimes need many args for MIR translation context
+too_many_arguments = "allow"
+# Clone::clone() assignment is acceptable in codegen builder patterns
+assigning_clones = "allow"
+# Large stack allocations are acceptable in test code
+large_stack_arrays = "allow"
+# Struct field naming follows MIR/SMT conventions
+struct_field_names = "allow"
+# Recursive self-calls are used in MIR traversal
+only_used_in_recursion = "allow"
+self_only_used_in_recursion = "allow"
+# Case-sensitivity in file ext comparisons is intentional
+case_sensitive_file_extension_comparisons = "allow"
+# Doc link style: quotes vs backticks both acceptable
+doc_link_with_quotes = "allow"
+# LazyLock vs lazy_static: migration deferred
+missing_const_for_fn = "allow"
+# lazy_static → LazyLock migration: deferred
+non_std_lazy_statics = "allow"
+# Comparison chains using if/else: both patterns acceptable in bitvec width logic
+comparison_chain = "allow"
+# format!() to build strings from iterators: acceptable pattern
+format_collect = "allow"
+# Missing semicolons on unit-returning expressions: acceptable in upstream code
+semicolon_if_nothing_returned = "allow"
+# Single-char string patterns: acceptable pattern choice
+single_char_pattern = "allow"
+# Redundant closure for method calls: closure form is sometimes clearer
+redundant_closure_for_method_calls = "allow"
+# Verification functions wrap unconditionally by design (e.g., always Some/Ok)
+unnecessary_wraps = "allow"
+# Trivially-copyable refs are common in verification parameter threading
+trivially_copy_pass_by_ref = "allow"
+# Nested Option is used intentionally for "present but empty" semantics
+option_option = "allow"
+# Upstream Kani code uses underscore-prefixed bindings that are later read
+used_underscore_binding = "allow"
+# f32/f64 comparisons are intentional in const-fold and math intrinsics
+float_cmp = "allow"
+# Struct booleans are acceptable in configuration/state types
+struct_excessive_bools = "allow"
+# &Option<T> params are used for consistency in codegen dispatch signatures
+option_if_let_else = "allow"
+# Wildcard imports are used for re-exporting in mod.rs files
+wildcard_imports = "allow"
+# `unreachable_pub` is our visibility guardrail; this avoids contradictory noise
+# when intentionally using `pub(crate)` during visibility narrowing.
+redundant_pub_crate = "allow"
+# Pedantic: explicit .iter() is sometimes clearer than &container in for loops
+explicit_iter_loop = "allow"
+# Pedantic: implicit clone via deref+to_string is acceptable in codegen
+implicit_clone = "allow"
+
+# Style lints from clippy::all — acceptable patterns in verification codegen
+collapsible_else_if = "allow"
+collapsible_match = "allow"
+doc_lazy_continuation = "allow"
+empty_line_after_doc_comments = "allow"
+for_kv_map = "allow"
+let_and_return = "allow"
+needless_borrows_for_generic_args = "allow"
+needless_question_mark = "allow"
+needless_return = "allow"
+op_ref = "allow"
+ptr_arg = "allow"
+question_mark = "allow"
+redundant_closure = "allow"
+type_complexity = "allow"
+unnecessary_get_then_check = "allow"
+unnecessary_lazy_evaluations = "allow"
+
+# Performance - warn on inefficient patterns (redundant_clone demoted: 29 warnings in codegen)
+redundant_clone = "allow"
+# Arc::clone(&x) vs x.clone(): both acceptable, not enforced codebase-wide
+clone_on_ref_ptr = "allow"
+large_enum_variant = "warn"
+vec_init_then_push = "warn"
+unnecessary_to_owned = "warn"
+manual_memcpy = "warn"
+inefficient_to_string = "warn"
+
+# Correctness - warn on unsafe patterns in library code
+# Using "warn" instead of "deny" since codebase has existing violations
+unwrap_used = "warn"
+# panic! is used legitimately in test assertions and unreachable paths
+panic = "allow"
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+# AY SMT solver - direct Rust linking (#513)
+#
+# Git+rev pinned for reproducible builds and bisection. The replacement-proof
+# standard (replacement-proof.md at the repo root) requires a pinned
+# 40-character ay rev;
+# all ay-* entries below share one rev. The active local path patch below means
+# Cargo.lock records the AY packages without a git source/hash. The manifest rev
+# records the reproducible upstream identity; `scripts/check-ay-pin.sh` separately
+# verifies that every entry is uniform, Cargo resolves each package from the
+# active ../ay checkout, and that checkout is clean at the exact declared rev.
+# `scripts/check-shared-pins.sh` applies the same fail-closed discipline to the
+# TrustIR and trust-vc authorities declared by member manifests, plus the Clean
+# kernel authority consumed transitively by the canonical TrustIR checkout.
+#
+# For local co-development:
+# 1. Keep ../ay checkout at the desired revision.
+# 2. The active [patch] table below redirects the pinned source to that checkout.
+#
+# To bump AY: change the shared rev on every ay-* entry below to the new
+# 40-char commit, align ../ay to it, run `scripts/check-ay-pin.sh`, then run
+# `cargo update -p ay-chc` plus locked metadata and re-run the corpus measurement
+# (scripts/ay-compiletest.sh) so the authority tuple is refreshed. With the path
+# patch, a no-op lockfile update is expected when AY's package graph and versions
+# are unchanged.
+[workspace.dependencies]
+# Keep all AY workspace dependencies pinned to the SAME 40-char rev. The
+# replacement-proof standard (replacement-proof.md at the repo root) requires a pinned
+# 40-character ay revision for reproducible measurements; a floating
+# `branch = "main"` does not satisfy it. Cargo.lock intentionally records the
+# path-patched packages; this manifest rev records the exact upstream commit.
+ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+ay-frontend = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+ay-chc = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+ay_bindings = { package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+# Trust: default-features = false drops ay's GMP-backed LRA path (`rug` +
+# `gmp-mpfr-sys`). trust-mc-driver links ay in-process; the pure-Rust
+# num_rational fallback is functionally identical and adds no native `-lgmp`
+# link, so the Trust rustc_driver link has no undefined `___gmpq_*` symbols.
+ay = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb", default-features = false }
+ay-sys = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+# Shared AY encoding/invocation surface — consumed from its canonical home in
+# the ay repo (NOT vendored). Because all ay-family deps above use the same
+# pinned rev, ay-encode's own ay-chc/ay-bindings/ay-core resolve to the same
+# rev — one shared copy of ChcProblem/VerifiedChcResult/etc.
+ay-encode = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+num-bigint = "0.4"
+
+# Common dependencies centralized for version consistency across workspace members.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.4.11", features = ["derive"] }
+strum = "0.27.1"
+strum_macros = "0.27.1"
+tracing = "0.1"
+anyhow = "1"
+regex = "1.11.1"
+sha2 = "0.10"
+syn = { version = "2.0.72", features = ["parsing", "full"] }
+thiserror = "2"
+
+# DEV/TEST glue only. Redirect trust-ir + trust-ir-build to the sibling TrustIR
+# working tree so local co-development exercises the exact checkout named by
+# the manifest revisions. Both crates are patched together so ModuleBuilder's
+# `Module` and trust-mc-trust-bmc's `Module` stay a single trust-ir instance.
+# TrustIR itself declares Clean as an exact Git dependency; trust-mc deliberately
+# does not mask that transitive authority with a Clean path patch. The lockfile
+# therefore records the immutable Clean source, and `scripts/check-shared-pins.sh`
+# proves it matches the Clean declarations and remains in the freshly queried
+# canonical main history even when that branch advances past the frozen content.
+# Ignored inside the trust superproject (a workspace member's [patch] is not
+# honored — trust's root [patch] governs there), so the reproducible trustc build
+# is unaffected.
+[patch."https://github.com/alabsystems/trust-ir.git"]
+trust-ir = { path = "../trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "../trust-ir/crates/trust-ir-build" }
+
+# Trust(local-co-dev / obligation-replay): redirect the pinned ay.git rev to the
+# in-tree `first-party/ay` checkout — the SAME source the stage-2 build resolves
+# via the main workspace's [patch]. Without this, standalone `cargo build` in
+# this inner workspace would resolve a separate Git copy instead of the exact
+# sibling checkout audited by `scripts/check-ay-pin.sh`. Patching the entry
+# crates is sufficient: the sibling AY workspace resolves their transitive deps
+# (ay-core, ay-theories/*, ...) by path. This is local-build-only and does NOT
+# affect the x.py stage-2 build, which uses the trust superproject's main
+# workspace manifest.
+[patch."https://github.com/alabsystems/ay.git"]
+ay = { path = "../ay/crates/ay" }
+ay-core = { path = "../ay/crates/ay-core" }
+ay-dpll = { path = "../ay/crates/ay-dpll" }
+ay-frontend = { path = "../ay/crates/ay-frontend" }
+ay-proof = { path = "../ay/crates/ay-proof" }
+ay-translate = { path = "../ay/crates/ay-translate" }
+ay-chc = { path = "../ay/crates/ay-chc" }
+ay-allsat = { path = "../ay/crates/ay-allsat" }
+ay-sat = { path = "../ay/crates/ay-sat" }
+ay-bindings = { path = "../ay/crates/ay-bindings" }
+ay-sys = { path = "../ay/crates/ay-sys" }
+ay-encode = { path = "../ay/crates/ay-encode" }

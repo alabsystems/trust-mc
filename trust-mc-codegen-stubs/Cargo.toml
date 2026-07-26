@@ -1,0 +1,20 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# Stub registry crate for AY codegen: maps stdlib function paths to StubKind.
+# Extracted from trust-mc-compiler/src/codegen_ay/stubs/ for incremental build speed.
+# Part of #2997: split codegen_ay into subcrates.
+
+[package]
+name = "trust-mc-codegen-stubs"
+version = "0.67.0"
+edition = "2024"
+description = "Stdlib function stub registry for trust-mc AY codegen."
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing = { workspace = true }

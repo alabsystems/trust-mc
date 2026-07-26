@@ -1,0 +1,32 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
+// Copyright Kani Contributors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// @expect error
+// kani-verify-fail
+// Reason: SMACK arithmetic test - assertion excludes all valid a*b products (expected failure)
+
+#[kani::proof]
+pub fn main() {
+    let a = kani::any();
+    let b = kani::any();
+    if 4 < a && a < 8 {
+        // a in [5,7]
+        if 5 < b && b < 9 {
+            // b in [6,8]
+            let x = a * b;
+            assert!(
+                !(x == 30
+                    || x == 35
+                    || x == 40
+                    || x == 36
+                    || x == 48
+                    || x == 42
+                    || x == 49
+                    || x == 56)
+            ); // a*b != anything allowed
+        }
+    }
+}

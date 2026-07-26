@@ -1,0 +1,14 @@
+// Copyright Kani Contributors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+#[kani::proof]
+fn main() {
+    // should succeed
+    assert!(div(4, 2) == 2);
+    // should fail
+    assert!(div(6, 2) == 2);
+}
+
+fn div(a: i32, b: i32) -> i32 {
+    a / b
+}

@@ -1,0 +1,4 @@
+Function `core::slice::ascii::<impl [u8]>::make_ascii_uppercase` is abstracted but has no stub
+[AY:UNKNOWN_QUALITY:EncodingGap:unsupported_construct_fallback=1]
+VERIFICATION:- INCONCLUSIVE (no checks)
+Verification failed for - harness

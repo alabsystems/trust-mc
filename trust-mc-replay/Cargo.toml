@@ -1,0 +1,32 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-mc-replay"
+version = "0.67.0"
+edition = "2024"
+description = "Standalone obligation-replay harness: deserialize a dumped native trust_ir verification bundle and re-run the private exact-module CHC/PDR authority lane WITHOUT rebuilding trustc. Iterate ay-chc / trust-mc verifier logic in seconds via `cargo build -p trust-mc-replay` instead of a 26-minute stage-2 build."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "trust-mc-replay"
+path = "src/main.rs"
+
+[dependencies]
+# Library-only driver: native-trust-ir-bundle pulls in the same translate
+# (trust-mc-trust-bmc) + native proof-grade CHC/PDR solve path the compiler
+# (trustc) statically links and runs. default-features=false drops the CLI.
+trust-mc-driver = { path = "../trust-mc-driver", default-features = false, features = ["native-trust-ir-bundle"] }
+trust-mc-core = { path = "../trust-mc-core" }
+# Same git+rev as trust-mc-driver's optional trust_ir dep; `serde` feature lets
+# us deserialize the bundle JSON dumped by `TRUST_DUMP_NATIVE_BUNDLE`. Feature
+# unification means trust_ir is built once (serde enabled) and shared with the
+# driver, so `solve_*` accept the deserialized `NativeVerificationBundle`.
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7cccbfcd7d3d5187e040e86fb4adc58a4beb977d", features = ["serde"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

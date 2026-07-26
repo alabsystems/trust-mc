@@ -1,0 +1,4 @@
+success: legacy cargo version command name appears
+success: legacy cargo verifier product appears
+success: version printed agrees
+success: `(cargo plugin)` appears in version line

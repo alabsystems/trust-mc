@@ -1,0 +1,15 @@
+# Temporary files and folders
+*.json
+!trust-mc/replacement-harness-inventory.json
+!trust-mc/replacement-harness-inventory.proof.json
+!trust-mc/non-proof-closure.json
+kani_concrete_playback
+rmet*/
+target/
+
+# Binary artifacts
+*.goto
+*.out
+smoke
+check_tests
+function

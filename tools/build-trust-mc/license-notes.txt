@@ -1,0 +1,28 @@
+
+This file contains an inventory of software (and their licenses) that are included as part of the Kani Rust Verifier.
+
+kani: https://github.com/model-checking/kani
+License: Apache-2.0 OR MIT
+
+rustc: https://github.com/rust-lang/rust
+License: Apache-2.0 OR MIT (plus some BSD)
+More info: https://github.com/rust-lang/rust/blob/master/COPYRIGHT
+
+## Notable Python dependencies
+
+voluptuous: https://github.com/alecthomas/voluptuous
+License: BSD-3-Clause
+
+jinja2: https://github.com/pallets/jinja
+License: BSD-3-Clause
+
+MarkupSafe: https://github.com/pallets/markupsafe
+License: BSD-3-Clause
+
+## Notable Rust crate dependencies
+
+Inflector: https://github.com/whatisinternet/inflector
+License: BSD-2-Clause
+
+unicode-ident: https://github.com/dtolnay/unicode-ident
+License: (MIT OR Apache-2.0) AND Unicode-DFS-2016

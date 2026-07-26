@@ -1,0 +1,22 @@
+SUCCESS\
+assertion failed: foo().x == 12
+FAILURE\
+assertion failed: foo().y == 12
+FAILURE\
+assertion failed: foo().x == 14
+SUCCESS\
+assertion failed: foo().y == 14
+SUCCESS\
+assertion failed: foo().x == 1
+FAILURE\
+assertion failed: foo().y == 1
+FAILURE\
+assertion failed: foo().x == 2
+SUCCESS\
+assertion failed: foo().y == 2
+SUCCESS\
+assertion failed: foo().x == 1 << 62
+FAILURE\
+assertion failed: foo().x == 1 << 31
+SUCCESS\
+assertion failed: foo().y == 1 << 31

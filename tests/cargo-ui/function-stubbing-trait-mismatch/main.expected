@@ -1,0 +1,2 @@
+error: `&str` doesn't implement `DoIt`. The function `foo` cannot be stubbed by `bar` due to generic bounds not being met.
+error: `&str` doesn't implement `std::cmp::PartialEq`. The function `foo` cannot be stubbed by `bar` due to generic bounds not being met.

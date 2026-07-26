@@ -1,0 +1,25 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-mc-trust-bmc"
+version = "0.67.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "trust_ir Module consumption for trust-mc BMC verification"
+
+[dependencies]
+trust-mc-core = { path = "../trust-mc-core" }
+ay_bindings.workspace = true
+thiserror.workspace = true
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7cccbfcd7d3d5187e040e86fb4adc58a4beb977d" }
+
+[dev-dependencies]
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7cccbfcd7d3d5187e040e86fb4adc58a4beb977d" }
+# In-process AY solving for guarded-path CFG encoding tests (SAT/UNSAT checks).
+ay_bindings = { workspace = true, features = ["direct"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+# STANDALONE workspace. kani-domination is a plain CLI that DRIVES the trust-mc
+# verifier as a subprocess; it deliberately does NOT join the trust-mc workspace,
+# so building it needs only stable Rust — no nightly, no rustc-dev/rust-src
+# components, and no ay/trust-ir/trust-vc git-dep resolution. (The verifier still
+# has to be built separately to actually run a measurement.)
+[workspace]
+
+[package]
+name = "kani-domination"
+description = "Download, build and run Kani's upstream test/benchmark corpus through trust-mc, and track the burndown to full Kani replacement (parity)."
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "kani-domination"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2.5"
+sha2 = "0.10"
+which = "8"

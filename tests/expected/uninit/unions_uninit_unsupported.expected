@@ -1,0 +1,14 @@
+Failed Checks: Transmuting between types of incompatible layouts.
+Failed Checks: unsupported construct
+Failed Checks: Undefined Behavior: Reading from an uninitialized pointer of type `u32`
+Verification failed for - pointer_union_should_pass
+Verification failed for - pointer_union_should_fail
+Verification failed for - union_as_subfields_should_pass
+Verification failed for - union_as_subfields_should_fail
+Verification failed for - uber_union_should_pass
+Verification failed for - uber_union_should_fail
+Verification failed for - transmute_union_should_pass
+Verification failed for - transmute_union_should_fail
+Verification failed for - transmute_into_union_should_pass
+Verification failed for - transmute_into_union_should_fail
+Complete - 0 successfully verified harnesses, 10 failures, 10 total.

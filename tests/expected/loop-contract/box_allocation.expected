@@ -1,0 +1,5 @@
+Failed Checks: dereference failure: dealloc size mismatch
+Failed Checks: dereference failure: dealloc base pointer mismatch
+Failed Checks: dereference failure: double free
+VERIFICATION:- FAILED
+Verification failed for - box_harness

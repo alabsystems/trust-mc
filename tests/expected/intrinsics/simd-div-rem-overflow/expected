@@ -1,0 +1,8 @@
+FAILURE\
+attempt to compute simd_div which would overflow
+UNREACHABLE\
+assertion failed: quotients.into_array()[0] == quotients.into_array()[1]
+FAILURE\
+attempt to compute simd_rem which would overflow
+UNREACHABLE\
+assertion failed: remainders.into_array()[0] == remainders.into_array()[1]

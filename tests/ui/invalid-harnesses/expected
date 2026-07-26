@@ -1,0 +1,11 @@
+error: only one '#[kani::proof]' attribute is allowed per harness\
+invalid.rs:\
+|\
+| #[kani::proof]\
+| ^^^^^^^^^^^^^^
+
+error: the '#[kani::proof]' attribute cannot be applied to generic functions\
+invalid.rs:\
+|\
+| #[kani::proof]\
+| ^^^^^^^^^^^^^^

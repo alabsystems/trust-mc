@@ -1,0 +1,170 @@
+# Copyright Kani Contributors
+# Modifications Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-mc-driver"
+version = "0.67.0"
+edition = "2024"
+description = "Build a project with trust-mc and run all proof harnesses"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/alabsystems/trust-mc"
+repository = "https://github.com/alabsystems/trust-mc"
+publish = false
+
+[[bin]]
+name = "trust-mc-driver"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+trust-mc-metadata = { path = "../trust-mc-metadata", optional = true }
+trust-mc-trust-vc-ingest = { path = "../trust-mc-trust-vc-ingest", optional = true }
+cargo_metadata = { version = "0.23", optional = true }
+anyhow = { workspace = true, optional = true }
+console = { version = "0.16", optional = true }
+once_cell = { version = "1.19.0", optional = true }
+to_markdown_table = { version = "0.1.0", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+clap = { workspace = true, optional = true }
+toml = { version = "0.9", optional = true }
+regex = { workspace = true, optional = true }
+rustc-demangle = { version = "0.1.21", optional = true }
+pathdiff = { version = "0.2.1", optional = true }
+rayon = { version = "1.5.3", optional = true }
+comfy-table = { version = "7.0.1", optional = true }
+strum = { workspace = true, optional = true }
+strum_macros = { workspace = true, optional = true }
+tempfile = { version = "3", optional = true }
+tracing = { workspace = true, features = ["max_level_trace", "release_max_level_debug"], optional = true }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json", "fmt"], optional = true }
+which = { version = "8", optional = true }
+time = { version = "0.3.36", features = ["formatting"], optional = true }
+chrono = { version = "0.4.41", default-features = false, features = [ "clock" ], optional = true }
+
+# AY backend support for the direct Rust-to-Rust solver path.
+ay_bindings = { workspace = true, optional = true }
+
+# AY S-expression parsing - required for trace parsing (#763)
+ay-frontend = { workspace = true, optional = true }
+
+# AY direct linking - native Rust SMT solver (#513)
+# This enables calling AY's solver API directly without subprocess/text file interchange
+ay-dpll = { workspace = true, optional = true }
+
+# AY root facade - consumer-facing CHC types via ay::chc (#3971)
+# Provides PDR/BMC/PDKIND/TPA engines for unbounded verification
+ay = { workspace = true, optional = true }
+# Native ay-chc crate path for proof-grade PDR runs (#1083/#1043).
+ay-chc = { workspace = true, optional = true }
+# Shared AY encoding/invocation surface (WS1 port): typed CHC problem invocation,
+# frontend-neutral verdict, and proof certificate. Re-exports the same ay-chc
+# types the typed CHC/PDR path already uses, so it joins the ay-chc-native set.
+ay-encode = { workspace = true, optional = true }
+# ay-sys for process-wide memory limit (RSS guard)
+ay-sys = { workspace = true, optional = true }
+# Core types for VC artifact parsing and CHC conversion (#1164)
+# Required for source location mapping from .vc.json sidecar files
+trust-mc-core = { path = "../trust-mc-core" }
+# Optional native trust_ir bundle embedding path for compiler integrations.
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7cccbfcd7d3d5187e040e86fb4adc58a4beb977d", optional = true }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7cccbfcd7d3d5187e040e86fb4adc58a4beb977d", optional = true }
+trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", optional = true }
+
+# Unix SIGPIPE handling (#663)
+# NOTE: keep this target table below the general [dependencies] section — every
+# key after a [target...] header belongs to that table, so placing it mid-list
+# silently makes the remaining dependencies Unix-only (breaks Windows builds).
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7cccbfcd7d3d5187e040e86fb4adc58a4beb977d" }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7cccbfcd7d3d5187e040e86fb4adc58a4beb977d" }
+ay_bindings = { workspace = true }
+trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc" }
+
+[lints]
+workspace = true
+
+[features]
+default = ["cli", "native-typed-chc-pdr", "ay-memory-limit"]
+cli = [
+    "dep:anyhow",
+    "dep:cargo_metadata",
+    "dep:chrono",
+    "dep:clap",
+    "dep:comfy-table",
+    "dep:console",
+    "dep:libc",
+    "dep:once_cell",
+    "dep:pathdiff",
+    "dep:rayon",
+    "dep:regex",
+    "dep:rustc-demangle",
+    "dep:strum",
+    "dep:strum_macros",
+    "dep:tempfile",
+    "dep:time",
+    "dep:to_markdown_table",
+    "dep:toml",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:which",
+    "dep:ay",
+    "dep:trust-mc-trust-vc-ingest",
+    "dep:trust-mc-metadata",
+]
+# Historical external-AY backend feature used by scripts. The subprocess path
+# does not need ay_bindings; keep this as a CLI compatibility switch.
+ay = ["cli"]
+# Enable direct AY linking - eliminates text file interchange for verification
+# Includes ay_bindings with direct feature for Phase 2 AYProgram direct execution (#513)
+# Note: ay-frontend is always available (required for trace parsing #763)
+ay-direct = ["cli", "dep:ay-dpll", "dep:ay-frontend", "dep:ay_bindings", "ay_bindings/direct"]
+# Enable native CHC solver using ay root facade (#632, #3971)
+# Removes dependency on Z3 Spacer subprocess for CHC verification
+ay-chc-native = ["dep:ay", "dep:ay-chc", "dep:ay-encode", "dep:ay-frontend", "dep:ay_bindings"]
+# Stable library-only feature for compiler integrations that already own typed
+# `trust-mc-core::ChcVc` obligations and need native CHC/PDR solving without the
+# CLI or rustc-private `trust-mc-compiler` crate. Embedders should use
+# `default-features = false, features = ["native-typed-chc-pdr"]`.
+native-typed-chc-pdr = ["ay-chc-native"]
+# Accept `trust_ir::NativeVerificationBundle` values directly and solve typed trust-mc
+# CHC/PDR requests through the library-only native proof-grade runner.
+native-trust-ir-bundle = [
+    "native-typed-chc-pdr",
+    "dep:trust_ir",
+    "dep:trust_ir-build",
+    "dep:trust-mc-trust-bmc",
+]
+ay-memory-limit = ["dep:ay-sys"]
+
+
+# A good set of suggested dependencies can be found in rustup:
+# https://github.com/rust-lang/rustup/blob/master/Cargo.toml
+# Here are a few notes I'm keeping after looking through these
+
+# string similarity, might be useful in suggesting fixes in 'cargo kani mispeled_harness'
+# strsim = "0.10"
+
+# open a file (or url presumably?) with platform application for that file type
+# opener = "0.5.0"
+
+# threadpool or rayon
+
+# neat: embed git commit/tag info
+# git-testament = "0.1.4"
+
+# Decompress a stream. then parse it as tar file
+# flate2 = "1"
+# tar = "0.4.26"
+# sha2 = "0.9"
+
+# color output on terminal
+# term = "=0.5.1"
+
+# terminal progress indicator
+# https://github.com/console-rs/indicatif

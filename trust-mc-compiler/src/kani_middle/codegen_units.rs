@@ -1,0 +1,767 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+
+// Copyright Kani Contributors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+//! This module is responsible for extracting grouping harnesses that can be processed together
+//! by codegen.
+//!
+//! Today, only stub / contracts can affect the harness codegen. Thus, we group the harnesses
+//! according to their stub configuration.
+
+use crate::args::{Arguments, ReachabilityType};
+use crate::kani_middle::attributes::{KaniAttributes, is_proof_harness};
+use crate::kani_middle::kani_functions::{KaniIntrinsic, KaniModel};
+use crate::kani_middle::metadata::{
+    gen_automatic_proof_metadata, gen_contracts_metadata, gen_proof_metadata,
+};
+use crate::kani_middle::reachability::filter_crate_items;
+use crate::kani_middle::stubbing::{check_compatibility, harness_stub_map};
+use crate::kani_middle::{can_derive_arbitrary, implements_arbitrary};
+use crate::kani_queries::QueryDb;
+use regex::RegexSet;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hir::def_id::DefId;
+use rustc_middle::ty::TyCtxt;
+use rustc_public::mir::mono::Instance;
+use rustc_public::rustc_internal;
+use rustc_public::ty::{FnDef, GenericArgKind, GenericArgs, RigidTy, Ty, TyKind};
+use rustc_public::{CrateDef, CrateItem};
+use rustc_public_bridge::IndexedVal;
+use rustc_session::config::OutputType;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use tracing::debug;
+use trust_mc_metadata::{
+    ArtifactType, AutoHarnessMetadata, AutoHarnessSkipReason, HarnessMetadata, KaniMetadata,
+    find_proof_harnesses,
+};
+
+/// An identifier for the harness function.
+pub(crate) type Harness = Instance;
+
+/// A set of stubs.
+pub(crate) type Stubs = HashMap<FnDef, FnDef>;
+
+static AUTOHARNESS_MD: OnceLock<AutoHarnessMetadata> = OnceLock::new();
+
+/// Store some relevant information about the crate compilation.
+#[derive(Clone, Debug)]
+struct CrateInfo {
+    /// The name of the crate being compiled.
+    name: String,
+}
+
+/// We group the harnesses that have the same stubs.
+pub(crate) struct CodegenUnits {
+    crate_info: CrateInfo,
+    harness_info: HashMap<Harness, HarnessMetadata>,
+    units: Vec<CodegenUnit>,
+}
+
+#[derive(Clone, Default, Debug)]
+pub(crate) struct CodegenUnit {
+    pub(crate) harnesses: Vec<Harness>,
+    pub(crate) stubs: Stubs,
+}
+
+impl CodegenUnits {
+    pub(crate) fn new(queries: &QueryDb, tcx: TyCtxt) -> Self {
+        let crate_info = CrateInfo { name: rustc_public::local_crate().name.as_str().into() };
+        let base_filepath = tcx.output_filenames(()).path(OutputType::Object);
+        let base_filename = base_filepath.as_path();
+        let args = queries.args();
+        match args.reachability_analysis {
+            ReachabilityType::Harnesses => {
+                let all_harnesses = determine_targets(
+                    get_all_manual_harnesses(tcx, base_filename),
+                    &args.harnesses,
+                    args.exact,
+                );
+                // Even if no_stubs is empty we still need to store rustc metadata.
+                let units = group_by_stubs(tcx, &all_harnesses);
+                validate_units(tcx, &units);
+                debug!(?units, "CodegenUnits::new");
+                CodegenUnits { units, harness_info: all_harnesses, crate_info }
+            }
+            ReachabilityType::AllFns => {
+                let mut all_harnesses = determine_targets(
+                    get_all_manual_harnesses(tcx, base_filename),
+                    &args.harnesses,
+                    args.exact,
+                );
+                let mut units = group_by_stubs(tcx, &all_harnesses);
+                validate_units(tcx, &units);
+
+                let kani_fns = queries.kani_functions();
+                let kani_harness_intrinsic = kani_fns
+                    .get(&KaniIntrinsic::AutomaticHarness.into())
+                    .expect("AutomaticHarness intrinsic should be registered");
+
+                let (chosen, skipped) = automatic_harness_partition(
+                    tcx,
+                    args,
+                    &crate_info.name,
+                    *kani_fns.get(&KaniModel::Any.into()).expect("Any model should be registered"),
+                );
+                AUTOHARNESS_MD
+                    .set(AutoHarnessMetadata {
+                        chosen: chosen
+                            .iter()
+                            .map(rustc_public::mir::mono::Instance::name)
+                            .collect::<BTreeSet<_>>(),
+                        skipped,
+                    })
+                    .expect("Initializing the autoharness metadata failed");
+
+                let automatic_harnesses = get_all_automatic_harnesses(
+                    tcx,
+                    chosen,
+                    *kani_harness_intrinsic,
+                    base_filename,
+                );
+                // We generate one contract harness per function under contract, so each harness is in its own unit,
+                // and these harnesses have no stubs.
+                units.extend(automatic_harnesses.keys().map(|harness| CodegenUnit {
+                    harnesses: vec![*harness],
+                    stubs: HashMap::default(),
+                }));
+                all_harnesses.extend(automatic_harnesses);
+
+                // No need to validate the units again because validation only checks stubs, and we haven't added any stubs.
+                debug!(?units, "CodegenUnits::new");
+                CodegenUnits { units, harness_info: all_harnesses, crate_info }
+            }
+            ReachabilityType::None | ReachabilityType::PubFns => {
+                // No codegen for None (skips crate) or PubFns (not yet implemented).
+                CodegenUnits { units: vec![], harness_info: HashMap::default(), crate_info }
+            }
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &CodegenUnit> {
+        self.units.iter()
+    }
+
+    /// Write compilation metadata into a file.
+    pub(crate) fn write_metadata(&self, queries: &QueryDb, tcx: TyCtxt) {
+        let metadata = self.generate_metadata(tcx);
+        let outpath = metadata_output_path(tcx);
+        store_metadata(queries, &metadata, &outpath);
+    }
+
+    pub(crate) fn harness_model_path(&self, harness: Harness) -> &PathBuf {
+        &self.harness_info[&harness].model_file
+    }
+
+    /// Retrieve the metadata associated with a harness.
+    pub(crate) fn harness_metadata(&self, harness: Harness) -> Option<&HarnessMetadata> {
+        self.harness_info.get(&harness)
+    }
+
+    /// Generate [KaniMetadata] for the target crate.
+    ///
+    /// Collects actual unsoundness counters from codegen globals (#2679)
+    /// so the driver can demote SUCCESS verdicts when unsound approximations
+    /// were used.
+    fn generate_metadata(&self, tcx: TyCtxt) -> KaniMetadata {
+        let (proof_harnesses, test_harnesses) =
+            self.harness_info.values().cloned().partition(|md| md.attributes.is_proof_harness());
+        let uf = crate::codegen_ay::collect_unsoundness_fields();
+        KaniMetadata {
+            crate_name: self.crate_info.name.clone(),
+            proof_harnesses,
+            unsupported_features: vec![],
+            test_harnesses,
+            contracted_functions: gen_contracts_metadata(tcx, &self.harness_info),
+            autoharness_md: AUTOHARNESS_MD.get().cloned(),
+            iterator_unsoundness: uf.iterator_unsoundness,
+            bigint_unsoundness: uf.bigint_unsoundness,
+            chc_fallbacks: uf.chc_fallbacks,
+            chc_translation_drops: uf.chc_translation_drops,
+            chc_coerce_eq_drops: uf.chc_coerce_eq_drops,
+            assume_dropped_transitions: uf.assume_dropped_transitions,
+            store_dropped_transitions: uf.store_dropped_transitions,
+            constant_zero_fallbacks: uf.constant_zero_fallbacks,
+            unhandled_calls: uf.unhandled_calls,
+            error_blocked_fmt: uf.error_blocked_fmt,
+            known_stdlib_unconstrained: uf.known_stdlib_unconstrained,
+            inferable_predicates: uf.inferable_predicates,
+            diverging_call_drops: uf.diverging_call_drops,
+            offset_provenance_unresolved: uf.offset_provenance_unresolved,
+            assert_untranslatable: uf.assert_untranslatable,
+            heap_check_untranslatable: uf.heap_check_untranslatable,
+            heap_check_unknown_layout: uf.heap_check_unknown_layout,
+            type_sort_fallbacks: uf.type_sort_fallbacks,
+            signedness_fallbacks: uf.signedness_fallbacks,
+            into_option_drops: uf.into_option_drops,
+            internal_workarounds: uf.internal_workarounds,
+            abstracted_fallbacks: uf.abstracted_fallbacks,
+            vec_field_fallbacks: uf.vec_field_fallbacks,
+            pointee_synthesis_fallbacks: uf.pointee_synthesis_fallbacks,
+            unsupported_construct_fallbacks: uf.unsupported_construct_fallbacks,
+            bmc_store_coercion_fallbacks: uf.bmc_store_coercion_fallbacks,
+            kani_mem_overapprox: uf.kani_mem_overapprox,
+            sort_harmonize_fresh_var_fallbacks: uf.sort_harmonize_fresh_var_fallbacks,
+            unconstrained_assignments: uf.unconstrained_assignments,
+            // Task #65: four of the previously-dropped counters are now
+            // plumbed after a per-site SoundHavoc/FailClose/Demoted audit
+            // (audit conclusions live as comments at each recording site):
+            // - ptr_metadata_unconstrained (codegen_stmt_ptr_metadata.rs):
+            //   widening-only havoc; SOUND_APPROXIMATION class — the driver's
+            //   Step-C fail-closes a Success that carries it.
+            // - static_init_incomplete (codegen_decl_static.rs): widening-only
+            //   havoc of a static's initial value; Step-C decides.
+            // - stub_approximation (stubs_util.rs and siblings): NOT a pure
+            //   widening (closure bodies' panics/effects are dropped); Step-C
+            //   fail-closes.
+            // - rounding_assertion_bypass (float_*_patterns.rs): audited per
+            //   site; provably-exact rewrites no longer count, the remaining
+            //   genuinely-weakening sites demote via the DEMOTED table.
+            ptr_metadata_unconstrained: uf.ptr_metadata_unconstrained,
+            static_init_incomplete: uf.static_init_incomplete,
+            stub_approximation: uf.stub_approximation,
+            rounding_assertion_bypass: uf.rounding_assertion_bypass,
+            // Still None — NOT an oversight (remaining work, documented):
+            // - fp_bitvector_encoding increments per float SORT DECLARATION
+            //   (decl/codegen_types.rs), not per lossy float OPERATION — 38x on
+            //   FastMath/add_f32 — and as a DEMOTED category it would demote
+            //   ~100+ clean float proofs that are sound by construction under
+            //   the congruent float-binop table + NaN-check obligation. On the
+            //   CHC path every lossy float-op lane is already gated by another
+            //   verdict-active category (chc_fallback for f16/f128 binops,
+            //   record_sound_fallback_reason for cast fallbacks), so there is
+            //   currently NO correct relocation target; plumbing raw would be
+            //   pure over-demotion. Leave None until the counter is relocated
+            //   to operation-level lossiness sites (and the codegen_results
+            //   writer path is re-audited under its own missed-bug gate).
+            fp_bitvector_encoding: None,
+            // - aggregate_encoding_gap fires on every inline nested-call
+            //   fresh-havoc (4x on Rotate/rotate_left) and Step-C would send
+            //   those clean proofs to Unknown. Out of scope here (documented
+            //   Step-C trap); needs its own per-site audit before plumbing.
+            aggregate_encoding_gap: None,
+        }
+    }
+}
+
+fn stub_def(tcx: TyCtxt, def_id: DefId) -> FnDef {
+    let ty_internal = tcx.type_of(def_id).instantiate_identity();
+    let ty = rustc_internal::stable(ty_internal);
+    if let TyKind::RigidTy(RigidTy::FnDef(def, _)) = ty.kind() {
+        def
+    } else {
+        unreachable!("Expected stub function for `{:?}`, but found: {ty}", tcx.def_path(def_id))
+    }
+}
+
+/// Group the harnesses by their stubs and contract usage.
+fn group_by_stubs(
+    tcx: TyCtxt,
+    all_harnesses: &HashMap<Harness, HarnessMetadata>,
+) -> Vec<CodegenUnit> {
+    let mut per_stubs: HashMap<_, CodegenUnit> = HashMap::default();
+    for (harness, metadata) in all_harnesses {
+        let stub_ids = harness_stub_map(tcx, *harness, metadata);
+        let contracts = extract_contracts(tcx, *harness);
+        let stub_map = stub_ids
+            .iter()
+            .map(|(k, v)| (tcx.def_path_hash(*k), tcx.def_path_hash(*v)))
+            .collect::<BTreeMap<_, _>>();
+        let key = (contracts, stub_map);
+        if let Some(unit) = per_stubs.get_mut(&key) {
+            unit.harnesses.push(*harness);
+        } else {
+            let stubs = stub_ids
+                .iter()
+                .map(|(from, to)| (stub_def(tcx, *from), stub_def(tcx, *to)))
+                .collect::<HashMap<_, _>>();
+            let stubs = apply_transitivity(tcx, *harness, stubs);
+            per_stubs.insert(key, CodegenUnit { stubs, harnesses: vec![*harness] });
+        }
+    }
+    per_stubs.into_values().collect()
+}
+
+#[derive(Copy, Clone, Debug, Ord, PartialOrd, PartialEq, Eq, Hash)]
+enum ContractUsage {
+    Stub(usize),
+    Check(usize),
+}
+
+/// Extract the contract related usages.
+///
+/// Note that any error interpreting the result is emitted, but we delay aborting, so we emit as
+/// many errors as possible.
+fn extract_contracts(tcx: TyCtxt, harness: Harness) -> BTreeSet<ContractUsage> {
+    let def = harness.def;
+    let mut result = BTreeSet::new();
+    let attributes = KaniAttributes::for_def_id(tcx, def.def_id());
+    if let Some(target) = attributes.interpret_for_contract_attribute() {
+        result.insert(ContractUsage::Check(target.def_id().to_index()));
+    }
+    for stub in attributes.interpret_stub_verified_attribute() {
+        result.insert(ContractUsage::Stub(stub.def_id().to_index()));
+    }
+
+    result
+}
+
+/// Extract the filename for the metadata file.
+fn metadata_output_path(tcx: TyCtxt) -> PathBuf {
+    let filepath = tcx.output_filenames(()).path(OutputType::Object);
+    let filename = filepath.as_path();
+    filename.with_extension(ArtifactType::Metadata)
+}
+
+/// Write the metadata to a file
+fn store_metadata(queries: &QueryDb, metadata: &KaniMetadata, filename: &Path) {
+    debug!(?filename, "store_metadata");
+    let out_file = File::create(filename).expect("failed to create metadata output file");
+    let writer = BufWriter::new(out_file);
+    if queries.args().output_pretty_json {
+        serde_json::to_writer_pretty(writer, &metadata)
+            .expect("failed to write metadata as pretty JSON");
+    } else {
+        serde_json::to_writer(writer, &metadata).expect("failed to write metadata as JSON");
+    }
+}
+
+/// Validate the unit configuration.
+fn validate_units(tcx: TyCtxt, units: &[CodegenUnit]) {
+    for unit in units {
+        for (from, to) in &unit.stubs {
+            // We use harness span since we don't keep the attribute span.
+            let Err(msg) = check_compatibility(tcx, *from, *to) else { continue };
+            let span = unit
+                .harnesses
+                .first()
+                .expect("codegen unit should have at least one harness")
+                .def
+                .span();
+            tcx.dcx().span_err(rustc_internal::internal(tcx, span), msg);
+        }
+    }
+    tcx.dcx().abort_if_errors();
+}
+
+/// Apply stub transitivity operations.
+///
+/// If `fn1` is stubbed by `fn2`, and `fn2` is stubbed by `fn3`, `f1` is in fact stubbed by `fn3`.
+fn apply_transitivity(tcx: TyCtxt, harness: Harness, stubs: Stubs) -> Stubs {
+    let mut new_stubs = Stubs::with_capacity(stubs.len());
+    for (orig, new) in &stubs {
+        let mut new_fn = *new;
+        let mut visited = HashSet::new();
+        while let Some(stub) = stubs.get(&new_fn) {
+            if !visited.insert(stub) {
+                // Visiting the same stub, i.e. found cycle.
+                let span = harness.def.span();
+                tcx.dcx().span_err(
+                    rustc_internal::internal(tcx, span),
+                    format!(
+                        "Cannot stub `{}`. Stub configuration for harness `{}` has a cycle",
+                        orig.name(),
+                        harness.def.name(),
+                    ),
+                );
+                break;
+            }
+            new_fn = *stub;
+        }
+        new_stubs.insert(*orig, new_fn);
+    }
+    new_stubs
+}
+
+/// Fetch all manual harnesses (i.e., functions provided by the user) and generate their metadata
+fn get_all_manual_harnesses(
+    tcx: TyCtxt,
+    base_filename: &Path,
+) -> HashMap<Harness, HarnessMetadata> {
+    let harnesses = filter_crate_items(tcx, |_, instance| is_proof_harness(tcx, instance));
+    harnesses
+        .into_iter()
+        .map(|harness| {
+            let metadata = gen_proof_metadata(tcx, harness, base_filename);
+            (harness, metadata)
+        })
+        .collect::<HashMap<_, _>>()
+}
+
+/// Filter which harnesses to codegen based on user filters. Shares use of `find_proof_harnesses` with the `determine_targets` function
+/// in `trust_mc-driver/src/metadata.rs` to ensure the filter is consistent and thus codegen is always done for the subset of harnesses we want
+/// to analyze.
+fn determine_targets(
+    all_harnesses: HashMap<Harness, HarnessMetadata>,
+    harness_filters: &[String],
+    exact_filter: bool,
+) -> HashMap<Harness, HarnessMetadata> {
+    if harness_filters.is_empty() {
+        return all_harnesses;
+    }
+
+    // If there are filters, only keep around harnesses that satisfy them.
+    // Collect valid mangled names into an owned set so the borrow on
+    // all_harnesses is released before retain mutates it.
+    let valid_names: std::collections::HashSet<String> = find_proof_harnesses(
+        &BTreeSet::from_iter(harness_filters.iter().map(std::string::String::as_str)),
+        all_harnesses.values(),
+        exact_filter,
+    )
+    .into_iter()
+    .map(|md| md.mangled_name.clone())
+    .collect();
+
+    let mut filtered = all_harnesses;
+    filtered.retain(|_, metadata| valid_names.contains(&metadata.mangled_name));
+    filtered
+}
+
+/// For each function eligible for automatic verification,
+/// generate a harness Instance for it, then generate its metadata.
+/// Note that the body of each harness instance is still the dummy body of `kani_harness_intrinsic`;
+/// the AutomaticHarnessPass will later transform the bodies of these instances to actually verify the function.
+fn get_all_automatic_harnesses(
+    tcx: TyCtxt,
+    verifiable_fns: Vec<Instance>,
+    kani_harness_intrinsic: FnDef,
+    base_filename: &Path,
+) -> HashMap<Harness, HarnessMetadata> {
+    verifiable_fns
+        .into_iter()
+        .map(|fn_to_verify| {
+            // Set the generic arguments of the harness to be the function it is verifying
+            // so that later, in AutomaticHarnessPass, we can retrieve the function to verify
+            // and generate the harness body accordingly.
+            let harness = Instance::resolve(
+                kani_harness_intrinsic,
+                &GenericArgs(vec![GenericArgKind::Type(fn_to_verify.ty())]),
+            )
+            .expect("harness intrinsic should be resolvable with function type argument");
+            let metadata = gen_automatic_proof_metadata(
+                tcx,
+                base_filename,
+                &fn_to_verify,
+                harness.mangled_name(),
+            );
+            (harness, metadata)
+        })
+        .collect::<HashMap<_, _>>()
+}
+
+#[allow(clippy::panic)] // Validation error - should be caught earlier
+fn make_regex_set<S: AsRef<str>>(patterns: &[S]) -> Option<RegexSet> {
+    if patterns.is_empty() {
+        None
+    } else {
+        Some(RegexSet::new(patterns).unwrap_or_else(|e| {
+            panic!("Invalid regexes should have been caught during argument validation: {e}")
+        }))
+    }
+}
+
+/// A function is filtered out if 1) none of the include patterns match it or 2) one of the exclude patterns matches it.
+fn autoharness_filtered_out(
+    name: &str,
+    included_set: &Option<RegexSet>,
+    excluded_set: &Option<RegexSet>,
+) -> bool {
+    // A function is included if `--include-pattern` is not provided or if at least one of its regexes matches `name`
+    let included = included_set.as_ref().is_none_or(|set| set.is_match(name));
+    // A function is excluded if `--exclude-pattern` is provided and at least one of its regexes matches `name`
+    let excluded = excluded_set.as_ref().is_some_and(|set| set.is_match(name));
+    !included || excluded
+}
+
+/// Partition every function in the crate into (chosen, skipped), where `chosen` is a vector of the Instances for which we'll generate automatic harnesses,
+/// and `skipped` is a map of function names to the reason why we skipped them.
+fn automatic_harness_partition(
+    tcx: TyCtxt,
+    args: &Arguments,
+    crate_name: &str,
+    kani_any_def: FnDef,
+) -> (Vec<Instance>, BTreeMap<String, AutoHarnessSkipReason>) {
+    let crate_fn_defs = rustc_public::local_crate().fn_defs().into_iter().collect::<FxHashSet<_>>();
+    // Filter out CrateItems that are functions, but not functions defined in the crate itself, i.e., rustc-inserted functions
+    // (c.f. https://github.com/model-checking/kani/issues/4189)
+    let crate_fns = rustc_public::all_local_items().into_iter().filter(|item| {
+        if let TyKind::RigidTy(RigidTy::FnDef(def, _)) = item.ty().kind() {
+            crate_fn_defs.contains(&def)
+        } else {
+            false
+        }
+    });
+
+    let included_set = make_regex_set(&args.autoharness_included_patterns);
+    let excluded_set = make_regex_set(&args.autoharness_excluded_patterns);
+
+    // Cache whether a type implements or can derive Arbitrary
+    let mut ty_arbitrary_cache: FxHashMap<Ty, bool> = FxHashMap::default();
+
+    // If `func` is not eligible for an automatic harness, return the reason why; if it is eligible, return None.
+    // Note that we only return one reason for ineligiblity, when there could be multiple;
+    // we can revisit this implementation choice in the future if users request more verbose output.
+    let mut skip_reason = |fn_item: CrateItem| -> Option<AutoHarnessSkipReason> {
+        if KaniAttributes::for_def_id(tcx, fn_item.def_id()).is_kani_instrumentation() {
+            return Some(AutoHarnessSkipReason::trust_mcImpl);
+        }
+
+        let instance = match Instance::try_from(fn_item) {
+            Ok(inst) => inst,
+            Err(_) => {
+                return Some(AutoHarnessSkipReason::GenericFn);
+            }
+        };
+
+        if !instance.has_body() {
+            return Some(AutoHarnessSkipReason::NoBody);
+        }
+
+        // Prepend the crate name so users can filter out entire crates with existing function
+        // filter flags.
+        let mut name = String::from(crate_name);
+        name.push_str("::");
+        name.push_str(&instance.name());
+        let body = instance.body().expect("instance should have body after has_body check");
+
+        if is_proof_harness(tcx, instance)
+            || name.contains("kani::Arbitrary")
+            || name.contains("kani::Invariant")
+        {
+            return Some(AutoHarnessSkipReason::trust_mcImpl);
+        }
+
+        if autoharness_filtered_out(&name, &included_set, &excluded_set) {
+            return Some(AutoHarnessSkipReason::UserFilter);
+        }
+
+        // Each argument of `instance` must implement Arbitrary.
+        // Note that we've already filtered out generic functions, so we know that each of these arguments has a concrete type.
+        let mut problematic_args = vec![];
+        for (idx, arg) in body.arg_locals().iter().enumerate() {
+            if !ty_arbitrary_cache.contains_key(&arg.ty) {
+                let impls_arbitrary =
+                    implements_arbitrary(arg.ty, kani_any_def, &mut ty_arbitrary_cache)
+                        || can_derive_arbitrary(arg.ty, kani_any_def, &mut ty_arbitrary_cache);
+                ty_arbitrary_cache.insert(arg.ty, impls_arbitrary);
+            }
+            let impls_arbitrary =
+                ty_arbitrary_cache.get(&arg.ty).expect("type should be in cache after insert");
+
+            if !impls_arbitrary {
+                // Find the name of the argument by referencing var_debug_info.
+                // Note that enumerate() starts at 0, while rustc_public argument_index starts at 1, hence the idx+1.
+                let arg_name = body
+                    .var_debug_info
+                    .iter()
+                    .find(|var| {
+                        var.argument_index.is_some_and(|arg_idx| idx + 1 == usize::from(arg_idx))
+                    })
+                    .map_or_else(
+                        || String::from("_"),
+                        |debug_info| debug_info.name.as_str().into(),
+                    );
+                let arg_type = std::fmt::format(format_args!("{}", arg.ty));
+                problematic_args.push((arg_name, arg_type));
+            }
+        }
+        if !problematic_args.is_empty() {
+            return Some(AutoHarnessSkipReason::MissingArbitraryImpl(problematic_args));
+        }
+        None
+    };
+
+    let mut chosen = vec![];
+    let mut skipped = BTreeMap::new();
+
+    for func in crate_fns {
+        if let Some(reason) = skip_reason(func) {
+            skipped.insert(func.name(), reason);
+        } else {
+            chosen.push(
+                Instance::try_from(func)
+                    .expect("non-skipped function should be convertible to Instance"),
+            );
+        }
+    }
+
+    (chosen, skipped)
+}
+
+#[cfg(test)]
+mod autoharness_filter_tests {
+    use super::*;
+
+    #[test]
+    fn both_none() {
+        let included = None;
+        let excluded = None;
+        assert!(!autoharness_filtered_out("test_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn only_included() {
+        let included = make_regex_set(&["test.*"]);
+        let excluded = None;
+
+        assert!(!autoharness_filtered_out("test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("other_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn only_excluded() {
+        let included = None;
+        let excluded = make_regex_set(&["test.*"]);
+
+        assert!(autoharness_filtered_out("test_fn", &included, &excluded));
+        assert!(!autoharness_filtered_out("other_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn both_matching() {
+        let included = make_regex_set(&[".*_fn"]);
+        let excluded = make_regex_set(&["test.*"]);
+
+        assert!(autoharness_filtered_out("test_fn", &included, &excluded));
+        assert!(!autoharness_filtered_out("other_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn multiple_include_patterns() {
+        let included = make_regex_set(&["test.*", "other.*"]);
+        let excluded = None;
+
+        assert!(!autoharness_filtered_out("test_fn", &included, &excluded));
+        assert!(!autoharness_filtered_out("other_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("different_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn multiple_exclude_patterns() {
+        let included = None;
+        let excluded = make_regex_set(&["test.*", "other.*"]);
+
+        assert!(autoharness_filtered_out("test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("other_fn", &included, &excluded));
+        assert!(!autoharness_filtered_out("different_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn exclude_precedence_identical_patterns() {
+        let pattern = "test.*";
+        let included = make_regex_set(std::slice::from_ref(&pattern));
+        let excluded = make_regex_set(std::slice::from_ref(&pattern));
+
+        assert!(autoharness_filtered_out("test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("other_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn exclude_precedence_overlapping_patterns() {
+        let included = make_regex_set(&[".*_fn"]);
+        let excluded = make_regex_set(&["test_.*", "other_.*"]);
+
+        assert!(autoharness_filtered_out("test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("other_fn", &included, &excluded));
+        assert!(!autoharness_filtered_out("different_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn exact_match() {
+        let included = make_regex_set(&["^test_fn$"]);
+        let excluded = None;
+
+        assert!(!autoharness_filtered_out("test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("test_fn_extra", &included, &excluded));
+    }
+
+    #[test]
+    fn include_specific_module() {
+        let included = make_regex_set(&["module1::.*"]);
+        let excluded = None;
+
+        assert!(!autoharness_filtered_out("module1::test_fn", &included, &excluded));
+        assert!(!autoharness_filtered_out("crate::module1::test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("module2::test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("crate::module2::test_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn exclude_specific_module() {
+        let included = None;
+        let excluded = make_regex_set(&[".*::internal::.*"]);
+
+        assert!(autoharness_filtered_out("crate::internal::helper_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("my_crate::internal::test_fn", &included, &excluded));
+        assert!(!autoharness_filtered_out("crate::public::test_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn test_exact_match_with_crate() {
+        let included = make_regex_set(&["^lib::foo_function$"]);
+        let excluded = None;
+
+        assert!(!autoharness_filtered_out("lib::foo_function", &included, &excluded));
+        assert!(autoharness_filtered_out("lib::foo_function_extra", &included, &excluded));
+        assert!(autoharness_filtered_out("lib::other::foo_function", &included, &excluded));
+        assert!(autoharness_filtered_out("other::foo_function", &included, &excluded));
+        assert!(autoharness_filtered_out("foo_function", &included, &excluded));
+    }
+
+    #[test]
+    fn complex_path_patterns() {
+        let included = make_regex_set(&["crate::module1::.*", "other_crate::tests::.*"]);
+        let excluded = make_regex_set(&[".*::internal::.*", ".*::private::.*"]);
+
+        assert!(!autoharness_filtered_out("crate::module1::test_fn", &included, &excluded));
+        assert!(!autoharness_filtered_out("other_crate::tests::test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out(
+            "crate::module1::internal::test_fn",
+            &included,
+            &excluded
+        ));
+        assert!(autoharness_filtered_out(
+            "other_crate::tests::private::test_fn",
+            &included,
+            &excluded
+        ));
+        assert!(autoharness_filtered_out("crate::module2::test_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn crate_specific_filtering() {
+        let included = make_regex_set(&["my_crate::.*"]);
+        let excluded = make_regex_set(&["other_crate::.*"]);
+
+        assert!(!autoharness_filtered_out("my_crate::test_fn", &included, &excluded));
+        assert!(!autoharness_filtered_out("my_crate::module::test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("other_crate::test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("third_crate::test_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn root_crate_paths() {
+        let included = make_regex_set(&["^crate::.*"]);
+        let excluded = None;
+
+        assert!(!autoharness_filtered_out("crate::test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("other_crate::test_fn", &included, &excluded));
+        assert!(autoharness_filtered_out("test_fn", &included, &excluded));
+    }
+
+    #[test]
+    fn impl_paths_with_spaces() {
+        let included = make_regex_set(&["num::<impl.i8>::wrapping_.*"]);
+        let excluded = None;
+
+        assert!(!autoharness_filtered_out("num::<impl i8>::wrapping_sh", &included, &excluded));
+        assert!(!autoharness_filtered_out("num::<impl i8>::wrapping_add", &included, &excluded));
+        assert!(autoharness_filtered_out("num::<impl i16>::wrapping_sh", &included, &excluded));
+    }
+}

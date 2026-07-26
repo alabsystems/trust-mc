@@ -1,0 +1,10 @@
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+assertion failed: original_num + 12 == num

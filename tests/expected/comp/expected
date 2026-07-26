@@ -1,0 +1,22 @@
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+assertion failed: a + b == b + a
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+assertion failed: a + b != a + b + 1
+SUCCESS\
+attempt to add with overflow
+SUCCESS\
+assertion failed: a + b > a
+SUCCESS\
+attempt to subtract with overflow
+SUCCESS\
+assertion failed: a - b < a

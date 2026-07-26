@@ -1,0 +1,22 @@
+# Copyright Kani Contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "bench_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "../src/lib.rs"
+
+[[bench]]
+name = "speed"
+path = "../benches/speed.rs"
+harness = false
+
+[[bench]]
+name = "slow"
+path = "../benches/slow.rs"
+harness = false
+
+[package.metadata.kani.flags]
+bench="speed"

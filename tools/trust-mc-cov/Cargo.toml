@@ -1,0 +1,26 @@
+# Copyright Kani Contributors
+# Modifications Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-mc-cov"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A tool to process coverage information from trust-mc"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+console = "0.16"
+serde = { workspace = true }
+serde_derive = "1.0.197"
+serde_json = { workspace = true }
+tree-sitter = "0.25.3"
+tree-sitter-rust = "0.24"

@@ -1,0 +1,25 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# Foundation crate for AY codegen: type coercion utilities and SMT naming.
+# Extracted from trust-mc-compiler/src/codegen_ay/ for incremental build speed.
+# Part of #2997: split codegen_ay into subcrates.
+
+[package]
+name = "trust-mc-codegen-types"
+version = "0.67.0"
+edition = "2024"
+description = "Type coercion and naming utilities for trust-mc AY codegen."
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+ay_bindings = { workspace = true }
+
+[package.metadata.rust-analyzer]
+# This package uses rustc crates.
+rustc_private = true

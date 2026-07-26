@@ -1,0 +1,30 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# `main-thread-purity` — a forbidden-call REACHABILITY checker for trust-mc.
+#
+# This crate is deliberately STANDALONE: it carries its own `[workspace]` table
+# so it is NOT absorbed by the top-level trust-mc workspace (which builds against
+# rustc-dev on a pinned nightly). It builds and tests on plain stable Rust, so it
+# can never break the trust-mc compiler build. Its `lint` module is written to
+# drop directly behind the real `CallGraph`/`Instance::name()` substrate in
+# `trust-mc-compiler/src/kani_middle/reachability.rs` (see module docs).
+
+[package]
+name = "trust-mc-main-thread-purity"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Reachability lint: no unbounded-blocking syscall on the UI/main thread (trust-mc)"
+publish = false
+
+[[bin]]
+name = "main-thread-purity"
+path = "src/main.rs"
+
+[lib]
+name = "main_thread_purity"
+path = "src/lib.rs"
+
+# Own workspace so the parent trust-mc workspace does not pull this in.
+[workspace]

@@ -1,0 +1,21 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-mc-trust-vc-ingest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Adapter crate: ingests trust-vc MergeBundle v4 artifacts into trust-mc/ay verification conditions"
+
+[dependencies]
+# Pinned git dependency (standalone-build policy, fd8df45f3): a fresh clone
+# must build without sibling checkouts. Bump the rev deliberately alongside
+# trust-vc contract changes, same as the pinned AY/trust-ir revs.
+trust-vc-merge-contract = { git = "https://github.com/alabsystems/trust-vc.git", rev = "fdc4753870053971a6a72c0cd994589c81707f07" }
+ay_bindings = { workspace = true }
+ay-frontend = { workspace = true }
+num-bigint = { workspace = true }
+syn = { workspace = true }
+thiserror = "2"

@@ -1,0 +1,87 @@
+{
+  "version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "mode": "chc",
+  "harness": {
+    "mangled_name": "check_evil",
+    "pretty_name": "check_evil"
+  },
+  "properties": [
+    {
+      "id": {
+        "id": 0,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p0",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 1,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p1",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 2,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p2",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 3,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p3",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 4,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p4",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 5,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p5",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 6,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p6",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 7,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p7",
+      "approximation_dependent": false
+    }
+  ],
+  "approximation_identity_complete": true
+}

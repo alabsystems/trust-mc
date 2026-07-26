@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+/env/
+/venv/
+/.venv/
+
+# Rust
+target/
+target_*/
+**/*.rs.bk
+.ruff_cache
+
+# C++
+*.o
+*.out
+*.exe
+build/
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# Test/lint output
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Credentials and secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+*_secret*
+*.secret
+.secrets/
+
+# Kani/trust-mc local artifact outputs
+*.rlib
+*.symtab.smt2
+*.symtab.z3_fixed.smt2
+mir_dump/
+out/
+doc/
+
+# Compiletest output (per-harness JSON/TSV reports)
+reports/
+
+# Crash dumps and temp artifacts
+rustc-ice-*.txt
+*.mir
+pytest-of-*/
+result_output_dir/
+
+# Agent worktrees + local Claude state (never commit)
+.claude/worktrees/
+
+# Publish tool work area (export tree, reports, staging clone)
+publish/.out/

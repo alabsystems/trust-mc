@@ -1,0 +1,22 @@
+# Copyright Kani Contributors
+# Modifications Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "build-trust-mc"
+version = "0.67.0"
+edition = "2024"
+description = "Builds trust-mc, Sysroot and release bundle."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+cargo_metadata = "0.23"
+clap = { workspace = true }
+libc = "0.2"
+which = "8"

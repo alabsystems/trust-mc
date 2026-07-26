@@ -1,0 +1,17 @@
+# Copyright trust-mc Contributors (Kani Contributors for original code)
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[book]
+title = "trust-mc RFC Book"
+description = "Design documents for trust-mc Rust Verifier"
+authors = ["trust-mc Developers", "Kani Contributors"]
+language = "en"
+src = "src"
+
+[output.html]
+site-url = "/trust-mc/rfc/"
+git-repository-url = "https://github.com/alabsystems/trust-mc"
+edit-url-template = "https://github.com/alabsystems/trust-mc/edit/main/rfc/{path}"
+no-section-label = true
+
+[output.html.playground]
+runnable = false

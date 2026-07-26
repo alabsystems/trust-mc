@@ -1,0 +1,134 @@
+{
+  "kani-version":
+  "trust-mc-version":
+  "file-version": "0.2",
+  "standard-harnesses": {
+    "src/lib.rs": [
+      "example::verify::check_modify",
+      "example::verify::check_new"
+    ]
+  },
+  "contract-harnesses": {
+    "src/lib.rs": [
+      "example::verify::check_bar",
+      "example::verify::check_foo_u32",
+      "example::verify::check_foo_u64",
+      "example::verify::check_func"
+    ]
+  },
+  "proof-obligations": [
+    {
+      "proof-item-id": "trust-mc:kani-proof-for-contract:lib:example::verify::check_bar",
+      "crate": "lib",
+      "harness": "example::verify::check_bar",
+      "role": "ContractHarness",
+      "source-form": "KaniProofForContractAttribute",
+      "target": "implementation::bar",
+      "file": "src/lib.rs",
+      "start-line": 42,
+      "end-line": 45,
+      "engine": "trust-mc",
+      "required-by-full-verify": true
+    },
+    {
+      "proof-item-id": "trust-mc:kani-proof-for-contract:lib:example::verify::check_foo_u32",
+      "crate": "lib",
+      "harness": "example::verify::check_foo_u32",
+      "role": "ContractHarness",
+      "source-form": "KaniProofForContractAttribute",
+      "target": "implementation::foo",
+      "file": "src/lib.rs",
+      "start-line": 48,
+      "end-line": 51,
+      "engine": "trust-mc",
+      "required-by-full-verify": true
+    },
+    {
+      "proof-item-id": "trust-mc:kani-proof-for-contract:lib:example::verify::check_foo_u64",
+      "crate": "lib",
+      "harness": "example::verify::check_foo_u64",
+      "role": "ContractHarness",
+      "source-form": "KaniProofForContractAttribute",
+      "target": "implementation::foo",
+      "file": "src/lib.rs",
+      "start-line": 54,
+      "end-line": 57,
+      "engine": "trust-mc",
+      "required-by-full-verify": true
+    },
+    {
+      "proof-item-id": "trust-mc:kani-proof-for-contract:lib:example::verify::check_func",
+      "crate": "lib",
+      "harness": "example::verify::check_func",
+      "role": "ContractHarness",
+      "source-form": "KaniProofForContractAttribute",
+      "target": "implementation::func",
+      "file": "src/lib.rs",
+      "start-line": 60,
+      "end-line": 63,
+      "engine": "trust-mc",
+      "required-by-full-verify": true
+    },
+    {
+      "proof-item-id": "trust-mc:kani-proof:lib:example::verify::check_modify",
+      "crate": "lib",
+      "harness": "example::verify::check_modify",
+      "role": "Harness",
+      "source-form": "KaniProofAttribute",
+      "target": null,
+      "file": "src/lib.rs",
+      "start-line": 66,
+      "end-line": 66,
+      "engine": "trust-mc",
+      "required-by-full-verify": true
+    },
+    {
+      "proof-item-id": "trust-mc:kani-proof:lib:example::verify::check_new",
+      "crate": "lib",
+      "harness": "example::verify::check_new",
+      "role": "Harness",
+      "source-form": "KaniProofAttribute",
+      "target": null,
+      "file": "src/lib.rs",
+      "start-line": 69,
+      "end-line": 69,
+      "engine": "trust-mc",
+      "required-by-full-verify": true
+    }
+  ],
+  "contracts": [
+    {
+      "function": "example::implementation::bar",
+      "file": "src/lib.rs",
+      "harnesses": [
+        "example::verify::check_bar"
+      ]
+    },
+    {
+      "function": "example::implementation::foo",
+      "file": "src/lib.rs",
+      "harnesses": [
+        "example::verify::check_foo_u32",
+        "example::verify::check_foo_u64"
+      ]
+    },
+    {
+      "function": "example::implementation::func",
+      "file": "src/lib.rs",
+      "harnesses": [
+        "example::verify::check_func"
+      ]
+    },
+    {
+      "function": "example::prep::parse",
+      "file": "src/lib.rs",
+      "harnesses": []
+    }
+  ],
+  "totals": {
+    "standard-harnesses": 2,
+    "contract-harnesses": 4,
+    "proof-obligations": 6,
+    "functions-under-contract": 4
+  }
+}

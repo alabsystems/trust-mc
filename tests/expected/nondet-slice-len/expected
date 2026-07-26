@@ -1,0 +1,14 @@
+Status: SATISFIED\
+Description: "cover condition: s.len() == 0"
+
+Status: SATISFIED\
+Description: "cover condition: s.len() == 1"
+
+Status: SATISFIED\
+Description: "cover condition: s.len() == 2"
+
+Status: SATISFIED\
+Description: "cover condition: s.len() == 3"
+
+Status: SATISFIED\
+Description: "cover condition: s.len() == 4"

@@ -1,0 +1,40 @@
+# Copyright Kani Contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# Limit parallel crate compilation to reduce peak memory usage.
+# Default parallelism can consume substantial memory while building the
+# compiler and rustc-driver integration crates.
+# Issue #3061: OOM on M2 Max during concurrent build/verification.
+[build]
+jobs = 3
+
+# Git authentication: use system git client instead of libgit2.
+[net]
+git-fetch-with-cli = true
+
+# Command aliases
+[alias]
+# Build trust-mc with development configuration.
+build-dev = "run --target-dir target/tools -p build-trust-mc -- build-dev"
+# Build trust-mc release bundle.
+bundle = "run -p build-trust-mc -- bundle"
+
+[env]
+# Runtime parallelism limits to prevent OOM (#3061).
+# force=true ensures these override any shell-level settings.
+# Reduced from 4→2 after repeated kernel panics (2026-03-01).
+# With 6 AI sessions, each test/rayon thread adds memory pressure.
+RAYON_NUM_THREADS = { value = "2", force = true }
+RUST_TEST_THREADS = { value = "2", force = true }
+[target.'cfg(all())']
+rustflags = [ # Global lints/warnings. Need to use underscore instead of -.
+
+    # Purposefully disabled lints
+    "-Aclippy::expect_fun_call",
+    "-Aclippy::or_fun_call",
+    "-Aclippy::new_without_default",
+
+    # New lints that we are not compliant yet
+    "-Aclippy::needless-borrow",
+    "-Aclippy::bool-to-int-with-if",
+]

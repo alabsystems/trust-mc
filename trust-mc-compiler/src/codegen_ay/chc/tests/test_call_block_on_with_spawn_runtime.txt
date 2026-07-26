@@ -1,0 +1,148 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+
+#![allow(dead_code, static_mut_refs)]
+
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, RawWaker, RawWakerVTable, Waker},
+};
+
+static mut GLOBAL_EXECUTOR: Option<Scheduler> = None;
+
+type BoxFuture = Pin<Box<dyn Future<Output = ()> + Sync + 'static>>;
+
+pub enum SchedulingAssumption {
+    CanAssumeRunning,
+    CannotAssumeRunning,
+}
+
+pub trait SchedulingStrategy {
+    fn pick_task(&mut self, num_tasks: usize) -> (usize, SchedulingAssumption);
+}
+
+#[derive(Default)]
+pub struct RoundRobin {
+    index: usize,
+}
+
+impl SchedulingStrategy for RoundRobin {
+    fn pick_task(&mut self, num_tasks: usize) -> (usize, SchedulingAssumption) {
+        self.index = (self.index + 1) % num_tasks;
+        (self.index, SchedulingAssumption::CannotAssumeRunning)
+    }
+}
+
+pub struct Scheduler {
+    tasks: Vec<Option<BoxFuture>>,
+    num_running: usize,
+}
+
+impl Scheduler {
+    pub const fn new() -> Scheduler {
+        Scheduler { tasks: Vec::new(), num_running: 0 }
+    }
+
+    pub fn spawn<F: Future<Output = ()> + Sync + 'static>(&mut self, fut: F) -> JoinHandle {
+        let index = self.tasks.len();
+        self.tasks.push(Some(Box::pin(fut)));
+        self.num_running += 1;
+        JoinHandle { index }
+    }
+
+    fn run(&mut self, mut scheduling_plan: impl SchedulingStrategy) {
+        let waker = unsafe { Waker::from_raw(NOOP_RAW_WAKER) };
+        let cx = &mut Context::from_waker(&waker);
+        while self.num_running > 0 {
+            let (index, assumption) = scheduling_plan.pick_task(self.tasks.len());
+            let task = &mut self.tasks[index];
+            if let Some(fut) = task.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(()) => {
+                        self.num_running -= 1;
+                        let _prev = task.take();
+                    }
+                    std::task::Poll::Pending => (),
+                }
+            } else if let SchedulingAssumption::CanAssumeRunning = assumption {
+            }
+        }
+    }
+
+    fn block_on<F: Future<Output = ()> + Sync + 'static>(
+        &mut self,
+        fut: F,
+        scheduling_plan: impl SchedulingStrategy,
+    ) {
+        self.spawn(fut);
+        self.run(scheduling_plan);
+    }
+}
+
+pub struct JoinHandle {
+    index: usize,
+}
+
+impl Future for JoinHandle {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
+        if unsafe { GLOBAL_EXECUTOR.as_mut().unwrap().tasks[self.index].is_some() } {
+            std::task::Poll::Pending
+        } else {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Ready(())
+        }
+    }
+}
+
+pub fn spawn<F: Future<Output = ()> + Sync + 'static>(fut: F) -> JoinHandle {
+    unsafe { GLOBAL_EXECUTOR.as_mut().unwrap().spawn(fut) }
+}
+
+pub fn block_on_with_spawn<F: Future<Output = ()> + Sync + 'static>(
+    fut: F,
+    scheduling_plan: impl SchedulingStrategy,
+) {
+    unsafe {
+        GLOBAL_EXECUTOR = Some(Scheduler::new());
+        GLOBAL_EXECUTOR.as_mut().unwrap().block_on(fut, scheduling_plan);
+        GLOBAL_EXECUTOR = None;
+    }
+}
+
+pub fn yield_now() -> impl Future<Output = ()> {
+    struct YieldNow {
+        yielded: bool,
+    }
+
+    impl Future for YieldNow {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
+            if self.yielded {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Ready(())
+            } else {
+                self.yielded = true;
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    YieldNow { yielded: false }
+}
+
+pub mod kani {
+    pub use super::{block_on_with_spawn, spawn, yield_now, RoundRobin};
+}
+
+const NOOP_RAW_WAKER: RawWaker = {
+    unsafe fn clone_waker(_: *const ()) -> RawWaker {
+        NOOP_RAW_WAKER
+    }
+    unsafe fn noop(_: *const ()) {}
+    RawWaker::new(std::ptr::null(), &RawWakerVTable::new(clone_waker, noop, noop, noop))
+};

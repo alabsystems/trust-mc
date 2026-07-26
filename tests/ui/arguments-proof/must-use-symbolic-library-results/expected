@@ -1,0 +1,9 @@
+error: unused return value of `kani::vec::any_vec` that must be used
+error: unused return value of `kani::vec::exact_vec` that must be used
+error: unused return value of `kani::hashmap::TrustMcMap::<K, V>::new` that must be used
+error: unused return value of `kani::hashmap::TrustMcMap::<K, V>::get` that must be used
+error: unused return value of `kani::hashmap::TrustMcMap::<K, V>::contains_key` that must be used
+error: unused return value of `kani::hashmap::TrustMcMap::<K, V>::is_empty` that must be used
+error: unused return value of `kani::hashmap::TrustMcMap::<K, V>::len` that must be used
+error: unused return value of `kani::shadow::ShadowMem::<T>::new` that must be used
+error: unused return value of `kani::shadow::ShadowMem::<T>::get` that must be used

@@ -1,0 +1,24 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-mc-core"
+version = "0.67.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Core verification condition IR for trust-mc"
+
+[dependencies]
+ay_bindings.workspace = true
+num-bigint = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

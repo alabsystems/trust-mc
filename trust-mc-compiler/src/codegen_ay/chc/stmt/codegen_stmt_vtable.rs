@@ -1,0 +1,210 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+
+//! Vtable discriminant tracking for dynamic dispatch CHC encoding.
+//!
+//! Extracted from `codegen_stmt_mirror.rs` per #4130 to keep files under 500 lines.
+//! Contains: capture_vtable_discriminant, capture_known_vtable_discriminant,
+//! try_capture_unsize_coercion_vtable, clear_known_vtable_discriminant,
+//! propagate_vtable_discriminant, get_or_create_vtable_state_var.
+
+use std::sync::Arc;
+
+use ay_bindings::{Expr, Sort};
+
+use crate::codegen_ay::types::CtorFieldExt;
+
+use super::ChcCtx;
+
+impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Capture vtable discriminant from a Dyn_Trait RHS expression (Part of #3159).
+    ///
+    /// When `translate_rvalue` produces a `Dyn_Trait{fld_ptr, fld_vtable}` expression
+    /// for an unsize coercion, extract and store the `fld_vtable` field so that
+    /// virtual dispatch can recover it later. Must be called before sort coercion
+    /// strips the datatype structure.
+    ///
+    /// Returns an `Option<Expr>` constraint (`vtable_out = vtable_val`) that the
+    /// caller MUST push to the block constraints. This makes the vtable a CHC
+    /// state variable, ensuring path-sensitivity across branches.
+    pub(in crate::codegen_ay::chc) fn capture_vtable_discriminant(
+        &mut self,
+        local_idx: usize,
+        rhs_expr: &Expr,
+    ) -> Option<Expr> {
+        let sort = rhs_expr.sort().clone();
+        let dt = sort.datatype_sort()?;
+        let cons = dt.constructors.first()?;
+        if !cons.has_field("fld_vtable") {
+            return None;
+        }
+        let vtable_expr = rhs_expr.clone().field_select(
+            &dt.name,
+            "fld_vtable",
+            Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH),
+        );
+        // Keep the compile-time side-table for single-block cases.
+        self.dyn_vtable_ids.insert(local_idx, vtable_expr.clone());
+
+        // Create or reuse a CHC state variable for path-sensitive tracking.
+        let (in_name, out_name) = self.get_or_create_vtable_state_var(local_idx);
+        // Mark the vtable state variable as modified so the rule generator
+        // emits out_var in the output args (not identity in=out).
+        if let Some(idx) = self.state_var_index_by_name(&in_name) {
+            self.mark_state_var_modified(idx);
+        }
+        let out_var = Expr::var(&*out_name, Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH));
+        Some(out_var.eq(vtable_expr))
+    }
+
+    /// Record a known vtable discriminant on a local without requiring a Dyn_Trait RHS.
+    ///
+    /// This is used for wrapper-dyn values like `Box<dyn Trait>` loaded from memory:
+    /// the loaded expression is a thin pointer bitvector, but the MIR body may still
+    /// uniquely determine the concrete vtable from its Unsize coercion site.
+    pub(in crate::codegen_ay::chc) fn capture_known_vtable_discriminant(
+        &mut self,
+        local_idx: usize,
+        vtable_expr: Expr,
+    ) -> Option<Expr> {
+        self.dyn_vtable_ids.insert(local_idx, vtable_expr.clone());
+
+        let (in_name, out_name) = self.get_or_create_vtable_state_var(local_idx);
+        if let Some(idx) = self.state_var_index_by_name(&in_name) {
+            self.mark_state_var_modified(idx);
+        }
+        let out_var = Expr::var(&*out_name, Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH));
+        Some(out_var.eq(vtable_expr))
+    }
+
+    /// Part of #3869: Capture vtable discriminant for PointerCoercion::Unsize casts
+    /// where the target wraps `dyn Trait` but the expression is a thin pointer (BV64).
+    ///
+    /// For `_dst = _src as Box<dyn Identity>`, the rhs_expr is BV64 so
+    /// `capture_vtable_discriminant` fails (no `fld_vtable` in DT sort), and
+    /// `propagate_vtable_discriminant` fails because the source `Box<Inner>` has
+    /// no vtable entry. This method resolves the vtable ID from the concrete source
+    /// type against the target's dyn trait candidates.
+    pub(in crate::codegen_ay::chc) fn try_capture_unsize_coercion_vtable(
+        &mut self,
+        rhs: &rustc_public::mir::Rvalue,
+        dst_local: usize,
+    ) -> Option<Expr> {
+        use rustc_public::mir::{CastKind, PointerCoercion};
+
+        let rustc_public::mir::Rvalue::Cast(
+            CastKind::PointerCoercion(PointerCoercion::Unsize),
+            operand,
+            target_ty,
+        ) = rhs
+        else {
+            return None;
+        };
+
+        let target_inner = super::super::dyn_coercion::peel_pointer_like_wrapper_ty(*target_ty);
+        super::super::dyn_coercion::find_dyn_trait_tail_ty(self, target_inner)?;
+
+        let src_ty = operand.ty(self.body.locals()).ok()?;
+        let src_inner = super::super::dyn_coercion::peel_pointer_like_wrapper_ty(src_ty);
+        let concrete_ty =
+            super::super::dyn_coercion::extract_concrete_tail_for_dyn(src_inner, target_inner);
+        let vtable_id = super::super::dyn_coercion::resolve_dyn_target_vtable_id(
+            self,
+            target_inner,
+            concrete_ty,
+        )?;
+        self.capture_known_vtable_discriminant(
+            dst_local,
+            Expr::bitvec_const(vtable_id as u128, crate::codegen_ay::types::POINTER_WIDTH),
+        )
+    }
+
+    /// Clear any stored vtable tracking for a local and make the CHC output
+    /// state unconstrained for this step instead of inheriting stale input state.
+    pub(in crate::codegen_ay::chc) fn clear_known_vtable_discriminant(&mut self, local_idx: usize) {
+        self.dyn_vtable_ids.remove(&local_idx);
+
+        if let Some((in_name, _out_name)) = self.vtable_state_vars.get(&local_idx)
+            && let Some(idx) = self.state_var_index_by_name(in_name)
+        {
+            self.mark_state_var_modified(idx);
+        }
+    }
+
+    /// Propagate vtable discriminant through Copy/Move (Part of #3159).
+    ///
+    /// When `_dst = move _src` and `_src` has a stored vtable ID, `_dst`
+    /// inherits it so virtual dispatch can look it up.
+    ///
+    /// Returns an `Option<Expr>` constraint (`dst_vtable_out = src_vtable`)
+    /// for path-sensitive propagation via CHC state variables.
+    pub(in crate::codegen_ay::chc) fn propagate_vtable_discriminant(
+        &mut self,
+        src_local: usize,
+        dst_local: usize,
+    ) -> Option<Expr> {
+        // Keep the compile-time side-table for single-block cases.
+        if let Some(vtable_expr) = self.dyn_vtable_ids.get(&src_local).cloned() {
+            self.dyn_vtable_ids.insert(dst_local, vtable_expr);
+        }
+
+        // Propagate via CHC state variables for path-sensitive tracking.
+        let (src_in, src_out) = self.vtable_state_vars.get(&src_local)?.clone();
+        let (dst_in, dst_out) = self.get_or_create_vtable_state_var(dst_local);
+        // Mark the destination vtable state variable as modified.
+        if let Some(idx) = self.state_var_index_by_name(&dst_in) {
+            self.mark_state_var_modified(idx);
+        }
+        // Part of #3159: If the source vtable state var was already modified
+        // in this block (e.g., by capture_vtable_discriminant for the same
+        // block's Unsize coercion), use the __out name so the propagation
+        // reads the newly captured value, not the stale predecessor input.
+        let src_modified = self
+            .state_var_index_by_name(&src_in)
+            .map(|idx| self.encode.modified_state_indices.contains(&idx))
+            .unwrap_or(false);
+        let src_name: &str = if src_modified { &src_out } else { &src_in };
+        let src_var = Expr::var(src_name, Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH));
+        let dst_var = Expr::var(&*dst_out, Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH));
+        Some(dst_var.eq(src_var))
+    }
+
+    /// Get or create a CHC state variable pair for vtable tracking (Part of #3159).
+    ///
+    /// Returns (input_name, output_name). Creates a late state variable pair
+    /// on first call for a given local_idx.
+    /// Part of #2267: returns Arc<str> pair — clones are cheap Arc bumps.
+    pub(in crate::codegen_ay::chc) fn get_or_create_vtable_state_var(
+        &mut self,
+        local_idx: usize,
+    ) -> (Arc<str>, Arc<str>) {
+        if let Some(names) = self.vtable_state_vars.get(&local_idx) {
+            return names.clone();
+        }
+        // Part of #2267: pre-allocate instead of format!().
+        use std::fmt::Write;
+        let mut in_name = String::with_capacity(20);
+        in_name.push_str("__vtable_sv_");
+        let _ = write!(in_name, "{local_idx}");
+        let mut out_name = String::with_capacity(25);
+        out_name.push_str("__vtable_sv_");
+        let _ = write!(out_name, "{local_idx}");
+        out_name.push_str("__out");
+        let sort = Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH);
+        // Part of #2267: create Arc<str> first, then share via O(1) clones
+        // instead of cloning the String (O(n)) then converting to Arc.
+        let in_arc: Arc<str> = Arc::from(in_name);
+        let out_arc: Arc<str> = Arc::from(out_name);
+        super::push_pending_var_decl(Arc::clone(&in_arc), sort.clone());
+        super::push_pending_var_decl(Arc::clone(&out_arc), sort.clone());
+        self.state_var_mgr.push_state_var_pair_arc(Arc::clone(&in_arc), &out_arc, sort);
+        tracing::debug!(
+            local_idx,
+            in_name = %in_arc,
+            "created vtable state variable for path-sensitive tracking (#3159)"
+        );
+        self.vtable_state_vars.insert(local_idx, (Arc::clone(&in_arc), Arc::clone(&out_arc)));
+        (in_arc, out_arc)
+    }
+}

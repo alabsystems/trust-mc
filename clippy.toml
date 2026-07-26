@@ -1,0 +1,13 @@
+# Clippy configuration for trust-mc
+#
+# This file lives in the repo root and is loaded by cargo/clippy.
+# Run: cargo clippy --all-targets
+#
+# Note: lint levels (warn/deny) are configured in Cargo.toml [workspace.lints.*]
+# This file only contains clippy threshold/behavior settings.
+#
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+# Large enum variant threshold (bytes)
+enum-variant-size-threshold = 64

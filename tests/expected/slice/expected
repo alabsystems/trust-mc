@@ -1,0 +1,8 @@
+SUCCESS\
+assertion failed: y.len() == 5
+SUCCESS\
+index out of bounds: the length is less than or equal to the given index
+SUCCESS\
+assertion failed: y[1] == 2
+SUCCESS\
+assertion failed: z.len() == 3

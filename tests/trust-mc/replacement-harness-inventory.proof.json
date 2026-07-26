@@ -1,0 +1,3033 @@
+{
+  "denominator": 504,
+  "provenance": "fresh public corpus over the included Kani verification suites, 2026-06-15",
+  "row_sha256": "62ddf770d23c96f5d45875e381ba310f9e0374658b50885df0a07b7c48d3c9cf",
+  "rows": [
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/adt_with_metadata.rs",
+      "harness": "check_arbitrary_metadata",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/adt_with_metadata.rs",
+      "harness": "check_arbitrary_metadata_is_sound",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/adt_with_metadata.rs",
+      "harness": "check_valid_dyn_ptr",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/fat_ptr_validity.rs",
+      "harness": "check_valid_dyn_ptr",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/fat_ptr_validity.rs",
+      "harness": "check_valid_slice_ptr",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/fat_ptr_validity.rs",
+      "harness": "check_valid_zst",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/ptr_size_validity.rs",
+      "harness": "verify_checked_size_of_raw_exceeds_isize_max",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/ptr_size_validity.rs",
+      "harness": "verify_is_inbounds",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/thin_ptr_validity.rs",
+      "harness": "check_dangling_zst",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/thin_ptr_validity.rs",
+      "harness": "check_invalid_zst",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/thin_ptr_validity.rs",
+      "harness": "check_valid_array",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/allocation/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/duration.rs",
+      "harness": "check_limits",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/enums/main.rs",
+      "harness": "check_basic",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/enums/main.rs",
+      "harness": "check_continuous",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/enums/main.rs",
+      "harness": "check_random",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/floats/non_standard_floats/main.rs",
+      "harness": "check_f128",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/floats/non_standard_floats/main.rs",
+      "harness": "check_f16",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/floats/standard_floats/main.rs",
+      "harness": "check_f32",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/floats/standard_floats/main.rs",
+      "harness": "check_f64",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_i128",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_i16",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_i32",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_i64",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_i8",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_isize",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_u128",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_u16",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_u32",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_u64",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_u8",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/integers/main.rs",
+      "harness": "check_usize",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/ptrs/pointer_inbounds.rs",
+      "harness": "check_alignment",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/ptrs/pointer_inbounds.rs",
+      "harness": "check_inbounds",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/ptrs/pointer_inbounds.rs",
+      "harness": "check_inbounds_initialized",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arbitrary/ptrs/pointer_inbounds.rs",
+      "harness": "check_overlap",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/arith-offset-overflow/main.rs",
+      "harness": "test_arith_offset_overflow",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/associated-fn/associated_fn.rs",
+      "harness": "new",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/bounded-arbitrary/hash/hash.rs",
+      "harness": "check_hashmap",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/bounded-arbitrary/hash/hash.rs",
+      "harness": "check_hashset",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/bounded-arbitrary/option/option.rs",
+      "harness": "check_option",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/bounded-arbitrary/result/result.rs",
+      "harness": "check_result",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/bounded-arbitrary/reverse_vec/vec.rs",
+      "harness": "check_reverse_is_its_own_inverse_incomplete",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/bounded-arbitrary/string/string.rs",
+      "harness": "check_string",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/closure/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/closure2/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/closure3/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/comp/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/coroutines/as_parameter/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/cover/cover-fail/main.rs",
+      "harness": "cover_overconstrained",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/cover/cover-message/main.rs",
+      "harness": "cover_match",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/cover/cover-pass/main.rs",
+      "harness": "cover_sorted",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-arbitrary/box/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-arbitrary/phantom_data/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-arbitrary/phantom_pinned/test.rs",
+      "harness": "check_arbitrary_phantom_pinned",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-arbitrary/safety_constraint_helper/safety_constraint_helper.rs",
+      "harness": "check_invariant_helper_ok",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-bounded-arbitrary/boxed_slice.rs",
+      "harness": "check_my_boxed_array",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-bounded-arbitrary/enum.rs",
+      "harness": "check_enum",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-bounded-arbitrary/enum_one_variant.rs",
+      "harness": "check_enum",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-bounded-arbitrary/generic_default.rs",
+      "harness": "check_my_vec",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-bounded-arbitrary/struct.rs",
+      "harness": "check_my_vec",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/attrs_cfg_guard/attrs_cfg_guard.rs",
+      "harness": "check_safety_constraint_cfg",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/attrs_mixed/attrs_mixed.rs",
+      "harness": "check_safety_constraint_cfg",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/empty_struct/empty_struct.rs",
+      "harness": "check_empty_struct_invariant_1",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/empty_struct/empty_struct.rs",
+      "harness": "check_empty_struct_invariant_2",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/empty_struct/empty_struct.rs",
+      "harness": "check_empty_struct_invariant_3",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/generic_struct/generic_struct.rs",
+      "harness": "check_generic_struct_invariant",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/named_struct/named_struct.rs",
+      "harness": "check_generic_struct_invariant",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/safety_constraint_helper/safety_constraint_helper.rs",
+      "harness": "check_invariant_helper_ok",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/safety_constraint_helper/safety_constraint_helper.rs",
+      "harness": "check_invariant_helper_ok_manual",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/safety_constraint_helper_funs/safety_constraint_helper_funs.rs",
+      "harness": "check_invariant_helper_ok",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/safety_constraint_helper_funs/safety_constraint_helper_funs.rs",
+      "harness": "check_invariant_helper_ok_manual",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/derive-invariant/unnamed_struct/unnamed_struct.rs",
+      "harness": "check_generic_struct_invariant",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/dynamic-trait-static-dispatch/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/dynamic-trait/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/empty/main.rs",
+      "harness": "check_nothing",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/foreign-function/ffi_ptr.rs",
+      "harness": "check_fn_ptr_not_called",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/arbitrary_ensures_pass.rs",
+      "harness": "max_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/arbitrary_requires_pass.rs",
+      "harness": "div_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/as-assertions/loops.rs",
+      "harness": "gcd_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/as-assertions/precedence.rs",
+      "harness": "check_add_two",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/as-assertions/precedence.rs",
+      "harness": "complex_proof_for_contract_takes_precedence",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/as-assertions/precedence.rs",
+      "harness": "simple_proof_for_contract_takes_precedence",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/as-assertions/precedence.rs",
+      "harness": "stub_verified_takes_precedence",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/attribute_no_complain.rs",
+      "harness": "random_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/checking_from_external_mod.rs",
+      "harness": "max_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/checking_in_impl.rs",
+      "harness": "max_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/const_block.rs",
+      "harness": "check_first",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/const_block.rs",
+      "harness": "check_of_i32",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/const_block.rs",
+      "harness": "check_of_i32_no_const",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/const_block.rs",
+      "harness": "check_second",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/const_block.rs",
+      "harness": "non_null_byte_add_dangling_proof",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/const_fn.rs",
+      "harness": "check",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/const_fn_with_effect.rs",
+      "harness": "check",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/gcd_rec_comparison_pass.rs",
+      "harness": "harness_as_check",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/gcd_rec_replacement_pass.rs",
+      "harness": "gcd_as_replace",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/gcd_rec_replacement_pass.rs",
+      "harness": "gcd_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/gcd_rec_simple_pass.rs",
+      "harness": "simple_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/gcd_replacement_fail.rs",
+      "harness": "gcd_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/gcd_replacement_pass.rs",
+      "harness": "gcd_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/gcd_replacement_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/gcd_success.rs",
+      "harness": "gcd_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/generic_infinity_recursion.rs",
+      "harness": "foo_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/block.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/clone_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/copy_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/function_call.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/no_modifies.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/respects-preconditions/ensures_before_requires.rs",
+      "harness": "check_next",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/respects-preconditions/modifies.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/respects-preconditions/requires_before_ensures.rs",
+      "harness": "check_next",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/simple_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/simple_pass_twice.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/stub.rs",
+      "harness": "double_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/history/stub.rs",
+      "harness": "quadruple_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/interior-mutability/api/cell.rs",
+      "harness": "harness_for_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/interior-mutability/api/cell_stub.rs",
+      "harness": "double_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/interior-mutability/api/cell_stub.rs",
+      "harness": "quadruple_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/interior-mutability/api/unsafecell.rs",
+      "harness": "harness_for_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/interior-mutability/whole-struct/cell.rs",
+      "harness": "harness_for_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/interior-mutability/whole-struct/oncecell.rs",
+      "harness": "harness_for_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/interior-mutability/whole-struct/refcell.rs",
+      "harness": "harness_for_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/interior-mutability/whole-struct/unsafecell.rs",
+      "harness": "harness_for_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/check_only_verification.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/check_only_verification.rs",
+      "harness": "modify_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/expr_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/expr_replace_fail.rs",
+      "harness": "check_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/expr_replace_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/expr_replace_pass.rs",
+      "harness": "modify_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/field_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/field_replace_fail.rs",
+      "harness": "check_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/field_replace_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/field_replace_pass.rs",
+      "harness": "modify_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/global_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/global_replace_fail.rs",
+      "harness": "check_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/global_replace_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/global_replace_pass.rs",
+      "harness": "modify_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/havoc_pass.rs",
+      "harness": "copy_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/havoc_pass.rs",
+      "harness": "copy_replace",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/havoc_pass_reordered.rs",
+      "harness": "copy_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/havoc_pass_reordered.rs",
+      "harness": "copy_replace",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/mistake_condition_return.rs",
+      "harness": "check_modify",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/simple_only_verification.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/simple_only_verification_modifies.rs",
+      "harness": "check_swap_primitive",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/simple_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/stmt_expr.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/unique_arguments.rs",
+      "harness": "test_contract",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/unique_arguments.rs",
+      "harness": "test_stubbing",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/vec_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/vec_pass.rs",
+      "harness": "modify_replace",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies/zst_pass.rs",
+      "harness": "check_replace_unit",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies_fat_pointer/nondeterministic_size.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies_fat_pointer/slice_of_array.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies_fat_pointer/u32slice.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/modifies_fat_pointer/u8slice.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/multiple_replace_pass.rs",
+      "harness": "check_one",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/multiple_replace_pass.rs",
+      "harness": "check_one_too",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/multiple_replace_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/mutable-references/return_mut_ref.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/prohibit-pointers/allowed_const_ptr.rs",
+      "harness": "allowed_pointer_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/prohibit-pointers/allowed_mut_ref.rs",
+      "harness": "allowed_mut_ref_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/prohibit-pointers/allowed_mut_return_ref.rs",
+      "harness": "allowed_mut_return_ref_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/prohibit-pointers/allowed_ref.rs",
+      "harness": "allowed_ref_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/prohibit-pointers/hidden.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/prohibit-pointers/plain_pointer.rs",
+      "harness": "plain_ptr_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/prohibit-pointers/return_pointer.rs",
+      "harness": "return_ptr_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/simple_ensures_pass.rs",
+      "harness": "max_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/simple_ensures_pass_no_annotation.rs",
+      "harness": "max_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/simple_replace_fail.rs",
+      "harness": "check_div",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/simple_replace_pass.rs",
+      "harness": "div_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/simple_replace_pass.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/associated_fn.rs",
+      "harness": "check_foo_a",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/associated_fn.rs",
+      "harness": "check_foo_b",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/impl_contract_precedence.rs",
+      "harness": "test_impl_contract_used",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/methods.rs",
+      "harness": "check_add",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/methods.rs",
+      "harness": "check_add_x",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/methods.rs",
+      "harness": "check_next_y",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/success.rs",
+      "harness": "a_bar_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/success.rs",
+      "harness": "a_foo_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/success.rs",
+      "harness": "b_bar_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/trait_impls/success.rs",
+      "harness": "x_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/type_annotation_needed.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/valid_ptr.rs",
+      "harness": "harness_head_ptr",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/valid_ptr.rs",
+      "harness": "harness_stack_ptr",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/generics/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/intrinsics/align_of_dst.rs",
+      "harness": "check_1char_tup",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/intrinsics/align_of_dst.rs",
+      "harness": "check_1zst_usize",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/intrinsics/align_of_dst.rs",
+      "harness": "check_large",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/intrinsics/align_of_dst.rs",
+      "harness": "check_zst1024",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/intrinsics/breakpoint/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/intrinsics/float-to-int/oob.rs",
+      "harness": "check_u128_upper",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/intrinsics/simd-bitmask/main.rs",
+      "harness": "check_simd_bitmask_model",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/issue-3022/issue_3022.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/iterator/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-backedge/test.rs",
+      "harness": "check_unwind_assertion",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/contract_proof_function_with_loop.rs",
+      "harness": "contract_proof",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/count_zero.rs",
+      "harness": "check_counter",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/count_zero_loop_contracts_disable.rs",
+      "harness": "check_counter",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_array.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_chain.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_enumerate.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_iter.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_map.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_range.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_slice.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_stepby.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_tuple.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_tuple_with_quantifiers.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_vec.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_for_zip.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/for_loop_with_quantifiers.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/function_with_loop_no_assertion.rs",
+      "harness": "contract_proof",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/loop_assigns_for_fat_ptr.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/loop_assigns_for_ptr.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/loop_assigns_for_ref.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/loop_assigns_for_vec.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/loop_in_generic_function.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/loop_with_old.rs",
+      "harness": "loop_with_old",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/loop_with_old_and_prev.rs",
+      "harness": "loop_with_old_and_prev",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/loop_with_prev.rs",
+      "harness": "loop_with_prev",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/loop_with_true_invariant.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/memchar_naive.rs",
+      "harness": "memchar_naive_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/multiple_loops.rs",
+      "harness": "multiple_loops_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/multiple_loops.rs",
+      "harness": "no_loop_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/multiple_prev.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/nested_forloop.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/nested_forloop_for_enumerate.rs",
+      "harness": "forloop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/nested_loop_local_var_assign.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/nested_loop_local_var_func_call.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/simple_loop_loop.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/simple_while_loop.rs",
+      "harness": "simple_while_loop_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/simple_while_loop_not_enabled.rs",
+      "harness": "simple_while_loop_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/small_slice_eq.rs",
+      "harness": "small_slice_eq_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/struct_projection.rs",
+      "harness": "struct_projection",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/loop-contract/while_let_loop_for_slice.rs",
+      "harness": "trim_ascii_start",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/nondet-slice-len/main.rs",
+      "harness": "check_possible_slice_lengths",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/nondet/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/offset-bounds-check/offset_from.rs",
+      "harness": "check_offset_from_same_dangling",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/offset-bounds-check/offset_from_unsigned.rs",
+      "harness": "check_offset_from_unsigned_same_dangling",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/offset-bounds-check/out_of_bounds_ub_check.rs",
+      "harness": "check_ptr_end",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/offset-overflows-isize/main.rs",
+      "harness": "test_zst",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/offset-wraps-around/main.rs",
+      "harness": "check_wrap_around_ptr",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/offset-wraps-around/main.rs",
+      "harness": "harness_without_ub",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/one-assert/test.rs",
+      "harness": "check_assert",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/per-harness/drop.rs",
+      "harness": "check_drop_bar",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/per-harness/drop.rs",
+      "harness": "check_drop_bar_debug",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/per-harness/drop.rs",
+      "harness": "check_drop_foo",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/ptr_to_ref_cast/invalid/test.rs",
+      "harness": "sanity_check_my_str",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/ptr_to_ref_cast/ptr_to_ref_cast.rs",
+      "harness": "check_equal_size_deref",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/ptr_to_ref_cast/ptr_to_ref_cast.rs",
+      "harness": "check_smaller_deref",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/ptr_to_ref_cast/slice/test.rs",
+      "harness": "check_with_byte_add_sub_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/quantifiers/assert_with_exists_pass.rs",
+      "harness": "exists_assert_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/quantifiers/assert_with_forall_pass.rs",
+      "harness": "forall_assert_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/quantifiers/multiple_quantifiers.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/quantifiers/quantifier_with_no_external_variable.rs",
+      "harness": "test",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/quantifiers/simple_four_quantifiers.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/quantifiers/typed_bounded_quantifiers.rs",
+      "harness": "typed_bounded_quantifiers_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/raw_slice/slice.rs",
+      "harness": "check_empty_raw",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/raw_slice/slice.rs",
+      "harness": "check_non_empty_raw",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/raw_slice/slice.rs",
+      "harness": "check_non_empty_slice",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/raw_slice_c_repr/slice.rs",
+      "harness": "check_empty_raw",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/raw_slice_c_repr/slice.rs",
+      "harness": "check_non_empty_raw",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/raw_slice_c_repr/slice.rs",
+      "harness": "check_non_empty_slice",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/raw_slice_packed/slice.rs",
+      "harness": "check_empty_raw",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/raw_slice_packed/slice.rs",
+      "harness": "check_non_empty_raw",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/raw_slice_packed/slice.rs",
+      "harness": "check_non_empty_slice",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/assert/reachable_pass/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/bounds/reachable_pass/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/debug-assert-eq/reachable_pass/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/debug-assert-ne/reachable_pass/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/debug-assert/reachable_pass/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/div-zero/reachable_pass/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/overflow-neg/reachable_pass/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/overflow/reachable_pass/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/rem-zero/reachable_pass/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/reach/turned-off/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/references/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/report/unsupported/unreachable/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/safety-constraint-attribute/abstract-value/abstract-value.rs",
+      "harness": "check_abstract_value",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/safety-constraint-attribute/check-arbitrary/check-arbitrary.rs",
+      "harness": "check_arbitrary",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/safety-constraint-attribute/grade-example/grade-example.rs",
+      "harness": "check_grade_safe",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/shadow/slices/slice_of_array/test.rs",
+      "harness": "check_slice_init",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/shadow/slices/slice_reverse/test.rs",
+      "harness": "check_reverse",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/shadow/slices/slice_split/test.rs",
+      "harness": "check_reverse",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/shadow/uninit_array/test.rs",
+      "harness": "check_init_true",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/shadow/unsupported_num_objects/test.rs",
+      "harness": "check_max_objects_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/shadow/unsupported_object_size/test.rs",
+      "harness": "check_max_object_size_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/slice/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/string-repeat/2235.rs",
+      "harness": "repeat_const",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-const-generics/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-different-sets/stubbing.rs",
+      "harness": "check_all_identity",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-different-sets/stubbing.rs",
+      "harness": "check_all_identity_2",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-different-sets/stubbing.rs",
+      "harness": "check_decrement",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-different-sets/stubbing.rs",
+      "harness": "check_decrement_is_increment",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-different-sets/stubbing.rs",
+      "harness": "check_identity",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-different-sets/stubbing.rs",
+      "harness": "check_indirect_all_identity",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-stub-set/main.rs",
+      "harness": "check_stub_set",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-trait-impls/success.rs",
+      "harness": "harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/stubbing-trait-impls/success.rs",
+      "harness": "stubbed_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/trait-receiver/receiver_types.rs",
+      "harness": "check_arc",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/trait-receiver/receiver_types.rs",
+      "harness": "check_bound",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/trait-receiver/receiver_types.rs",
+      "harness": "check_box",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/trait-receiver/receiver_types.rs",
+      "harness": "check_mut",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/trait-receiver/receiver_types.rs",
+      "harness": "check_pin",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/trait-receiver/receiver_types.rs",
+      "harness": "check_pin_box",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/trait-receiver/receiver_types.rs",
+      "harness": "check_rc",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/transmute/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-diverging-variants.rs",
+      "harness": "access_padding_supported",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-multiple-variants.rs",
+      "harness": "access_padding_init_a",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-multiple-variants.rs",
+      "harness": "access_padding_init_b",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-single-field.rs",
+      "harness": "access_padding_init",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-single-variant.rs",
+      "harness": "access_padding_init",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/atomic/atomic.rs",
+      "harness": "local_atomic_uninit",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/copy/copy_without_padding.rs",
+      "harness": "copy_without_padding",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/copy/non_byte_copy_without_padding.rs",
+      "harness": "non_byte_copy_without_padding",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/delayed-ub-overapprox.rs",
+      "harness": "check_delayed_ub_overapprox",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
+      "harness": "check_compare_bytes_safe",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
+      "harness": "check_copy",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
+      "harness": "check_copy_nonoverlapping",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
+      "harness": "check_copy_nonoverlapping_safe",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
+      "harness": "check_copy_safe",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
+      "harness": "check_volatile_store_and_load_safe",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
+      "harness": "check_write_bytes_safe",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/simd-conservative-aliasing/simd-conservative-aliasing.rs",
+      "harness": "check_simd_conservative_aliasing",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions.rs",
+      "harness": "basic_multifield_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions.rs",
+      "harness": "basic_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions.rs",
+      "harness": "cross_function_multi_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions.rs",
+      "harness": "cross_function_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions.rs",
+      "harness": "multi_cross_function_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions.rs",
+      "harness": "pointer_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions.rs",
+      "harness": "union_complex_subfields_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions.rs",
+      "harness": "union_update_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "pointer_union_should_fail",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "pointer_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "transmute_into_union_should_fail",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "transmute_into_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "transmute_union_should_fail",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "transmute_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "uber_union_should_fail",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "uber_union_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "union_as_subfields_should_fail",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "union_as_subfields_should_pass",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/union/static_union.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/union/union_transmute.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/can_dereference.rs",
+      "harness": "check_can_dereference_always_invalid",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/can_dereference.rs",
+      "harness": "check_can_dereference_always_valid",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/can_dereference.rs",
+      "harness": "check_can_dereference_char",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/char_validity.rs",
+      "harness": "cannot_dereference_invalid_char",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/char_validity.rs",
+      "harness": "check_valid_char_wrappers",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/char_validity.rs",
+      "harness": "check_valid_mixed_wrapper",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/constants.rs",
+      "harness": "cast_to_valid_char",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/constants.rs",
+      "harness": "cast_to_valid_offset",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/constants.rs",
+      "harness": "transmute_valid_bool",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/custom_niche.rs",
+      "harness": "check_niche",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/custom_niche.rs",
+      "harness": "check_valid_increment",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/maybe_uninit.rs",
+      "harness": "check_valid_zeroed",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/non_null.rs",
+      "harness": "check_valid_dangling",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/write_bytes.rs",
+      "harness": "check_valid_write",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/write_bytes.rs",
+      "harness": "check_zero_count_write_to_niche_is_noop",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/vecdq/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/verbose-cmds/main.rs",
+      "harness": "real_harness",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/wrapping-offset-bytes-overflow/main.rs",
+      "harness": "check_wrap_offset",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/prusti/100_doors.rs",
+      "harness": "main",
+      "lane": "tests/prusti"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/prusti/Ackermann_function.rs",
+      "harness": "main",
+      "lane": "tests/prusti"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/prusti/Binary_search.rs",
+      "harness": "main",
+      "lane": "tests/prusti"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/prusti/Fibonacci_sequence.rs",
+      "harness": "main",
+      "lane": "tests/prusti"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/prusti/Heapsort.rs",
+      "harness": "main",
+      "lane": "tests/prusti"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/prusti/Selection_sort.rs",
+      "harness": "main",
+      "lane": "tests/prusti"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/prusti/Tower_of_Hanoi.rs",
+      "harness": "main",
+      "lane": "tests/prusti"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/prusti/borrow_first.rs",
+      "harness": "main",
+      "lane": "tests/prusti"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/drop_after_moving_across_channel.rs",
+      "harness": "main",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_chain.rs",
+      "harness": "chain",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_copy.rs",
+      "harness": "copy",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_copy.rs",
+      "harness": "proxy",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_lines.rs",
+      "harness": "lines_inherent",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "across_tasks",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "disconnect",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "disconnect_reader",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "duplex_is_cooperative",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "max_write_size",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "ping_pong",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read.rs",
+      "harness": "read",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_buf.rs",
+      "harness": "read_buf",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_exact.rs",
+      "harness": "read_exact",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line_fail",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line_fail_and_utf8_fail",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line_invalid_utf8",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line_not_all_ready",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_end.rs",
+      "harness": "read_to_end",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_end.rs",
+      "harness": "read_to_end_uninit",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
+      "harness": "read_to_string",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
+      "harness": "to_string_appends",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
+      "harness": "to_string_does_not_truncate_on_io_error",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
+      "harness": "to_string_does_not_truncate_on_utf8_error",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_until.rs",
+      "harness": "read_until",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_until.rs",
+      "harness": "read_until_fail",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_until.rs",
+      "harness": "read_until_not_all_ready",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_take.rs",
+      "harness": "issue_4435",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_take.rs",
+      "harness": "take",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_util_empty.rs",
+      "harness": "empty_buf_reads_are_cooperative",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_util_empty.rs",
+      "harness": "empty_read_is_cooperative",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_write.rs",
+      "harness": "write2",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_write.rs",
+      "harness": "write_cursor",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_write_all.rs",
+      "harness": "write_all",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_write_all_buf.rs",
+      "harness": "write_all_buf",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_write_all_buf.rs",
+      "harness": "write_buf_err",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_write_buf.rs",
+      "harness": "write_all1",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/io_write_int.rs",
+      "harness": "write_int_should_err_if_write_count_0",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "dropping_rx_closes_channel",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "dropping_rx_closes_channel_for_try",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "no_t_bounds_buffer",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "no_t_bounds_unbounded",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "recv_close_gets_none_idle",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "recv_timeout",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "send_recv_unbounded",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "send_recv_with_buffer",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "try_recv_bounded",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "try_recv_close_while_empty_bounded",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "try_recv_close_while_empty_unbounded",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "try_reserve_fails",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "try_send_fail",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "try_send_fail_with_try_recv",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "tx_close_gets_none",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio/sync_mpsc.rs",
+      "harness": "unconsumed_messages_are_dropped",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_chain.rs",
+      "harness": "basic_usage_chain",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_collect.rs",
+      "harness": "empty_box_slice",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_collect.rs",
+      "harness": "empty_result",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_collect.rs",
+      "harness": "empty_string",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_collect.rs",
+      "harness": "empty_unit",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_collect.rs",
+      "harness": "empty_vec",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_empty.rs",
+      "harness": "basic_usage_empty",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_fuse.rs",
+      "harness": "basic_usage_fuse",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_merge.rs",
+      "harness": "merge_sync_streams",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_once.rs",
+      "harness": "basic_usage_once",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_stream_map.rs",
+      "harness": "empty",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_test/block_on.rs",
+      "harness": "async_block",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_test/block_on.rs",
+      "harness": "async_fn",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
+      "harness": "read1",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
+      "harness": "read_error",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
+      "harness": "write1",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
+      "harness": "write_error",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_util/io_reader_stream.rs",
+      "harness": "correct_behavior_on_errors",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/slow/tokio-proofs/src/tokio_util/io_stream_reader.rs",
+      "harness": "test_stream_reader",
+      "lane": "tests/slow"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/basic/add.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/basic/arith.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/basic/arith_assume.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/basic/arith_assume2.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/basic/arith_assume3.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/basic/div.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/basic/mod.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/basic/mul.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/basic/sub.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/functions/closure.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/functions/closure_fail.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/functions/double.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/functions/double_fail.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/generics/generic_function.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/generics/generic_function1.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/generics/generic_function2.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/generics/generic_function3.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/generics/generic_function4.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/generics/generic_function5.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/loops/gauss_sum_nondet.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/loops/gauss_sum_nondet_fail.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/loops/iterator.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/loops/iterator_fail.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/overflow/add_overflow.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/overflow/mul_overflow.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/overflow/sub_overflow.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/recursion/fac.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/recursion/fac_fail.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/recursion/fib.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/recursion/fib_fail.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/structures/option.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/structures/option_fail.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/structures/point.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/structures/point_fail.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/vector/vec1.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/vector/vec11.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/vector/vec12.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/vector/vec13.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/vector/vec_resize.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/smack/vector/vec_resize_fail.rs",
+      "harness": "main",
+      "lane": "tests/smack"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/mem.rs",
+      "harness": "check_replace_adt_no_drop",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/mem.rs",
+      "harness": "check_replace_large_adt_no_drop",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/mem.rs",
+      "harness": "check_replace_primitive",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/mem.rs",
+      "harness": "check_swap_adt_no_drop",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/mem.rs",
+      "harness": "check_swap_large_adt_no_drop",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/mem.rs",
+      "harness": "check_swap_primitive",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/mem.rs",
+      "harness": "check_swap_unit",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/ptr.rs",
+      "harness": "check_as_ref",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/ptr.rs",
+      "harness": "check_new",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/ptr.rs",
+      "harness": "check_new_unchecked",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/ptr.rs",
+      "harness": "check_replace_char",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/slice.rs",
+      "harness": "check_from_raw_parts_mut_primitive",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/core/src/slice.rs",
+      "harness": "check_from_raw_parts_primitive",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/std/src/boxed.rs",
+      "harness": "check_from_raw_u32",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/std/src/boxed.rs",
+      "harness": "check_from_raw_unit",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/std/src/sync/atomic.rs",
+      "harness": "check_from_ptr_u16",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/std/src/sync/atomic.rs",
+      "harness": "check_from_ptr_u32",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/std/src/sync/atomic.rs",
+      "harness": "check_from_ptr_u64",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/std/src/sync/atomic.rs",
+      "harness": "check_from_ptr_u8",
+      "lane": "tests/std-checks"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/std-checks/std/src/sync/atomic.rs",
+      "harness": "check_from_ptr_usize",
+      "lane": "tests/std-checks"
+    }
+  ],
+  "schema_version": 1,
+  "suite": "tests/trust-mc"
+}

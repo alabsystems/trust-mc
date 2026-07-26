@@ -1,0 +1,9 @@
+Checking harness verify::alt_harness...
+Status: SATISFIED\
+Description: "Cover example `alt`"
+
+Checking harness verify::demo_harness...
+Status: SATISFIED\
+Description: "Cover example `demo`"
+
+Complete - 2 successfully verified harnesses, 0 failures, 2 total.

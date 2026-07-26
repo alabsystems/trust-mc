@@ -1,0 +1,7 @@
+error: The function specified in the `proof_for_contract` attribute, `foo`, is not reachable from the harness `check_foo`.\
+test.rs:\
+|
+| fn check_foo() {
+| ^^^^^^^^^^^^^^
+|
+= help: Make sure that `check_foo` calls `foo`
