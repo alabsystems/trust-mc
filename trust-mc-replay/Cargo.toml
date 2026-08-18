@@ -4,7 +4,7 @@
 
 [package]
 name = "trust-mc-replay"
-version = "0.67.0"
+version = "0.1.0"
 edition = "2024"
 description = "Standalone obligation-replay harness: deserialize a dumped native trust_ir verification bundle and re-run the private exact-module CHC/PDR authority lane WITHOUT rebuilding trustc. Iterate ay-chc / trust-mc verifier logic in seconds via `cargo build -p trust-mc-replay` instead of a 26-minute stage-2 build."
 license = "MIT OR Apache-2.0"

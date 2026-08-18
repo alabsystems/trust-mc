@@ -9,7 +9,7 @@
 
 [package]
 name = "trust-mc-codegen-shared"
-version = "0.67.0"
+version = "0.1.0"
 edition = "2024"
 description = "Shared signedness, IntoOption, and type utilities for trust-mc AY codegen."
 license = "MIT OR Apache-2.0"

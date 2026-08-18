@@ -9,7 +9,7 @@
 
 [package]
 name = "trust-mc-kani-types"
-version = "0.67.0"
+version = "0.1.0"
 edition = "2024"
 description = "Kani function enums and LayoutOf utilities for trust-mc codegen subcrates."
 license = "MIT OR Apache-2.0"

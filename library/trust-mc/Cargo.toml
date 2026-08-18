@@ -5,7 +5,7 @@
 # Package named 'kani' for upstream test compatibility - tests use kani:: paths.
 # The directory is library/trust-mc/ for trust-mc branding.
 name = "kani"
-version = "0.67.0"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false

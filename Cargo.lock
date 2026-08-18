@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "build-trust-mc"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "cargo_metadata 0.23.1",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "kani"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "kani_core",
  "kani_macros",
@@ -1383,14 +1383,14 @@ dependencies = [
 
 [[package]]
 name = "kani_core"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "kani_macros",
 ]
 
 [[package]]
 name = "kani_macros"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "proc-macro-error2",
  "proc-macro2",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "std"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "kani",
 ]
@@ -2698,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "home",
@@ -2708,21 +2708,21 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-codegen-shared"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "trust-mc-codegen-stubs"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "trust-mc-codegen-types"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "ay-bindings",
  "tracing",
@@ -2730,7 +2730,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-compiler"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "ay-bindings",
  "ay-chc",
@@ -2764,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-core"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "ay-bindings",
  "num-bigint",
@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-driver"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "ay",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-kani-types"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "strum",
  "strum_macros",
@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-metadata"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "serde",
@@ -2853,7 +2853,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-replay"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -2864,7 +2864,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-trust-bmc"
-version = "0.67.0"
+version = "0.1.0"
 dependencies = [
  "ay-bindings",
  "serde_json",

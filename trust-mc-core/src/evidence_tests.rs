@@ -1135,7 +1135,7 @@ fn content_addressed_manifest_cache_key_covers_native_artifact_digests() {
 
 fn cache_key_parts(proof_mode: &str) -> FullVerificationCacheKeyParts {
     FullVerificationCacheKeyParts {
-        trust_mc_version: "0.67.0".to_string(),
+        trust_mc_version: "0.1.0".to_string(),
         trust_mc_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
         trust_mc_dirty: false,
         ay_solver: digest_artifact(
