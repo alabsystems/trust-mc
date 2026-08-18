@@ -182,6 +182,34 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             _ => PropertyKind::Assertion,
         };
+        // `--prove-safety-only`: check UB, not user panics. Kani classifies the
+        // MIR asserts that land in the `Assertion` arm above — DivisionByZero,
+        // RemainderByZero, Overflow, OverflowNeg, BoundsCheck, ResumedAfter* —
+        // as `PropertyClass::Assertion` (kani-compiler codegen/statement.rs), and
+        // `codegen_assert_assume` turns any Assertion-class check into a bare
+        // `assume` under the flag (codegen/assert.rs). Only NullPointerDereference
+        // and MisalignedPointerDereference are SafetyCheck and survive — which is
+        // exactly the split the `kind` match above already computes.
+        //
+        // We honoured the flag only in the Kani-HOOK emitters (kani::assert/check,
+        // Panic, Abort), never here, so `attempt to divide by zero` and overflow
+        // checks from the MIR `Assert` terminator were still reported and the
+        // harness FAILED where Kani reports SUCCESS.
+        //
+        // Skipping ONLY the error rule reproduces Kani's semantics exactly,
+        // because the assume half already exists: the block-level caller emits a
+        // separate guarded goto (`emit_guarded_goto_rule_shared`) carrying the
+        // same condition, so the successor stays constrained by the assertion
+        // instead of the check simply vanishing. That constraint is load-bearing
+        // — it is what makes a subsequent `ptr.add(offset)` provably in bounds in
+        // the harness this fixes.
+        if self.prove_safety_only && matches!(kind, PropertyKind::Assertion) {
+            debug!(
+                ?bb_idx,
+                "prove_safety_only: suppressing Assertion-class MIR assert (assume half retained)"
+            );
+            return;
+        }
         // Kani-parity descriptions: the property Description line must carry
         // rustc's AssertKind text ("attempt to divide by zero", …) exactly as
         // Kani reports it, so expected-output matching sees the same line.

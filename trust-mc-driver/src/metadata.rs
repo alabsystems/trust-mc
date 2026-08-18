@@ -32,8 +32,8 @@ impl KaniSession {
         &self,
         compiler_filtered_harnesses: Vec<&'a HarnessMetadata>,
     ) -> Result<Vec<&'a HarnessMetadata>> {
-        let harness_filters =
-            BTreeSet::from_iter(self.args.harnesses.iter().map(std::string::String::as_str));
+        let harness_filters: BTreeSet<_> =
+            self.args.harnesses.iter().map(std::string::String::as_str).collect();
 
         // For dev builds, re-filter the harnesses to double check filtering in the compiler
         // and ensure we're doing the minimal harness codegen possible. That filtering happens in

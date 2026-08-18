@@ -13,6 +13,10 @@ use tracing::{debug, warn};
 
 use crate::args::ChcTrackLevel;
 use crate::codegen_ay::names::{struct_sort, vec_layout};
+use crate::codegen_ay::provenance::{
+    Loc, Val, is_value_widened_into_address, mir_ty_denotes_address,
+};
+use crate::codegen_ay::ptr_repr::PtrSlot;
 use crate::codegen_ay::types::POINTER_WIDTH;
 use trust_mc_core::chc::{Rule, RuleBody};
 use trust_mc_core::violation::PropertyKind;
@@ -125,8 +129,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Prefer concrete byte backing before generic referent resolution.
         let slice_backing = self.resolve_slice_backing(slice_arg, modified_locals);
-        let slice_backing_len = slice_backing.as_ref().map(|backing| backing.len.clone());
-        let slice_backing_offset = slice_backing.as_ref().map(|backing| backing.offset.clone());
+        let slice_backing_len = slice_backing.as_ref().map(|backing| backing.len.as_expr().clone());
+        let slice_backing_offset =
+            slice_backing.as_ref().map(|backing| backing.offset.as_expr().clone());
 
         // Try to resolve the slice/array value.
         // Part of #3606: Try struct-embedded Vec data array FIRST. When `s.data`
@@ -135,21 +140,57 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // through to `slice_index_via_memory_model` and returns None. By trying
         // the direct fld_data Array lookup first, we get an Array-sort expression
         // that hits the efficient array-select path instead.
-        let slice_value = slice_backing
+        //
+        // Provenance of the four lanes: the first three all hand back element
+        // STORAGE (`ResolvedSliceBacking::data` is a `Val`, and the two
+        // `*_vec_data_array` helpers select an `fld_data` array). Only
+        // `resolve_ref_or_const_referent` can stop at a pointer instead of
+        // dereferencing it — so that is the ONE lane whose result may be an
+        // address, and `storage_lane` below carries that fact forward instead
+        // of leaving the pointer arm of the `match` to re-derive it from a
+        // width comparison.
+        let storage_value = slice_backing
             .as_ref()
-            .map(|backing| backing.data.clone())
+            .map(|backing| backing.data.as_expr().clone())
             .or_else(|| self.try_resolve_struct_vec_data_array(slice_arg))
-            .or_else(|| self.try_resolve_projected_vec_data_array(slice_arg))
+            .or_else(|| self.try_resolve_projected_vec_data_array(slice_arg));
+        let mut storage_lane = storage_value.is_some();
+        let slice_value = storage_value
             .or_else(|| self.resolve_ref_or_const_referent(slice_arg, modified_locals));
 
         // Part of #4003: follow closure-captured Vec pointers back to data arrays.
+        //
+        // Four producers feed `slice_value` above and only the last of them can
+        // stop at a pointer, so what this asks is "did resolution land in a
+        // pointer-shaped SLOT rather than on array data?" — a question about the
+        // declared sort, which is what `PtrSlot` names. The predicate is the one
+        // it replaces (`PtrSlot::Thin` is exactly `width == POINTER_WIDTH`); it
+        // is written this way so it is not mistaken for a provenance test, which
+        // a width comparison can never be.
         let slice_value = if slice_value
             .as_ref()
-            .is_some_and(|sv| sv.sort().bitvec_width() == Some(POINTER_WIDTH))
+            .is_some_and(|sv| PtrSlot::of_sort(sv.sort()) == Some(PtrSlot::Thin))
         {
-            self.try_resolve_closure_captured_vec_data(slice_arg, modified_locals).or(slice_value)
+            match self.try_resolve_closure_captured_vec_data(slice_arg, modified_locals) {
+                // This lane hands back the capture's `fld_data` array: storage.
+                Some(data) => {
+                    storage_lane = true;
+                    Some(data)
+                }
+                None => slice_value,
+            }
         } else {
             slice_value
+        };
+
+        // The pointer lane's address, established once, here, at the producer.
+        // `None` means "nothing available says this term is an address", and
+        // the `match` below then takes the constrained-symbolic fallback rather
+        // than dereferencing whatever landed in the slot.
+        let slice_ptr = if storage_lane {
+            None
+        } else {
+            slice_value.clone().and_then(|sv| self.slice_referent_as_address(slice_arg, sv))
         };
 
         // Emit bounds guard if we can determine array length.
@@ -166,15 +207,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     Expr::bitvec_const(0, POINTER_WIDTH)
                 }
             };
-            if len_coerced.sort().bitvec_width() == Some(POINTER_WIDTH) {
-                let oob = idx.clone().bvuge(len_coerced);
-                debug!(fn_name = %self.fn_name, "CHC slice index: emitting bounds_check error rule");
-                let error_app = RelationApp::new("error", Vec::new());
-                let body =
-                    RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, [oob]);
-                self.vc.add_rule(Rule::new(body, error_app));
-                bounds_guard_emitted = true;
-            }
+            // The width re-test that used to guard this block is deleted: every
+            // arm of the `match` above yields a `POINTER_WIDTH` bitvector (two
+            // coerce to it, one is already it, the `None` arm builds a constant
+            // at it), so the guard was vacuously true and decided nothing. A
+            // length is a VALUE, and re-measuring a value's width is exactly the
+            // kind of test this refactor exists to remove.
+            let oob = idx.clone().bvuge(len_coerced);
+            debug!(fn_name = %self.fn_name, "CHC slice index: emitting bounds_check error rule");
+            let error_app = RelationApp::new("error", Vec::new());
+            let body =
+                RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, [oob]);
+            self.vc.add_rule(Rule::new(body, error_app));
+            bounds_guard_emitted = true;
         }
 
         // Part of #3495: Check for subslice offset from range-based indexing.
@@ -207,8 +252,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         });
 
         // Attempt to compute element expression via array select.
-        let elem_expr = match (&idx_expr, &slice_value) {
-            (Some(idx), Some(sv)) if sv.sort().is_array() => {
+        let elem_expr = match (&idx_expr, &slice_value, &slice_ptr) {
+            (Some(idx), Some(sv), _) if sv.sort().is_array() => {
                 // Direct array select — parity with statement/slice.rs:185-186.
                 // Part of #3495: Apply subslice offset if present.
                 let effective_idx = if let Some(ref offset) = subslice_offset {
@@ -223,7 +268,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 );
                 Some(sv.clone().select(effective_idx))
             }
-            (Some(idx), Some(sv)) if sv.sort().datatype_name().is_some() => {
+            (Some(idx), Some(sv), _) if sv.sort().datatype_name().is_some() => {
                 // Datatype: check for fld_data (Vec/Slice backing array).
                 // Parity with statement/slice.rs:187-192.
                 let dt_name =
@@ -239,11 +284,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     None
                 }
             }
-            (Some(idx), Some(sv))
-                if sv.sort().is_bitvec() && sv.sort().bitvec_width() == Some(POINTER_WIDTH) =>
-            {
+            (Some(idx), Some(_), Some(ptr)) => {
                 // Pointer-to-slice: dereference through memory model. Part of #2915.
-                self.slice_index_via_memory_model(slice_arg, sv, idx)
+                //
+                // The width fallback that used to select this arm is retired.
+                // It was the only arm not matched structurally, so every
+                // pointer-width scalar that reached the slice slot — a
+                // dematerialized `usize`, an opaque `ptr_sort()` ADT, a
+                // zero-extended narrow datum — became a base address that this
+                // path then offsets by `idx * sizeof(elem)` and LOADS from.
+                // `slice_ptr` is `Some` only when a producer established the
+                // address; see `slice_referent_as_address`.
+                self.slice_index_via_memory_model(slice_arg, ptr, idx)
             }
             _ => {
                 // non-enum: (Option, Option) tuple exhaustion
@@ -717,6 +769,52 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         );
     }
 
+    /// The address the slice's elements live at, when the referent resolver
+    /// stopped at the pointer instead of dereferencing it.
+    ///
+    /// # What establishes the tag
+    ///
+    /// Two facts, neither of them a width:
+    ///
+    /// 1. The resolver did **not** hand back element storage. An `Array`- or
+    ///    `Datatype`-sorted term is the backing itself and has no address lane,
+    ///    so those shapes answer `None` and take their own `match` arm.
+    /// 2. The MIR type of the operand denotes a pointer
+    ///    ([`mir_ty_denotes_address`]). This is the fact the retired width test
+    ///    stood in for, and it is the one the operand's Rust type states
+    ///    outright — `&[T]`, `&Vec<T>`, `*const T`, a `NonNull` field reached
+    ///    through a projection chain. A `usize` slot, or one of the ADTs
+    ///    `translate_adt_ty` collapses to an opaque `ptr_sort()`, answers `no`.
+    ///
+    /// The widened-value refusal runs on the UNCOERCED term, before any
+    /// pointer-width coercion could make a narrow datum look addressable.
+    fn slice_referent_as_address(&self, slice_arg: &Operand, referent: Expr) -> Option<Loc> {
+        if referent.sort().is_array() || referent.sort().datatype_name().is_some() {
+            return None;
+        }
+        if is_value_widened_into_address(&referent) {
+            debug!(
+                fn_name = %self.fn_name,
+                "CHC slice index: refusing widened value-as-address for pointer lane"
+            );
+            return None;
+        }
+        if PtrSlot::of_sort(referent.sort()) != Some(PtrSlot::Thin) {
+            return None;
+        }
+        let arg_ty = self.resolve_body_ty(slice_arg.ty(self.body.locals()).ok()?);
+        if !mir_ty_denotes_address(arg_ty) {
+            debug!(
+                fn_name = %self.fn_name,
+                ?arg_ty,
+                "CHC slice index: pointer-width slice slot whose MIR type is not a pointer; \
+                 refusing the memory-model deref"
+            );
+            return None;
+        }
+        Some(Loc::of_address(referent))
+    }
+
     /// When `resolve_ref_or_const_referent` returns a raw pointer (bv64) instead of
     /// Array/Datatype — because ref_targets can't track through complex projection
     /// chains (e.g., PolymorphicIter field access) — compute `ptr + idx * sizeof(elem)`
@@ -724,7 +822,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     fn slice_index_via_memory_model(
         &mut self,
         slice_arg: &Operand,
-        ptr: &Expr,
+        ptr: &Loc,
         idx: &Expr,
     ) -> Option<Expr> {
         let elem_ty = self.chc_slice_elem_ty(slice_arg)?;
@@ -738,10 +836,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } else {
             idx.clone().bvmul(Expr::bitvec_const(elem_size as i128, POINTER_WIDTH))
         };
-        let elem_addr =
-            crate::codegen_ay::chc::pointer_step::step_split_pointer(ptr.clone(), byte_offset)
-                .result;
+        // Byte-offset arithmetic on an address is still an address (wave 11's
+        // `Loc` producer rule), so the `Loc` the caller established is inherited
+        // here rather than re-minted — which lets the load go through the typed
+        // `load_from_memory` instead of the deprecated untyped shim.
+        let elem_addr = Loc::of_address(
+            crate::codegen_ay::chc::pointer_step::step_split_pointer(
+                ptr.as_expr().clone(),
+                byte_offset,
+            )
+            .result,
+        );
         debug!(fn_name = %self.fn_name, ?elem_size, "CHC slice index: pointer deref via memory model");
-        self.load_from_memory(elem_addr, elem_ty)
+        self.load_from_memory(elem_addr, elem_ty).map(Val::into_expr)
     }
 }

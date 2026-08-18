@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 
 use super::super::ChcCtx;
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::provenance::Loc;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Shared logic for `Rvalue::Ref` and `Rvalue::AddressOf` encoding.
@@ -76,7 +77,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
             debug!(?place, "CHC: Mem-level reference using symbolic address");
-            return self.translate_ref_to_address(place, modified_locals);
+            // The Rvalue::Ref/AddressOf result becomes the destination local's
+            // DATUM (a pointer value), and this function's other lanes are
+            // value-semantics lanes for Reg/Ptr track levels, so the slot is
+            // not an address slot; the wave-11 tag ends here.
+            return self.translate_ref_to_address(place, modified_locals).map(Loc::into_expr);
         }
 
         // Ref/AddressOf at Reg vs Ptr level:
@@ -164,7 +169,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         // After deref-chain resolution, compute the address of
                         // the resolved place (e.g., &(*ptr).field -> &target.field),
                         // not the field value.
-                        return self.translate_ref_to_address(&resolved_place, modified_locals);
+                        return self
+                            .translate_ref_to_address(&resolved_place, modified_locals)
+                            .map(Loc::into_expr);
                     }
                 }
             }

@@ -13,6 +13,8 @@
 
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::alloc::{AllocId, GlobalAlloc};
+
+use crate::codegen_ay::provenance::{Loc, Val};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -65,12 +67,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         None
     }
 
+    /// Records "the initializer datum `value` lives at address `addr`" for the
+    /// entry rule's typed-memory mirror.
+    ///
+    /// The two operands used to be adjacent bare `Expr`s — one an address, one a
+    /// value, with nothing but argument order keeping them apart. That is the
+    /// canonical shape of the slot-misalignment defect class (see
+    /// `docs/addr-vs-value-conversion-queue.md` wave 13); taking [`Val`] and
+    /// [`Loc`] makes the swap a compile error.
     pub(in crate::codegen_ay::chc) fn push_static_memory_init_entry(
         &mut self,
         rust_ty: rustc_public::ty::Ty,
-        value_expr: Expr,
-        addr_expr: Expr,
+        value: Val,
+        addr: Loc,
     ) {
+        let value_expr = value.into_expr();
+        let addr_expr = addr.into_expr();
         // Part of #3661: resolve generic params for consistent type keys.
         let type_key: Arc<str> = Arc::from(&*self.type_key_for_body_ty(rust_ty));
         let elem_sort = self.elem_sort_for_memory_array(rust_ty);
@@ -98,25 +110,33 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
-    pub(in crate::codegen_ay::chc) fn static_addr_with_offset(
-        addr_expr: Expr,
-        offset: u64,
-    ) -> Expr {
+    /// Address arithmetic: a byte offset into the object `addr` names. Address
+    /// in, address out — the offset is a value and cannot be swapped for the
+    /// base.
+    pub(in crate::codegen_ay::chc) fn static_addr_with_offset(addr: Loc, offset: u64) -> Loc {
         if offset == 0 {
-            addr_expr
+            addr
         } else {
-            addr_expr
-                .bvadd(Expr::bitvec_const(offset as i128, crate::codegen_ay::types::POINTER_WIDTH))
+            Loc::of_address(
+                addr.into_expr().bvadd(Expr::bitvec_const(
+                    offset as i128,
+                    crate::codegen_ay::types::POINTER_WIDTH,
+                )),
+            )
         }
     }
 
+    /// Mirrors a static's initializer into typed memory, decomposing arrays and
+    /// structs into per-element / per-field `(value, address)` pairs.
     pub(in crate::codegen_ay::chc) fn register_static_memory_init_entries(
         &mut self,
         rust_ty: rustc_public::ty::Ty,
-        value_expr: Expr,
-        addr_expr: Expr,
+        value: Val,
+        addr: Loc,
     ) {
         use rustc_public::ty::{RigidTy, TyKind};
+
+        let value_expr = value.as_expr().clone();
 
         // P2-S1: in a contract CHECK harness, interior-mutable (UnsafeCell-
         // covered) static memory must stay unconstrained — the contract has
@@ -133,7 +153,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if self.contract_static_havoc && self.ty_has_interior_mut(rust_ty) {
             return; // full havoc of this memory region
         }
-        self.push_static_memory_init_entry(rust_ty, value_expr.clone(), addr_expr.clone());
+        self.push_static_memory_init_entry(rust_ty, value.clone(), addr.clone());
 
         // Part of #4196: Decompose array-typed statics into per-element memory inits.
         // For `[T; N]`, the whole-array value sort is `Array(BV64, elem_sort)` but
@@ -151,12 +171,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             .unwrap_or(crate::codegen_ay::types::POINTER_WIDTH);
                         for i in 0..array_len {
                             let idx = Expr::bitvec_const(i as u128, idx_width);
-                            let elem_expr = value_expr.clone().select(idx);
-                            let elem_addr = Self::static_addr_with_offset(
-                                addr_expr.clone(),
-                                i * elem_size as u64,
+                            // Selecting out of an initializer array yields the
+                            // element DATUM; the address moves by the element
+                            // stride. The two can no longer be transposed.
+                            let elem_value = Val::of_value(value_expr.clone().select(idx));
+                            let elem_addr =
+                                Self::static_addr_with_offset(addr.clone(), i * elem_size as u64);
+                            self.register_static_memory_init_entries(
+                                elem_ty, elem_value, elem_addr,
                             );
-                            self.register_static_memory_init_entries(elem_ty, elem_expr, elem_addr);
                         }
                         debug!(
                             array_len,
@@ -194,10 +217,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let field_ty =
                 <ChcCtx as CodegenTypesAdtSort>::resolve_generic_ty(field_def.ty(), &args)
                     .unwrap_or_else(|| field_def.ty());
-            let field_expr =
-                value_expr.clone().field_select(&dt.name, &field.name, field.sort.clone());
-            let field_addr = Self::static_addr_with_offset(addr_expr.clone(), offset);
-            self.register_static_memory_init_entries(field_ty, field_expr, field_addr);
+            let field_value = Val::of_value(value_expr.clone().field_select(
+                &dt.name,
+                &field.name,
+                field.sort.clone(),
+            ));
+            let field_addr = Self::static_addr_with_offset(addr.clone(), offset);
+            self.register_static_memory_init_entries(field_ty, field_value, field_addr);
         }
     }
 
@@ -206,12 +232,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Compute initial value for a static, handling flattened Datatype array elements.
     /// Detects BV-flattened arrays and reads fields individually to fix byte ordering.
     /// Part of #3496 Phase 5.
+    ///
+    /// This is a producer of [`Val`]: whatever the initializer image decodes to
+    /// is the static's *datum*, including the case where that datum happens to
+    /// be a pointer the static holds. It is never the address of the static
+    /// itself — that is minted separately, and confusing the two is what
+    /// `static_address_exprs` vs `static_initial_values` keeps apart.
     pub(in crate::codegen_ay::chc) fn static_init_from_alloc(
         &mut self,
         alloc: &rustc_public::ty::Allocation,
         sort: &Sort,
         rust_ty: rustc_public::ty::Ty,
-    ) -> Option<Expr> {
+    ) -> Option<Val> {
         use rustc_public::ty::{RigidTy, TyKind};
 
         // Check if this is an Array whose element sort was flattened from a Datatype.
@@ -238,7 +270,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 sort,
                                 &dt_sort,
                                 bv_width,
-                            );
+                            )
+                            .map(Val::of_value);
                         }
                     }
                 }
@@ -248,24 +281,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 && matches!(elem_ty.kind(), TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)))
             {
                 let array_len = len.eval_target_usize().ok()? as usize;
-                return self.read_array_with_pointer_elements_from_allocation(
-                    alloc, 0, sort, elem_ty, array_len,
-                );
+                return self
+                    .read_array_with_pointer_elements_from_allocation(
+                        alloc, 0, sort, elem_ty, array_len,
+                    )
+                    .map(Val::of_value);
             }
         }
 
         // Fall back to standard reading for non-array or non-flattened statics.
-        Self::scalar_from_alloc(alloc, sort)
+        Self::scalar_from_alloc(alloc, sort).map(Val::of_value)
     }
 
+    /// Both halves of a referent seed are values: the referent's contents and,
+    /// for an unsized referent, its element count. Neither is an address.
     pub(in crate::codegen_ay::chc) fn static_seed_metadata_for_value(
         &mut self,
         value_ty: rustc_public::ty::Ty,
-        value_expr: Expr,
+        value: Val,
         backing_alloc: Option<&rustc_public::ty::Allocation>,
     ) -> Option<(Expr, Option<Expr>)> {
         use rustc_public::ty::{RigidTy, TyKind};
 
+        let value_expr = value.into_expr();
         if !value_expr.sort().is_array() {
             return None;
         }

@@ -38,6 +38,8 @@ use super::inline_field_map::populate_inline_self_field_hints;
 use super::inline_result_shared::{
     InlineResultEpilogueSpec, emit_prepared_inline_result, prepare_inline_result_epilogue,
 };
+use crate::codegen_ay::provenance::Val;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH};
 
 /// Extension trait for virtual call dispatch on `ChcCtx`.
@@ -173,23 +175,41 @@ fn resolve_virtual_instance(
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// The vtable discriminant embedded in a wide pointer, if it has one.
+    ///
+    /// Wave 4 of the address-vs-value conversion: a vtable id is metadata — a
+    /// VALUE — so the result is a [`Val`].
+    ///
+    /// The `bitvec_width() == 2 * POINTER_WIDTH` test that used to be the whole
+    /// second branch is deleted. It could not distinguish a real `[vtable|data]`
+    /// pair from a thin pointer that `coerce_bitvec_width_safe` had widened into
+    /// the same slot, and on the latter it returned the extension padding as a
+    /// vtable id. That id is not a discriminant the program ever computed;
+    /// downstream it pins `capture_known_vtable_constraint` /
+    /// `build_dispatch_ite_chain` to whichever impl carries it, which is a
+    /// dispatch decision made from padding. `PtrRepr::into_metadata` answers
+    /// `None` for `Thin` and `WidenedThin` alike, so every caller falls through
+    /// to its own recovery (source-local table, wrapper peeling, statically
+    /// unique vtable) instead.
+    ///
+    /// The datatype branch is unchanged and is a declared role: the field is
+    /// literally named `fld_vtable`.
     pub(in crate::codegen_ay::chc) fn extract_embedded_vtable_expr(
         &self,
         expr: &Expr,
-    ) -> Option<Expr> {
+    ) -> Option<Val> {
         if let SortInner::Datatype(dt) = expr.sort().inner()
             && let Some(cons) = dt.constructors.first()
             && cons.has_field("fld_vtable")
         {
-            return Some(expr.clone().field_select(
+            return Some(Val::of_value(expr.clone().field_select(
                 &dt.name,
                 "fld_vtable",
                 Sort::bitvec(POINTER_WIDTH),
-            ));
+            )));
         }
 
-        (expr.sort().bitvec_width() == Some(2 * POINTER_WIDTH))
-            .then(|| expr.clone().extract(2 * POINTER_WIDTH - 1, POINTER_WIDTH))
+        PtrRepr::classify(expr)?.into_metadata()
     }
 
     /// Look up the vtable discriminant expression for a local, checking both
@@ -372,7 +392,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if let Some(receiver) = param_exprs.first()
             && let Some(vtable_expr) = self.extract_embedded_vtable_expr(receiver)
         {
-            return vtable_expr;
+            return vtable_expr.into_expr();
         }
         // Part of #3159: Look up vtable from side table for BV64 receivers.
         // The vtable expr was captured when the Dyn_Trait RHS was coerced to BV64

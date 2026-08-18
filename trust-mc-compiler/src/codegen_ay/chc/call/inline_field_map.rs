@@ -346,7 +346,7 @@ fn extend_field_map_for_param<'tcx, 'body>(
                 map.insert((local_idx, field_idx), reconstructed);
                 continue;
             }
-            if let Some(loaded) = ctx.load_from_memory(addr.clone(), *field_ty) {
+            if let Some(loaded) = ctx.load_from_memory_untyped(addr.clone(), *field_ty) {
                 map.insert((local_idx, field_idx), loaded);
                 continue;
             }
@@ -385,7 +385,8 @@ fn pointer_storage_expr<'tcx, 'body>(
         Some(param_expr.clone())
     } else {
         ctx.extract_pointer_storage_expr(param_expr)
-            .filter(|ptr| *ptr.sort() == Sort::bitvec(POINTER_WIDTH))
+            .filter(|ptr| *ptr.as_expr().sort() == Sort::bitvec(POINTER_WIDTH))
+            .map(crate::codegen_ay::provenance::Loc::into_expr)
     }
 }
 

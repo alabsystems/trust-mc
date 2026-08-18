@@ -63,15 +63,15 @@ fn compute_slice_backing_cmp_expr(
     rhs: &ResolvedSliceBacking,
     is_signed: bool,
 ) -> Option<Expr> {
-    if *lhs.data.sort() != *rhs.data.sort() {
+    if *lhs.data.as_expr().sort() != *rhs.data.as_expr().sort() {
         return None;
     }
-    let arr = lhs.data.sort().array_sort()?;
+    let arr = lhs.data.as_expr().sort().array_sort()?;
     if !arr.element_sort.is_bitvec() {
         return None;
     }
-    let lhs_len = concrete_usize(&lhs.len)?;
-    let rhs_len = concrete_usize(&rhs.len)?;
+    let lhs_len = concrete_usize(lhs.len.as_expr())?;
+    let rhs_len = concrete_usize(rhs.len.as_expr())?;
     let min_len = lhs_len.min(rhs_len);
     if min_len > SLICE_BACKING_REBASE_MAX_ELEMS
         || lhs_len.max(rhs_len) > SLICE_BACKING_REBASE_MAX_ELEMS
@@ -148,7 +148,7 @@ fn build_slice_eq(
     if lhs_len != rhs_len {
         return Some(Expr::bool_const(false));
     }
-    let mut result = lhs.len.clone().eq(rhs.len.clone());
+    let mut result = lhs.len.as_expr().clone().eq(rhs.len.as_expr().clone());
     for i in 0..lhs_len {
         let l = select_slice_elem(lhs, i)?;
         let r = select_slice_elem(rhs, i)?;
@@ -166,8 +166,8 @@ fn build_slice_lexicographic_cmp(
     let neg1 = Expr::bitvec_const(-1i128, 32);
     let zero = Expr::bitvec_const(0, 32);
     let pos1 = Expr::bitvec_const(1, 32);
-    let len_lt = lhs.len.clone().bvult(rhs.len.clone());
-    let len_eq = lhs.len.clone().eq(rhs.len.clone());
+    let len_lt = lhs.len.as_expr().clone().bvult(rhs.len.as_expr().clone());
+    let len_eq = lhs.len.as_expr().clone().eq(rhs.len.as_expr().clone());
     let mut result = Expr::ite(len_lt, neg1.clone(), Expr::ite(len_eq, zero, pos1.clone()));
 
     for i in (0..min_len).rev() {
@@ -182,11 +182,11 @@ fn build_slice_lexicographic_cmp(
 }
 
 fn select_slice_elem(slice: &ResolvedSliceBacking, logical_index: usize) -> Option<Expr> {
-    slice.data.sort().array_sort()?;
-    let idx = Expr::bitvec_const(logical_index as u64, slice.offset.sort().bitvec_width()?);
-    let src_idx =
-        if logical_index == 0 { slice.offset.clone() } else { slice.offset.clone().bvadd(idx) };
-    Some(slice.data.clone().select(src_idx))
+    slice.data.as_expr().sort().array_sort()?;
+    let offset = slice.offset.as_expr();
+    let idx = Expr::bitvec_const(logical_index as u64, offset.sort().bitvec_width()?);
+    let src_idx = if logical_index == 0 { offset.clone() } else { offset.clone().bvadd(idx) };
+    Some(slice.data.as_expr().clone().select(src_idx))
 }
 
 fn concrete_usize(expr: &Expr) -> Option<usize> {
@@ -230,11 +230,16 @@ mod tests {
     use ay_bindings::Sort;
 
     use super::*;
+    use crate::codegen_ay::provenance::Val;
     use crate::codegen_ay::types::POINTER_WIDTH;
 
     fn backing(name: &str, len: Expr, offset: Expr) -> ResolvedSliceBacking {
         let data_sort = Sort::array(Sort::bitvec(POINTER_WIDTH), Sort::bitvec(8));
-        ResolvedSliceBacking { data: Expr::var(name, data_sort), len, offset }
+        ResolvedSliceBacking {
+            data: Val::of_value(Expr::var(name, data_sort)),
+            len: Val::of_value(len),
+            offset: Val::of_value(offset),
+        }
     }
 
     #[test]

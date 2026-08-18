@@ -95,16 +95,56 @@ pub struct Summary {
     /// `rekey:legacy(<reason>)` -> unit count. Empty for legacy-surface runs
     /// (their reports and ledger rows stay byte-identical).
     pub rekey: BTreeMap<String, u64>,
+    /// Parity-integrity instrumentation: `<classification>` -> count of rows in
+    /// it whose run emitted `[AY:DEMOTION_REASONS:…]`, i.e. whose FAILED
+    /// verdict is a DEMOTED PROOF and not a counterexample. A nonzero
+    /// `parity` entry here is the number of parity credits that rest on a
+    /// result with no counterexample at all. Empty on runs whose driver
+    /// predates the marker, keeping those rows byte-identical.
+    pub demoted_by_class: BTreeMap<String, u64>,
+    /// `<demotion reason>` -> count of rows that emitted it (any
+    /// classification). Names which nets are actually load-bearing.
+    pub demotion_reasons: BTreeMap<String, u64>,
+    /// `<unknown_reason>` -> count, over rows that finished inconclusive.
+    ///
+    /// The point of this rollup is to keep the driver's own split visible:
+    /// `PreSolveDeadline` is BUDGET-bound (the per-harness deadline expired before
+    /// solving even began), `UndecidedModel` is solver-side inconclusiveness, and
+    /// `SolverError` is a genuine ay-chc error. Those used to share one label,
+    /// which made the gate's largest bucket impossible to act on.
+    pub unknown_reasons: BTreeMap<String, u64>,
+    /// Normalized `[AY:UNKNOWN-CATEGORY]` key -> count. Groups inconclusive
+    /// rows by a driver-side label. Treat these as DESCRIPTIVE: `ArrayParamLimit`
+    /// records that some predicate has >=2 Array-sorted params, which is a
+    /// structural fact about the VC, not a demonstrated solver ceiling — ay
+    /// proves 2-array VCs. See docs/ay-asks/2026-08-02-array-scale.
+    pub unknown_categories: BTreeMap<String, u64>,
 }
 
 pub fn summarize(results: &[TestResult]) -> Summary {
     let mut per: BTreeMap<String, Roll> = BTreeMap::new();
     let mut rekey: BTreeMap<String, u64> = BTreeMap::new();
+    let mut demoted_by_class: BTreeMap<String, u64> = BTreeMap::new();
+    let mut demotion_reasons: BTreeMap<String, u64> = BTreeMap::new();
+    let mut unknown_reasons: BTreeMap<String, u64> = BTreeMap::new();
+    let mut unknown_categories: BTreeMap<String, u64> = BTreeMap::new();
     for r in results {
         let c = r.classification.unwrap_or(Classification::Skipped);
         per.entry(r.suite.clone()).or_default().add(c);
         if let Some(prov) = &r.rekey {
             *rekey.entry(prov.clone()).or_default() += 1;
+        }
+        if !r.demotion_reasons.is_empty() {
+            *demoted_by_class.entry(c.as_str().to_string()).or_default() += 1;
+            for reason in &r.demotion_reasons {
+                *demotion_reasons.entry(reason.clone()).or_default() += 1;
+            }
+        }
+        if let Some(reason) = &r.unknown_reason {
+            *unknown_reasons.entry(reason.clone()).or_default() += 1;
+        }
+        if let Some(category) = &r.unknown_category {
+            *unknown_categories.entry(category.clone()).or_default() += 1;
         }
     }
     let mut by_suite = Vec::new();
@@ -125,7 +165,18 @@ pub fn summarize(results: &[TestResult]) -> Summary {
     full.merge(&verification);
     full.merge(&benchmark);
     full.merge(&diagnostic);
-    Summary { by_suite, verification, benchmark, diagnostic, full, rekey }
+    Summary {
+        by_suite,
+        verification,
+        benchmark,
+        diagnostic,
+        full,
+        rekey,
+        demoted_by_class,
+        demotion_reasons,
+        unknown_reasons,
+        unknown_categories,
+    }
 }
 
 fn bar(pct: f64) -> String {
@@ -269,6 +320,27 @@ pub fn format_text(s: &Summary, p: &Provenance) -> String {
     if !s.rekey.is_empty() {
         o.push_str(&format!("  surface=native re-key: {}\n", rekey_line(&s.rekey)));
     }
+    if !s.demoted_by_class.is_empty() {
+        o.push_str(&format!("  demoted-proof rows (FAILED with no counterexample) by class: {}\n", count_line(&s.demoted_by_class)));
+        if let Some(n) = s.demoted_by_class.get("parity") {
+            o.push_str(&format!(
+                "  ⚠️  {n} PARITY row(s) rest on a demoted proof, not a counterexample — parity credited against a fail oracle with no cex\n"
+            ));
+        }
+        o.push_str(&format!("  demotion reasons: {}\n", count_line(&s.demotion_reasons)));
+    }
+    if !s.unknown_reasons.is_empty() {
+        o.push_str(&format!("  inconclusive reasons: {}\n", count_line(&s.unknown_reasons)));
+        let budget = s.unknown_reasons.get("PreSolveDeadline").copied().unwrap_or(0);
+        if budget > 0 {
+            o.push_str(&format!(
+                "    ^ {budget} of these are BUDGET-bound (deadline expired before solving began)\n"
+            ));
+        }
+    }
+    if !s.unknown_categories.is_empty() {
+        o.push_str(&format!("  inconclusive categories: {}\n", count_line(&s.unknown_categories)));
+    }
     o.push_str("  ---- by suite ----\n");
     for (name, _scope, r) in &s.by_suite {
         o.push_str(&format!(
@@ -321,6 +393,16 @@ pub fn ledger_row(s: &Summary, p: &Provenance) -> serde_json::Value {
     if !s.rekey.is_empty() {
         row["rekey"] = serde_json::json!(s.rekey);
     }
+    if !s.demoted_by_class.is_empty() {
+        row["demoted_by_class"] = serde_json::json!(s.demoted_by_class);
+        row["demotion_reasons"] = serde_json::json!(s.demotion_reasons);
+    }
+    if !s.unknown_reasons.is_empty() {
+        row["unknown_reasons"] = serde_json::json!(s.unknown_reasons);
+    }
+    if !s.unknown_categories.is_empty() {
+        row["unknown_categories"] = serde_json::json!(s.unknown_categories);
+    }
     row
 }
 
@@ -341,6 +423,14 @@ fn short(s: &str) -> String {
 }
 
 /// `rekey:native=412 rekey:legacy(cargo_unit)=131 …`, native first.
+/// `k=v` pairs, highest count first, name-tiebroken. Used for the
+/// demoted-proof instrumentation rollups.
+fn count_line(counts: &BTreeMap<String, u64>) -> String {
+    let mut entries: Vec<(&String, &u64)> = counts.iter().collect();
+    entries.sort_by(|a, b| (std::cmp::Reverse(a.1), a.0).cmp(&(std::cmp::Reverse(b.1), b.0)));
+    entries.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
+}
+
 fn rekey_line(rekey: &BTreeMap<String, u64>) -> String {
     let mut entries: Vec<(&String, &u64)> = rekey.iter().collect();
     entries.sort_by(|a, b| {
@@ -368,6 +458,9 @@ mod tests {
             native_proof_accepted: false,
             ctrex_category: None,
             unknown_reason: None,
+            unknown_category: None,
+            unknown_category_detail: None,
+            demotion_reasons: Vec::new(),
             self_reported_unsound: false,
             duration_ms: 1,
             exit_code: Some(0),

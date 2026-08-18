@@ -81,7 +81,25 @@ fn collect_guards_recursive(
                             // a bare `BoolConst`, so peel nested negations before
                             // deciding. Part of the multi-variant-flattened enum
                             // downcast-guard fix.
-                            if peel_bool_const(&guard).is_some() {
+                            // SOUNDNESS: a guard may only be asserted when the
+                            // block's path already establishes the container's
+                            // constructor (the #3207 case: a plain state var the
+                            // block switched on). When the container is an `Ite`,
+                            // the constructor is DATA-DEPENDENT — a reconstructed
+                            // flattened enum `ite(tag, Ok(..), Err(..))` — so
+                            // `((_ is Err) …)` folds to `not(tag)` (via
+                            // `literal_constructor_guard`), which is not a
+                            // constant and therefore survives the check below.
+                            // Asserting it PRUNES the complementary `tag` path:
+                            // observed as `OnceCell::set` making everything after
+                            // it unreachable, so an `assert!(false)` "verifies".
+                            // Same defect as the #3896 constant case, only
+                            // data-dependent instead of static. Dropping the guard
+                            // only leaves the accessor uninterpreted (UNKNOWN at
+                            // worst) — never a fabricated proof.
+                            let container_is_data_dependent =
+                                matches!(container.value(), ExprValue::Ite { .. });
+                            if container_is_data_dependent || peel_bool_const(&guard).is_some() {
                                 collect_guards_recursive(container, guards, seen);
                                 return;
                             }
@@ -413,5 +431,64 @@ fn bool_const_value(expr: &Expr) -> Option<bool> {
     match expr.value() {
         ExprValue::BoolConst(value) => Some(*value),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_constructor_guards;
+    use ay_bindings::{Expr, Sort};
+    use trust_mc_codegen_types::names::enum_sort;
+
+    fn result_sort() -> Sort {
+        enum_sort(
+            "Result_t_u32",
+            vec![
+                ("Ok_Result", vec![]),
+                ("Err_Result", vec![("Err_field_0", Sort::bitvec(32))]),
+            ],
+        )
+    }
+
+    /// A reconstructed flattened enum is `ite(tag, Ok(..), Err(..))`. Applying an
+    /// `Err` selector to it must NOT emit a tester guard: `literal_constructor_guard`
+    /// folds `((_ is Err) …)` to `not(tag)`, which is not a constant and so escapes
+    /// the `peel_bool_const` net — asserting it as a rule-body constraint DELETES the
+    /// whole `tag` (Ok) path. Live symptom: `OnceCell::set` made every statement
+    /// after it unreachable, so an `assert!(false)` following it "verified".
+    #[test]
+    fn skips_guard_for_data_dependent_ite_container() {
+        let sort = result_sort();
+        let ok = Expr::datatype_constructor("Result_t_u32", "Ok_Result", vec![], sort.clone());
+        let err = Expr::datatype_constructor(
+            "Result_t_u32",
+            "Err_Result",
+            vec![Expr::bitvec_const(7u64, 32)],
+            sort,
+        );
+        // The container's constructor is decided by a symbolic tag, not by the path.
+        let reconstructed = Expr::ite(Expr::var("tag", Sort::bool()), ok, err);
+        let selector = reconstructed.field_select("Result_t_u32", "Err_field_0", Sort::bitvec(32));
+
+        let guards = collect_constructor_guards(&[selector.eq(Expr::bitvec_const(0u64, 32))]);
+
+        assert!(
+            guards.is_empty(),
+            "must NOT assert `not(tag)` for a tag-selected container — it prunes the Ok path, \
+             got {guards:?}"
+        );
+    }
+
+    /// The #3207 case is unchanged: a plain state var container still gets its
+    /// tester guard, so PDR keeps treating the accessor as interpreted.
+    #[test]
+    fn still_emits_guard_for_plain_var_container() {
+        let sort = result_sort();
+        let container = Expr::var("r", sort);
+        let selector = container.field_select("Result_t_u32", "Err_field_0", Sort::bitvec(32));
+
+        let guards = collect_constructor_guards(&[selector.eq(Expr::bitvec_const(0u64, 32))]);
+
+        assert_eq!(guards.len(), 1, "symbolic var container still needs its is_constructor guard");
     }
 }

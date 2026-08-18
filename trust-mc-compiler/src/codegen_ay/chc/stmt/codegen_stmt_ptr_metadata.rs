@@ -14,12 +14,14 @@
 
 use std::collections::HashSet;
 
-use ay_bindings::{Expr, ExprValue, Sort};
+use ay_bindings::Expr;
 use rustc_public::mir::{Operand, ProjectionElem, Rvalue, StatementKind, TerminatorKind};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
 use crate::codegen_ay::names::vec_layout;
+use crate::codegen_ay::provenance::Val;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 use crate::kani_middle::abi::LayoutOf;
 
@@ -31,7 +33,25 @@ use super::{
 use crate::codegen_ay::chc::codegen_ctx::diagnostics::CellCounter;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Resolves `PtrMetadata(operand)` — the slice/str length or the vtable
+    /// discriminant of a wide pointer.
+    ///
+    /// Pointer metadata is a **[`Val`]**, never a [`Loc`]: consumers compare it
+    /// against indices, feed it to `size_of_val`, and constrain bounds with it.
+    /// The single tag introduction below is this producer boundary — it is the
+    /// site that knows, from the MIR `PtrMetadata` rvalue itself, that the
+    /// result denotes a datum and not somewhere a datum lives.
+    ///
+    /// [`Loc`]: crate::codegen_ay::provenance::Loc
     pub(in crate::codegen_ay::chc) fn translate_ptr_metadata(
+        &self,
+        operand: &Operand,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Val> {
+        self.resolve_ptr_metadata_expr(operand, modified_locals).map(Val::of_value)
+    }
+
+    fn resolve_ptr_metadata_expr(
         &self,
         operand: &Operand,
         modified_locals: &HashSet<usize>,
@@ -115,15 +135,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 _ => false, // external enum: TyKind
             };
             if is_dyn {
-                // Try compile-time vtable ID (single-block case).
-                if let Some(vtable_expr) = self.dyn_vtable_ids.get(&local_idx) {
-                    debug!(local_idx, "PtrMetadata: resolved dyn vtable from dyn_vtable_ids");
-                    return Some(vtable_expr.clone());
-                }
-                // Try path-sensitive vtable state variable (multi-block case).
-                if let Some((in_name, _out_name)) = self.vtable_state_vars.get(&local_idx) {
-                    debug!(local_idx, "PtrMetadata: resolved dyn vtable from state var");
-                    return Some(Expr::var(&**in_name, Sort::bitvec(POINTER_WIDTH)));
+                // Defer to the CANONICAL resolver rather than re-deriving the
+                // lookup here. The previous local version had the #4111 bug at
+                // this site: it consulted the `dyn_vtable_ids` side table FIRST
+                // (a plain HashMap that is overwritten when several coercion
+                // sites write the same local — e.g. an if/else returning two
+                // concrete types as `Box<dyn Trait>`), and then read ONLY the
+                // `__in` state var, discarding `__out`. So a `ptr::metadata` /
+                // `vtable!()` / `to_raw_parts()` in the same block as a
+                // coercion could observe the predecessor's unconstrained
+                // vtable — while dispatch and drop, which BOTH go through
+                // `known_vtable_expr_for_local`, observed the real one. That is
+                // an internal inconsistency, not a safety net: a harness could
+                // dispatch to one impl while `size_of_val` reported another's
+                // layout.
+                //
+                // Sound because it invents no new argument: it makes metadata
+                // agree with the resolver that is already the SOLE authority
+                // for the two decisions that pick program behaviour (which impl
+                // body a virtual call runs; which drop body a dyn drop runs).
+                // The change is a NARROWING — from a stale/unconstrained read
+                // to the concrete constant or ITE actually produced at the
+                // coercion site — so it removes spurious counterexamples rather
+                // than admitting new behaviours.
+                if let Some(vtable_expr) = self.known_vtable_expr_for_local(local_idx) {
+                    debug!(local_idx, "PtrMetadata: resolved dyn vtable (canonical, #4111)");
+                    return Some(vtable_expr);
                 }
             }
         }
@@ -181,32 +218,35 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
 
-        // Part of #4163: BV128 fat pointer high-bits extraction.
-        // Some fat pointer locals are declared as BV128 (not flattened). The
-        // metadata (length) occupies bits 127..64. This covers non-flattened
-        // fat pointers (e.g., results of inlined calls or casts).
-        if let Operand::Copy(place) | Operand::Move(place) = operand {
-            if let Some(ptr_expr) = self.translate_place_with_modified(place, modified_locals) {
-                if ptr_expr.sort().bitvec_width() == Some(128) {
-                    // Only trust the high half when it can actually carry metadata.
-                    // A thin BV64 address WIDENED into the 128-bit slot has a high
-                    // half that is pure padding, and extracting it fabricates a
-                    // metadata word the program never computed — reliably `0` for a
-                    // zero-extension. That is not merely imprecise: a length of 0
-                    // makes size/bounds obligations trivially satisfiable, so it can
-                    // manufacture a PROOF. Fall through to the unconstrained fallback
-                    // instead, which is a `SOUND_APPROXIMATION` category the driver
-                    // force-demotes.
-                    if is_fabricated_fat_ptr_metadata(&ptr_expr) {
-                        debug!(
-                            place.local,
-                            "PtrMetadata: refusing fabricated BV128 high bits (widened thin pointer)"
-                        );
-                    } else {
-                        debug!(place.local, "PtrMetadata: resolved from BV128 high bits");
-                        return Some(ptr_expr.extract(127, 64));
-                    }
+        // Part of #4163: fat pointer metadata from a non-flattened pointer.
+        // Some fat pointer locals are declared as BV128 (not flattened), with the
+        // metadata (length / vtable) in the high half.
+        //
+        // The high half is only *metadata* on a genuine fat pointer. A thin
+        // address WIDENED into the same slot has a high half that is pure
+        // extension padding, and reading it fabricates a metadata word the
+        // program never computed — reliably `0` for a zero-extension. That is not
+        // merely imprecise: a length of 0 makes size/bounds obligations trivially
+        // satisfiable, so it can manufacture a PROOF.
+        //
+        // `PtrRepr` is what separates the two, structurally. `metadata()` is
+        // `None` for `Thin` and `WidenedThin`, so the fabrication is now
+        // unrepresentable rather than merely refused by a local predicate; the
+        // `?`-free fall-through below reaches the unconstrained fallback, a
+        // `SOUND_APPROXIMATION` category the driver force-demotes.
+        if let Operand::Copy(place) | Operand::Move(place) = operand
+            && let Some(ptr_expr) = self.translate_place_with_modified(place, modified_locals)
+            && let Some(repr) = PtrRepr::classify(&ptr_expr)
+        {
+            match repr.into_metadata() {
+                Some(meta) => {
+                    debug!(place.local, "PtrMetadata: resolved from fat pointer metadata half");
+                    return Some(meta.into_expr());
                 }
+                None => debug!(
+                    place.local,
+                    "PtrMetadata: no metadata on this pointer shape (thin or widened thin)"
+                ),
             }
         }
 
@@ -506,40 +546,5 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .state_vars
             .get(len_slot)
             .map(|(name, sort)| Expr::var(&**name, sort.clone()))
-    }
-}
-
-/// Does this 128-bit expression's high half carry *fabricated* pointer metadata?
-///
-/// A genuine fat pointer packs `(metadata, address)` into the 128-bit slot, so
-/// `extract(127, 64)` is the program's own slice length. But the same slot is
-/// also reached by WIDENING a thin 64-bit address, and then the high half is
-/// extension padding — extracting it invents a length the program never
-/// computed. For a zero-extension that invented length is exactly `0`, which
-/// makes `size_of_val`, `len()` and bounds obligations trivially satisfiable:
-/// the fabrication can manufacture a PROOF, not merely a spurious failure.
-///
-/// Two shapes are refused, matching what actually reaches the encoder:
-///
-/// * an extension node over a `<= 64`-bit expression (`zero_extend`/`sign_extend`),
-///   the un-folded form seen when the address is symbolic;
-/// * a 128-bit constant whose high half is zero, the folded form — constant
-///   folding erases the extension node, so matching on the node alone misses it.
-///
-/// The second shape also catches a genuinely-empty slice whose real metadata is
-/// `0`. That loss is deliberate: the two are indistinguishable at this point, and
-/// refusing costs precision (a havoced length, hence a possible spurious
-/// counterexample) while trusting costs soundness (a fabricated proof).
-fn is_fabricated_fat_ptr_metadata(ptr_expr: &Expr) -> bool {
-    match ptr_expr.value() {
-        // Widened thin pointer: the high half is extension padding, never metadata.
-        ExprValue::BvZeroExtend { expr, .. } | ExprValue::BvSignExtend { expr, .. } => {
-            expr.sort().bitvec_width().is_some_and(|w| w <= 64)
-        }
-        // Folded form of the same thing: `zero_extend` of a concrete address.
-        ExprValue::BitVecConst { value, width } => {
-            *width == 128 && (value >> 64u32) == num_bigint::BigInt::from(0)
-        }
-        _ => false,
     }
 }

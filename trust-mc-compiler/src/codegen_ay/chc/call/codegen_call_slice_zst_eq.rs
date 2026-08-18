@@ -75,7 +75,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         if let Some(len) = self.translate_ptr_metadata(receiver, modified_locals) {
-            return Some(len);
+            return Some(len.into_expr());
         }
 
         if let Some(expr) = self.resolve_ref_or_const_referent(receiver, modified_locals) {

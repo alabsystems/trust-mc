@@ -13,7 +13,8 @@ use rustc_public::mir::BinOp;
 use tracing::{debug, warn};
 
 use super::StatementCodegen;
-use crate::codegen_ay::types::POINTER_WIDTH;
+use crate::codegen_ay::provenance::{Loc, Val, is_value_widened_into_address};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Emit overflow check assertions for checked binary operations.
@@ -93,6 +94,49 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
+    /// Establishes that `expr` — the term the encoder produced for an operand
+    /// whose MIR type is **already known** to be `*T` / `&T` — really denotes
+    /// STORAGE, and hands it back in the thin address lane.
+    ///
+    /// # Why this is not `Loc::of_address(coerce_to_ptr_width(expr))`
+    ///
+    /// [`StatementCodegen::coerce_to_ptr_width`] is TOTAL: for a non-bitvec sort
+    /// it substitutes the literal `FALLBACK_PTR` (`0x1000`), and for a
+    /// sub-pointer-width term it zero-extends. Both outputs are pointer-width
+    /// bitvectors that no downstream consumer can tell apart from a real
+    /// address, and the second is precisely the shape
+    /// [`is_value_widened_into_address`] refuses **by name** in
+    /// `normalize_deref_address_expr` — a widened VALUE whose upper 32 bits (the
+    /// split-pointer model's obj_id) are forced to zero, i.e. the null object.
+    /// Tagging either of them [`Loc`] would move the old heuristic guess *inside*
+    /// the type system rather than remove it, which is exactly the failure mode
+    /// `provenance.rs` exists to prevent.
+    ///
+    /// So the coercion is not consulted at all. The shape decision is delegated
+    /// to [`PtrRepr::classify`], which decides it structurally, plus the
+    /// declared-field-role decoder for fat-pointer datatypes; the two
+    /// fabrications are refused.
+    ///
+    /// `None` means "no address could be established". Callers MUST take a
+    /// demoting path — they must not fall back to a tag.
+    pub(super) fn establish_pointer_base_address(expr: &Expr) -> Option<Loc> {
+        // A narrow datum widened into pointer width is never storage.
+        if is_value_widened_into_address(expr) {
+            return None;
+        }
+        if let Some(repr) = PtrRepr::classify(expr) {
+            return Some(repr.into_data());
+        }
+        // Fat-pointer DATATYPE: the declared `fld_ptr` / `fld_data` role names
+        // the address, so this lane reports a declaration rather than guessing.
+        // This is the shape `coerce_to_ptr_width` would have replaced with
+        // `FALLBACK_PTR`.
+        expr.sort()
+            .datatype_sort()
+            .and_then(|sdt| Self::dt_fat_pointer_repr(expr, sdt))
+            .map(PtrRepr::into_data)
+    }
+
     /// Emit overflow check for pointer offset operations.
     ///
     /// BinOp::Offset computes `ptr.offset(count)` where count is in units of the
@@ -100,6 +144,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// 1. Offset value overflow: count doesn't exceed isize bounds
     /// 2. Byte offset overflow: `count * size_of::<T>()` doesn't overflow isize
     /// 3. Result overflow: ptr + count * size doesn't wrap around address space
+    ///
+    /// # Why the two operands are typed
+    ///
+    /// `ptr` is an **address** and `count` is a **value**, they are adjacent, and
+    /// before this wave both were a bare `Expr` — the canonical swap shape. The
+    /// asymmetry is real and load-bearing here: `count` is sign-extended and
+    /// multiplied, while `ptr` is the only operand the allocation obligation may
+    /// be asked about. Taking [`Loc`] and [`Val`] makes a transposition a compile
+    /// error, and it is what lets the `pointer_invalid` obligation below stop
+    /// being decided by a width test.
+    ///
+    /// The [`Loc`] must come from an address PRODUCER —
+    /// [`Self::establish_pointer_base_address`] for the `ptr::offset` lanes,
+    /// `translate_ref_to_address` for the rest. Minting one here from a coerced
+    /// term is the wave-13b laundering this signature exists to make visible.
     ///
     /// REQUIRES: ptr.sort().is_bitvec() (pointer represented as bitvector)
     /// REQUIRES: count.sort().is_bitvec() (count represented as bitvector)
@@ -109,10 +168,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ENSURES: No-op for ZST (pointee_size == 0) beyond value bounds check
     pub(super) fn emit_offset_overflow_check(
         &mut self,
-        ptr: &Expr,
-        count: &Expr,
+        ptr: &Loc,
+        count: &Val,
         pointee_size: usize,
     ) {
+        let (ptr, count) = (ptr.as_expr(), count.as_expr());
         let Some(ptr_width) = ptr.sort().bitvec_width() else {
             return;
         };
@@ -142,8 +202,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let offset_value_overflow = count_too_large.or(count_too_small);
         self.record_violation_guarded(offset_value_overflow, "offset_value_overflow");
 
-        if self.ctx.config.extra_pointer_checks && ptr_width == POINTER_WIDTH {
-            let is_valid = self.ctx.heap_is_allocated(ptr.clone(), None);
+        // The `pointer_invalid` obligation used to be gated on
+        // `ptr_width == POINTER_WIDTH`. That test conflated two unrelated
+        // questions: `heap_is_allocated` REQUIRES a pointer-width operand (a
+        // well-formedness precondition), and "is the base a pointer at all?" (a
+        // provenance question). A wide pointer failed the width test, so the
+        // obligation was silently DROPPED for exactly the operands that carry
+        // metadata — a fail-open on the offset path. The base is an address by
+        // construction now ([`Loc`], established from the MIR type at the call
+        // site), so all that is left to decide is the *shape*, and `PtrRepr`
+        // decides that structurally and hands back a pointer-width data address
+        // for every shape it recognizes. A thin pointer decodes to itself, so
+        // the emitted VC is unchanged there.
+        if self.ctx.config.extra_pointer_checks
+            && let Some(addr) = PtrRepr::classify(ptr).map(PtrRepr::into_data)
+        {
+            let is_valid = self.ctx.heap_is_allocated(addr.into_expr(), None);
             self.record_violation_guarded(is_valid.not(), "pointer_invalid");
         }
 
@@ -268,5 +342,75 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Assert: -operand does not overflow (only fails for INT_MIN)
         let no_overflow = operand.clone().bvneg_no_overflow();
         self.record_violation_guarded(no_overflow.not(), "overflow_check_neg");
+    }
+}
+
+/// Tests for [`StatementCodegen::establish_pointer_base_address`].
+///
+/// These lock in wave 13b: the offset base's [`Loc`] must NOT be mintable from
+/// a coerced term. `coerce_to_ptr_width` is TOTAL — it zero-extends narrow
+/// terms and substitutes the `FALLBACK_PTR` literal for non-bitvec sorts — so
+/// tagging its output asserts address-ness of terms that are demonstrably
+/// values, which is the fabrication this establisher exists to refuse.
+///
+/// They live inline rather than in `statement/tests/` because that whole module
+/// is `#[cfg(feature = "compiler-corpus-tests")]` and would not run in the
+/// default `cargo test -p trust-mc-compiler --bins` gate.
+#[cfg(test)]
+mod establish_pointer_base_address_tests {
+    use super::StatementCodegen;
+    use crate::codegen_ay::types::POINTER_WIDTH;
+    use ay_bindings::{Expr, Sort};
+
+    /// A thin pointer-width term is an address; the establisher is the identity.
+    #[test]
+    fn accepts_thin_pointer() {
+        let expr = Expr::var("p", Sort::bitvec(POINTER_WIDTH));
+        let loc = StatementCodegen::establish_pointer_base_address(&expr)
+            .expect("a pointer-width term is a thin address");
+        assert_eq!(loc.as_expr(), &expr);
+    }
+
+    /// A wide pointer yields its DATA half, not the packed term.
+    #[test]
+    fn takes_fat_pointer_data_half() {
+        let data = Expr::var("d", Sort::bitvec(POINTER_WIDTH));
+        let meta = Expr::var("m", Sort::bitvec(POINTER_WIDTH));
+        let loc = StatementCodegen::establish_pointer_base_address(&meta.concat(data.clone()))
+            .expect("a fat pointer decodes");
+        assert_eq!(loc.as_expr(), &data);
+    }
+
+    /// A sub-pointer-width term is REFUSED rather than zero-extended into an
+    /// address — the shape `coerce_to_ptr_width` used to widen silently.
+    #[test]
+    fn refuses_narrow_value() {
+        let narrow = Expr::var("v", Sort::bitvec(32));
+        assert!(
+            StatementCodegen::establish_pointer_base_address(&narrow).is_none(),
+            "a narrow datum must not be widened into an address"
+        );
+    }
+
+    /// A narrow value ALREADY widened into pointer width is refused by name —
+    /// the `is_value_widened_into_address` fabrication (obj_id forced to 0).
+    #[test]
+    fn refuses_pre_widened_value() {
+        let widened = Expr::var("v", Sort::bitvec(32)).zero_extend(POINTER_WIDTH - 32);
+        assert_eq!(widened.sort().bitvec_width(), Some(POINTER_WIDTH));
+        assert!(
+            StatementCodegen::establish_pointer_base_address(&widened).is_none(),
+            "a pre-widened value must not pass as an address just because it is 64 bits"
+        );
+    }
+
+    /// A non-bitvec sort is refused instead of being replaced by `FALLBACK_PTR`.
+    #[test]
+    fn refuses_non_bitvec() {
+        assert!(
+            StatementCodegen::establish_pointer_base_address(&Expr::var("s", Sort::int()))
+                .is_none(),
+            "a non-bitvec sort has no address to establish"
+        );
     }
 }

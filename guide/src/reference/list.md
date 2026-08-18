@@ -3,8 +3,8 @@
 The `list` subcommand provides an overview of harnesses and contracts in the provided project/file. This is useful for understanding which parts of your codebase have verification coverage and tracking verification progress.
 
 ## Usage
-For basic usage, run `cargo trust-mc list` or `trust-mc list <FILE>`. For the default
-terminal table, `cargo trust-mc --harnesses` and `trust-mc <FILE> --harnesses` are
+For basic usage, run `targo trust-mc list` or `trust-mc list <FILE>`. For the default
+terminal table, `targo trust-mc --harnesses` and `trust-mc <FILE> --harnesses` are
 equivalent shortcuts. The current options are:
 - `--format [pretty|markdown|json]`: Choose output format
 - `--std`: List harnesses and contracts in the standard library (standalone `trust-mc` only)

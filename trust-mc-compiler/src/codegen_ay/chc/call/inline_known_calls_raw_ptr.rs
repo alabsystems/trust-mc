@@ -11,7 +11,8 @@ use rustc_public::mir::{LocalDecl, Operand};
 use rustc_public::ty::{RigidTy, TyKind};
 
 use super::ChcCtx;
-use crate::codegen_ay::types::POINTER_WIDTH;
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 
 pub(super) fn operand_is_raw_pointer_like(operand: &Operand, caller_locals: &[LocalDecl]) -> bool {
     fn ty_is_raw_pointer_like(ty: rustc_public::ty::Ty) -> bool {
@@ -104,17 +105,26 @@ fn raw_pointer_cmp_from_exprs(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
     raw_pointer_cmp_from_components(lhs_ptr, lhs_meta, rhs_ptr, rhs_meta)
 }
 
-fn raw_pointer_components(expr: &Expr) -> Option<(Expr, Option<Expr>)> {
-    if let Some(width) = expr.sort().bitvec_width() {
-        if width == POINTER_WIDTH {
-            return Some((expr.clone(), None));
-        }
-        if width == 2 * POINTER_WIDTH {
-            return Some((
-                expr.clone().extract(POINTER_WIDTH - 1, 0),
-                Some(expr.clone().extract(2 * POINTER_WIDTH - 1, POINTER_WIDTH)),
-            ));
-        }
+/// Splits a raw-pointer operand into its address and (optional) metadata.
+///
+/// Wave 4 of the address-vs-value conversion: the two halves have different
+/// provenance, so they get different types — `Loc` for the address, `Val` for
+/// the metadata — and no signature downstream can transpose them.
+///
+/// The `width == POINTER_WIDTH` / `width == 2 * POINTER_WIDTH` pair that used to
+/// open this function is deleted. The second arm read bits 127..64 as metadata
+/// whenever the operand happened to be double-width, which a thin pointer
+/// zero-extended into a BV128 slot satisfies exactly as well as a real fat one —
+/// and then compared that padding as if it were a slice length. `PtrRepr`
+/// separates the two structurally; `WidenedThin` reports no metadata, so the
+/// comparison falls back to the address-only lane instead of ordering on
+/// fabricated bits.
+///
+/// The datatype arm is unchanged and reports DECLARED roles: the fields are
+/// named `fld_ptr`/`ptr`/`fld_data` and `fld_len`/`fld_vtable`/`fld_meta`.
+fn raw_pointer_components(expr: &Expr) -> Option<(Loc, Option<Val>)> {
+    if let Some(repr) = PtrRepr::classify(expr) {
+        return Some(repr.into_parts());
     }
 
     let dt = expr.sort().datatype_sort()?;
@@ -123,7 +133,11 @@ fn raw_pointer_components(expr: &Expr) -> Option<(Expr, Option<Expr>)> {
         (field.name == "fld_ptr" || field.name == "ptr" || field.name == "fld_data")
             && field.sort.is_bitvec()
     })?;
-    let ptr = expr.clone().field_select(&dt.name, &ptr_field.name, ptr_field.sort.clone());
+    let ptr = Loc::of_address(expr.clone().field_select(
+        &dt.name,
+        &ptr_field.name,
+        ptr_field.sort.clone(),
+    ));
     let metadata = cons
         .fields
         .iter()
@@ -131,16 +145,19 @@ fn raw_pointer_components(expr: &Expr) -> Option<(Expr, Option<Expr>)> {
             (field.name == "fld_len" || field.name == "fld_vtable" || field.name == "fld_meta")
                 && field.sort.is_bitvec()
         })
-        .map(|field| expr.clone().field_select(&dt.name, &field.name, field.sort.clone()));
+        .map(|field| {
+            Val::of_value(expr.clone().field_select(&dt.name, &field.name, field.sort.clone()))
+        });
     Some((ptr, metadata))
 }
 
 fn raw_pointer_cmp_from_components(
-    lhs_ptr: Expr,
-    lhs_meta: Option<Expr>,
-    rhs_ptr: Expr,
-    rhs_meta: Option<Expr>,
+    lhs_ptr: Loc,
+    lhs_meta: Option<Val>,
+    rhs_ptr: Loc,
+    rhs_meta: Option<Val>,
 ) -> Option<Expr> {
+    let (lhs_ptr, rhs_ptr) = (lhs_ptr.into_expr(), rhs_ptr.into_expr());
     let ptr_width = ChcCtx::max_bitvec_width(&lhs_ptr, &rhs_ptr)?;
     let lhs_ptr_width = lhs_ptr.sort().bitvec_width()?;
     let rhs_ptr_width = rhs_ptr.sort().bitvec_width()?;
@@ -151,6 +168,7 @@ fn raw_pointer_cmp_from_components(
     let tie_cmp = match (lhs_meta, rhs_meta) {
         (None, None) => Expr::bitvec_const(0, 32),
         (Some(lhs_meta), Some(rhs_meta)) => {
+            let (lhs_meta, rhs_meta) = (lhs_meta.into_expr(), rhs_meta.into_expr());
             let meta_width = ChcCtx::max_bitvec_width(&lhs_meta, &rhs_meta)?;
             let lhs_meta_width = lhs_meta.sort().bitvec_width()?;
             let rhs_meta_width = rhs_meta.sort().bitvec_width()?;

@@ -13,6 +13,8 @@ use std::collections::HashSet;
 use ay_bindings::{Expr, ExprValue};
 use rustc_public::mir::Operand;
 
+use crate::codegen_ay::provenance::Loc;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 
 use super::super::codegen_call_misc::CallMisc;
@@ -163,6 +165,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         {
             // Part of #4099: prefer concrete lengths over symbolic.
             let len = match (&len_hint, Self::extract_const_usize_from_expr(&backing.len)) {
+                // Task #69: an unseeded sidecar ghost is a free variable, not an
+                // upgrade — keep the rule-constrained length we already have.
+                (Some(hint), None) if self.len_hint_is_unseeded_ghost(hint) => backing.len,
                 (Some(hint), None) => hint.clone(),
                 (_, Some(_)) => backing.len,
                 (None, None) => backing.len,
@@ -210,6 +215,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         (len_hint, offset)
     }
 
+    /// Task #69: is this length hint a collection-length sidecar ghost that no
+    /// rule ever writes?
+    ///
+    /// `string_backing_metadata_for_local` falls back to the sidecar ghost for
+    /// the *metadata* local, and `detect_collection_type` looks through `&`, so
+    /// a `&String` local is minted its own length ghost distinct from the
+    /// pointee's. Only the pointee's ghost is ever seeded by a stub
+    /// (`String::from_raw_parts` and friends), leaving the reference's ghost
+    /// unwritten — a free variable threaded through every block relation.
+    ///
+    /// Per the `seeded_len_vars` contract (see `ChcCollectionLenState`), a
+    /// constraint on an unseeded len var "produces arbitrary counterexamples
+    /// misclassified as Genuine", so such a hint must never displace a length
+    /// that the rules already constrain.
+    fn len_hint_is_unseeded_ghost(&self, hint: &Expr) -> bool {
+        let ExprValue::Var { name } = hint.value() else {
+            return false;
+        };
+        let len_state = &self.collections.len_state;
+        len_state.local_for_len_var(name).is_some() && !len_state.is_len_seeded(name)
+    }
+
     /// Part of #4161: public wrapper for the inline walker to build a
     /// `StringBacking` from a pre-translated expression without needing
     /// operand resolution or MIR access.
@@ -249,37 +276,42 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(backing);
         }
 
-        if expr.sort().bitvec_width() != Some(2 * POINTER_WIDTH) {
+        // `split_fat_pointer_expr` used to live here: it matched *any*
+        // `bv64‖bv64` concat as a fat pointer and, when that failed, the
+        // `unwrap_or_else` below re-derived the same two halves by extraction —
+        // which is where a widened thin pointer became a length of 0. `PtrRepr`
+        // is that decoder, structurally: `data()` is total, and `metadata()` is
+        // `None` for a widened thin pointer, so the `?` bails to the caller's
+        // fallback exactly as a 0 length used to (`static_byte_backing_from_inits`
+        // rejects `len == 0`) — without inventing the 0 in the first place.
+        let repr = PtrRepr::classify(&expr)?;
+        if matches!(repr, PtrRepr::Thin(_)) {
+            // This helper only ever handled wide pointers (it was gated on
+            // `width == 2 * POINTER_WIDTH`); a thin one has no static-bytes route
+            // here. Kept as a shape test, not a width test.
             return None;
         }
-        let (data_ptr, len) = Self::split_fat_pointer_expr(&expr).unwrap_or_else(|| {
-            (
-                expr.clone().extract(POINTER_WIDTH - 1, 0),
-                expr.extract(2 * POINTER_WIDTH - 1, POINTER_WIDTH),
-            )
-        });
+        let data_ptr = repr.data().clone();
         let effective_len = match len_hint {
+            // An independently-sourced constant length is not fabricated metadata,
+            // so it is honoured for every wide shape — including a widened thin
+            // pointer, whose own high half stays unreadable.
             Some(hint) if Self::extract_const_usize_from_expr(&hint).is_some() => hint,
-            _ => len.clone(),
+            _ => repr.into_metadata()?.into_expr(),
         };
         let data = self.static_byte_backing_from_inits(data_ptr, &effective_len)?;
         Some(StringBacking { data, len: effective_len, offset })
     }
 
-    fn split_fat_pointer_expr(expr: &Expr) -> Option<(Expr, Expr)> {
-        let ExprValue::BvConcat(metadata, data_ptr) = expr.value() else {
-            return None;
-        };
-        if metadata.sort().bitvec_width() == Some(POINTER_WIDTH)
-            && data_ptr.sort().bitvec_width() == Some(POINTER_WIDTH)
-        {
-            Some((data_ptr.clone(), metadata.clone()))
-        } else {
-            None
-        }
-    }
-
-    fn static_byte_backing_from_inits(&self, base_addr: Expr, len: &Expr) -> Option<Expr> {
+    /// Recovers the bytes a static's initializer mirrored at `base_addr`.
+    ///
+    /// `base_addr` is the data half of a decoded [`PtrRepr`], threaded through
+    /// as a [`Loc`] rather than flattened back to an `Expr`: the address it
+    /// names is the key the `static_memory_inits` mirror is looked up by, and
+    /// the value it finds is what is stored into the returned byte array. The
+    /// two are matched by textual address equality below, so a value arriving
+    /// in the address slot would silently return an empty backing.
+    fn static_byte_backing_from_inits(&self, base_addr: Loc, len: &Expr) -> Option<Expr> {
         let len = Self::extract_const_usize_from_expr(len)?;
         if len == 0 || len > 64 {
             return None;
@@ -289,7 +321,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut result = Expr::const_array(ptr_sort(), Expr::bitvec_const(0u64, 8));
         for idx in 0..len {
             let expected_addr = ChcCtx::static_addr_with_offset(base_addr.clone(), idx as u64);
-            let expected_addr_text = expected_addr.to_string();
+            let expected_addr_text = expected_addr.as_expr().to_string();
             let byte_expr = self
                 .ref_resolution
                 .static_memory_inits

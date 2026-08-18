@@ -19,12 +19,17 @@
 //! bit-vector overflow obligations refute with a concrete witness rather than
 //! stalling at Unknown.
 
-use std::collections::{HashMap, HashSet};
+mod wide_nonlinear_abstraction;
+
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ay_chc::{
     ChcExpr, ChcProblem, ClauseHead, HornClause, PredicateId, SmtContext, SmtResult, SmtValue,
 };
+
+use self::wide_nonlinear_abstraction::abstract_wide_nonlinear;
 
 /// Wall-clock bound for any single decidable SMT query in this CEX-search
 /// shortcut. A real counterexample is a *satisfiable* (SAT) derivation, which the
@@ -55,7 +60,7 @@ const AY_CHC_SUBSTITUTION_MAX_DISTINCT_NODES: usize = 1_000_000;
 pub(crate) enum AcyclicDecision {
     /// Acyclic problem; the exhaustive search composed a satisfiable derivation of
     /// `error` — a real counterexample (sound).
-    Unsafe(serde_json::Value),
+    Unsafe(AcyclicUnsafeWitness),
     /// Acyclic problem; the EXHAUSTIVE (non-truncated) bounded search found no
     /// satisfiable derivation of `error`. Because the dependency graph is acyclic
     /// every derivation has bounded length, so this is a COMPLETE decision: SAFE.
@@ -69,9 +74,24 @@ pub(crate) enum AcyclicDecision {
     Inconclusive,
 }
 
+/// Concrete result of composing one satisfiable acyclic error derivation.
+///
+/// The clause-index trace is part of the witness rather than a diagnostic: a
+/// fresh consumer uses it to select the exact clauses from its independently
+/// rebuilt problem, reconstructs the accumulated path formula, binds every
+/// variable to the supplied typed model, and asks SMT to check that exact
+/// assignment.  A model without this trace cannot identify which of several
+/// possible derivations it is supposed to satisfy and is therefore not
+/// replayable.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AcyclicUnsafeWitness {
+    pub(crate) model: serde_json::Value,
+    pub(crate) derivation_clause_indices: Vec<u64>,
+}
+
 #[allow(clippy::large_enum_variant)] // short-lived decision value
 enum DerivationOutcome {
-    Witness(serde_json::Value),
+    Witness(AcyclicUnsafeWitness),
     ExhaustivelyNone,
     Truncated,
 }
@@ -106,44 +126,47 @@ fn is_acyclic_problem(problem: &ChcProblem) -> bool {
         return true;
     }
     let edges = problem.dependency_edges();
-    if n <= 1 {
-        return !edges.iter().any(|(from, to)| from == to);
-    }
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut incoming = vec![0usize; n];
     for (from, to) in &edges {
         let from_idx = from.index();
         let to_idx = to.index();
-        if from_idx < n && to_idx < n {
-            adj[from_idx].push(to_idx);
-        }
-    }
-    let mut state = vec![0u8; n];
-    for v in 0..n {
-        if state[v] == 0 && has_cycle_dfs(v, &adj, &mut state) {
+        if from_idx >= n || to_idx >= n {
             return false;
         }
+        adj[from_idx].push(to_idx);
+        let Some(next) = incoming[to_idx].checked_add(1) else {
+            return false;
+        };
+        incoming[to_idx] = next;
     }
-    true
-}
 
-fn has_cycle_dfs(v: usize, adj: &[Vec<usize>], state: &mut [u8]) -> bool {
-    state[v] = 1;
-    for &w in &adj[v] {
-        if state[w] == 1 {
-            return true;
-        }
-        if state[w] == 0 && has_cycle_dfs(w, adj, state) {
-            return true;
+    // Kahn's topological walk avoids recursive DFS: a retained-but-large
+    // obligation must not be able to overflow the consumer's call stack while
+    // it is deciding whether a serialized witness is replayable.
+    let mut ready: VecDeque<usize> = incoming
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect();
+    let mut visited = 0usize;
+    while let Some(node) = ready.pop_front() {
+        visited += 1;
+        for &successor in &adj[node] {
+            incoming[successor] -= 1;
+            if incoming[successor] == 0 {
+                ready.push_back(successor);
+            }
         }
     }
-    state[v] = 2;
-    false
+    visited == n
 }
 
 #[derive(Clone)]
 struct ReachFact {
     args: Vec<ChcExpr>,
     constraints: Vec<ChcExpr>,
+    derivation_clause_indices: Vec<u64>,
 }
 
 /// Conservative exact reachability for acyclic CHCs. Returns a JSON rendering of
@@ -169,7 +192,7 @@ fn acyclic_error_derivation(problem: &ChcProblem) -> DerivationOutcome {
     for _ in 0..=problem.predicates().len().saturating_add(problem.clauses().len()) {
         let mut changed = false;
 
-        for clause in &clauses {
+        for (clause_index, clause) in clauses.iter().enumerate() {
             let Some(body_fact_options) = body_fact_options(clause, &facts) else {
                 continue;
             };
@@ -210,9 +233,20 @@ fn acyclic_error_derivation(problem: &ChcProblem) -> DerivationOutcome {
                     }
                 };
 
+                let mut derivation_clause_indices = combo
+                    .first()
+                    .map_or_else(Vec::new, |fact| fact.derivation_clause_indices.clone());
+                let Ok(clause_index) = u64::try_from(clause_index) else {
+                    return DerivationOutcome::Truncated;
+                };
+                derivation_clause_indices.push(clause_index);
+
                 match &clause.head {
                     ClauseHead::False => {
-                        return DerivationOutcome::Witness(model);
+                        return DerivationOutcome::Witness(AcyclicUnsafeWitness {
+                            model,
+                            derivation_clause_indices,
+                        });
                     }
                     ClauseHead::Predicate(pred, args) => {
                         let entry = facts.entry(*pred).or_default();
@@ -226,7 +260,11 @@ fn acyclic_error_derivation(problem: &ChcProblem) -> DerivationOutcome {
                         }) {
                             continue;
                         }
-                        entry.push(ReachFact { args: args.clone(), constraints });
+                        entry.push(ReachFact {
+                            args: args.clone(),
+                            constraints,
+                            derivation_clause_indices,
+                        });
                         changed = true;
                     }
                     _ => {}
@@ -247,6 +285,254 @@ fn acyclic_error_derivation(problem: &ChcProblem) -> DerivationOutcome {
 
     // Ran the iteration bound without converging — treat as incomplete.
     DerivationOutcome::Truncated
+}
+
+/// Hard replay ceilings.  They are deliberately independent of the producer's
+/// saturation caps: a hostile serialized witness must not be able to turn the
+/// consumer check into an unbounded allocation or path walk.
+const MAX_REPLAY_PATH_CLAUSES: usize = 262_144;
+const MAX_REPLAY_MODEL_BINDINGS: usize = 65_536;
+const MAX_REPLAY_PROBLEM_PREDICATES: usize = 65_536;
+const MAX_REPLAY_PROBLEM_CLAUSES: usize = 262_144;
+
+/// Independently replay an acyclic direct-SMT witness against a freshly built
+/// problem.
+///
+/// This does not trust a producer's `SAT` tag or its model object.  It
+/// alpha-renames the fresh clauses exactly as the composer does, reconstructs
+/// the clause-local path named by `derivation_clause_indices`, requires a
+/// well-formed fact-to-query chain, parses a total and sort-exact assignment for
+/// every variable in that path (with no extras), and checks the conjunction
+/// with all supplied values fixed.  Any malformed/unsupported value, budget
+/// breach, path mismatch, or non-SAT result fails closed.
+pub(crate) fn replay_acyclic_direct_smt_witness(
+    problem: &ChcProblem,
+    witness: &AcyclicUnsafeWitness,
+) -> Result<(), String> {
+    if problem.predicates().len() > MAX_REPLAY_PROBLEM_PREDICATES
+        || problem.clauses().len() > MAX_REPLAY_PROBLEM_CLAUSES
+    {
+        return Err(format!(
+            "fresh replay problem has {} predicates and {} clauses, above the replay budget",
+            problem.predicates().len(),
+            problem.clauses().len()
+        ));
+    }
+    if !is_acyclic_problem(problem) {
+        return Err("fresh replay problem is cyclic".to_string());
+    }
+    if problem.clauses().iter().any(|clause| clause.body.predicates.len() > 1) {
+        return Err("fresh replay problem contains a nonlinear Horn clause".to_string());
+    }
+    let trace = &witness.derivation_clause_indices;
+    if trace.is_empty() {
+        return Err("derivation trace is empty".to_string());
+    }
+    if trace.len() > MAX_REPLAY_PATH_CLAUSES || trace.len() > problem.clauses().len() {
+        return Err(format!("derivation trace length {} exceeds the replay budget", trace.len()));
+    }
+
+    let clauses = alpha_renamed_clauses(problem)
+        .ok_or_else(|| "fresh clauses exceed the exact alpha-renaming budget".to_string())?;
+    let mut seen = HashSet::with_capacity(trace.len());
+    let mut constraints = Vec::new();
+    let mut previous_head: Option<(PredicateId, Vec<ChcExpr>)> = None;
+
+    for (position, raw_index) in trace.iter().copied().enumerate() {
+        let index = usize::try_from(raw_index)
+            .map_err(|_| format!("derivation clause index {raw_index} is not representable"))?;
+        let clause = clauses
+            .get(index)
+            .ok_or_else(|| format!("derivation clause index {raw_index} is out of range"))?;
+        if !seen.insert(index) {
+            return Err(format!("derivation clause index {raw_index} is repeated"));
+        }
+
+        match (&previous_head, clause.body.predicates.as_slice()) {
+            (None, []) => {}
+            (None, _) => {
+                return Err("derivation does not begin with a fact clause".to_string());
+            }
+            (Some((head_predicate, head_args)), [(body_predicate, body_args)]) => {
+                if head_predicate != body_predicate || head_args.len() != body_args.len() {
+                    return Err(format!(
+                        "derivation transition at position {position} does not consume the previous head"
+                    ));
+                }
+                constraints.extend(
+                    body_args.iter().zip(head_args).map(|(body_arg, head_arg)| {
+                        ChcExpr::eq(body_arg.clone(), head_arg.clone())
+                    }),
+                );
+            }
+            (Some(_), _) => {
+                return Err(format!("derivation transition at position {position} is not linear"));
+            }
+        }
+        if let Some(constraint) = &clause.body.constraint {
+            constraints.push(constraint.clone());
+        }
+
+        let is_last = position + 1 == trace.len();
+        match (&clause.head, is_last) {
+            (ClauseHead::Predicate(predicate, args), false) => {
+                previous_head = Some((*predicate, args.clone()));
+            }
+            (ClauseHead::False, true) => {
+                previous_head = None;
+            }
+            (ClauseHead::False, false) => {
+                return Err(format!(
+                    "non-final derivation clause at position {position} has a false head"
+                ));
+            }
+            (ClauseHead::Predicate(_, _), true) => {
+                return Err("derivation does not end in a query clause".to_string());
+            }
+            _ => return Err("derivation contains an unrecognized clause-head shape".to_string()),
+        }
+    }
+
+    let formula = ChcExpr::and_all(constraints.iter().cloned());
+    let mut variables = BTreeMap::new();
+    for variable in formula.vars() {
+        if let Some(previous_sort) = variables.insert(variable.name.clone(), variable.sort.clone())
+            && previous_sort != variable.sort
+        {
+            return Err(format!(
+                "derivation variable `{}` is used at inconsistent sorts",
+                variable.name
+            ));
+        }
+    }
+    if variables.len() > MAX_REPLAY_MODEL_BINDINGS {
+        return Err(format!(
+            "derivation model requires {} bindings, above the replay budget",
+            variables.len()
+        ));
+    }
+    let model = witness
+        .model
+        .as_object()
+        .ok_or_else(|| "witness model is not a JSON object".to_string())?;
+    if model.len() != variables.len() {
+        return Err(format!(
+            "witness model has {} bindings but the derivation requires exactly {}",
+            model.len(),
+            variables.len()
+        ));
+    }
+    if model.keys().any(|name| !variables.contains_key(name)) {
+        return Err("witness model contains an unexpected binding".to_string());
+    }
+
+    for (name, sort) in variables {
+        let encoded =
+            model.get(&name).ok_or_else(|| format!("witness model is missing `{name}`"))?;
+        let value = parse_model_value(&name, &sort, encoded)?;
+        constraints.push(ChcExpr::eq(ChcExpr::var(ay_chc::ChcVar::new(name, sort)), value));
+    }
+
+    let mut smt = problem.make_smt_context();
+    match solve_constraints(&mut smt, &constraints) {
+        SolveOutcome::Sat(_) => Ok(()),
+        SolveOutcome::Unsat => {
+            Err("witness assignment does not satisfy the reconstructed derivation".to_string())
+        }
+        SolveOutcome::Undecided => {
+            Err("witness replay was undecided within the strict SMT budget".to_string())
+        }
+    }
+}
+
+fn parse_model_value(
+    name: &str,
+    expected_sort: &ay_chc::ChcSort,
+    encoded: &serde_json::Value,
+) -> Result<ChcExpr, String> {
+    let object = encoded
+        .as_object()
+        .ok_or_else(|| format!("model binding `{name}` is not a typed object"))?;
+    let kind = object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("model binding `{name}` has no string kind"))?;
+    match (expected_sort, kind) {
+        (ay_chc::ChcSort::Bool, "bool") if object.len() == 2 => object
+            .get("value")
+            .and_then(serde_json::Value::as_bool)
+            .map(ChcExpr::bool_const)
+            .ok_or_else(|| format!("model binding `{name}` has an invalid Bool value")),
+        (ay_chc::ChcSort::Int, "int") if object.len() == 2 => {
+            let value = object
+                .get("value")
+                .and_then(parse_json_i128)
+                .ok_or_else(|| format!("model binding `{name}` has an invalid Int value"))?;
+            Ok(ChcExpr::int(value))
+        }
+        (ay_chc::ChcSort::Real, "real") if object.len() == 4 => {
+            let numerator = object
+                .get("numerator")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<i64>().ok())
+                .ok_or_else(|| format!("model binding `{name}` has an invalid Real numerator"))?;
+            let denominator = object
+                .get("denominator")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|value| *value != 0)
+                .ok_or_else(|| format!("model binding `{name}` has an invalid Real denominator"))?;
+            if object.get("decimal").and_then(serde_json::Value::as_str).is_none() {
+                return Err(format!("model binding `{name}` has no Real decimal rendering"));
+            }
+            Ok(ChcExpr::Real(numerator, denominator))
+        }
+        (ay_chc::ChcSort::BitVec(expected_width), "bit_vec") if object.len() == 4 => {
+            let width = object
+                .get("width")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|width| u32::try_from(width).ok())
+                .ok_or_else(|| format!("model binding `{name}` has an invalid bit-vector width"))?;
+            if width != *expected_width || width == 0 || width > 128 {
+                return Err(format!(
+                    "model binding `{name}` has width {width}, expected {expected_width}"
+                ));
+            }
+            let value = object
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<u128>().ok())
+                .ok_or_else(|| format!("model binding `{name}` has an invalid bit-vector value"))?;
+            if width < 128 && value >= (1u128 << width) {
+                return Err(format!("model binding `{name}` exceeds its bit-vector width"));
+            }
+            let expected_hex =
+                format!("0x{:0width$x}", value, width = (width as usize).div_ceil(4));
+            if object.get("hex").and_then(serde_json::Value::as_str) != Some(expected_hex.as_str())
+            {
+                return Err(format!("model binding `{name}` has a non-canonical hex rendering"));
+            }
+            Ok(ChcExpr::BitVec(value, width))
+        }
+        (ay_chc::ChcSort::Array(key_sort, value_sort), "const_array") if object.len() == 2 => {
+            let default = object
+                .get("default")
+                .ok_or_else(|| format!("model binding `{name}` has no array default"))?;
+            let default = parse_model_value(name, value_sort, default)?;
+            Ok(ChcExpr::ConstArray((**key_sort).clone(), Arc::new(default)))
+        }
+        _ => Err(format!(
+            "model binding `{name}` kind `{kind}` does not exactly encode sort `{expected_sort}`"
+        )),
+    }
+}
+
+fn parse_json_i128(value: &serde_json::Value) -> Option<i128> {
+    value
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| value.as_u64().map(i128::from))
+        .or_else(|| value.as_str()?.parse::<i128>().ok())
 }
 
 /// Give every clause a disjoint variable namespace before composing facts.
@@ -542,8 +828,29 @@ fn solve_constraints(smt: &mut SmtContext, constraints: &[ChcExpr]) -> SolveOutc
         // proves the body unsatisfiable and licenses pruning it.
         SolveOutcomeTag::Unsat => SolveOutcome::Unsat,
         // `SmtResult::Unknown` — and, fail-closed, any future indeterminate
-        // variant — is NOT a proof of unsatisfiability. Never prune on it.
-        SolveOutcomeTag::Undecided => SolveOutcome::Undecided,
+        // variant — is NOT a proof of unsatisfiability. Before giving up, make ONE
+        // last-resort attempt on a sound OVER-approximation of the body: havoc the
+        // wide-integer / nonlinear noise (the base-1e9 Horner encoding of `>i128`
+        // constants and nonlinear `Mul`/`Div`/`Mod`, which choke the LIA/NIA core)
+        // to fresh unconstrained variables, leaving the boolean/comparison skeleton
+        // intact. Because `models(concrete) ⊆ models(abstract)`, a DEFINITIVE
+        // abstract-UNSAT proves the concrete body unsatisfiable too — the only
+        // direction we consume. Anything other than a definitive abstract-UNSAT
+        // (including an abstract-SAT, whose model is meaningless for the concrete
+        // body) falls through to the original, fail-closed `Undecided`. The
+        // abstract model is NEVER read — it can only license, never refute.
+        SolveOutcomeTag::Undecided => {
+            let abstract_constraints = abstract_wide_nonlinear(constraints);
+            let abstract_formula = ChcExpr::and_all(abstract_constraints.iter().cloned());
+            smt.reset();
+            let abstract_result = smt.check_sat_with_timeout(&abstract_formula, SMT_QUERY_TIMEOUT);
+            // Reuse the differential-oracle-pinned classifier: only a definitive
+            // UNSAT tag (never `Unknown`, never `Sat`) may promote the verdict.
+            match classify_smt_result(&abstract_result) {
+                SolveOutcomeTag::Unsat => SolveOutcome::Unsat,
+                _ => SolveOutcome::Undecided,
+            }
+        }
     }
 }
 
@@ -741,9 +1048,51 @@ mod tests {
             ClauseHead::False,
         ));
 
+        let AcyclicDecision::Unsafe(witness) = acyclic_direct_smt_decision(&problem) else {
+            panic!("clause-local names must be alpha-renamed; this error derivation is reachable");
+        };
+        replay_acyclic_direct_smt_witness(&problem, &witness)
+            .expect("the producer's exact trace/model must independently replay");
+
+        let mut wrong_values = witness.clone();
+        for binding in wrong_values
+            .model
+            .as_object_mut()
+            .expect("producer model is an assignment object")
+            .values_mut()
+        {
+            if binding.get("kind").and_then(serde_json::Value::as_str) == Some("int") {
+                binding["value"] = serde_json::json!(42);
+            }
+        }
         assert!(
-            matches!(acyclic_direct_smt_decision(&problem), AcyclicDecision::Unsafe(_)),
-            "clause-local names must be alpha-renamed; this error derivation is reachable"
+            replay_acyclic_direct_smt_witness(&problem, &wrong_values).is_err(),
+            "a model that violates the reconstructed equalities must fail replay"
+        );
+
+        let mut missing_binding = witness.clone();
+        let first_name = missing_binding
+            .model
+            .as_object()
+            .and_then(|model| model.keys().next().cloned())
+            .expect("fixture model has at least one binding");
+        missing_binding
+            .model
+            .as_object_mut()
+            .expect("producer model is an assignment object")
+            .remove(&first_name);
+        assert!(
+            replay_acyclic_direct_smt_witness(&problem, &missing_binding).is_err(),
+            "a partial model must fail the total-assignment gate"
+        );
+
+        let mut wrong_transition = witness;
+        assert!(wrong_transition.derivation_clause_indices.len() >= 2);
+        wrong_transition.derivation_clause_indices[1] =
+            wrong_transition.derivation_clause_indices[0];
+        assert!(
+            replay_acyclic_direct_smt_witness(&problem, &wrong_transition).is_err(),
+            "a repeated/wrong transition cannot identify the original derivation"
         );
     }
 

@@ -7,7 +7,7 @@ As of now, only `x86_64-unknown-linux-gnu` (Ubuntu 22.04) is supported for trust
 
 trust-mc does not currently have a pre-built GitHub Action. To use trust-mc in CI, build from source as shown below.
 
-The following workflow will checkout your repository, build trust-mc from source, and run `cargo trust-mc` on your code.
+The following workflow will checkout your repository, build trust-mc from source, and run `targo trust-mc` on your code.
 
 ```yaml
 name: trust-mc CI
@@ -37,20 +37,20 @@ jobs:
           echo "/tmp/trust-mc/scripts" >> $GITHUB_PATH
 
       - name: 'Run trust-mc on your code.'
-        run: cargo trust-mc
+        run: targo trust-mc
 ```
 
 This builds trust-mc from source and runs verification on your crate.
 
 ### Options
 
-Common `cargo trust-mc` options include:
+Common `targo trust-mc` options include:
 - `--output-format=terse` to generate terse output.
 - `--tests` to run on proofs inside the `test` module (needed for running Bolero).
 - `--workspace` to run on all crates within your repository.
 - `--smt-solver=ay` to explicitly select the AY solver (alias: `--ay-solver`).
 
-See `cargo trust-mc --help` for a full list of options.
+See `targo trust-mc --help` for a full list of options.
 
 ## FAQ
 - **trust-mc takes too long for my CI**: Try running trust-mc on a

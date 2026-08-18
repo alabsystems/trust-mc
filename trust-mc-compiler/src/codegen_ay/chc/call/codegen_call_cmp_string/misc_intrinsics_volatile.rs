@@ -34,6 +34,7 @@ use super::misc_intrinsics_volatile_helpers::{
     try_volatile_load_via_projected_vec, try_volatile_load_via_ptr_add,
     try_volatile_load_via_vec_trace,
 };
+use crate::codegen_ay::provenance::Val;
 
 fn extract_plain_operand_local(arg: &rustc_public::mir::Operand) -> Option<usize> {
     use rustc_public::mir::Operand;
@@ -167,7 +168,7 @@ pub(in crate::codegen_ay::chc) fn codegen_volatile_load(
 
     // #3697: Mem-level load via shared raw-pointer bridge.
     if let Some((addr, pointee_ty)) = receiver_mem_target(ctx, &dcx.args[0], dcx.modified_locals) {
-        if let Some(mem_val) = load_from_memory(ctx, &addr, pointee_ty) {
+        if let Some(mem_val) = load_from_memory(ctx, &addr, pointee_ty).map(Val::into_expr) {
             if let Some((_, dest_var)) = ctx.resolve_destination(dest_local) {
                 let s = dest_var.sort().clone();
                 let eq = ctx.make_coerced_eq_constraint(
@@ -297,7 +298,14 @@ pub(in crate::codegen_ay::chc) fn codegen_volatile_store(
     {
         if let Some((addr, pointee_ty)) =
             receiver_mem_target(ctx, &dcx.args[0], dcx.modified_locals)
-            && emit_mem_store_transition(ctx, dcx, target, new_value, addr, pointee_ty)
+            && emit_mem_store_transition(
+                ctx,
+                dcx,
+                target,
+                new_value,
+                addr.into_addr_expr(),
+                pointee_ty,
+            )
         {
             debug!(dest_local, "CHC: volatile_store via Mem bridge (#3697)");
             return;

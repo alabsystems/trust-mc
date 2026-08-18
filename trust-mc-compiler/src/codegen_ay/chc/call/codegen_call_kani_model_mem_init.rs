@@ -305,6 +305,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Translate and split a mem-init pointer operand.
+    ///
+    /// UNRESOLVED address-vs-value guard — deliberately left standing. The
+    /// `128` arm reads bits 127..64 as the slice length, which is the
+    /// `PtrRepr::WidenedThin` fabrication: for a thin pointer widened into a
+    /// wide slot by `coerce_bitvec_width_safe` those bits are extension
+    /// padding, and the "length" is a fabricated `0`.
+    ///
+    /// Converting it to `PtrRepr` would not be the safe direction here. This
+    /// module's stated policy is fail-OPEN (see the module doc): declining the
+    /// operand degrades to pre-MEMUB behaviour, where reads return `true` and
+    /// writes bless the tracked byte. So refusing trades one fail-open shape
+    /// for another while losing precision — the honest fix is a real metadata
+    /// source for the operand, not a refusal. The BMC twin
+    /// `statement/kani_shadow_mem.rs::shadow_mem_ptr` carries the same guard
+    /// and fails CLOSED, so refusing there flips harnesses to FAILED instead.
+    /// Either way the change is a coverage change and needs a burndown
+    /// measurement.
     fn mem_init_ptr(&mut self, dcx: &DispatchCallContext<'_>, op: &Operand) -> Option<MemInitPtr> {
         let expr = self.translate_operand_with_modified(op, dcx.modified_locals)?;
         match expr.sort().bitvec_width()? {

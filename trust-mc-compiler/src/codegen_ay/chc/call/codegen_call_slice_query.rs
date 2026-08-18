@@ -12,6 +12,7 @@ use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
+use crate::codegen_ay::provenance::Loc;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::ChcCtx;
@@ -72,7 +73,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
             // Strategy 3: use the wide-pointer metadata path for `&[T]`.
             if let Some(len) = self.translate_ptr_metadata(receiver, cx.modified_locals) {
-                return Some(len);
+                return Some(len.into_expr());
             }
 
             // Strategy 4: read `fld_len` from the resolved slice referent.
@@ -182,7 +183,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
             if let Some(len) = self.translate_ptr_metadata(receiver, cx.modified_locals) {
-                return Some(len);
+                return Some(len.into_expr());
             }
             if let Some(expr) = self.resolve_ref_or_const_referent(receiver, cx.modified_locals) {
                 let expr_sort = expr.sort().clone();
@@ -275,7 +276,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             local: ref_target.local,
                             projection: ref_target.projections,
                         };
-                        return self.translate_ref_to_address(&target_place, cx.modified_locals);
+                        // `first_ref`'s other lanes are pointer VALUES (a bv
+                        // receiver, an `fld_ptr` select, a ZST payload), so the
+                        // slot is not uniformly an address; the address lane
+                        // drops its tag rather than laundering the others.
+                        return self
+                            .translate_ref_to_address(&target_place, cx.modified_locals)
+                            .map(Loc::into_expr);
                     }
                     if let Some(receiver_expr) =
                         self.translate_operand_with_modified(receiver, cx.modified_locals)

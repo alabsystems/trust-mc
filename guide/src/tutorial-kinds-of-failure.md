@@ -49,7 +49,7 @@ But if we write a trust-mc proof harness:
 And run this proof with:
 
 ```bash
-cargo trust-mc --harness bound_check
+targo trust-mc --harness bound_check
 ```
 
 We still see a failure from trust-mc, even without Rust's runtime bounds checking.
@@ -102,7 +102,7 @@ VERIFICATION:- FAILED
 <details>
 <summary>Click to see explanation for exercise 2</summary>
 
-`cargo trust-mc -Z concrete-playback --concrete-playback=inplace --harness bound_check` produces the following test:
+`targo trust-mc -Z concrete-playback --concrete-playback=inplace --harness bound_check` produces the following test:
 ```
 rust
 #[test]
@@ -148,7 +148,7 @@ trust-mc will find these failures as well.
 Here's the output from trust-mc:
 
 ```
-# cargo trust-mc --harness add_overflow
+# targo trust-mc --harness add_overflow
 [...]
 SUMMARY:
  ** 1 of 2 failed
@@ -172,7 +172,7 @@ This often naively looks like this (code available [here](https://github.com/mod
 ```
 
 ```
-cargo trust-mc --harness midpoint_overflow
+targo trust-mc --harness midpoint_overflow
 ```
 
 trust-mc immediately spots the bug in the above code.

@@ -14,9 +14,13 @@ unbounded verification. AY is trust-mc's sole solver backend.
 **Source:** `trust-mc-driver/src/call_ay/chc.rs` (`try_ay_chc_solver`)
 
 **Bump guardrail:** Before trusting any AY rev bump, run
-`./scripts/ay-bump-canary.sh`. The first gate is
+`scripts/check-ay-pin.sh` and then
 `cargo check -p trust-mc-driver --all-targets --features "ay,ay-chc-native"`,
-which catches `ay-chc` public API drift (`#3571`, upstream `ay#3604`).
+which catches `ay-chc` public API drift (`#3571`, upstream `ay#3604`), followed
+by the corpus suites (`scripts/ay-compiletest.sh`,
+`scripts/ay-soundness-gate.sh`). A single `scripts/ay-bump-canary.sh` wrapper
+for this ceremony is planned but NOT yet implemented (roadmap item 6.1 in
+`docs/roadmap-100-parity-2026-07-06.md`).
 
 ### How It Works
 

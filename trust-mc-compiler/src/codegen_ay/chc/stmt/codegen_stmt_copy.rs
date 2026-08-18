@@ -10,6 +10,8 @@ use rustc_public::ty::{RigidTy, TyKind};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{
     SignExtension, coerce_bitvec_width_safe, coerce_datatype_structural,
 };
@@ -184,18 +186,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         && has_vtable
                         && out_width == 2 * crate::codegen_ay::types::POINTER_WIDTH
                     {
-                        let ptr_expr = rhs_expr.clone().field_select(
+                        // Wave 4: the two halves are DECLARED roles — the
+                        // fields are literally named `fld_ptr` and `fld_vtable`
+                        // — so report them to `PtrRepr` as `(Loc, Val)` and let
+                        // it state the `[vtable:upper | ptr:lower]` byte order.
+                        // Handing a bare `concat` two same-sorted operands is
+                        // the slot-misalign shape: swapping them writes a vtable
+                        // id where consumers read a data pointer, silently.
+                        let data = Loc::of_address(rhs_expr.clone().field_select(
                             &dt.name,
                             "fld_ptr",
                             Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH),
-                        );
-                        let vtable_expr = rhs_expr.clone().field_select(
+                        ));
+                        let meta = Val::of_value(rhs_expr.clone().field_select(
                             &dt.name,
                             "fld_vtable",
                             Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH),
-                        );
-                        // Convention: [vtable:upper | ptr:lower]
-                        return Some(vtable_expr.concat(ptr_expr));
+                        ));
+                        return PtrRepr::from_declared_roles(data, meta).into_packed();
                     }
                 }
             }

@@ -38,8 +38,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         // raw_eq takes &T references, get the underlying values
-        let lhs = self.get_value_through_ref(&args[0]);
-        let rhs = self.get_value_through_ref(&args[1]);
+        let lhs_resolved = self.get_value_through_ref_source(&args[0]);
+        let rhs_resolved = self.get_value_through_ref_source(&args[1]);
+        let lhs_source = lhs_resolved.as_ref().map(|(_, source)| *source);
+        let rhs_source = rhs_resolved.as_ref().map(|(_, source)| *source);
+        let lhs = lhs_resolved.map(|(expr, _)| expr);
+        let rhs = rhs_resolved.map(|(expr, _)| expr);
 
         debug!(
             "codegen_raw_eq: lhs={:?}, rhs={:?}",
@@ -51,13 +55,45 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // ZST cases: zero-length arrays, unit type arrays, or unit type itself
         let is_zst = self.is_raw_eq_zst(&args[0]);
 
-        // Check if dereferencing succeeded by examining the result sort (#409)
-        // If operand is a reference but result is a pointer-width bitvec, we got the pointer not the value
+        // Did the dereference actually happen? (#409)
+        //
+        // Address-vs-value: this was a deref-identity guess — "the result is
+        // pointer-width, so we got the pointer, not the value" — and it is wrong
+        // in both directions. `&[u64; 1]` / `&usize` dereference to a
+        // legitimately 64-bit VALUE and were demoted here for no reason, while an
+        // array modeled through typed memory can hand back its base ADDRESS from
+        // a path the width cannot see.
+        //
+        // `get_value_through_ref` now REPORTS which lane produced the result, so
+        // for three of its four lanes the question is answered by the producer
+        // instead of re-derived here:
+        //
+        //   * `Value`      — the pointee's own SSA value. The deref happened; the
+        //                    64-bit `&usize` case is no longer demoted.
+        //   * `Reference`  — the fallback returned the reference's own pointer.
+        //                    The deref did NOT happen, whatever width it is.
+        //   * `Unreported` — `codegen_place` on `*place`, whose typed-memory
+        //                    array lane may return a base address without saying
+        //                    so. THIS lane keeps the old width test verbatim: it
+        //                    is the residual guess, and it is confined to the one
+        //                    producer that still cannot report (queue waves 6/12,
+        //                    `docs/addr-vs-value-conversion-queue.md`).
+        //
+        // The `either_is_array_ref` premise below is unchanged, so no operand
+        // shape is newly demoted outside the array-reference case this check has
+        // always been about.
         let deref_failed = match (&lhs, &rhs) {
             (Some(l), Some(r)) => {
-                let is_ptr_sort = l.sort().is_bitvec()
+                use crate::codegen_ay::statement::codegen_place_value::RefValueSource;
+                let returned_the_reference = lhs_source == Some(RefValueSource::Reference)
+                    || rhs_source == Some(RefValueSource::Reference);
+                let lane_cannot_report = lhs_source == Some(RefValueSource::Unreported)
+                    || rhs_source == Some(RefValueSource::Unreported);
+                let residual_width_guess = lane_cannot_report
+                    && l.sort().is_bitvec()
                     && l.sort().bitvec_width() == Some(POINTER_WIDTH)
                     && r.sort().is_bitvec();
+                let got_pointer_not_value = returned_the_reference || residual_width_guess;
                 // Helper: check if operand is a reference/pointer to array
                 let is_array_ref_or_ptr = |operand: &Operand| -> bool {
                     match operand {
@@ -82,7 +118,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // Check both operands - either being an array ref indicates deref failure
                 let either_is_array_ref =
                     is_array_ref_or_ptr(&args[0]) || is_array_ref_or_ptr(&args[1]);
-                is_ptr_sort && either_is_array_ref
+                got_pointer_not_value && either_is_array_ref
             }
             _ => false, // non-enum: tuple (Option, Option) — covers None variants
         };

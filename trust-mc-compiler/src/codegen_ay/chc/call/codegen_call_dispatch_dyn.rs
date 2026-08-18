@@ -14,17 +14,19 @@ use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto};
 use super::codegen_rules::CodegenRules;
 use super::dyn_coercion;
+use crate::codegen_ay::provenance::{Loc, Val, is_transparent_pointer_wrapper_repr};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::kani_middle::abi::LayoutOf;
 use tracing::{debug, warn};
 
-fn try_extract_data_obj_id(ptr_expr: &Expr) -> Option<u32> {
-    ChcCtx::try_extract_obj_id(ptr_expr).or_else(|| {
-        let width = ptr_expr.sort().bitvec_width()?;
-        let ptr_width = crate::codegen_ay::types::POINTER_WIDTH;
-        (width == 2 * ptr_width).then(|| {
-            let data_ptr = ptr_expr.clone().extract(ptr_width - 1, 0);
-            ChcCtx::try_extract_obj_id(&data_ptr)
-        })?
+fn try_extract_data_obj_id(ptr: &Loc) -> Option<u32> {
+    ChcCtx::try_extract_obj_id(ptr.as_expr()).or_else(|| {
+        // Wave 4: the `width == 2 * POINTER_WIDTH` gate is deleted. `PtrRepr`
+        // says which half is the address and `into_data` is total, so a thin
+        // pointer decodes to itself (making this retry a no-op for it) and a
+        // packed one decodes to its data half — no width arithmetic needed.
+        let data = PtrRepr::classify(ptr.as_expr())?.into_data();
+        ChcCtx::try_extract_obj_id(data.as_expr())
     })
 }
 
@@ -143,7 +145,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// intermediate wrapper value on the heap. Loading from memory at
     /// `base_ptr` recovers the inner data pointer stored in that wrapper.
     /// Returns `None` if no indirection is needed (single-level Box).
-    fn resolve_chained_box_deref_ptr(&mut self, base_ptr: &Expr, src_local: usize) -> Option<Expr> {
+    fn resolve_chained_box_deref_ptr(&mut self, base_ptr: &Loc, src_local: usize) -> Option<Loc> {
         use rustc_public::CrateDef;
         use rustc_public::ty::{RigidTy, TyKind};
         let local_ty = self.body.locals().get(src_local)?.ty;
@@ -170,46 +172,98 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
         // Load the stored pointer value from the heap at base_ptr.
-        let loaded = self.load_from_memory(base_ptr.clone(), wrapper_ty)?;
+        let loaded = self.load_from_memory(base_ptr.clone(), wrapper_ty)?.into_expr();
         // Extract the data pointer from the loaded wrapper value.
-        self.extract_pointer_storage_expr(&loaded).or(Some(loaded))
+        //
+        // PROVENANCE for the fallback comes from the MIR type, not from a width
+        // test: `is_wrapper` above established that `wrapper_ty` is a
+        // `Box`/`Unique`/`NonNull`, whose CHC term IS the pointer it holds
+        // (`translate_adt_ty` flattens all three to `ptr_sort()`), so the load
+        // crossed `Loc -> Val` into a datum that is itself an address.
+        //
+        // What the fallback must still check is REPRESENTATION. It used to tag
+        // `loaded` whatever its shape was, which was harmless only because
+        // `extract_pointer_storage_expr` used to swallow every datatype through
+        // its own first-bitvector-field guess. That guess is deleted below, so a
+        // residual non-pointer-shaped term (an unrecognized datatype, a narrow
+        // bitvector) now reaches here — and such a term has no address to hand
+        // back. Declining is the caller's existing lane.
+        self.extract_pointer_storage_expr(&loaded).or_else(|| {
+            is_transparent_pointer_wrapper_repr(loaded.sort()).then(|| Loc::of_address(loaded))
+        })
     }
 
+    /// The data ADDRESS held in a pointer-wrapper's storage slot.
+    ///
+    /// Wave 4 of the address-vs-value conversion: the result is an address, so
+    /// it is a [`Loc`] and every consumer inherits that fact instead of
+    /// re-deriving it. The whole of that fact is now produced by
+    /// `dyn_coercion::extract_pointer_expr` (a DECLARED role — the `fld_ptr`
+    /// name or the field-role table — or a pointer-shaped term the caller
+    /// established is a pointer) and decoded for shape by [`PtrRepr`]. This
+    /// function adds no provenance of its own.
+    ///
+    /// # The first-bitvector-field fallback is DELETED, not re-tagged
+    ///
+    /// It used to read: when `extract_pointer_expr` declines, take the
+    /// datatype's FIRST field whenever that field is any bitvector at all — not
+    /// even `POINTER_WIDTH` — and tag it as an address. The precondition is what
+    /// makes that indefensible. The branch was reachable EXACTLY when
+    /// `extract_pointer_expr` had already refused, i.e. on a datatype carrying
+    /// no declared `fld_ptr` role and more than four fields — precisely the
+    /// shape the `<= 4` bound then in `dyn_coercion.rs` existed to reject.
+    /// `DtSolver` (11 fields, first field `fld_scope_len: bv64`) is the shape
+    /// that motivated #4099, and this branch handed its `scope_len` VALUE back
+    /// as a heap address to ~14 callers, most of which are not MIR-type-gated:
+    /// #4099 through the back door.
+    ///
+    /// There was no sound case it uniquely covered. Its reachable inputs are
+    /// (a) the many-field datatypes #4099 is about, and (b) `<= 4`-field
+    /// datatypes whose first field is a differently-shaped bitvector — a `bv8`
+    /// tag, a `bv32` index, a `bv128` slot the wide-pointer decoder would have
+    /// had to split rather than take whole. Restricting the branch to
+    /// pointer-width fields instead of deleting it would have produced dead
+    /// code: `extract_pointer_expr`'s own fallback already searched for the
+    /// first `POINTER_WIDTH` field and would have claimed every such input
+    /// first.
+    ///
+    /// Wave 18 then deleted that fallback too, and the argument above is why no
+    /// consumer here changes: what replaced it reads the field-role table the
+    /// declaration writes, so the only datatypes that resolve now are the ones
+    /// that SAID which field is the address.
+    ///
+    /// `None` means "no address could be established", which every caller
+    /// already handles: the two pointer-identity handlers fall through to their
+    /// non-pointer route, `inline_result_shared` / `codegen_call_virtual_utils`
+    /// / `inline_field_map` decline the optimization, `memory_impl_addr_normalize`
+    /// keeps the un-normalized address, and `resolve_chained_box_deref_ptr`
+    /// above supplies its own MIR-established fallback.
     pub(in crate::codegen_ay::chc) fn extract_pointer_storage_expr(
         &self,
         expr: &Expr,
-    ) -> Option<Expr> {
-        dyn_coercion::extract_pointer_expr(expr)
-            .map(|ptr| {
-                // Part of #3589: When the expression is a packed BV fat pointer
-                // (2×POINTER_WIDTH = BV128 on 64-bit), extract the data pointer
-                // from the lower POINTER_WIDTH bits. The upper bits contain the
-                // vtable discriminant, handled separately by vtable propagation.
-                if let Some(w) = ptr.sort().bitvec_width() {
-                    if w == 2 * crate::codegen_ay::types::POINTER_WIDTH {
-                        return ptr.extract(crate::codegen_ay::types::POINTER_WIDTH - 1, 0);
-                    }
-                }
-                ptr
-            })
-            .or_else(|| {
-                let dt = expr.sort().datatype_sort()?;
-                let cons = dt.constructors.first()?;
-                let first = cons.fields.first()?;
-                if first.sort.is_bitvec() {
-                    Some(expr.clone().field_select(&dt.name, &first.name, first.sort.clone()))
-                } else {
-                    None
-                }
-            })
+    ) -> Option<Loc> {
+        dyn_coercion::extract_pointer_expr(expr).map(|ptr| {
+            // Part of #3589 / Wave 4: the slot may hold a packed wide
+            // pointer, whose data address is the low half. `PtrRepr` decides
+            // that STRUCTURALLY — the width test deleted here could not tell
+            // a genuine fat pointer from a thin one widened into the same
+            // slot, and `into_data` is total across all three shapes, so the
+            // decode is exact where the width test was a guess. The upper
+            // bits, when they exist, are the vtable discriminant, handled
+            // separately by vtable propagation.
+            match PtrRepr::classify(ptr.as_expr()) {
+                Some(repr) => repr.into_data(),
+                None => ptr,
+            }
+        })
     }
 
     fn pointer_wrapper_deref_result_ptr(
         &mut self,
         callee_path: &str,
         dest_local: usize,
-        ptr_expr: Expr,
-    ) -> Option<Expr> {
+        ptr_expr: Loc,
+    ) -> Option<Loc> {
         if Self::path_mentions_pointer_wrapper(callee_path, "boxed::Box") {
             return Some(ptr_expr);
         }
@@ -244,10 +298,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(if value_offset == 0 {
                 ptr_expr
             } else {
-                ptr_expr.bvadd(Expr::bitvec_const(
+                // Address + byte offset is still an address.
+                Loc::of_address(ptr_expr.into_expr().bvadd(Expr::bitvec_const(
                     value_offset as u128,
                     crate::codegen_ay::types::POINTER_WIDTH,
-                ))
+                )))
             });
         }
 
@@ -301,13 +356,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Without this, the Rc local points to the RcInner base
             // (offset 0), but stores write the value at offset 16,
             // causing a 16-byte address mismatch → Genuine CTREX.
-            let ptr_expr = if let Some(ptr_width) = ptr_expr.sort().bitvec_width() {
+            let ptr_expr = if let Some(ptr_width) = ptr_expr.as_expr().sort().bitvec_width() {
                 let rc_header_size = 2u64 * (crate::codegen_ay::types::POINTER_WIDTH as u64 / 8);
                 debug!(
                     rc_header_size,
                     ptr_width, dest_local, "from_inner_in: adding Rc header offset to pointer"
                 );
-                ptr_expr.bvadd(Expr::bitvec_const(rc_header_size as u128, ptr_width))
+                // Address + byte offset is still an address, so the tag carries.
+                Loc::of_address(
+                    ptr_expr
+                        .into_expr()
+                        .bvadd(Expr::bitvec_const(rc_header_size as u128, ptr_width)),
+                )
             } else {
                 warn!(?ptr_expr, "from_inner_in: ptr_expr is NOT bitvec, cannot add header offset");
                 ptr_expr
@@ -315,7 +375,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
             let Some(eq) = self.make_coerced_eq_constraint(
                 &dest_var,
-                ptr_expr,
+                ptr_expr.into_expr(),
                 dest_var.sort(),
                 dest_local,
                 "codegen_call_pointer_wrapper_from_inner_in",
@@ -437,8 +497,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         });
         let concrete_deref_ptr = src_local.and_then(|sl| {
             let obj_id = self.known_alloc_ids.get(&sl).copied()?;
-            let base_ptr =
-                Expr::bitvec_const(obj_id as u128, 32).concat(Expr::bitvec_const(0u128, 32));
+            // A synthesized `(obj_id, offset 0)` pair — an allocation base, one
+            // of the campaign's genuine address producers.
+            let base_ptr = Loc::of_address(
+                Expr::bitvec_const(obj_id as u128, 32).concat(Expr::bitvec_const(0u128, 32)),
+            );
             // Part of #3871 D3: For chained Box deref (e.g., Box<Box<dyn T>>),
             // the first deref propagates known_alloc_ids to the result. The
             // second deref then computes base_ptr = obj_outer << 32, which is
@@ -469,7 +532,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let mut extra: Vec<Expr> = self
                 .make_coerced_eq_constraint(
                     &dest_var,
-                    ptr_expr,
+                    ptr_expr.into_expr(),
                     dest_var.sort(),
                     dest_local,
                     "codegen_call_pointer_wrapper_deref",
@@ -541,17 +604,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .and_then(|expr| {
                     // Part of #3589: Extract vtable from packed BV128 fat pointer.
                     // Rc<dyn Trait> values are encoded as BV128 = [vtable:64 | ptr:64].
-                    // The upper POINTER_WIDTH bits carry the vtable discriminant.
-                    let w = expr.sort().bitvec_width()?;
-                    if w == 2 * crate::codegen_ay::types::POINTER_WIDTH {
-                        let pw = crate::codegen_ay::types::POINTER_WIDTH;
-                        Some(expr.clone().extract(2 * pw - 1, pw))
-                    } else {
-                        None
-                    }
+                    //
+                    // Wave 4: the `w == 2 * POINTER_WIDTH` gate is deleted. It
+                    // matched a thin pointer that had merely been WIDENED into a
+                    // BV128 slot just as readily as a real fat one, and then read
+                    // the extension padding as a vtable id — a discriminant the
+                    // program never computed, constraining dispatch to whatever
+                    // impl happens to carry id 0. `PtrRepr::into_metadata` yields
+                    // `None` for both `Thin` and `WidenedThin`, so that
+                    // fabrication is now unrepresentable and the code falls
+                    // through to the wrapper-peeling recovery below.
+                    PtrRepr::classify(expr)?.into_metadata()
                 })
-                .and_then(|vtable_expr| {
-                    self.capture_known_vtable_constraint(dest_local, vtable_expr)
+                .and_then(|vtable: Val| {
+                    self.capture_known_vtable_constraint(dest_local, vtable.into_expr())
                 })
             {
                 debug!(

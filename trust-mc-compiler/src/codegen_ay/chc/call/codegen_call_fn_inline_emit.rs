@@ -13,7 +13,10 @@ use ay_bindings::Expr;
 use rustc_public::mir::Operand;
 use std::collections::{BTreeMap, HashMap};
 use tracing::debug;
+use trust_mc_core::violation::PropertyKind;
 
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::ChcCtx;
@@ -194,11 +197,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let Some(inline_assert_guard) = inline_assert_guard else {
             return Vec::new();
         };
-        self.emit_error_rule_for_condition(
+        // Report this as the ASSERTION it is. `emit_error_rule_for_condition`
+        // defaults to `PropertyKind::MemorySafety` with no message, so every
+        // inline-assert-guard failure previously surfaced as
+        // "CHC verification: memory safety" — sending triage to the heap model for
+        // what is an assertion inside an inlined callee. Observed on
+        // `expected/function-contract/modifies/zst_pass.rs`, whose headline failure
+        // is this edge, not a heap check.
+        self.emit_error_rule_for_condition_with_kind(
             dcx.from_app,
             inline_assert_guard.clone(),
             dcx.stmt_constraints,
             dcx.bb_idx,
+            PropertyKind::Assertion,
+            Some("assertion failed inside inlined callee".to_string()),
         );
         vec![inline_assert_guard]
     }
@@ -239,15 +251,31 @@ pub(in crate::codegen_ay::chc) fn widen_inline_result_for_fat_pointer(
     let dest_width = dest_sort.as_ref().and_then(|s| s.bitvec_width());
     let needs_widen = dest_width == Some(2 * POINTER_WIDTH);
 
+    // Wave 4: both paths below build a wide pointer out of a data half and a
+    // metadata half. The roles are DECLARED, not inferred: this function's
+    // contract (see the doc comment) is that `result_expr` is the inline
+    // callee's data pointer, and the metadata comes from a side table that
+    // says what it is — `inline_vtable_ids` for a vtable id, `subslice_len`
+    // for a slice length. Reporting them to `PtrRepr` as `(Loc, Val)` keeps
+    // the `[meta:upper | data:lower]` byte order in one place; the bare
+    // `concat`s replaced here took two same-sorted operands and would have
+    // packed a vtable id into the data slot without complaint if transposed.
+    let data = Loc::of_address(result_expr.clone());
+
     // Path 1: Vtable-based fat pointer (dyn Trait).
     if let Some(vtable_expr) = inline_vtable {
         if let Some(vtable_width) = vtable_expr.sort().bitvec_width() {
-            if vtable_width == POINTER_WIDTH && needs_widen {
+            if vtable_width == POINTER_WIDTH
+                && needs_widen
+                && let Some(packed) =
+                    PtrRepr::from_declared_roles(data.clone(), Val::of_value(vtable_expr.clone()))
+                        .into_packed()
+            {
                 debug!(
                     dest_local,
                     "fn_inline: widening BV64 result + vtable to BV128 fat pointer (#4014)"
                 );
-                return vtable_expr.clone().concat(result_expr);
+                return packed;
             }
         }
     }
@@ -263,11 +291,15 @@ pub(in crate::codegen_ay::chc) fn widen_inline_result_for_fat_pointer(
                 POINTER_WIDTH,
                 crate::codegen_ay::types::SignExtension::ZeroExtend,
             );
-            debug!(
-                dest_local,
-                "fn_inline: widening BV64 result + subslice_len to BV128 fat pointer"
-            );
-            return len_bv.concat(result_expr);
+            if let Some(packed) =
+                PtrRepr::from_declared_roles(data, Val::of_value(len_bv)).into_packed()
+            {
+                debug!(
+                    dest_local,
+                    "fn_inline: widening BV64 result + subslice_len to BV128 fat pointer"
+                );
+                return packed;
+            }
         }
     }
 

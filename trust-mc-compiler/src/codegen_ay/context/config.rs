@@ -75,6 +75,13 @@ pub(in crate::codegen_ay) struct AYConfig {
     pub(in crate::codegen_ay) memory_safety_checks: bool,
     /// Emit arithmetic overflow checks.
     pub(in crate::codegen_ay) overflow_checks: bool,
+    /// Emit NaN-generation obligations for float binops (`--nan-check`).
+    ///
+    /// OFF by default, matching Kani: producing a NaN is DEFINED behaviour in
+    /// Rust, not UB, so this is an opt-in lint and not a safety property.
+    /// Emitting it unconditionally made every harness containing symbolic
+    /// float arithmetic report a false FAILURE.
+    pub(in crate::codegen_ay) nan_checks: bool,
     /// Emit failures for reachable undefined foreign function calls.
     pub(in crate::codegen_ay) undefined_function_checks: bool,
     /// Apply bounded loop unrolling before CHC encoding.
@@ -121,6 +128,7 @@ impl Default for AYConfig {
             prove_safety_only: false,
             memory_safety_checks: true,
             overflow_checks: true,
+            nan_checks: false,
             undefined_function_checks: true,
             chc_bounded_unroll: false,
             has_explicit_unwind: false,

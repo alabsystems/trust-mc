@@ -22,6 +22,8 @@ use crate::codegen_ay::chc::call::inline_shared::{
 };
 use crate::codegen_ay::chc::codegen_types::CodegenTypes;
 use crate::codegen_ay::chc::stub_codegen::stubs_option_helpers::OptionHelpers;
+use crate::codegen_ay::provenance::Loc;
+use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH};
 
 /// Part of #3159: Propagate vtable discriminant through inline body assignments.
@@ -145,10 +147,10 @@ fn projected_source_vtable(
     }
 
     let src_expr = resolve_place(ctx, local_exprs, src, resolver, locals)?;
-    let embedded = ctx.extract_embedded_vtable_expr(&src_expr);
+    let embedded = ctx.extract_embedded_vtable_expr(&src_expr).map(Val::into_expr);
     let heap = heap_forward_vtable_for_expr(ctx, &src_expr).or_else(|| {
         ctx.extract_pointer_storage_expr(&src_expr)
-            .and_then(|ptr| heap_forward_vtable_for_expr(ctx, &ptr))
+            .and_then(|ptr| heap_forward_vtable_for_expr(ctx, ptr.as_expr()))
     });
     embedded.or(heap)
 }
@@ -173,6 +175,7 @@ fn projected_heap_forward_vtable(
 
     let root_expr = local_exprs.get(&src.local)?;
     let addr = super::super::dyn_coercion::extract_pointer_expr(root_expr)
+        .map(Loc::into_expr)
         .unwrap_or_else(|| root_expr.clone());
     heap_forward_vtable_for_expr(ctx, &addr)
 }

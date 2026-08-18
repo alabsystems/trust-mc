@@ -22,6 +22,8 @@ use ay_bindings::Expr;
 use rustc_public::mir::{Place, ProjectionElem};
 use tracing::debug;
 
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 
 use super::ChcCtx;
@@ -131,14 +133,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(elem);
         }
 
-        // Extract the data pointer from the fat pointer.
-        // Fat pointers are BV128 = concat(len:BV64, data:BV64), data in bits [63:0].
-        let data_ptr = if fat_ptr_expr.sort().bitvec_width() == Some(2 * POINTER_WIDTH) {
-            fat_ptr_expr.clone().extract(POINTER_WIDTH - 1, 0)
-        } else if fat_ptr_expr.sort().bitvec_width() == Some(POINTER_WIDTH) {
-            // Already a thin pointer (e.g., after extract_pointer_expr).
-            fat_ptr_expr.clone()
-        } else {
+        // Decode the data pointer out of the receiver.
+        //
+        // This used to be a three-way width test — bv128 means "fat, take the low
+        // half", bv64 means "already thin" (e.g. after `extract_pointer_expr`),
+        // anything else bails. `PtrRepr::data()` is total across all three
+        // pointer shapes, so the width ladder collapses; the only remaining
+        // decision is "is this pointer-shaped at all?", which `classify` answers.
+        let Some(repr) = PtrRepr::classify(fat_ptr_expr) else {
             debug!(
                 sort = ?fat_ptr_expr.sort(),
                 local_idx,
@@ -146,6 +148,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             );
             return None;
         };
+        let data_ptr = repr.into_data();
 
         // Compute element address: data_ptr + idx * sizeof(elem).
         // Split-add keeps the obj_id lane intact for symbolic indices (#3921):
@@ -157,8 +160,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } else {
             idx_expr.bvmul(Expr::bitvec_const(elem_size as u128, POINTER_WIDTH))
         };
-        let elem_addr =
-            crate::codegen_ay::chc::pointer_step::step_split_pointer(data_ptr, byte_offset).result;
+        // `step_split_pointer` advances an address by a byte offset in the
+        // offset lane, leaving the obj_id lane alone. Address in, address out —
+        // the tag is inherited from `PtrRepr::into_data`, not re-derived.
+        let elem_addr = Loc::of_address(
+            crate::codegen_ay::chc::pointer_step::step_split_pointer(
+                data_ptr.into_expr(),
+                byte_offset,
+            )
+            .result,
+        );
 
         // Raw-alloc route: strict element-access bound for a slice whose base
         // local walk-resolves to a stack or `__rust_alloc` allocation (e.g.
@@ -166,11 +177,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // claimed length is a caller assertion, NOT the allocation extent;
         // `load_from_memory`'s heap_access_checks fail-open on the opaque
         // obj_id lane, so without this the claimed length is the only bound).
-        let bound_checks = self.provenance_deref_bound_checks(&elem_addr, elem_ty, local_idx);
+        let bound_checks =
+            self.provenance_deref_bound_checks(elem_addr.as_expr(), elem_ty, local_idx);
         self.heap_state.pending_checks.extend(bound_checks);
 
         debug!(local_idx, ?elem_size, "CHC: slice deref+index via memory model (#4099)");
-        self.load_from_memory(elem_addr, elem_ty)
+        self.load_from_memory(elem_addr, elem_ty).map(Val::into_expr)
     }
 
     /// Try to resolve a slice element access via `const_ref_values` array select.

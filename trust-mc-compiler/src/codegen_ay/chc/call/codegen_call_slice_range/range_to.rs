@@ -86,14 +86,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
 
         let slice_backing = self.resolve_slice_backing(slice_arg, modified_locals);
-        let effective_start = slice_backing.as_ref().map(|backing| backing.offset.clone());
+        let effective_start =
+            slice_backing.as_ref().map(|backing| backing.offset.as_expr().clone());
 
         let error_app = RelationApp::new("error", Vec::new());
         if let Some(ref backing) = slice_backing {
             let oob = if inclusive {
-                end_bv.clone().bvuge(backing.len.clone())
+                end_bv.clone().bvuge(backing.len.as_expr().clone())
             } else {
-                end_bv.clone().bvugt(backing.len.clone())
+                end_bv.clone().bvugt(backing.len.as_expr().clone())
             };
             let body =
                 RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, [oob]);
@@ -101,7 +102,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         if let (Some(backing), Some(effective_start)) = (&slice_backing, &effective_start) {
-            self.ref_resolution.const_ref_values.insert(dest_local, backing.data.clone());
+            self.ref_resolution.const_ref_values.insert(dest_local, backing.data.as_expr().clone());
             if effective_start != &Expr::bitvec_const(0u64, POINTER_WIDTH) {
                 self.ref_resolution.subslice_offset.insert(dest_local, effective_start.clone());
             } else {
@@ -115,7 +116,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         const MAX_SUBSLICE_ELEMS: usize = 32;
 
         let elem_ty = self.chc_slice_elem_ty(slice_arg);
-        let source_inner = slice_backing.as_ref().map(|backing| backing.data.clone());
+        let source_inner = slice_backing.as_ref().map(|backing| backing.data.as_expr().clone());
         if source_inner.is_none() || elem_ty.is_none() {
             debug!(
                 fn_name = %self.fn_name,

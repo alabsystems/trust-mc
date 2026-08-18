@@ -187,7 +187,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 stored_fields += 1;
                 continue;
             }
-            constraints.extend(self.build_memory_store(field_addr, field_val, *field_ty));
+            constraints.extend(self.build_memory_store_untyped(field_addr, field_val, *field_ty));
             stored_fields += 1;
         }
 

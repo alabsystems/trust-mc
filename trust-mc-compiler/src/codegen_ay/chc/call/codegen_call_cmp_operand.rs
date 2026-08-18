@@ -19,6 +19,7 @@ use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, TyKind};
 
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::ptr_repr::PtrSlot;
 use crate::codegen_ay::types::ptr_sort;
 
 use super::ChcCtx;
@@ -35,9 +36,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         args: &[Operand],
         modified_locals: &HashSet<usize>,
     ) {
+        // The first two tests are the ones that decide anything: they are type
+        // tests on the MIR operand, and #4030 had to add them *above* the width
+        // test precisely because the width test over-fired on its own. What is
+        // left for the third is the declared-sort question — is the operand
+        // currently sitting in a thin-pointer slot, i.e. has the outer `&` not
+        // been peeled yet — so it goes through `PtrSlot`. Same accepted set.
         if is_raw_ptr_cmp_arg(&args[0], self.body.locals())
             || !is_raw_ptr_cmp_arg_any_depth(&args[0], self.body.locals())
-            || lhs.sort().bitvec_width() != Some(64)
+            || PtrSlot::of_sort(lhs.sort()) != Some(PtrSlot::Thin)
         {
             return;
         }
@@ -144,7 +151,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if is_raw_ptr_cmp_arg_any_depth(arg, self.body.locals()) {
             return;
         }
-        if expr.sort().bitvec_width() == Some(64)
+        // As above: the raw-pointer veto is the decision, and this is the
+        // residual "still a pointer slot, not yet an array" sort test.
+        if PtrSlot::of_sort(expr.sort()) == Some(PtrSlot::Thin)
             && let Some(arr) = self.resolve_ref_chain_to_array(arg, modified_locals)
         {
             *expr = arr;
@@ -185,7 +194,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .unwrap_or(false);
 
         let prev_checks = self.heap_state.pending_checks.len();
-        let result = self.load_from_memory(addr.clone(), pointee_ty);
+        let result = self.load_from_memory_untyped(addr.clone(), pointee_ty);
 
         if is_stack_local {
             // Stack local with non-scalar type (Datatype/Array): checks are

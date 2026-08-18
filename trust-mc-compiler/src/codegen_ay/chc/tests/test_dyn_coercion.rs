@@ -17,6 +17,8 @@
 use super::common::*;
 use ay_bindings::{Expr, Sort};
 
+use crate::codegen_ay::field_roles::{FieldRole, declare_field_role};
+
 use super::super::codegen_call_closure::resolve_unique_dyn_callable_body;
 use super::super::dyn_coercion::{
     extract_concrete_tail_for_dyn, extract_pointer_expr, find_dyn_trait_tail_ty,
@@ -33,7 +35,7 @@ fn test_extract_pointer_expr_bv_passthrough() {
     let ptr = Expr::bitvec_const(0x1000u64, 64);
     let result = extract_pointer_expr(&ptr);
     assert!(result.is_some(), "BV expression should pass through");
-    assert_eq!(*result.unwrap().sort(), Sort::bitvec(64));
+    assert_eq!(*result.unwrap().as_expr().sort(), Sort::bitvec(64));
 }
 
 /// A Bool expression (not a pointer, not a datatype) returns None.
@@ -62,7 +64,11 @@ fn test_extract_pointer_expr_datatype_with_fld_ptr() {
     let wrapper_var = Expr::var("wrapper_val", wrapper_sort);
     let result = extract_pointer_expr(&wrapper_var);
     assert!(result.is_some(), "Datatype with fld_ptr should extract pointer");
-    assert_eq!(*result.unwrap().sort(), ptr_sort, "Extracted pointer should have BV64 sort");
+    assert_eq!(
+        *result.unwrap().as_expr().sort(),
+        ptr_sort,
+        "Extracted pointer should have BV64 sort"
+    );
 }
 
 /// A datatype with `fld_ptr` and additional fields still extracts the pointer.
@@ -77,7 +83,7 @@ fn test_extract_pointer_expr_datatype_multi_field() {
     let fat_ptr = Expr::var("fat_ptr_val", wrapper_sort);
     let result = extract_pointer_expr(&fat_ptr);
     assert!(result.is_some(), "Multi-field datatype with fld_ptr should extract");
-    assert_eq!(*result.unwrap().sort(), ptr_sort);
+    assert_eq!(*result.unwrap().as_expr().sort(), ptr_sort);
 }
 
 /// A datatype WITHOUT `fld_ptr` and no pointer-width BV field returns None.
@@ -90,42 +96,121 @@ fn test_extract_pointer_expr_datatype_no_fld_ptr() {
     assert!(result.is_none(), "Datatype without fld_ptr or BV64 field should return None");
 }
 
-/// A generic ADT fat pointer using positional field names (`field_0`, `field_1`)
-/// instead of `fld_ptr` should still extract the first BV64 field as the data pointer.
+/// A generic ADT fat pointer using positional field names (`fld_0`, `fld_1`)
+/// instead of `fld_ptr` extracts the field the DECLARATION recorded as an
+/// address — and nothing at all before that role is recorded.
 /// Part of #3953: fat-pointer deref_non_bitvec_field_load recovery.
+/// Wave 18: the recovery is now driven by the declared role, not by position.
 #[test]
 fn test_extract_pointer_expr_generic_adt_fat_pointer() {
     let ptr_sort = Sort::bitvec(64);
     let generic_fat_ptr = Sort::struct_type(
-        "GenericFatPtr",
-        [("field_0", ptr_sort.clone()), ("field_1", Sort::bitvec(64))],
+        "GenericFatPtr_wave18",
+        [("fld_0", ptr_sort.clone()), ("fld_1", Sort::bitvec(64))],
+    );
+    let fat_ptr = Expr::var("generic_fat_ptr_val", generic_fat_ptr);
+
+    assert!(
+        extract_pointer_expr(&fat_ptr).is_none(),
+        "with no declared role, the first BV64 field is a GUESS and must not be an address"
     );
 
-    let fat_ptr = Expr::var("generic_fat_ptr_val", generic_fat_ptr);
+    // What `translate_ty` records for `(*const T, usize)`.
+    declare_field_role("GenericFatPtr_wave18", "fld_0", FieldRole::Addr);
+    declare_field_role("GenericFatPtr_wave18", "fld_1", FieldRole::Value);
+
     let result = extract_pointer_expr(&fat_ptr);
-    assert!(result.is_some(), "Generic ADT fat pointer with BV64 field_0 should extract pointer");
-    assert_eq!(*result.unwrap().sort(), ptr_sort, "Extracted pointer should have BV64 sort");
+    assert!(result.is_some(), "the declared address field must be extracted");
+    assert_eq!(
+        *result.unwrap().as_expr().sort(),
+        ptr_sort,
+        "Extracted pointer should have BV64 sort"
+    );
 }
 
-/// A generic ADT fat pointer where the BV64 field is not the first field but is
-/// the first *pointer-width* BV field should still be extracted.
+/// The declared address field is found wherever it sits — the position of the
+/// field carried no information, which is why the positional guess was wrong.
 #[test]
 fn test_extract_pointer_expr_generic_adt_mixed_fields() {
     let ptr_sort = Sort::bitvec(64);
     let mixed_sort = Sort::struct_type(
-        "MixedFatPtr",
-        [("tag", Sort::bitvec(8)), ("data_ptr", ptr_sort.clone()), ("metadata", Sort::bitvec(64))],
+        "MixedFatPtr_wave18",
+        [
+            ("fld_tag", Sort::bitvec(8)),
+            ("fld_len", Sort::bitvec(64)),
+            ("fld_data_ptr", ptr_sort.clone()),
+        ],
     );
-
     let mixed_ptr = Expr::var("mixed_fat_ptr_val", mixed_sort);
+
+    declare_field_role("MixedFatPtr_wave18", "fld_tag", FieldRole::Value);
+    declare_field_role("MixedFatPtr_wave18", "fld_len", FieldRole::Value);
+    declare_field_role("MixedFatPtr_wave18", "fld_data_ptr", FieldRole::Addr);
+
     let result = extract_pointer_expr(&mixed_ptr);
-    assert!(result.is_some(), "Should extract first BV64 field even if preceded by BV8");
-    assert_eq!(*result.unwrap().sort(), ptr_sort);
+    assert!(result.is_some(), "the declared address field must be extracted, whatever its index");
+    assert_eq!(*result.unwrap().as_expr().sort(), ptr_sort);
+}
+
+/// The shape the guess used to fabricate on: a small datatype whose leading
+/// pointer-width field is a LENGTH (`IndexRange`, `Layout`, `VecIntoIter`'s
+/// `fld_pos`, `struct S(usize, *mut u8)`). The declaration says `Value`, so the
+/// caller gets `None` and takes its demotion lane.
+#[test]
+fn test_extract_pointer_expr_declared_value_field_is_not_an_address() {
+    let range_sort = Sort::struct_type(
+        "IndexRange_wave18",
+        [("fld_start", Sort::bitvec(64)), ("fld_end", Sort::bitvec(64))],
+    );
+    declare_field_role("IndexRange_wave18", "fld_start", FieldRole::Value);
+    declare_field_role("IndexRange_wave18", "fld_end", FieldRole::Value);
+
+    let range = Expr::var("index_range_val", range_sort);
+    assert!(
+        extract_pointer_expr(&range).is_none(),
+        "a declared VALUE field must never be handed back as an address"
+    );
+}
+
+/// Two declared address fields do not say which one is "the" pointer this
+/// wrapper holds. Answering by position is the guess wave 18 deleted, so the
+/// ambiguous datatype fails closed.
+#[test]
+fn test_extract_pointer_expr_two_declared_addresses_is_ambiguous() {
+    let pair_sort = Sort::struct_type(
+        "PtrPair_wave18",
+        [("fld_0", Sort::bitvec(64)), ("fld_1", Sort::bitvec(64))],
+    );
+    declare_field_role("PtrPair_wave18", "fld_0", FieldRole::Addr);
+    declare_field_role("PtrPair_wave18", "fld_1", FieldRole::Addr);
+
+    let pair = Expr::var("ptr_pair_val", pair_sort);
+    assert!(
+        extract_pointer_expr(&pair).is_none(),
+        "two declared addresses are ambiguous — picking the first is the deleted guess"
+    );
+}
+
+/// `fld_ptr` is itself a declared role, so it keeps working with no table
+/// entry: the pointer-wrapper sorts the encoder writes literally are unchanged.
+#[test]
+fn test_extract_pointer_expr_fld_ptr_needs_no_table_entry() {
+    let ptr_sort = Sort::bitvec(64);
+    let wrapper = Sort::struct_type(
+        "Slice_wave18",
+        [("fld_ptr", ptr_sort.clone()), ("fld_len", Sort::bitvec(64))],
+    );
+    let val = Expr::var("slice_val", wrapper);
+    let result = extract_pointer_expr(&val);
+    assert!(result.is_some(), "the `fld_ptr` name IS the declared role");
+    assert_eq!(*result.unwrap().as_expr().sort(), ptr_sort);
 }
 
 /// A many-field user ADT with BV64 fields must NOT have a field extracted as a
-/// pointer. The fallback heuristic is restricted to ≤ 4 fields. Part of #4099:
-/// DtSolver(11 fields) had scope_len (first BV64) mistaken for a pointer.
+/// pointer. Part of #4099: DtSolver(11 fields) had scope_len (first BV64)
+/// mistaken for a pointer. Wave 18: the `≤ 4` blast-radius bound this test was
+/// written against is gone, and the reason the answer is `None` is now the only
+/// honest one — the declaration recorded no address field.
 #[test]
 fn test_extract_pointer_expr_many_field_adt_no_extract() {
     let many_field_sort = Sort::struct_type(
@@ -148,11 +233,13 @@ fn test_extract_pointer_expr_many_field_adt_no_extract() {
     let result = extract_pointer_expr(&solver);
     assert!(
         result.is_none(),
-        "Many-field ADT (>4 fields) without fld_ptr should return None, not extract scope_len"
+        "an ADT with no declared address field returns None, never scope_len"
     );
 }
 
-/// A 5-field ADT at the boundary (>4) should NOT extract. Part of #4099.
+/// A 5-field ADT at the old `≤ 4` boundary still does not extract — and neither
+/// does a 4-field one now, unless the declaration recorded which field is the
+/// address. Part of #4099.
 #[test]
 fn test_extract_pointer_expr_five_field_adt_no_extract() {
     let five_field = Sort::struct_type(
@@ -167,7 +254,7 @@ fn test_extract_pointer_expr_five_field_adt_no_extract() {
     );
     let val = Expr::var("five_val", five_field);
     let result = extract_pointer_expr(&val);
-    assert!(result.is_none(), "5-field ADT should not extract a field as pointer");
+    assert!(result.is_none(), "no declared address field: nothing may be extracted as a pointer");
 }
 
 // =============================================================================

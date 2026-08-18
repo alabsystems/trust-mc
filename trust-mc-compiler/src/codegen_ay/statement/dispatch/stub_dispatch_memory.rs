@@ -13,12 +13,31 @@ use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
 use tracing::{debug, warn};
 
 use crate::codegen_ay::names::{self, struct_sort};
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::statement::StatementCodegen;
 use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::{POINTER_WIDTH, flatten_dt_array_element, ptr_sort};
 use crate::kani_middle::abi::LayoutOf;
 
 use super::super::IntoOption;
+
+/// Builds the `RawVec` datatype term from its two declared field roles.
+///
+/// `RawVec_mk`'s arguments are `[fld_ptr, fld_cap]` — an address and a value,
+/// adjacent, and until this wave both were a bare `Expr` in a `Vec<Expr>`, so
+/// transposing them was a silent slot misalignment rather than a compile error.
+/// Taking [`Loc`] and [`Val`] states the field roles once, in the one place the
+/// datatype is constructed.
+fn make_rawvec(ptr: Loc, cap: Val) -> Expr {
+    let rawvec_sort = struct_sort("RawVec", names::rawvec_fields());
+    Expr::datatype_constructor(
+        "RawVec",
+        "RawVec_mk",
+        vec![ptr.into_expr(), cap.into_expr()],
+        rawvec_sort,
+    )
+}
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     pub(in crate::codegen_ay::statement) fn try_codegen_pointer_memory_stub(
@@ -286,20 +305,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if let (Some(base), Some(rawvec)) = (rawvec_base, rawvec_expr) {
             let is_rawvec_datatype = rawvec.sort().datatype_name() == Some("RawVec");
             if is_rawvec_datatype {
-                let rawvec_sort = rawvec.sort().clone();
-                let ptr = rawvec.clone().field_select("RawVec", "fld_ptr", ptr_sort());
+                // Both halves come from DECLARED field roles: `fld_ptr` is the
+                // base address, `fld_cap` the capacity. Nothing is inferred.
+                let ptr =
+                    Loc::of_address(rawvec.clone().field_select("RawVec", "fld_ptr", ptr_sort()));
                 let old_cap = rawvec.field_select("RawVec", "fld_cap", ptr_sort());
                 let one = Expr::bitvec_const(1u64, POINTER_WIDTH);
                 let cap_name = self.ctx.fresh_name("rawvec_new_cap");
                 let new_cap = self.ctx.declare_var(&cap_name, ptr_sort());
                 self.ctx.assert(new_cap.clone().bvugt(old_cap.clone()));
                 self.ctx.assert(new_cap.clone().bvuge(old_cap.bvadd(one)));
-                let new_rawvec = Expr::datatype_constructor(
-                    "RawVec",
-                    "RawVec_mk",
-                    vec![ptr, new_cap],
-                    rawvec_sort,
-                );
+                let new_rawvec = make_rawvec(ptr, Val::of_value(new_cap));
                 self.env_update(base, new_rawvec);
             } else {
                 warn!(
@@ -348,37 +364,56 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ) -> Option<BasicBlockIdx> {
         debug!("codegen_stubbed_call: RawVec::from_nonnull_in - constructing from NonNull");
 
-        let ptr = args.first().and_then(|a| self.codegen_operand(a)).unwrap_or_else(|| {
-            let name = self.ctx.fresh_name("rawvec_ptr");
-            self.ctx.declare_var(&name, ptr_sort())
-        });
+        // `RawVec::from_nonnull_in(ptr: NonNull<T>, cap: usize, alloc)`: args[0]
+        // is an ADDRESS and args[1] is a VALUE. Both used to run through the
+        // *same* width-coercion dance, which is what "erases the width evidence
+        // every later check depends on" means concretely: a `bv32` payload
+        // reaching the pointer slot was zero-extended into it and became
+        // indistinguishable from a real address, fabricating obj_id 0 provenance
+        // for every subsequent deref / alignment / liveness obligation on this
+        // RawVec. Widening a *value* is legitimate; widening a *value into an
+        // address slot* is the defect (`refused_ptr_widening`, same wave).
+        //
+        // So the two operands no longer share a code path: the capacity keeps
+        // the coercion, and the pointer is decoded by `PtrRepr` — which accepts
+        // the thin shape unchanged and takes the data half of a wide one, but
+        // has no way to manufacture an address out of a narrower term. That case
+        // falls back to a fresh symbolic pointer, i.e. a havoc, which is the
+        // sound over-approximation.
+        let ptr: Loc = match args.first().and_then(|a| self.codegen_operand(a)) {
+            Some(expr) => match PtrRepr::classify(&expr).map(PtrRepr::into_data) {
+                Some(addr) => addr,
+                None => self.fresh_rawvec_slot("rawvec_ptr_fallback"),
+            },
+            None => self.fresh_rawvec_slot("rawvec_ptr"),
+        };
 
         let cap = args.get(1).and_then(|a| self.codegen_operand(a)).unwrap_or_else(|| {
             let name = self.ctx.fresh_name("rawvec_cap");
             self.ctx.declare_var(&name, ptr_sort())
         });
-
-        let ptr = if ptr.sort().is_bitvec() && ptr.sort().bitvec_width() != Some(POINTER_WIDTH) {
-            Self::coerce_to_width(ptr, POINTER_WIDTH)
-        } else if !ptr.sort().is_bitvec() {
-            let name = self.ctx.fresh_name("rawvec_ptr_fallback");
-            self.ctx.declare_var(&name, ptr_sort())
-        } else {
-            ptr
-        };
         let cap = if cap.sort().is_bitvec() && cap.sort().bitvec_width() != Some(POINTER_WIDTH) {
-            Self::coerce_to_width(cap, POINTER_WIDTH)
+            Val::of_value(Self::coerce_to_width(cap, POINTER_WIDTH))
         } else if !cap.sort().is_bitvec() {
             let name = self.ctx.fresh_name("rawvec_cap_fallback");
-            self.ctx.declare_var(&name, ptr_sort())
+            Val::of_value(self.ctx.declare_var(&name, ptr_sort()))
         } else {
-            cap
+            Val::of_value(cap)
         };
 
-        let rawvec_sort = struct_sort("RawVec", names::rawvec_fields());
-        let rawvec = Expr::datatype_constructor("RawVec", "RawVec_mk", vec![ptr, cap], rawvec_sort);
+        let rawvec = make_rawvec(ptr, cap);
         self.assign_value_to_place(destination, rawvec);
         target
+    }
+
+    /// A fresh symbolic pointer-width slot, as an address.
+    ///
+    /// The declaration is the producer: an unconstrained `bv(POINTER_WIDTH)`
+    /// standing in for a `RawVec`'s base pointer is an address by construction,
+    /// with nothing guessed.
+    fn fresh_rawvec_slot(&mut self, hint: &str) -> Loc {
+        let name = self.ctx.fresh_name(hint);
+        Loc::of_address(self.ctx.declare_var(&name, ptr_sort()))
     }
 
     fn codegen_rawvec_drop_stub(&mut self, target: Option<BasicBlockIdx>) -> Option<BasicBlockIdx> {

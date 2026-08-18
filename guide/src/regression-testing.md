@@ -176,7 +176,7 @@ for:
  * Standard library codegen
  * Diamond dependency
 
-In fact, most of them are equivalent to running `cargo trust-mc` and performing
+In fact, most of them are equivalent to running `targo trust-mc` and performing
 checks on the output. The downside to scripting is that these tests will always
 be run, even if there have not been any changes since the last time the
 regression was run.

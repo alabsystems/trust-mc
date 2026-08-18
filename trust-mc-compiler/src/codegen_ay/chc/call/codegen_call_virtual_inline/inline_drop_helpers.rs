@@ -10,6 +10,10 @@ use std::collections::HashMap;
 
 use super::super::ChcCtx;
 use super::walker::InlineWalkCtx;
+use crate::codegen_ay::provenance::{
+    Loc, Val, is_value_widened_into_address, mir_ty_denotes_address,
+};
+use crate::codegen_ay::ptr_repr::PtrSlot;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 /// Find the concrete Rust type that was coerced to `dyn Trait` for a local.
@@ -267,7 +271,10 @@ pub(super) fn seed_box_new_payload_vtable_inline(
         .cloned()
         .or_else(|| ctx.known_vtable_expr_for_local(payload_local))
         .or_else(|| {
-            local_exprs.get(&payload_local).and_then(|expr| ctx.extract_embedded_vtable_expr(expr))
+            local_exprs
+                .get(&payload_local)
+                .and_then(|expr| ctx.extract_embedded_vtable_expr(expr))
+                .map(Val::into_expr)
         })
     else {
         return;
@@ -320,8 +327,11 @@ pub(super) fn forwarded_heap_vtable_for_dyn_local(
                         .is_some()
                         && let Some(root_expr) = local_exprs.get(&src.local)
                     {
+                        // Fallback lane is the untranslated root term, so
+                        // the merged slot cannot be typed; tag dropped here.
                         let addr =
                             crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(root_expr)
+                                .map(Loc::into_expr)
                                 .unwrap_or_else(|| root_expr.clone());
                         if let Some(vtable) = forwarded_heap_vtable_for_expr(ctx, &addr) {
                             return Some(vtable);
@@ -418,7 +428,13 @@ pub(super) fn resolve_inline_drop_self_expr(
     if matches!(proj.first(), Some(ProjectionElem::Deref)) {
         let root = local_exprs.get(&place.local)?;
         let base_addr = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(root)
+            .map(Loc::into_expr)
             .unwrap_or_else(|| root.clone());
+        // GUARD KEPT (not a provenance guess): the fallback lane above is the
+        // untyped root term of any sort, and the `bvadd` byte-offset walk below
+        // needs a POINTER_WIDTH operand. `extract_pointer_expr`'s named
+        // `fld_ptr` lane also returns whatever sort that field was DECLARED
+        // with, so this is not vacuous on the extracted lane either.
         if base_addr.sort().bitvec_width() != Some(POINTER_WIDTH) {
             return None;
         }
@@ -470,13 +486,45 @@ pub(super) fn resolve_inline_drop_self_expr(
             if crate::codegen_ay::types::is_coroutine_root_sort(val.sort()) {
                 return Some(val.clone());
             }
-            if val.sort().bitvec_width() == Some(POINTER_WIDTH) {
+            // The width test that used to stand alone here is retired: it read
+            // "this local's term is 64 bits wide" as "this local's term is the
+            // drop target's ADDRESS", and handed the result to the drop body as
+            // its `&mut Self` — i.e. straight onto the free/deref path. It is
+            // not a provenance test. `translate_adt_ty` collapses a dozen
+            // non-pointer ADTs (`Cow`, `Alignment`, `Drain`, every opaque
+            // iterator adapter) to the same `ptr_sort()`, and a `usize` local
+            // lands there too, so the guess fabricated an address out of an
+            // opaque VALUE for exactly the types whose drop glue is non-trivial.
+            //
+            // Provenance now comes from the MIR type of the local, which states
+            // the fact outright — see `mir_ty_denotes_address`. When it says no,
+            // fall through: `resolve_inline_drop_self_expr` returning `None` is
+            // the caller's supported lane (a fresh symbolic `__drop_self`, the
+            // sound over-approximation already used for ZSTs), never a
+            // fabricated address.
+            let local_is_pointer = walk_ctx
+                .locals
+                .get(place.local)
+                .map(|decl| ctx.resolve_body_ty(decl.ty))
+                .is_some_and(mir_ty_denotes_address);
+            // The pointer-width requirement survives as a REPRESENTATION check
+            // only: a `&mut T` local can hold the pointee's own term under the
+            // walker's transparent-Deref model, and that term is not addressable.
+            if local_is_pointer
+                && PtrSlot::of_sort(val.sort()) == Some(PtrSlot::Thin)
+                && !is_value_widened_into_address(val)
+            {
                 return Some(val.clone());
             }
             // Part of #3872: Fat-pointer Datatype -- extract pointer component.
             if let Some(ptr) = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(val) {
-                if ptr.sort().bitvec_width() == Some(POINTER_WIDTH) {
-                    return Some(ptr);
+                // Same as above: this tests the DECLARED sort of the extracted
+                // field, not whether the term is an address — so it asks the
+                // one classification of a declared pointer slot, `PtrSlot`,
+                // exactly as the `local_is_pointer` arm does. Provenance came
+                // from `extract_pointer_expr`'s declared `fld_ptr` role.
+                if PtrSlot::of_sort(ptr.as_expr().sort()) == Some(PtrSlot::Thin) {
+                    return Some(ptr.into_expr());
                 }
             }
             // Part of #3977: BV128 packed fat pointer (data:64 | vtable:64).

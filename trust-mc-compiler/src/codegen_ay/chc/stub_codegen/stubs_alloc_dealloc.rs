@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, ExprValue, Sort};
+use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
 use tracing::{debug, warn};
 
@@ -16,6 +17,46 @@ use super::types::POINTER_WIDTH;
 use super::{AllocCallResult, ChcCtx, chc_fresh_name, codegen_expr_heap, declare_pending_var};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Index of the argument that carries the allocation's ADDRESS, decided by
+    /// the Rust type the MIR gives it.
+    ///
+    /// # Why this is not a width test
+    ///
+    /// The allocator stubs see two shapes — `__rust_dealloc(ptr, size, align)` /
+    /// `__rust_realloc(ptr, old_size, align, new_size)` and the trait methods
+    /// `<Global as Allocator>::{deallocate,grow,shrink}(&self, ptr, ..)` — and
+    /// have to decide which operand is the pointer that the free / move model is
+    /// built on. Every candidate is `bv64` in the encoding: a `*mut u8`, a
+    /// `&Global`, and a `usize` size are indistinguishable by width, which is how
+    /// #3184 came to free the allocator reference.
+    ///
+    /// The Rust type answers it outright. A raw pointer, or a `NonNull` /
+    /// `Unique` (the `Allocator` trait's pointer type), is the pointer; a
+    /// reference is the receiver; everything else is neither. Only the first two
+    /// positions are considered, because those are the only two either ABI puts
+    /// the pointer in — a match further along would be a coincidence, not a
+    /// convention.
+    ///
+    /// `None` means the pointer could not be identified, and every caller fails
+    /// closed on it rather than guessing.
+    pub(in crate::codegen_ay::chc) fn allocator_pointer_arg_idx(
+        &self,
+        args: &[Operand],
+    ) -> Option<usize> {
+        use rustc_public::ty::{RigidTy, TyKind};
+        args.iter().take(2).position(|arg| {
+            arg.ty(self.body.locals()).ok().is_some_and(|ty| match ty.kind() {
+                TyKind::RigidTy(RigidTy::RawPtr(..)) => true,
+                TyKind::RigidTy(RigidTy::Adt(def, _)) => {
+                    let name = def.name();
+                    let trimmed = name.rsplit("::").next().unwrap_or(name.as_str());
+                    matches!(trimmed, "NonNull" | "Unique")
+                }
+                _ => false, // external enum: TyKind
+            })
+        })
+    }
+
     /// Translate `__rust_dealloc` to CHC constraints.
     ///
     /// Handles two calling conventions:
@@ -30,33 +71,33 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         args: &[Operand],
         modified_locals: &HashSet<usize>,
     ) -> Option<AllocCallResult> {
-        // Fix #3184: Distinguish `__rust_dealloc(ptr, size, align)` from
-        // `<Global as Allocator>::deallocate(&self, ptr, layout)`.
-        // The previous heuristic (checking bitvec_width) fails because `&self`
-        // (e.g. `&Global`) is also a 64-bit pointer-width bitvec. Using the
-        // allocator reference as the dealloc pointer gives a non-zero field
-        // offset that trips the base-pointer safety check (offset != 0).
-        // Check the Rust TYPE of arg[0]: a reference or raw pointer to a non-u8
-        // type indicates `&self` in the trait method convention.
-        let first_ty = args.first().and_then(|arg| arg.ty(self.body.locals()).ok());
-        let first_is_self_ref = first_ty.as_ref().is_some_and(|ty| {
-            use rustc_public::ty::{RigidTy, TyKind};
-            matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(..)))
-        });
-        let first_expr =
-            args.first().and_then(|arg| self.translate_operand_with_modified(arg, modified_locals));
-        let is_first_pointer = !first_is_self_ref
-            && first_expr.as_ref().is_some_and(|e| e.sort().bitvec_width() == Some(POINTER_WIDTH));
-        let (ptr_expr, size_align_start) = if is_first_pointer {
-            // __rust_dealloc(ptr, size, align) convention
-            (first_expr, 1)
-        } else {
-            // <Global as Allocator>::deallocate(&self, ptr, layout) — skip self
-            let ptr = args
-                .get(1)
-                .and_then(|arg| self.translate_operand_with_modified(arg, modified_locals));
-            (ptr, 2)
+        // Address-vs-value: which argument is the FREED ADDRESS is read off the
+        // Rust types in MIR, never off a width.
+        //
+        // Fix #3184 recorded that the width heuristic had already failed once —
+        // `&Global` is a 64-bit pointer-width bitvec too, so the allocator
+        // reference was freed instead of the allocation — and bolted a MIR-type
+        // veto ABOVE the width test. Width still decided every remaining case:
+        // with `__rust_dealloc(ptr, size, align)`, a `ptr` operand that failed to
+        // translate (or translated to any non-`bv64` sort) fell through to the
+        // `deallocate(&self, ptr, layout)` arm and named `size` — a VALUE — as
+        // the address to free, shifting the `(size, align)` window with it.
+        //
+        // `allocator_pointer_arg_idx` replaces the test outright: a raw pointer
+        // or a `NonNull`/`Unique` is the pointer, a reference (`&self`) is not,
+        // and when no argument is pointer-typed the stub fails closed rather than
+        // freeing whichever operand happened to be 64 bits wide.
+        let Some(ptr_arg_idx) = self.allocator_pointer_arg_idx(args) else {
+            warn!(
+                "RustDealloc: no pointer-typed argument in MIR; falling back to unconstrained call"
+            );
+            self.record_sound_fallback_reason("dealloc_pointer_arg_unresolved");
+            return None;
         };
+        let size_align_start = ptr_arg_idx + 1;
+        let ptr_expr = args
+            .get(ptr_arg_idx)
+            .and_then(|arg| self.translate_operand_with_modified(arg, modified_locals));
 
         // Supports both:
         // - __rust_dealloc(ptr, size, align)
@@ -145,7 +186,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     });
                 }
             };
-            let ptr_arg_idx = size_align_start.saturating_sub(1);
             let resolved_alloc_id = Self::const_obj_id_u32(&raw_obj_id_expr)
                 .or_else(|| args.get(ptr_arg_idx).and_then(|arg| self.trace_arg_to_alloc_id(arg)));
             let obj_id_expr = resolved_alloc_id

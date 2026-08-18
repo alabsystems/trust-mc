@@ -89,7 +89,8 @@ fn main() -> Result<()> {
 
     let proved = evidence.obligations.len();
     let not_proved = evidence.not_proved.len();
-    println!("replayed {} obligation(s) in {elapsed:?}\n", proved + not_proved);
+    let refuted = evidence.refuted.len();
+    println!("replayed {} obligation(s) in {elapsed:?}\n", proved + not_proved + refuted);
 
     for (i, solved) in evidence.obligations.iter().enumerate() {
         // Recompute the private mutation-bound seal at the point where this
@@ -120,9 +121,20 @@ fn main() -> Result<()> {
         );
     }
 
+    for (offset, row) in evidence.refuted.iter().enumerate() {
+        let i = proved + not_proved + offset;
+        let obligation = &row.translated.obligation;
+        // A witnessed refutation is dev-loop diagnostics here; the compiler's
+        // consumer independently revalidates the witness before any verdict.
+        println!(
+            "[{i}] {} :: {}\n     verdict=REFUTED (witnessed; consumer revalidation required)",
+            obligation.function_name, obligation.obligation_id
+        );
+    }
+
     println!(
-        "\nsummary: {proved} proved (live exact-module authority), {not_proved} not-proved, {} total",
-        proved + not_proved
+        "\nsummary: {proved} proved (live exact-module authority), {not_proved} not-proved, {refuted} refuted (witnessed), {} total",
+        proved + not_proved + refuted
     );
 
     // Non-zero exit if nothing received live exact-module authority, so scripts

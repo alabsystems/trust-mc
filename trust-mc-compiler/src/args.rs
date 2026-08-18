@@ -116,6 +116,12 @@ pub(crate) struct Arguments {
     /// Turn off undefined foreign function checks.
     #[arg(long)]
     pub no_undefined_function_checks: bool,
+    /// Emit NaN-generation obligations for float arithmetic (opt-in).
+    ///
+    /// OFF by default, matching Kani: producing a NaN is DEFINED behaviour in
+    /// Rust, not UB, so this is a lint rather than a safety property.
+    #[arg(long = "nan-check")]
+    pub nan_checks: bool,
     /// Turn off default unwinding checks.
     ///
     /// Used by the AY backend to disable unwinding assertions.

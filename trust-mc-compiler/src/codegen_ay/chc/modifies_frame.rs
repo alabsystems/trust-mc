@@ -42,6 +42,7 @@ use tracing::debug;
 
 use super::ChcCtx;
 use super::call::chc_call_context::DispatchCallContext;
+use crate::codegen_ay::types::POINTER_WIDTH;
 use crate::kani_middle::kani_functions::{KaniFunction, KaniHook, try_kani_function_from_fn_def};
 
 /// One byte-range of the declared assignable footprint.
@@ -274,14 +275,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             );
             return;
         };
-        // Fat pointers (slice refs): the data pointer is the low 64 bits.
-        let addr = match addr.sort().bitvec_width() {
-            Some(128) => addr.extract(63, 0),
-            _ => addr,
-        };
+        // GUARD DELETED (wave 11): this site used to re-test the width of
+        // `translate_ref_to_address`'s result and take `extract(63, 0)` on a
+        // 128-bit "fat pointer". That branch is unreachable — the producer's
+        // ENSURES states every `Some` result is exactly `POINTER_WIDTH` wide
+        // (allocation base `concat(bv32, bv32)`, deref lanes normalized by
+        // `normalize_deref_address_expr`, projections width-preserving
+        // `bvadd`s), and it now says so in its return type. Re-deriving
+        // address shape from a width test is exactly the heuristic this
+        // refactor removes.
+        //
+        // The assertion below restates the ENSURES but is NOT what makes the
+        // deletion safe: this workspace sets `profile.dev.debug-assertions =
+        // false`, so it is compiled out of the driver. The argument is the
+        // structural one above (and a non-`POINTER_WIDTH` `current_addr` could
+        // not survive a projection's `bvadd` in the first place).
+        debug_assert_eq!(
+            addr.as_expr().sort().bitvec_width(),
+            Some(POINTER_WIDTH),
+            "translate_ref_to_address must mint POINTER_WIDTH addresses"
+        );
         let pointee_ty =
             lhs.ty(self.body.locals()).ok().unwrap_or_else(|| self.body.locals()[lhs.local].ty);
-        self.modifies_frame_store_check(&addr, pointee_ty);
+        self.modifies_frame_store_check(addr.as_expr(), pointee_ty);
     }
 
     /// Check a memory store against the active modifies frame, if any.

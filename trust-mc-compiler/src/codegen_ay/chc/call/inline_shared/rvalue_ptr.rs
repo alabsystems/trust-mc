@@ -16,6 +16,7 @@ use tracing::debug;
 use super::super::ChcCtx;
 use super::PlaceResolver;
 use super::place::inline_operand_to_expr;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 /// Route a float BinaryOp through FP theory (arithmetic) or IEEE 754
@@ -149,6 +150,25 @@ pub(super) fn coerce_dt_wrapper_to_bv(expr: Expr) -> Expr {
     expr
 }
 
+/// Lexicographic `(data, metadata)` comparison of two wide-pointer operands.
+///
+/// Wave 4 of the address-vs-value conversion. The double-width test below is
+/// the handler's applicability gate — "is this the wide-pointer lane?" — and
+/// stays. What is deleted is the assumption that followed it: that bits 127..64
+/// of a double-width operand ARE metadata. `coerce_bitvec_width_safe` widens
+/// thin pointers into exactly this slot, so that assumption compared extension
+/// padding as if it were a slice length or vtable id.
+///
+/// `PtrRepr` reports metadata only for a genuine `Fat`, which leaves three
+/// cases:
+///
+/// * **both fat** — unchanged: address lane first, metadata as tie-break;
+/// * **neither fat** — both are widened thin pointers, so there is no
+///   tie-break: the address lane decides alone. For a zero- or sign-extension
+///   the high halves were equal whenever the low halves were, so this is the
+///   same predicate the old code built, minus the padding terms;
+/// * **mixed** — one real length against another's padding. Nothing honest to
+///   compare, so decline and let the caller's generic lane handle it.
 pub(super) fn try_translate_inline_wide_pointer_binop(
     op: BinOp,
     lhs: &Expr,
@@ -159,44 +179,70 @@ pub(super) fn try_translate_inline_wide_pointer_binop(
     {
         return None;
     }
-    let lhs_data = lhs.clone().extract(POINTER_WIDTH - 1, 0);
-    let rhs_data = rhs.clone().extract(POINTER_WIDTH - 1, 0);
-    let lhs_meta = lhs.clone().extract(2 * POINTER_WIDTH - 1, POINTER_WIDTH);
-    let rhs_meta = rhs.clone().extract(2 * POINTER_WIDTH - 1, POINTER_WIDTH);
+    let (lhs_data, lhs_meta) = PtrRepr::classify(lhs)?.into_parts();
+    let (rhs_data, rhs_meta) = PtrRepr::classify(rhs)?.into_parts();
+    let meta = match (lhs_meta, rhs_meta) {
+        (Some(lhs_meta), Some(rhs_meta)) => Some((lhs_meta.into_expr(), rhs_meta.into_expr())),
+        (None, None) => None,
+        _ => return None,
+    };
+    let (lhs_data, rhs_data) = (lhs_data.into_expr(), rhs_data.into_expr());
     let data_eq = lhs_data.clone().eq(rhs_data.clone());
-    let meta_eq = lhs_meta.clone().eq(rhs_meta.clone());
+    let meta_eq = meta.as_ref().map(|(l, r)| l.clone().eq(r.clone()));
     match op {
-        BinOp::Eq => Some(data_eq.and(meta_eq)),
-        BinOp::Ne => Some(data_eq.and(meta_eq).not()),
+        BinOp::Eq => Some(match meta_eq {
+            Some(meta_eq) => data_eq.and(meta_eq),
+            None => data_eq,
+        }),
+        BinOp::Ne => Some(
+            match meta_eq {
+                Some(meta_eq) => data_eq.and(meta_eq),
+                None => data_eq,
+            }
+            .not(),
+        ),
         BinOp::Lt => {
             let data_lt = lhs_data.bvult(rhs_data);
-            let meta_lt = lhs_meta.bvult(rhs_meta);
-            Some(data_lt.or(data_eq.and(meta_lt)))
+            Some(match meta {
+                Some((lhs_meta, rhs_meta)) => data_lt.or(data_eq.and(lhs_meta.bvult(rhs_meta))),
+                None => data_lt,
+            })
         }
         BinOp::Le => {
             let data_lt = lhs_data.bvult(rhs_data);
-            let data_eq_meta_le = data_eq.and(lhs_meta.bvule(rhs_meta));
-            Some(data_lt.or(data_eq_meta_le))
+            Some(match meta {
+                // `<=` on the metadata is vacuously true when there is none, so
+                // the tie-break degenerates to plain address equality.
+                Some((lhs_meta, rhs_meta)) => data_lt.or(data_eq.and(lhs_meta.bvule(rhs_meta))),
+                None => data_lt.or(data_eq),
+            })
         }
         BinOp::Gt => {
             let data_gt = rhs_data.bvult(lhs_data);
-            let meta_gt = rhs_meta.bvult(lhs_meta);
-            Some(data_gt.or(data_eq.and(meta_gt)))
+            Some(match meta {
+                Some((lhs_meta, rhs_meta)) => data_gt.or(data_eq.and(rhs_meta.bvult(lhs_meta))),
+                None => data_gt,
+            })
         }
         BinOp::Ge => {
             let data_gt = rhs_data.bvult(lhs_data);
-            let data_eq_meta_ge = data_eq.and(rhs_meta.bvule(lhs_meta));
-            Some(data_gt.or(data_eq_meta_ge))
+            Some(match meta {
+                Some((lhs_meta, rhs_meta)) => data_gt.or(data_eq.and(rhs_meta.bvule(lhs_meta))),
+                None => data_gt.or(data_eq),
+            })
         }
         BinOp::Cmp => {
             let data_lt = lhs_data.clone().bvult(rhs_data.clone());
             let data_gt = rhs_data.bvult(lhs_data);
-            let meta_lt = lhs_meta.bvult(rhs_meta);
-            let meta_cmp = Expr::ite(
-                meta_lt,
-                Expr::bitvec_const(-1i128, 32),
-                Expr::ite(meta_eq, Expr::bitvec_const(0, 32), Expr::bitvec_const(1, 32)),
-            );
+            // No metadata means no tie to break: equal addresses compare equal.
+            let meta_cmp = match (meta, meta_eq) {
+                (Some((lhs_meta, rhs_meta)), Some(meta_eq)) => Expr::ite(
+                    lhs_meta.bvult(rhs_meta),
+                    Expr::bitvec_const(-1i128, 32),
+                    Expr::ite(meta_eq, Expr::bitvec_const(0, 32), Expr::bitvec_const(1, 32)),
+                ),
+                _ => Expr::bitvec_const(0, 32),
+            };
             Some(Expr::ite(
                 data_lt,
                 Expr::bitvec_const(-1i128, 32),
@@ -300,16 +346,29 @@ pub(super) fn translate_inline_ptr_metadata<'tcx, 'body>(
     }
 
     if let Some(expr) = inline_operand_to_expr(ctx, operand, local_exprs, resolver, locals) {
-        match expr.sort().bitvec_width() {
-            Some(128) => {
-                debug!("inline PtrMetadata: BV128 high-bits extraction");
-                return Some(expr.extract(127, 64));
-            }
-            Some(64) => {
+        // `is_wide` above established from the MIR TYPE that this operand has
+        // metadata; what shape the TERM has is a separate question, and the
+        // width test that used to answer it here read bits 127..64 of any
+        // double-width term as the length. For a thin pointer that
+        // `coerce_bitvec_width_safe` widened into a bv128 slot those bits are
+        // zero-extension padding, so the "length" was a fabricated 0 — which
+        // makes every bounds obligation over it trivially satisfiable.
+        // `PtrRepr` hands back metadata for a genuine `Fat` only; the widened
+        // shape declines and falls through to the `fld_len` lane and then to
+        // `translate_ptr_metadata`, which are the honest producers.
+        match PtrRepr::classify(&expr) {
+            Some(PtrRepr::Thin(_)) => {
                 debug!("inline PtrMetadata: BV64 — returning 0 (thin pointer)");
                 return Some(Expr::bitvec_const(0, POINTER_WIDTH));
             }
-            _ => {}
+            Some(repr) => {
+                if let Some(meta) = repr.into_metadata() {
+                    debug!("inline PtrMetadata: BV128 metadata half");
+                    return Some(meta.into_expr());
+                }
+                debug!("inline PtrMetadata: widened thin pointer — no metadata to read");
+            }
+            None => {}
         }
         let sort = expr.sort().clone();
         if let SortInner::Datatype(dt) = sort.inner()
@@ -327,5 +386,5 @@ pub(super) fn translate_inline_ptr_metadata<'tcx, 'body>(
     }
 
     let empty = std::collections::HashSet::new();
-    ctx.translate_ptr_metadata(operand, &empty)
+    ctx.translate_ptr_metadata(operand, &empty).map(|meta| meta.into_expr())
 }

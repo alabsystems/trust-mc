@@ -19,6 +19,7 @@ use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::provenance::Loc;
 use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width_safe};
 
 use super::codegen_expr_signedness::ExprSignedness;
@@ -132,7 +133,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             } else if let Some(out_width) = out_sort.bitvec_width() {
                 let addr_fallback = match rhs {
                     Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
-                        self.translate_ref_to_address(place, acc.modified)
+                        // `&place` / `&raw place` STORES the address as this
+                        // local's datum, so the address is about to be coerced
+                        // to the destination's width and become a value; the
+                        // wave-11 tag ends at that crossing.
+                        self.translate_ref_to_address(place, acc.modified).map(Loc::into_expr)
                     }
                     _ => None,
                 };

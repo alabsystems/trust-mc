@@ -776,3 +776,145 @@ fn test_trace_alloc_id_via_copy_for_deref() {
         assert_eq!(chc_ctx.trace_deref_store_alloc_id(1), Some(0xCFDF));
     });
 }
+
+// =============================================================================
+// deref_load_referent_local: the ADDRESS-used-as-VALUE structural test
+// =============================================================================
+
+/// `_r = &_v` with no projections, then a load through `_r`. This is the shape
+/// where a deref load must NOT inherit `_r`'s alloc_id: that id names `_v`'s
+/// own slot, while the loaded value is `_v`'s CONTENTS.
+const REF_TO_LOCAL_SOURCE: &str = r#"
+    #![allow(dead_code)]
+
+    pub unsafe fn probe_ref_to_local(dst: *mut u32) {
+        let v: u32 = 7;
+        let r: &u32 = &v;
+        unsafe { *dst = *r; }
+    }
+"#;
+
+/// Find the first `_lhs = &_place` with no projections; returns (lhs, place).
+fn find_unprojected_ref(body: &rustc_public::mir::Body) -> Option<(usize, usize)> {
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            if let StatementKind::Assign(lhs, Rvalue::Ref(_, _, place)) = &stmt.kind
+                && lhs.projection.is_empty()
+                && place.projection.is_empty()
+            {
+                return Some((lhs.local, place.local));
+            }
+        }
+    }
+    None
+}
+
+/// Positive: the pointer provably holds `&_v` and carries `_v`'s slot obj_id,
+/// so the predicate reports `_v` as the referent whose provenance to use.
+#[test]
+fn test_deref_load_referent_local_matches_ref_to_local() {
+    with_test_ay_ctx_for_source(REF_TO_LOCAL_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_ref_to_local");
+        let body = instance.body().expect("body");
+        let Some((ptr_local, referent)) = find_unprojected_ref(&body) else {
+            return; // optimizer removed the reference; nothing to assert
+        };
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_ref_to_local",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        const SLOT_OBJ: u32 = 0xA11C;
+        chc_ctx.heap_state.insert_local_address(referent, SLOT_OBJ, "addr_v".to_string());
+        chc_ctx.known_alloc_ids.insert(ptr_local, SLOT_OBJ);
+
+        assert_eq!(
+            chc_ctx.deref_load_referent_local(ptr_local),
+            Some(referent),
+            "a pointer holding &_v whose alloc_id is _v's own slot must report _v"
+        );
+    });
+}
+
+/// Negative: the pointer carries no alloc_id at all, so there is nothing to
+/// mis-inherit and the existing propagation path must stay untouched.
+#[test]
+fn test_deref_load_referent_local_none_without_alloc_id() {
+    with_test_ay_ctx_for_source(REF_TO_LOCAL_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_ref_to_local");
+        let body = instance.body().expect("body");
+        let Some((ptr_local, referent)) = find_unprojected_ref(&body) else {
+            return;
+        };
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_ref_to_local",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        chc_ctx.heap_state.insert_local_address(referent, 0xA11C, "addr_v".to_string());
+
+        assert_eq!(
+            chc_ctx.deref_load_referent_local(ptr_local),
+            None,
+            "no recorded alloc_id means the guard must not fire"
+        );
+    });
+}
+
+/// Negative: the alloc_id names a heap allocation rather than a stack slot —
+/// the Box/Rc/NonNull deref-chain case, which must keep inheriting.
+#[test]
+fn test_deref_load_referent_local_none_for_heap_alloc_id() {
+    with_test_ay_ctx_for_source(REF_TO_LOCAL_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_ref_to_local");
+        let body = instance.body().expect("body");
+        let Some((ptr_local, _referent)) = find_unprojected_ref(&body) else {
+            return;
+        };
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_ref_to_local",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        // 0xBEEF is never registered as a stack local's slot.
+        chc_ctx.known_alloc_ids.insert(ptr_local, 0xBEEF);
+
+        assert_eq!(
+            chc_ctx.deref_load_referent_local(ptr_local),
+            None,
+            "an alloc_id naming no stack slot must keep the existing behaviour"
+        );
+    });
+}
+
+/// Negative: the pointer's alloc_id names some OTHER local's slot, so the load
+/// is not reading its own referent and the inheritance stays as it was.
+#[test]
+fn test_deref_load_referent_local_none_for_unrelated_slot() {
+    with_test_ay_ctx_for_source(REF_TO_LOCAL_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_ref_to_local");
+        let body = instance.body().expect("body");
+        let Some((ptr_local, referent)) = find_unprojected_ref(&body) else {
+            return;
+        };
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_ref_to_local",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        const OTHER_OBJ: u32 = 0xA11D;
+        let unrelated = referent + 100;
+        chc_ctx.heap_state.insert_local_address(unrelated, OTHER_OBJ, "addr_other".to_string());
+        chc_ctx.known_alloc_ids.insert(ptr_local, OTHER_OBJ);
+
+        assert_eq!(
+            chc_ctx.deref_load_referent_local(ptr_local),
+            None,
+            "the guard must only fire when the alloc_id names the pointer's own referent"
+        );
+    });
+}

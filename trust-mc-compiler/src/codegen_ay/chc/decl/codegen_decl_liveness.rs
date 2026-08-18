@@ -16,6 +16,49 @@ use tracing::{debug, trace};
 
 use super::ChcCtx;
 
+/// Opt-in lever: `TRUST_MC_FRAME_NARROWING=1` enables backward-live frame narrowing
+/// for the whole run.
+///
+/// Narrowing is DEFAULT OFF. It measures net positive on the corpus (+6 parity,
+/// unknown -16 at a 15 s budget, frames 34-59% narrower) but carries a tail the
+/// free-variable validator provably cannot see: `prusti/Selection_sort.rs` goes
+/// from 0.54 s to NO VERDICT at 150 s, `bounded-arbitrary/hash.rs` from 0.57 s to
+/// 95 s, `kani/Coroutines/main.rs` from 1.57 s to 80 s — and NONE of the three
+/// re-encodes. One mechanism is confirmed (it defeats the straightline discharge on
+/// Coroutines/main); the others are unidentified, and loops do not predict them.
+/// Until that is understood, a noise-level parity gain does not justify turning a
+/// half-second proof into a hang.
+///
+/// Same idiom as `TRUST_MC_NO_STRAIGHTLINE_DISCHARGE` (chc/straightline_proof.rs).
+fn frame_narrowing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TRUST_MC_FRAME_NARROWING").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+thread_local! {
+    /// Names of state-var columns the current function's frame narrowing removed,
+    /// in both polarities. Precise by construction: the retry in
+    /// `mir_to_chc_internal` must know exactly which columns were dropped, and
+    /// inferring that from variable-name shape guesses wrong (it misses
+    /// static-backed columns such as `_static_main_CELL` and over-flags generated
+    /// symbols such as `__partial_vdisp_0`).
+    static DROPPED_FRAME_COLUMNS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Clear the dropped-column record before encoding a function.
+pub(in crate::codegen_ay::chc) fn reset_dropped_frame_columns() {
+    DROPPED_FRAME_COLUMNS.with(|c| c.borrow_mut().clear());
+}
+
+/// Take the set of state-var names whose columns frame narrowing removed.
+pub(in crate::codegen_ay::chc) fn take_dropped_frame_columns() -> std::collections::HashSet<String>
+{
+    DROPPED_FRAME_COLUMNS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Phase 1: Build reverse map from state variable index to MIR local.
     ///
@@ -378,6 +421,162 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// Textbook backward liveness over MIR locals, used to REMOVE state columns
+    /// the forward analysis cannot.
+    ///
+    /// `compute_forward_per_block_liveness` keeps a column unless the local is
+    /// storage-dead at block entry AND unused there — its default arm is
+    /// `live_indices.push(idx)`. So a local that is initialized early and never
+    /// read again rides in every downstream block relation, because nothing
+    /// proves it dead. Measured cost of that: across 15 slow harnesses, 48,746 of
+    /// 61,612 frame columns (79%) are never constrained by any rule reachable from
+    /// the relation carrying them; every frame over 1000 columns is ~80% dead,
+    /// with `kani/Str/utf8.rs` at 41,175 of 50,858. Frame width is the query-size
+    /// driver on the solver-latency bucket, so those columns are not free.
+    ///
+    /// This is the standard dataflow the forward pass is missing:
+    ///   live_out[B] = ⋃ live_in[S] for S ∈ succ(B)
+    ///   live_in[B]  = used[B] ∪ (live_out[B] \ killed[B])
+    /// where `used` is the existing per-block source-operand set and `killed` is
+    /// `StorageDead`. A local absent from `live_in[B]` is read on no path out of
+    /// B, so carrying it through B's relation cannot affect any obligation.
+    ///
+    /// Deliberately RESTRICT-ONLY, and run before `enforce_atomic_flattened_liveness`
+    /// / `propagate_ref_target_liveness` so those repair passes can put back whole
+    /// flattened field groups and pointer-mediated pointees. Only columns that map
+    /// to a MIR local are eligible; ambient state (heap metadata, shadow memory,
+    /// vtables, mutable statics, memory arrays) is never touched.
+    fn restrict_to_backward_live_locals(
+        &self,
+        result: &mut [Vec<usize>],
+        state_idx_to_local: &HashMap<usize, usize>,
+    ) {
+        let block_count = self.body.blocks.len();
+        if block_count == 0 || result.len() != block_count {
+            return;
+        }
+        let used_per_block = Self::compute_used_locals_per_block(self.body);
+        let killed_per_block: Vec<HashSet<usize>> = self
+            .body
+            .blocks
+            .iter()
+            .map(|block| {
+                block
+                    .statements
+                    .iter()
+                    .filter_map(|stmt| match &stmt.kind {
+                        rustc_public::mir::StatementKind::StorageDead(local) => Some(*local),
+                        _ => None, // external enum: StatementKind
+                    })
+                    .collect()
+            })
+            .collect();
+        let successors: Vec<Vec<usize>> = self
+            .body
+            .blocks
+            .iter()
+            .map(|block| Self::block_successors(&block.terminator.kind))
+            .collect();
+
+        // Worklist to fixpoint. The bound mirrors `propagate_backward_liveness`:
+        // if it is ever hit the sets are incomplete, so bail without restricting
+        // rather than drop a column that might be live.
+        let mut live_in: Vec<HashSet<usize>> = used_per_block.clone();
+        let max_iters = block_count.saturating_mul(block_count).saturating_add(block_count) + 16;
+        let mut iters = 0usize;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for bb in (0..block_count).rev() {
+                iters += 1;
+                if iters > max_iters {
+                    tracing::debug!(
+                        block_count,
+                        "backward liveness: iteration bound hit; skipping restriction"
+                    );
+                    return;
+                }
+                let mut merged: HashSet<usize> = HashSet::new();
+                for &succ in &successors[bb] {
+                    if succ < block_count {
+                        merged.extend(live_in[succ].iter().copied());
+                    }
+                }
+                for k in &killed_per_block[bb] {
+                    merged.remove(k);
+                }
+                merged.extend(used_per_block[bb].iter().copied());
+                if merged.len() != live_in[bb].len() || !merged.is_subset(&live_in[bb]) {
+                    live_in[bb] = merged;
+                    changed = true;
+                }
+            }
+        }
+
+        // Columns that `build_state_idx_to_local_map` ALIASES onto a MIR local.
+        // That map is a PROTECT marker (#2978: "Associate auxiliary pointee state
+        // vars with their argument locals so they are treated as local-backed and
+        // survive the non-local pruning"), so reading it as a kill-list inverts its
+        // polarity: an ambient column would be dropped whenever the unrelated local
+        // it was aliased onto happens to be dead. `static_ref_to_state_idx` is also
+        // keyed by REF local, and several ref locals can alias one static, so the
+        // `insert` is last-writer-wins over HashMap iteration order — attributing a
+        // static's column to a nondeterministically chosen local, and with it the
+        // liveness decision. Excluding these keeps the map's intended direction and
+        // removes that nondeterminism from the emitted VC.
+        let ambient_protected: std::collections::HashSet<usize> = self
+            .ref_resolution
+            .mutable_static_state_idxs
+            .iter()
+            .copied()
+            .chain(self.ref_resolution.static_ref_to_state_idx.values().copied())
+            .chain(self.ref_resolution.ref_arg_pointee_idx.values().copied())
+            .collect();
+
+        let mut removed = 0usize;
+        let mut dropped_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (bb, indices) in result.iter_mut().enumerate() {
+            let live = &live_in[bb];
+            let before = indices.len();
+            indices.retain(|idx| {
+                if ambient_protected.contains(idx) {
+                    return true;
+                }
+                let keep = match state_idx_to_local.get(idx) {
+                    // A FLATTENED aggregate's field slots are all keyed to the base
+                    // local, so a single `retain` kills the whole group — and
+                    // `enforce_atomic_flattened_liveness` iterates the SURVIVING set,
+                    // so it cannot restore a group that was wholly removed. Worse,
+                    // `used` cannot see field reads at all: `collect_place_index_locals`
+                    // records only `ProjectionElem::Index`, so `L.field` never marks `L`
+                    // used. Both together make MIR liveness structurally wrong for
+                    // these locals — observed as `_check_utf8_1_fld2__out` surviving in
+                    // the encoding of the corpus's widest frame (kani/Str/utf8.rs,
+                    // ~49,805 columns) after its group had been dropped.
+                    Some(local) if self.flatten.flattened_tuple_locals.contains(local) => true,
+                    Some(local) => live.contains(local),
+                    None => true, // ambient state var: never restricted here
+                };
+                if !keep {
+                    if let Some((name, _)) = self.state_var_mgr.state_vars.get(*idx) {
+                        dropped_names.insert(name.to_string());
+                    }
+                    if let Some((name, _)) = self.state_var_mgr.output_state_vars.get(*idx) {
+                        dropped_names.insert(name.to_string());
+                    }
+                }
+                keep
+            });
+            removed += before - indices.len();
+        }
+        if !dropped_names.is_empty() {
+            DROPPED_FRAME_COLUMNS.with(|c| c.borrow_mut().extend(dropped_names));
+        }
+        if removed > 0 {
+            tracing::debug!(removed, "backward liveness: restricted dead state columns");
+        }
+    }
+
     /// Compute per-block live state variable indices from `dead_locals_at_entry`.
     ///
     /// For each basic block, determines which state variables are live at entry:
@@ -398,6 +597,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let state_idx_to_local = self.build_state_idx_to_local_map();
         let mut result = self.compute_forward_per_block_liveness(&state_idx_to_local);
         self.propagate_backward_liveness(&mut result, &state_idx_to_local, retained_blocks);
+        if self.frame_narrowing || frame_narrowing_enabled() {
+            self.restrict_to_backward_live_locals(&mut result, &state_idx_to_local);
+        }
         self.enforce_atomic_flattened_liveness(&mut result, &state_idx_to_local);
         self.propagate_ref_target_liveness(&mut result, &state_idx_to_local);
 

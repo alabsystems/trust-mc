@@ -55,7 +55,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             args.first().and_then(|arg| self.resolve_slice_backing(arg, modified_locals));
         let input_len = slice_backing
             .as_ref()
-            .map(|backing| backing.len.clone())
+            .map(|backing| backing.len.as_expr().clone())
             .or_else(|| self.vec_from_slice_input_len(args));
 
         if let Some(len_expr) = input_len.clone() {
@@ -114,8 +114,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 ptr_sort_val,
             );
             let data = if let Some(backing) = slice_backing.as_ref() {
-                let uses_exact_data = backing.data.sort() == &data_sort
-                    && Self::is_zero_pointer_width_bitvec(&backing.offset);
+                let uses_exact_data = backing.data.as_expr().sort() == &data_sort
+                    && Self::is_zero_pointer_width_bitvec(backing.offset.as_expr());
                 if !uses_exact_data {
                     self.record_aggregate_gap("vec_from_slice_data_sort_or_offset_mismatch");
                 }
@@ -212,8 +212,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .and_then(|c| c.field_sort(vec_layout::FLD_DATA))
                 .unwrap_or_else(|| Sort::array(ptr_sort(), ptr_sort()));
             let data = if let Some(backing) = slice_backing.as_ref() {
-                let uses_exact_data = backing.data.sort() == &data_sort
-                    && Self::is_zero_pointer_width_bitvec(&backing.offset);
+                let uses_exact_data = backing.data.as_expr().sort() == &data_sort
+                    && Self::is_zero_pointer_width_bitvec(backing.offset.as_expr());
                 if !uses_exact_data {
                     self.record_aggregate_gap("vec_from_slice_dt_data_sort_or_offset_mismatch");
                 }

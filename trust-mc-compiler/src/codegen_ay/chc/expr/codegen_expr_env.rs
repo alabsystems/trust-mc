@@ -248,7 +248,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             Rvalue::UnaryOp(UnOp::PtrMetadata, operand) => {
                 // PtrMetadata in closure/expr context: use same logic as statement path.
-                self.translate_ptr_metadata(operand, &HashSet::new())
+                self.translate_ptr_metadata(operand, &HashSet::new()).map(|meta| meta.into_expr())
             }
             Rvalue::UnaryOp(op, operand) => {
                 // Part of #3043: derive BV width from operand's MIR type.

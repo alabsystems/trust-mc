@@ -19,13 +19,19 @@ use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
 use super::ptr_receiver_mem;
+use crate::codegen_ay::provenance::{MaybeLoc, Val};
 
 /// Re-export: load from CHC memory model at a given address.
+/// A load is the one legal `Loc -> Val` crossing, so this is the one place in
+/// the atomic path where an address becomes a datum. The address half is a
+/// [`MaybeLoc`] because that is what the receiver resolver can honestly report
+/// (§4 item 10); the *result* is unambiguous — whatever was read out of memory
+/// is a value.
 pub(in crate::codegen_ay::chc) fn atomic_load_from_memory(
     ctx: &mut ChcCtx<'_, '_>,
-    addr: &Expr,
+    addr: &MaybeLoc,
     pointee_ty: Ty,
-) -> Option<Expr> {
+) -> Option<Val> {
     ptr_receiver_mem::load_from_memory(ctx, addr, pointee_ty)
 }
 
@@ -39,24 +45,40 @@ pub(in crate::codegen_ay::chc) fn drain_atomic_pending_checks(
 }
 
 /// Re-export: resolve raw pointer operand to (addr, pointee_ty).
+///
+/// The address half is a [`MaybeLoc`]: `Known` when the encoder built it from a
+/// traced allocation id, `Unknown` when it came from a general operand
+/// translation that reports no provenance.
 pub(in crate::codegen_ay::chc) fn atomic_receiver_mem_target(
     ctx: &mut ChcCtx<'_, '_>,
     arg: &rustc_public::mir::Operand,
     modified_locals: &std::collections::HashSet<usize>,
-) -> Option<(Expr, Ty)> {
+) -> Option<(MaybeLoc, Ty)> {
     ptr_receiver_mem::receiver_mem_target(ctx, arg, modified_locals)
 }
 
 /// Re-export: emit memory-backed store transition.
+///
+/// `value` and `addr` used to be two adjacent `Expr` parameters — one datum,
+/// one address, same type, trivially transposable at any call site. That is the
+/// canonical slot-misalign shape (see wave 13), and typing them [`Val`] and
+/// [`MaybeLoc`] makes the transposition a compile error.
 pub(in crate::codegen_ay::chc) fn emit_atomic_mem_store_transition(
     ctx: &mut ChcCtx<'_, '_>,
     dcx: &DispatchCallContext<'_>,
     target: BasicBlockIdx,
-    value: Expr,
-    addr: Expr,
+    value: Val,
+    addr: MaybeLoc,
     pointee_ty: Ty,
 ) -> bool {
-    ptr_receiver_mem::emit_mem_store_transition(ctx, dcx, target, value, addr, pointee_ty)
+    ptr_receiver_mem::emit_mem_store_transition(
+        ctx,
+        dcx,
+        target,
+        value.into_expr(),
+        addr.into_addr_expr(),
+        pointee_ty,
+    )
 }
 
 /// Re-export: emit constraints for RMW when receiver is heap-addressable.
@@ -66,7 +88,7 @@ pub(in crate::codegen_ay::chc) fn emit_rmw_constraints_mem(
     target: BasicBlockIdx,
     old_value: Expr,
     new_value: Expr,
-    addr: Expr,
+    addr: MaybeLoc,
     pointee_ty: Ty,
 ) {
     let dest_local: usize = dcx.destination.local;
@@ -83,7 +105,7 @@ pub(in crate::codegen_ay::chc) fn emit_rmw_constraints_mem(
 
     // Part of #3710: build_memory_store accumulates into store chains
     // (returns None on success). Drain via drain_pending_updates below.
-    ctx.build_memory_store(addr, new_value, pointee_ty);
+    ctx.build_memory_store_untyped(addr.into_addr_expr(), new_value, pointee_ty);
     ptr_receiver_mem::drain_pending_updates(ctx, &mut extra);
 
     let out = ctx.build_output_args(dcx.modified_locals, &[dest_local]);

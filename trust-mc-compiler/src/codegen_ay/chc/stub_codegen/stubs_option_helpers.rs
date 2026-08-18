@@ -78,9 +78,27 @@ pub(in crate::codegen_ay::chc) fn option_value_sort(option_sort: &Sort) -> Optio
             return constructor.fields.first().map(|field| field.sort.clone());
         }
     }
-    for constructor in &dt.constructors {
-        if constructor.fields.len() == 1 && !names::is_none_constructor(&constructor.name) {
-            return Some(constructor.fields[0].sort.clone());
+    // The single-field fallback only makes sense for an Option-LIKE type, which by
+    // definition has at least two variants (a payload variant and a nullary one).
+    // A datatype with ONE constructor is a struct/newtype, and unwrapping it here
+    // hands back the FIELD's sort where callers need the NOMINAL sort.
+    //
+    // That mismatch is not cosmetic: `std::io::Error` is
+    // `(declare-datatype Error ((Error_mk (fld_repr Repr))))`, so this loop returned
+    // `Repr`, the nested-call fallback declared its havoc var at `Repr`, and the rule
+    // then passed it to `Err_Result_usize_std_io_Error`, whose field is declared
+    // `Error`. ay-chc rejects that at PARSE time —
+    //     Function 'Err_Result_usize_std_io_Error' expected argument sort Error, got Repr
+    // — and a parse error aborts the WHOLE problem, so the harness is scored
+    // inconclusive having never been solved (kani/FatPointers/boxmuttrait{,_fail}.rs).
+    //
+    // Returning None here makes callers keep the nominal sort, which is the sort the
+    // datatype declaration actually uses.
+    if dt.constructors.len() >= 2 {
+        for constructor in &dt.constructors {
+            if constructor.fields.len() == 1 && !names::is_none_constructor(&constructor.name) {
+                return Some(constructor.fields[0].sort.clone());
+            }
         }
     }
     None

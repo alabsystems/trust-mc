@@ -14,6 +14,8 @@
 
 use super::*;
 
+use crate::codegen_ay::provenance::{Loc, Val};
+
 const ARITH_PROBE_SOURCE: &str = r#"
 pub fn probe(x: u32, y: u32) -> u32 { x.wrapping_add(y) }
 "#;
@@ -421,8 +423,8 @@ fn test_emit_offset_overflow_check_nonzst_three_violations() {
 
         let violations_before = codegen.ctx.bmc_vc.violations.len();
 
-        let ptr = Expr::var("p", Sort::bitvec(POINTER_WIDTH));
-        let count = Expr::var("c", Sort::bitvec(POINTER_WIDTH));
+        let ptr = Loc::of_address(Expr::var("p", Sort::bitvec(POINTER_WIDTH)));
+        let count = Val::of_value(Expr::var("c", Sort::bitvec(POINTER_WIDTH)));
         codegen.emit_offset_overflow_check(&ptr, &count, 8); // u64 pointee
 
         assert_eq!(
@@ -447,8 +449,8 @@ fn test_emit_offset_overflow_check_size1_two_violations() {
 
         let violations_before = codegen.ctx.bmc_vc.violations.len();
 
-        let ptr = Expr::var("p", Sort::bitvec(POINTER_WIDTH));
-        let count = Expr::var("c", Sort::bitvec(POINTER_WIDTH));
+        let ptr = Loc::of_address(Expr::var("p", Sort::bitvec(POINTER_WIDTH)));
+        let count = Val::of_value(Expr::var("c", Sort::bitvec(POINTER_WIDTH)));
         codegen.emit_offset_overflow_check(&ptr, &count, 1); // u8 pointee
 
         assert_eq!(
@@ -473,8 +475,8 @@ fn test_emit_offset_overflow_check_zst_one_violation() {
 
         let violations_before = codegen.ctx.bmc_vc.violations.len();
 
-        let ptr = Expr::var("p", Sort::bitvec(POINTER_WIDTH));
-        let count = Expr::var("c", Sort::bitvec(POINTER_WIDTH));
+        let ptr = Loc::of_address(Expr::var("p", Sort::bitvec(POINTER_WIDTH)));
+        let count = Val::of_value(Expr::var("c", Sort::bitvec(POINTER_WIDTH)));
         codegen.emit_offset_overflow_check(&ptr, &count, 0); // ZST
 
         assert_eq!(
@@ -497,8 +499,8 @@ fn test_emit_offset_overflow_check_noop_for_non_bitvec_ptr() {
 
         let violations_before = codegen.ctx.bmc_vc.violations.len();
 
-        let ptr = Expr::var("p", Sort::int());
-        let count = Expr::var("c", Sort::bitvec(64));
+        let ptr = Loc::of_address(Expr::var("p", Sort::int()));
+        let count = Val::of_value(Expr::var("c", Sort::bitvec(64)));
         codegen.emit_offset_overflow_check(&ptr, &count, 8);
 
         assert_eq!(
@@ -522,8 +524,8 @@ fn test_emit_offset_overflow_check_zst_extra_checks_adds_provenance_violation() 
 
         let violations_before = codegen.ctx.bmc_vc.violations.len();
 
-        let ptr = Expr::var("p", Sort::bitvec(POINTER_WIDTH));
-        let count = Expr::var("c", Sort::bitvec(POINTER_WIDTH));
+        let ptr = Loc::of_address(Expr::var("p", Sort::bitvec(POINTER_WIDTH)));
+        let count = Val::of_value(Expr::var("c", Sort::bitvec(POINTER_WIDTH)));
         codegen.emit_offset_overflow_check(&ptr, &count, 0);
 
         assert_eq!(

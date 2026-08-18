@@ -175,7 +175,7 @@ fn test_translate_ref_field_projection() {
                         addr.is_some(),
                         "translate_ref_to_address should handle field projection"
                     );
-                    let addr_expr = addr.unwrap();
+                    let addr_expr = addr.unwrap().into_expr();
                     assert!(
                         addr_expr.sort().is_bitvec(),
                         "result address should be bitvec, got: {:?}",
@@ -248,7 +248,7 @@ fn test_translate_ref_indexed_custom_dst_field_extracts_storage_addr() {
                         addr.is_some(),
                         "translate_ref_to_address should handle custom-DST field refs"
                     );
-                    let addr_expr = addr.unwrap();
+                    let addr_expr = addr.unwrap().into_expr();
                     assert_eq!(
                         addr_expr.sort().bitvec_width(),
                         Some(64),
@@ -290,7 +290,7 @@ fn test_translate_ref_base_local_no_projection() {
         let place = rustc_public::mir::Place { local: 1, projection: Vec::new() };
         let addr = chc_ctx.translate_ref_to_address(&place, &modified);
         assert!(addr.is_some(), "base local address should be available");
-        let addr_expr = addr.unwrap();
+        let addr_expr = addr.unwrap().into_expr();
         assert!(
             addr_expr.sort().is_bitvec(),
             "base address should be bitvec, got: {:?}",

@@ -22,6 +22,8 @@ use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
+use crate::codegen_ay::provenance::{Loc, MaybeLoc, Val, is_value_widened_into_address};
+use crate::codegen_ay::ptr_repr::PtrSlot;
 
 /// Resolve the MIR local that a pointer operand points to via `ref_targets`.
 ///
@@ -46,28 +48,72 @@ pub(in crate::codegen_ay::chc) fn resolve_ptr_target_local(
     Some(ref_target.local)
 }
 
-/// Resolve a raw pointer operand to a BV64 address plus pointee type.
+/// Resolve a raw pointer operand to an address plus pointee type.
 ///
 /// Works for heap-backed receivers where the pointee has no stack-local owner
 /// (e.g. `AtomicUsize::from_ptr(Box::into_raw(...))`).
+///
+/// # Two producers, one slot
+///
+/// The address comes from one of two places, and only one of them knows what it
+/// produced — see `docs/addr-vs-value-conversion-queue.md` §4 item 10, and the
+/// [`MaybeLoc`] docs for what this wave did and did not close:
+///
+/// * a traced allocation id, packed into `concat(obj_id, 0)`. The encoder built
+///   that expression *as an address*; there is nothing to infer, and the width
+///   test this function used to apply to it was vacuous (the concat is `bv64`
+///   by construction).
+/// * `translate_operand_with_modified`, which serves every operand in the
+///   encoder and reports nothing about what it returned. Here the pointer-shape
+///   test is a real filter, and it is the only guess left in this function.
 pub(in crate::codegen_ay::chc) fn receiver_mem_target(
     ctx: &mut ChcCtx<'_, '_>,
     arg: &Operand,
     modified_locals: &std::collections::HashSet<usize>,
-) -> Option<(Expr, Ty)> {
+) -> Option<(MaybeLoc, Ty)> {
     let pointee_ty = arg.ty(ctx.body.locals()).ok().and_then(|ty| match ty.kind() {
         TyKind::RigidTy(RigidTy::RawPtr(pointee, _))
         | TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => Some(pointee),
         _ => None,
     })?;
-    let addr = match arg {
-        Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => ctx
-            .trace_deref_store_alloc_id(place.local)
-            .map(|obj_id| Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32)))
-            .or_else(|| ctx.translate_operand_with_modified(arg, modified_locals)),
-        _ => ctx.translate_operand_with_modified(arg, modified_locals),
-    }?;
-    (addr.sort().bitvec_width() == Some(64)).then_some((addr, pointee_ty))
+    let traced_alloc = match arg {
+        Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+            ctx.trace_deref_store_alloc_id(place.local)
+        }
+        _ => None,
+    };
+    if let Some(obj_id) = traced_alloc {
+        // An object id paired with a zero offset: an address by construction.
+        let addr = Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32));
+        return Some((MaybeLoc::Known(Loc::of_address(addr)), pointee_ty));
+    }
+    let translated = ctx.translate_operand_with_modified(arg, modified_locals)?;
+    // Unknown provenance, and NOT upgradable: the operand's MIR type says
+    // `RawPtr`/`Ref` (that is what produced `pointee_ty` above), but references
+    // are modelled transparently in this encoding, so the translated term is
+    // equally the pointer's own datum and the REFERENT's. A width test cannot
+    // separate those, and neither can this one — which is why the result stays
+    // `Unknown` rather than becoming a `Loc`.
+    //
+    // Two things did change. The shape question is asked of the DECLARED sort
+    // via `PtrSlot` (`Thin` is exactly the `== POINTER_WIDTH` the literal `64`
+    // used to spell), so it is visibly a representation test and not a
+    // provenance one. And the one fabrication that IS decidable here is now
+    // refused: a narrow value zero/sign-extended into pointer width can never be
+    // a real address — the split-pointer model reads its all-zero upper half as
+    // obj_id, i.e. the null object — so `is_value_widened_into_address` fails it
+    // closed instead of handing every `as_addr_expr` consumer a guess that is
+    // known to be wrong.
+    //
+    // What remains open is §4 item 10 proper: `Unknown` still does not fail
+    // closed for the shapes that are merely unproven rather than disproven.
+    // That is a coverage change and has to be measured against the burndown.
+    if is_value_widened_into_address(&translated) {
+        debug!("receiver_mem_target: widened-value operand refused as an address");
+        return None;
+    }
+    matches!(PtrSlot::of_sort(translated.sort()), Some(PtrSlot::Thin))
+        .then_some((MaybeLoc::Unknown(translated), pointee_ty))
 }
 
 /// Load a value from the CHC memory model at a given address.
@@ -75,13 +121,25 @@ pub(in crate::codegen_ay::chc) fn receiver_mem_target(
 /// Phase 1: concrete address → extract obj_id → owning local's type.
 /// Phase 2: if pointee array unwritten, find aliased array with same elem_sort.
 /// Part of #3452, #3697.
+///
+/// # Why the parameter is a [`MaybeLoc`] and not a [`Loc`]
+///
+/// This is the receiver-side half of keystone A, and its callers split exactly
+/// the way §4 item 10 predicts. Two of them (`atomic_load_from_memory`, the
+/// volatile intrinsic path) already hold a [`MaybeLoc`] from
+/// `receiver_mem_target` and were unwrapping it with `as_addr_expr` on the way
+/// in. The other two hand over a translated call argument
+/// (`atomic_inline`'s `translated_args[0]`) or byte-offset arithmetic on a
+/// `data_ptr` parameter (`cmp_array`) — neither of which can say what it
+/// produced, so they now say [`MaybeLoc::Unknown`] out loud instead of letting a
+/// bare `Expr` imply an address it never established.
 pub(in crate::codegen_ay::chc) fn load_from_memory(
     ctx: &mut ChcCtx<'_, '_>,
-    addr: &Expr,
+    addr: &MaybeLoc,
     pointee_ty: Ty,
-) -> Option<Expr> {
+) -> Option<Val> {
     // Phase 1: Concrete addresses — resolve owning local's type.
-    let load_ty = ChcCtx::try_extract_obj_id(addr)
+    let load_ty = ChcCtx::try_extract_obj_id(addr.as_addr_expr())
         .and_then(|obj_id| ctx.heap_state.local_idx_for_obj_id(obj_id))
         .and_then(|local_idx| ctx.body.locals().get(local_idx))
         .map(|decl| decl.ty)
@@ -97,7 +155,17 @@ pub(in crate::codegen_ay::chc) fn load_from_memory(
         .unwrap_or(false);
 
     if arr_written {
-        return ctx.load_from_memory(addr.clone(), load_ty);
+        // DELIBERATELY still on the untyped entry. Re-tagging a `MaybeLoc` as a
+        // `Loc` here would launder `Unknown` into a claim the caller never
+        // made, which is the exact failure mode this campaign exists to
+        // prevent — worse than leaving the crossing untyped, because it would
+        // look converted. The deprecation warning is the marker for the
+        // residual §4 item 10 work: make `Unknown` fail closed, which is a
+        // coverage change and has to be measured against the burndown.
+        #[allow(deprecated)]
+        return ctx
+            .load_from_memory_untyped(addr.as_addr_expr().clone(), load_ty)
+            .map(Val::of_value);
     }
 
     // Phase 2: search for aliased repr(transparent) array with matching elem_sort.
@@ -123,11 +191,13 @@ pub(in crate::codegen_ay::chc) fn load_from_memory(
             alt_key = %alt_key,
             "ptr_receiver: repr(transparent) alias fallback (#3452)"
         );
-        return Some(arr_expr.select(addr.clone()));
+        return Some(Val::of_value(arr_expr.select(addr.as_addr_expr().clone())));
     }
 
     // No aliased array found — fall back to primary (value will be unconstrained).
-    ctx.load_from_memory(addr.clone(), load_ty)
+    // Untyped for the same reason as the `arr_written` lane above.
+    #[allow(deprecated)]
+    ctx.load_from_memory_untyped(addr.as_addr_expr().clone(), load_ty).map(Val::of_value)
 }
 
 /// Register a raw-pointer argument as call-forwarded when its ref_target resolves.
@@ -198,7 +268,7 @@ pub(in crate::codegen_ay::chc) fn emit_mem_store_transition(
     // build_memory_store accumulates the store into heap store chains
     // and returns None (success). The accumulated constraint is flushed
     // by drain_pending_updates → drain_store_chains below.
-    ctx.build_memory_store(addr, value, pointee_ty);
+    ctx.build_memory_store_untyped(addr, value, pointee_ty);
 
     let mut extra = Vec::new();
     drain_pending_updates(ctx, &mut extra);

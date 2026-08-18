@@ -36,6 +36,13 @@ pub struct RunConfig {
     /// (byte-identical to pre-`--surface` behavior); `Native` re-keys each
     /// expressible single-file unit to `#[kani::harness]` before compilation.
     pub surface: Surface,
+    /// Extra flags appended verbatim to every driver invocation.
+    ///
+    /// Exists so a backend knob can be A/B'd across the whole corpus WITHOUT
+    /// editing the runner (e.g. deciding whether bounded-loop unrolling should
+    /// become a default). Recorded in the run header so a flagged run can never
+    /// be mistaken for a stock one.
+    pub extra_driver_flags: Vec<String>,
 }
 
 impl RunConfig {
@@ -154,6 +161,9 @@ fn run_one(env: &Env, test: &Discovered, cfg: &RunConfig) -> TestResult {
         native_proof_accepted: false,
         ctrex_category: None,
         unknown_reason: None,
+        unknown_category: None,
+        unknown_category_detail: None,
+        demotion_reasons: Vec::new(),
         self_reported_unsound: false,
         duration_ms: 0,
         exit_code: None,
@@ -225,6 +235,9 @@ fn run_one(env: &Env, test: &Discovered, cfg: &RunConfig) -> TestResult {
         }
     }
 
+    // Built as a closure so an outer-watchdog kill can be RETRIED once; see the
+    // retry below for why that is a measurement fix, not budget laundering.
+    let build_cmd = || {
     let mut cmd = Command::new(&env.verifier);
     let outer_timeout = match &test.kind {
         EntryKind::SingleFile { harness_count } => {
@@ -254,9 +267,12 @@ fn run_one(env: &Env, test: &Discovered, cfg: &RunConfig) -> TestResult {
     if !test.rustflags.is_empty() {
         cmd.env("RUSTFLAGS", test.rustflags.join(" "));
     }
+        (cmd, outer_timeout)
+    };
 
     let start = Instant::now();
-    let (out, err, exit, timed_out) = match spawn_with_timeout(cmd, outer_timeout) {
+    let (cmd, outer_timeout) = build_cmd();
+    let (mut out, mut err, mut exit, mut timed_out) = match spawn_with_timeout(cmd, outer_timeout) {
         Ok(v) => v,
         Err(e) => {
             result.note = format!("spawn-failed: {e}");
@@ -264,6 +280,34 @@ fn run_one(env: &Env, test: &Discovered, cfg: &RunConfig) -> TestResult {
             return result;
         }
     };
+    // RETRY ONCE ON AN OUTER-WATCHDOG KILL.
+    //
+    // The outer watchdog is a harness-level backstop, not a verdict. With
+    // `--jobs N` the corpus runs N tests concurrently, and a large fraction of
+    // this corpus sits at 40-80s against a 105s ceiling, so a load spike from
+    // co-scheduled peers pushes an otherwise-passing row over the edge and it
+    // is recorded as `unknown`. MEASURED: `arbitrary/enums/main.rs` (52s),
+    // `function-contract/history/block.rs` (52s) and
+    // `bounded-arbitrary/reverse_vec/vec.rs` (79s) each answered CORRECTLY when
+    // re-run alone, having been killed at 102s/55s/110s inside a 3-job run.
+    // Attributing those flips to a code change is simply wrong, and it has
+    // burned real debugging time.
+    //
+    // This is NOT extra budget: the retry gets the SAME `outer_timeout`, so a
+    // row that genuinely needs longer still fails. It only removes the
+    // dependence on what happened to be running alongside it. Retries are
+    // recorded in the note so the number stays auditable.
+    let mut retried_after_outer_timeout = false;
+    if timed_out {
+        retried_after_outer_timeout = true;
+        let (cmd2, outer_timeout2) = build_cmd();
+        if let Ok((o2, e2, x2, t2)) = spawn_with_timeout(cmd2, outer_timeout2) {
+            out = o2;
+            err = e2;
+            exit = x2;
+            timed_out = t2;
+        }
+    }
     result.duration_ms = start.elapsed().as_millis() as u64;
     result.exit_code = exit;
 
@@ -301,6 +345,9 @@ fn run_one(env: &Env, test: &Discovered, cfg: &RunConfig) -> TestResult {
     }
     if result.note.is_empty() {
         result.note = note_for(&result, timed_out, &combined, test.check_fail);
+    }
+    if retried_after_outer_timeout {
+        result.note = format!("{} [retried-after-outer-timeout]", result.note);
     }
     // Reclaim the per-test artifact dir (rmeta/rlib/smt2) — the verdict is
     // captured, so ~20MB/test * thousands of tests need not accumulate.
@@ -349,6 +396,9 @@ fn sanitize_flags(raw: &[String], cfg: &RunConfig) -> Vec<String> {
     if !has_htimeout {
         out.push(format!("--harness-timeout={}s", cfg.harness_timeout_s));
     }
+    // Appended last so an operator-supplied knob wins over the corpus's own
+    // kani-flags, and so an A/B of a backend default needs no runner edit.
+    out.extend(cfg.extra_driver_flags.iter().cloned());
     out
 }
 
@@ -425,6 +475,10 @@ fn parse_markers(s: &str, r: &mut TestResult) {
     r.sound_fallback = sum_marker(s, "[AY:SOUND_FALLBACK:");
     r.ctrex_category = marker_value(s, "[AY:CTREX_CAT:");
     r.unknown_reason = marker_value(s, "[AY:UNKNOWN_REASON:");
+    let (category, detail) = parse_unknown_category(s);
+    r.unknown_category = category;
+    r.unknown_category_detail = detail;
+    r.demotion_reasons = marker_csv_values(s, "[AY:DEMOTION_REASONS:");
     r.self_reported_unsound = s.contains("created fresh unconstrained")
         || s.contains("pointee_synthesis_fallback")
         || s.contains("unconstrained_assignment")
@@ -432,6 +486,46 @@ fn parse_markers(s: &str, r: &mut TestResult) {
 }
 
 /// Extract the `<value>` from the first `prefix<value>]` marker.
+/// Parse the driver's `[AY:UNKNOWN-CATEGORY] <free text>` line into a
+/// (normalized key, raw detail) pair.
+///
+/// Unlike the other markers this one closes its bracket BEFORE the payload, so
+/// the value is the remainder of the LINE rather than a bracketed token — the
+/// `marker_value` helpers cannot read it.
+///
+/// The keys mirror the driver's `UnknownCategory` variants
+/// (`call_ay/chc/native.rs`). Matching is on stable ASCII substrings, never on
+/// the leading `≥`/`—` punctuation, so an encoding change cannot silently
+/// reclassify a bucket. An unrecognized line yields `Other` and keeps its raw
+/// text, so a NEW driver category shows up as visibly unmapped instead of being
+/// dropped.
+fn parse_unknown_category(s: &str) -> (Option<String>, Option<String>) {
+    const TAG: &str = "[AY:UNKNOWN-CATEGORY]";
+    let idx = match s.find(TAG) {
+        Some(i) => i,
+        None => return (None, None),
+    };
+    let rest = &s[idx + TAG.len()..];
+    let line = rest.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return (None, None);
+    }
+    let key = if line.contains("Array-sorted state parameters") {
+        "ArrayParamLimit"
+    } else if line.contains("PDR invariant synthesis timeout") {
+        "PdrTimeout"
+    } else if line.contains("solver error (engine=") {
+        "SolverError"
+    } else if line.contains("no error rule encoded") {
+        "NoErrorRule"
+    } else if line.contains("uncategorized") {
+        "Uncategorized"
+    } else {
+        "Other"
+    };
+    (Some(key.to_string()), Some(line.to_string()))
+}
+
 fn marker_value(s: &str, prefix: &str) -> Option<String> {
     let idx = s.find(prefix)?;
     let rest = &s[idx + prefix.len()..];
@@ -439,6 +533,26 @@ fn marker_value(s: &str, prefix: &str) -> Option<String> {
     // The value may itself be `Cat:detail`; keep only the leading token.
     let v = &rest[..end];
     Some(v.split([':', ' ']).next().unwrap_or(v).to_string())
+}
+
+/// Collect the comma-separated values of EVERY `prefix<a,b,c>]` occurrence,
+/// de-duplicated, preserving first-seen order. A multi-harness file prints one
+/// marker per demoted harness, so a single scan is not enough.
+fn marker_csv_values(s: &str, prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = s;
+    while let Some(idx) = rest.find(prefix) {
+        rest = &rest[idx + prefix.len()..];
+        let end = rest.find(']').unwrap_or(rest.len());
+        for tok in rest[..end].split(',') {
+            let tok = tok.trim();
+            if !tok.is_empty() && !out.iter().any(|seen| seen == tok) {
+                out.push(tok.to_string());
+            }
+        }
+        rest = &rest[end..];
+    }
+    out
 }
 
 fn sum_marker(s: &str, needle: &str) -> u32 {
@@ -467,6 +581,22 @@ fn failure_quality(s: &str, r: &TestResult) -> (bool, bool) {
         || cat == Some("OverApproximation")
         || s.contains("ay-chc inconclusive")
         || r.unknown_reason.is_some()
+        // A DEMOTED PROOF is not a counterexample. The driver classifies CTREX
+        // only for non-demoted failures (harness_runner.rs:573), so a demoted
+        // proof emits `[AY:DEMOTION_REASONS:…]` and NO `[AY:CTREX_CAT:…]` at
+        // all. Without this disjunct such a row was read as a genuine cex:
+        // oracle=fail credited PARITY for a result with no counterexample, and
+        // oracle=success was blamed as a FalsePositive it never earned. The
+        // multi-harness lane already fail-closes on precisely this state
+        // (`cats.is_empty()`, see classify_multi_harness_fail), so the two lanes
+        // disagreed on identical driver output; this aligns them.
+        //
+        // Deliberately gated on `!demotion_reasons.is_empty()` rather than
+        // `cat.is_none()` alone: a bare cat-less FAILED can also come from a
+        // driver predating the marker, and tainting those would over-reject.
+        // Demotion reasons are positive evidence that the FAILED was originally
+        // a PROOF.
+        || (cat.is_none() && !r.demotion_reasons.is_empty())
         || (breakdown_count(s, "Genuine") == 0
             && (breakdown_count(s, "Unknown") > 0 || breakdown_count(s, "OverApproximation") > 0));
     (encoding_gap, inconclusive)
@@ -1082,7 +1212,9 @@ mod tests {
             suite: "t".into(), file: "f.rs".into(), oracle, observed: None,
             classification: None, sound_fallback: 0, effective_success: false,
             proof_marker: false, native_proof_accepted: false, ctrex_category: None,
-            unknown_reason: None, self_reported_unsound: false, duration_ms: 0,
+            unknown_reason: None, unknown_category: None, unknown_category_detail: None,
+            demotion_reasons: vec![], self_reported_unsound: false,
+            duration_ms: 0,
             exit_code: exit, flags: vec![], note: String::new(), rekey: None,
         };
         parse_markers(combined, &mut r);
@@ -1114,7 +1246,9 @@ mod tests {
             suite: "".into(), file: "".into(), oracle: V::Success, observed: None,
             classification: None, sound_fallback: 0, effective_success: false,
             proof_marker: false, native_proof_accepted: false, ctrex_category: None,
-            unknown_reason: None, self_reported_unsound: false, duration_ms: 0,
+            unknown_reason: None, unknown_category: None, unknown_category_detail: None,
+            demotion_reasons: vec![], self_reported_unsound: false,
+            duration_ms: 0,
             exit_code: None, flags: vec![], note: String::new(), rekey: None,
         };
         parse_markers(
@@ -1125,6 +1259,108 @@ mod tests {
         assert_eq!(r.ctrex_category.as_deref(), Some("Unknown"));
         assert_eq!(r.unknown_reason.as_deref(), Some("SolverError"));
         assert!(r.self_reported_unsound);
+        assert!(r.demotion_reasons.is_empty(), "no marker => empty, not a phantom entry");
+    }
+
+    /// The `[AY:UNKNOWN-CATEGORY]` line closes its bracket BEFORE the payload,
+    /// so the value is the rest of the line. Normalizing is what makes the
+    /// rollup usable: the raw text carries `predicate=…, array_sorts=…`, which
+    /// would otherwise make every row its own bucket.
+    ///
+    /// This exact line is copied from a real run (prusti/Heapsort.rs), which is
+    /// the whole point of the field — it names the specific ceiling (#4259)
+    /// instead of the useless catch-all `SolverError`.
+    #[test]
+    fn unknown_category_normalizes_and_keeps_detail() {
+        let (key, detail) = parse_unknown_category(
+            "[AY:UNKNOWN-CATEGORY] ≥2 Array-sorted state parameters \
+             (predicate=main__bb0, array_sorts=6) — see #4259\nVERIFICATION:- FAILED\n",
+        );
+        assert_eq!(key.as_deref(), Some("ArrayParamLimit"));
+        assert!(detail.unwrap().contains("array_sorts=6"), "raw detail must survive");
+    }
+
+    /// Each driver-side `UnknownCategory` variant maps to its own key, and an
+    /// UNRECOGNIZED line becomes `Other` rather than being silently dropped —
+    /// so a newly added driver category shows up as visibly unmapped.
+    #[test]
+    fn unknown_category_covers_every_variant_and_flags_new_ones() {
+        for (line, want) in [
+            ("[AY:UNKNOWN-CATEGORY] PDR invariant synthesis timeout (900ms, 2 engine(s) timed out)", "PdrTimeout"),
+            ("[AY:UNKNOWN-CATEGORY] solver error (engine=pdr, stop_reason=NotApplicable)", "SolverError"),
+            ("[AY:UNKNOWN-CATEGORY] no error rule encoded (see #4284)", "NoErrorRule"),
+            ("[AY:UNKNOWN-CATEGORY] uncategorized — see verbose output", "Uncategorized"),
+            ("[AY:UNKNOWN-CATEGORY] something the driver learned to say later", "Other"),
+        ] {
+            let (key, _) = parse_unknown_category(line);
+            assert_eq!(key.as_deref(), Some(want), "line: {line}");
+        }
+    }
+
+    /// Absent tag => both fields stay None (no phantom bucket on the ~88% of
+    /// rows that never print the line).
+    #[test]
+    fn unknown_category_absent_yields_none() {
+        let (key, detail) = parse_unknown_category("VERIFICATION:- SUCCESSFUL\n[AY:PROOF]\n");
+        assert!(key.is_none() && detail.is_none());
+    }
+
+    /// A multi-harness file prints one `[AY:DEMOTION_REASONS:…]` per demoted
+    /// harness. All occurrences are collected, comma-split, de-duplicated,
+    /// first-seen order preserved.
+    #[test]
+    fn demotion_reasons_collected_across_occurrences_and_deduped() {
+        let mut r = TestResult {
+            suite: "".into(), file: "".into(), oracle: V::Fail, observed: None,
+            classification: None, sound_fallback: 0, effective_success: false,
+            proof_marker: false, native_proof_accepted: false, ctrex_category: None,
+            unknown_reason: None, unknown_category: None, unknown_category_detail: None,
+            demotion_reasons: vec![], self_reported_unsound: false,
+            duration_ms: 0,
+            exit_code: None, flags: vec![], note: String::new(), rekey: None,
+        };
+        parse_markers(
+            "[AY:DEMOTION_REASONS:chc_fallback,constant_zero_fallback=1]\n\
+             VERIFICATION:- FAILED\n\
+             [AY:DEMOTION_REASONS:chc_fallback,drop_fallback]\n",
+            &mut r,
+        );
+        assert_eq!(
+            r.demotion_reasons,
+            vec![
+                "chc_fallback".to_string(),
+                "constant_zero_fallback=1".to_string(),
+                "drop_fallback".to_string()
+            ]
+        );
+    }
+
+    /// PARITY INTEGRITY: a demoted proof is not a counterexample, so it may
+    /// never be credited as parity.
+    ///
+    /// A demoted proof carries `[AY:DEMOTION_REASONS:…]` and NO
+    /// `[AY:CTREX_CAT:…]` (the driver classifies CTREX only for non-demoted
+    /// failures, harness_runner.rs:573). Before the fix this row was read as a
+    /// genuine cex: oracle=fail scored `Parity` — a parity credit for a result
+    /// with no counterexample at all — and oracle=success scored
+    /// `FalsePositive`. Both are now `Unknown`, matching what the multi-harness
+    /// lane already did via `cats.is_empty()`.
+    #[test]
+    fn demoted_proof_is_never_credited_as_parity() {
+        let demoted = "[AY:DEMOTION_REASONS:chc_fallback]\nVERIFICATION:- FAILED\n";
+        assert_eq!(classify_output(V::Fail, demoted, false, Some(1)), C::Unknown);
+        assert_eq!(classify_output(V::Success, demoted, false, Some(1)), C::Unknown);
+    }
+
+    /// The taint is gated on demotion EVIDENCE, not merely on a missing
+    /// category: a bare cat-less FAILED (e.g. from a driver predating the
+    /// marker) must keep its previous classification, so the fix cannot
+    /// silently over-reject historical or third-party output.
+    #[test]
+    fn bare_cat_less_failure_is_unaffected_by_the_demotion_taint() {
+        let bare = "VERIFICATION:- FAILED\n";
+        assert_eq!(classify_output(V::Fail, bare, false, Some(1)), C::Parity);
+        assert_eq!(classify_output(V::Success, bare, false, Some(1)), C::FalsePositive);
     }
 
     #[test]
@@ -1500,6 +1736,7 @@ mod tests {
             backend: "chc".into(),
             strip_cbmc: true,
             surface: Surface::Legacy,
+            extra_driver_flags: Vec::new(),
         };
         let base = Duration::from_secs(15 * 5 + 30);
         assert_eq!(cfg.outer_timeout(0), base);
@@ -1547,7 +1784,9 @@ mod tests {
             suite: "t".into(), file: "f.rs".into(), oracle: V::Success, observed: None,
             classification: None, sound_fallback: 0, effective_success: false,
             proof_marker: false, native_proof_accepted: false, ctrex_category: None,
-            unknown_reason: None, self_reported_unsound: false, duration_ms: 0,
+            unknown_reason: None, unknown_category: None, unknown_category_detail: None,
+            demotion_reasons: vec![], self_reported_unsound: false,
+            duration_ms: 0,
             exit_code: Some(1), flags: vec![], note: String::new(), rekey: None,
         };
         parse_markers(out, &mut r);

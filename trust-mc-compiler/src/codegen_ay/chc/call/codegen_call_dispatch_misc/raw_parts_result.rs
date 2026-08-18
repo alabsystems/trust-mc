@@ -20,6 +20,8 @@ use super::super::dyn_coercion::extract_pointer_expr;
 use super::super::{ChcCtx, RelationApp};
 use super::raw_parts_ref_target::propagate_nonnull_from_raw_parts_identity;
 use crate::codegen_ay::names::{self, struct_sort};
+use crate::codegen_ay::provenance::Loc;
+use crate::codegen_ay::ptr_repr::PtrSlot;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -36,7 +38,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let metadata_ty = *fields.get(1)?;
         match metadata_ty.kind() {
             TyKind::RigidTy(RigidTy::Tuple(tys)) if tys.is_empty() => Some(Expr::bool_const(true)),
-            _ => self.translate_ptr_metadata(arg, modified_locals),
+            _ => self.translate_ptr_metadata(arg, modified_locals).map(|meta| meta.into_expr()),
         }
     }
 
@@ -140,7 +142,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let raw_expr = self
             .resolve_ref_operand(arg, modified_locals)
             .or_else(|| self.translate_operand_with_modified(arg, modified_locals));
-        let Some(data_expr) = raw_expr.as_ref().and_then(extract_pointer_expr) else {
+        // `to_raw_parts` puts the data pointer in the RESULT TUPLE's first slot,
+        // i.e. it becomes a datum again; the tag ends at that crossing.
+        let Some(data_expr) = raw_expr.as_ref().and_then(extract_pointer_expr).map(Loc::into_expr)
+        else {
             emit_sound_fallback_goto(
                 self,
                 from_app,
@@ -293,7 +298,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Extract the thin pointer BV from the data argument. The operand
         // may be a NonNull<()> wrapper — extract_pointer_expr peels it.
-        let thin_ptr = extract_pointer_expr(&data_expr).unwrap_or(data_expr);
+        let thin_ptr = extract_pointer_expr(&data_expr).map(Loc::into_expr).unwrap_or(data_expr);
 
         let src_local = args.first().and_then(|arg| match arg {
             rustc_public::mir::Operand::Copy(p) | rustc_public::mir::Operand::Move(p)
@@ -318,12 +323,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         if let Some((_, dest_var)) = self.resolve_destination(dest_local) {
             let dest_sort = dest_var.sort().clone();
-            let result_expr =
-                if dest_sort.is_bitvec() && dest_sort.bitvec_width() == Some(POINTER_WIDTH) {
-                    thin_ptr
-                } else {
-                    vtable_bv.concat(thin_ptr)
-                };
+            // How wide a slot did `translate_ty` give the destination — one
+            // word or two? That is a question about the DECLARED sort, which
+            // `PtrSlot` answers once (`ptr_repr.rs`); it is deliberately not a
+            // question about either term, and it must not become one: both
+            // halves have just been zero-extended above, so a width test on
+            // `thin_ptr` would pass for a narrow datum that was never an
+            // address. Non-thin destinations keep the packed
+            // `[metadata | data]` form the caller's `to_raw_parts` reads back.
+            let result_expr = if PtrSlot::of_sort(&dest_sort) == Some(PtrSlot::Thin) {
+                thin_ptr
+            } else {
+                vtable_bv.concat(thin_ptr)
+            };
             if let Some(eq) = self.make_coerced_eq_constraint(
                 &dest_var,
                 result_expr,

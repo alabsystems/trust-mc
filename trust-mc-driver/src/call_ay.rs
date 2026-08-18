@@ -341,7 +341,10 @@ impl KaniSession {
                             demotion_reasons: Vec::new(),
                             ctrex_category: None,
                             unknown_quality: None,
-                            solver_unknown_reason: Some(SolverUnknownReason::SolverError),
+                            // Split the old catch-all: a pre-solve deadline bail is
+                            // BUDGET-bound (no solving was attempted), anything else
+                            // here is a genuine ay-chc error. Attribution only.
+                            solver_unknown_reason: Some(SolverUnknownReason::from_chc_error(&e)),
                             kani_mem_overapprox_count: 0,
                             sound_fallback_count: 0,
                             proof_crosscheck: ProofCrosscheck::NotRun,
@@ -425,14 +428,18 @@ impl KaniSession {
         // preserved undecided-model path reach here as Failure/Other with NO
         // decided failing property — solver-side inconclusiveness that
         // previously carried no reason, so [AY:UNKNOWN_REASON:] never printed
-        // and the scoreboard filed these as unknown:None. Stamp SolverError
-        // for exactly that shape (a DECIDED failure has a failing property and
+        // and the scoreboard filed these as unknown:None. Stamp the reason for
+        // exactly that shape (a DECIDED failure has a failing property and
         // keeps reason=None). Attribution only; verdicts unchanged.
+        //
+        // This is UndecidedModel, NOT SolverError: nothing errored, the model was
+        // simply not decided. Sharing one label with real ay-chc errors is what
+        // made the gate's largest bucket unactionable.
         let solver_unknown_reason = if status == VerificationStatus::Failure
             && matches!(failed_properties, FailedProperties::Other)
             && matches!(determine_failed_from_properties(&properties), FailedProperties::None)
         {
-            Some(SolverUnknownReason::SolverError)
+            Some(SolverUnknownReason::UndecidedModel)
         } else {
             None
         };

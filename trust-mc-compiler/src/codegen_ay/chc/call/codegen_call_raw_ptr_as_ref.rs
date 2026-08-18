@@ -20,6 +20,7 @@ use super::codegen_call_ptr_identity::{propagate_alloc_id, propagate_ref_target}
 use super::codegen_rules::CodegenRules;
 use super::codegen_types::CodegenTypes;
 use super::dyn_coercion::extract_pointer_expr;
+use crate::codegen_ay::provenance::Val;
 
 /// Raw pointer `{as_ref,as_mut}` returns `Option<&T>`, not pointer identity.
 ///
@@ -62,7 +63,10 @@ pub(super) fn try_dispatch_raw_ptr_as_ref(
     let Some(data_ptr) = extract_pointer_expr(&ptr_expr) else {
         return false;
     };
-    let Some(width) = data_ptr.sort().bitvec_width() else {
+    // Not a provenance test: `width` sizes the null CONSTANT compared against
+    // below. The address-ness of `data_ptr` is `extract_pointer_expr`'s answer
+    // (wave 11), not this call's.
+    let Some(width) = data_ptr.as_expr().sort().bitvec_width() else {
         return false;
     };
 
@@ -87,7 +91,7 @@ pub(super) fn try_dispatch_raw_ptr_as_ref(
         &dcx.args[0],
         dcx.modified_locals,
         ptr_expr,
-        data_ptr.clone(),
+        data_ptr.as_expr().clone(),
         &dest_sort,
         src_local,
     ) else {
@@ -96,10 +100,13 @@ pub(super) fn try_dispatch_raw_ptr_as_ref(
     let Some(none_expr) = ctx.make_none_expr_for_option(&dest_sort) else {
         return false;
     };
-    let result =
-        Expr::ite(data_ptr.clone().eq(Expr::bitvec_const(0u64, width)), none_expr, some_expr);
+    let result = Expr::ite(
+        data_ptr.as_expr().clone().eq(Expr::bitvec_const(0u64, width)),
+        none_expr,
+        some_expr,
+    );
 
-    let ptr_obj_id = ChcCtx::try_extract_obj_id(&data_ptr);
+    let ptr_obj_id = ChcCtx::try_extract_obj_id(data_ptr.as_expr());
     propagate_alloc_id(ctx, dest_local, src_local);
     propagate_ref_target(ctx, dest_local, src_local, ptr_obj_id);
     let vtable_constraint =
@@ -193,8 +200,11 @@ fn raw_ptr_as_ref_vtable_expr(
     src_local: Option<usize>,
 ) -> Option<Expr> {
     ctx.extract_embedded_vtable_expr(ptr_expr)
+        .map(Val::into_expr)
         .or_else(|| src_local.and_then(|local| ctx.known_vtable_expr_for_local(local)))
-        .or_else(|| ctx.translate_ptr_metadata(operand, modified_locals))
+        .or_else(|| {
+            ctx.translate_ptr_metadata(operand, modified_locals).map(|vtable| vtable.into_expr())
+        })
 }
 
 fn make_dyn_payload_for_raw_ptr(

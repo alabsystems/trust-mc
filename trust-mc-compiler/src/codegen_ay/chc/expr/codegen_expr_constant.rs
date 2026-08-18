@@ -411,8 +411,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Part of #3496 Bug B: if the provenance points to a known static,
             // return its unique symbolic address so pointer comparisons are decidable.
             let alloc_id = alloc.provenance.ptrs[0].1.0;
-            if let Some(expr) = Self::fn_ptr_identity_expr_from_alloc_id(alloc_id) {
-                return Some(expr);
+            // A function's identity term is its address; this helper returns
+            // `Expr` because the whole constant-translation path is untyped.
+            if let Some(fn_addr) = Self::fn_ptr_identity_expr_from_alloc_id(alloc_id) {
+                return Some(fn_addr.into_expr());
             }
             if let Some(addr_expr) = self.ref_resolution.static_address_exprs.get(&alloc_id) {
                 return Some(addr_expr.clone());

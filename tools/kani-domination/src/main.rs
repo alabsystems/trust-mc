@@ -91,6 +91,17 @@ enum Cmd {
         /// Forward `--cbmc-args …` verbatim instead of stripping (default strips).
         #[arg(long)]
         keep_cbmc_args: bool,
+        /// Append a flag verbatim to EVERY driver invocation (repeatable).
+        ///
+        /// For A/B-ing a backend knob across the whole corpus without editing
+        /// the runner — e.g. deciding whether bounded-loop unrolling should be
+        /// a default:
+        ///   --extra-driver-flag=--ay-chc-bounded-unroll
+        ///   --extra-driver-flag=--default-unwind --extra-driver-flag=20
+        /// Any run using this prints a NON-STOCK banner so its number is never
+        /// mistaken for a stock measurement.
+        #[arg(long = "extra-driver-flag")]
+        extra_driver_flag: Vec<String>,
         /// Results JSONL path (default: cache/reports/results-<scope>.jsonl).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -176,6 +187,7 @@ fn main() -> Result<()> {
             filter,
             surface,
             keep_cbmc_args,
+            extra_driver_flag,
             out,
             fresh,
             auto_clone,
@@ -189,6 +201,7 @@ fn main() -> Result<()> {
             filter,
             surface,
             keep_cbmc_args,
+            extra_driver_flag,
             out,
             fresh,
             auto_clone,
@@ -235,6 +248,7 @@ struct RunArgs {
     filter: Vec<String>,
     surface: rekey::Surface,
     keep_cbmc_args: bool,
+    extra_driver_flag: Vec<String>,
     out: Option<PathBuf>,
     fresh: bool,
     auto_clone: bool,
@@ -322,7 +336,14 @@ fn cmd_run(a: RunArgs) -> Result<()> {
         backend: a.backend.clone(),
         strip_cbmc: !a.keep_cbmc_args,
         surface: a.surface,
+        extra_driver_flags: a.extra_driver_flag.clone(),
     };
+    if !cfg.extra_driver_flags.is_empty() {
+        println!(
+            "[kani-domination] EXTRA DRIVER FLAGS ACTIVE (non-stock run): {:?}",
+            cfg.extra_driver_flags
+        );
+    }
 
     // Persist the authority tuple as a sidecar so `score`/`burndown` (and the
     // committed ledger) report the run's true timeout/jobs/backend.

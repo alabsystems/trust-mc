@@ -159,8 +159,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if !var_sort.is_datatype() {
             return None;
         }
-        let root_expr = Expr::var(&**var_name, var_sort.clone());
+        // A CHC state variable IS the local's current contents, so it is a value
+        // (it is the local's datum even when that datum is a pointer bit-pattern;
+        // the local's *address* would be a `Loc`, and is not what is wanted here).
+        let root_expr =
+            crate::codegen_ay::provenance::Val::of_value(Expr::var(&**var_name, var_sort.clone()));
         Self::datatype_field_select(&root_expr, field_idx, None)
+            .map(crate::codegen_ay::provenance::Val::into_expr)
     }
 
     /// Part of #3930: Compute validity predicate for a field extracted from SSA.

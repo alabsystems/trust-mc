@@ -140,8 +140,10 @@ fn test_push_late_state_var_pair_patches_existing_block_rules() {
         let body_arity_before =
             chc_ctx.vc.rules[0].body.relation.as_ref().expect("body relation").args.len();
         let head_arity_before = chc_ctx.vc.rules[0].head.args.len();
-        let live_len_before =
-            chc_ctx.state_var_mgr.live_state_indices.first().expect("live sets").len();
+        // Per-set lengths: frames are live-scoped and need not be uniform, so the
+        // "+1" invariant has to be checked against each set's own prior length.
+        let live_lens_before: Vec<usize> =
+            chc_ctx.state_var_mgr.live_state_indices.iter().map(Vec::len).collect();
         let late_sort = Sort::array(ptr_sort(), Sort::bitvec(32));
         let late_expr = Expr::var("__late_region_i32", late_sort.clone());
 
@@ -169,8 +171,9 @@ fn test_push_late_state_var_pair_patches_existing_block_rules() {
                 .state_var_mgr
                 .live_state_indices
                 .iter()
-                .all(|live| live.len() == live_len_before + 1),
-            "all live sets should include the late state var",
+                .zip(live_lens_before.iter())
+                .all(|(live, before)| live.len() == before + 1),
+            "every live set should have gained exactly the late state var",
         );
         assert_eq!(
             chc_ctx
@@ -246,8 +249,10 @@ fn test_push_late_collection_aux_var_patches_existing_block_rules() {
 
         let body_arity_before =
             chc_ctx.vc.rules[0].body.relation.as_ref().expect("body relation").args.len();
-        let live_len_before =
-            chc_ctx.state_var_mgr.live_state_indices.first().expect("live sets").len();
+        // Per-set lengths: frames are live-scoped and need not be uniform, so the
+        // "+1" invariant has to be checked against each set's own prior length.
+        let live_lens_before: Vec<usize> =
+            chc_ctx.state_var_mgr.live_state_indices.iter().map(Vec::len).collect();
         let late_sort = ptr_sort();
         let late_expr = Expr::var("__late_len", late_sort.clone());
 
@@ -270,8 +275,9 @@ fn test_push_late_collection_aux_var_patches_existing_block_rules() {
                 .state_var_mgr
                 .live_state_indices
                 .iter()
-                .all(|live| live.len() == live_len_before + 1),
-            "all live sets should include the late collection aux var",
+                .zip(live_lens_before.iter())
+                .all(|(live, before)| live.len() == before + 1),
+            "every live set should have gained exactly the late collection aux var",
         );
         assert_eq!(
             chc_ctx

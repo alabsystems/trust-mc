@@ -151,7 +151,11 @@ pub(in crate::codegen_ay) fn inline_rvalue_to_expr<'tcx, 'body>(
         // Preserve address identity for ref-like rvalues rooted at an existing pointer local.
         Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
             preserve_inline_subslice_metadata_from_place(ctx, dest_local, place.local);
+            // The inline walker's expression map is still untyped, so the
+            // Address / Transparent distinction is dropped here rather than
+            // resolved — see `InlineRefExpr`.
             super::place::inline_ref_place_to_expr(ctx, local_exprs, place, resolver, locals)
+                .map(super::place::InlineRefExpr::into_expr)
         }
         Rvalue::CopyForDeref(place) => resolve_place(ctx, local_exprs, place, resolver, locals),
         Rvalue::Discriminant(place) => {
@@ -387,9 +391,30 @@ fn inline_adt_variant_aggregate_to_expr<'tcx, 'body>(
         return None;
     }
 
+    // Translate operands ONCE — `inline_operand_to_expr` declares pending vars.
+    let mut operand_exprs = Vec::with_capacity(operands.len());
+    for op in operands {
+        operand_exprs.push(inline_operand_to_expr(ctx, op, local_exprs, resolver, locals)?);
+    }
+
+    // TRANSPARENT WRAPPER PASS-THROUGH — see the twin guard in
+    // `inline_aggregate::inline_aggregate_to_expr`. `translate_ty` collapses
+    // `MaybeUninit<T>` / `ManuallyDrop<T>` / `#[repr(transparent)]` newtypes
+    // onto the PAYLOAD's sort, so the aggregate that builds the wrapper is
+    // already holding a value of the destination sort and must hand it back
+    // unchanged. Running it through the field loop instead re-wraps it in the
+    // payload's own constructor (`AscII_mk(<AscII>)`), an ill-sorted term that
+    // only aborts much later, in whatever consumer finally believes the
+    // declared field sort (#3312 raw_ptr: `Expr::extract` on a Datatype).
+    // A real one-field struct never matches: its field sort is a strict
+    // component of its own sort.
+    if operand_exprs.len() == 1 && *operand_exprs[0].sort() == sort {
+        debug!(dt_name = %dt.name, "inline ADT aggregate: transparent wrapper, passing payload through");
+        return operand_exprs.pop();
+    }
+
     let mut field_values = Vec::with_capacity(operands.len());
-    for (i, op) in operands.iter().enumerate() {
-        let expr = inline_operand_to_expr(ctx, op, local_exprs, resolver, locals)?;
+    for (i, expr) in operand_exprs.into_iter().enumerate() {
         let field_sort = &cons.fields[i].sort;
         let coerced = if *expr.sort() == *field_sort {
             expr

@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 use tracing::{debug, warn};
 
 use crate::codegen_ay::coroutine_layout::build_coroutine_sort_info;
+use crate::codegen_ay::field_roles;
 use crate::codegen_ay::type_depth_guard::TypeDepthGuard;
 use crate::codegen_ay::types::{
     POINTER_WIDTH, bool_sort, bv8_sort, flatten_dt_array_element, float_ty_to_bitvec_width,
@@ -203,6 +204,18 @@ impl<'tcx, 'body> CodegenTypes<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                         return Some(sole_sort.clone());
                     }
                     let tuple_name = Self::tuple_sort_name(&fields);
+                    // Part of §4 item 7. `(*const T, usize)` — the shape
+                    // `ptr::from_raw_parts` and every `as_mut_ptr()`-plus-len
+                    // pair produces — is exactly the datatype whose first
+                    // `bv64` field used to be *assumed* to be the pointer.
+                    // The element type says which one it is.
+                    for (i, elem_ty) in tys.iter().enumerate() {
+                        field_roles::declare_field_role_from_mir_ty(
+                            &tuple_name,
+                            &names::tuple_field_name(i),
+                            *elem_ty,
+                        );
+                    }
                     Some(struct_sort(tuple_name, fields))
                 } else {
                     None
@@ -307,6 +320,17 @@ impl<'tcx, 'body> CodegenTypes<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                         })
                         .collect();
 
+                    // Part of §4 item 7: a closure that captures a `&T` by value
+                    // stores an address in `cap_i`, and a closure that captures
+                    // a `usize` stores a datum in the identically-sorted slot.
+                    // The upvar type is the only thing that separates them.
+                    for (i, upvar_ty) in upvar_tys.iter().enumerate() {
+                        field_roles::declare_field_role_from_mir_ty(
+                            &closure_name,
+                            &crate::codegen_ay::names::capture_field_name(i),
+                            *upvar_ty,
+                        );
+                    }
                     debug!(closure_name, num_captures = fields.len(), "closure -> Datatype sort");
                     Some(struct_sort(closure_name, fields))
                 }

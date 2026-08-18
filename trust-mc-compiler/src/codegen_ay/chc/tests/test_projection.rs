@@ -15,7 +15,7 @@ fn test_datatype_field_select_struct() {
     let p = Expr::var("p", point_sort_prefixed());
 
     // Select field 0 (x)
-    let x = ChcCtx::datatype_field_select(&p, 0, None);
+    let x = select_field_val(&p, 0, None);
     assert!(x.is_some());
     let x = x.unwrap();
     assert_eq!(x.sort().bitvec_width(), Some(32));
@@ -23,7 +23,7 @@ fn test_datatype_field_select_struct() {
     assert!(smt.contains("fld_x"), "Field 0 select should reference 'fld_x', got: {smt}");
 
     // Select field 1 (y) — distinct from field 0
-    let y = ChcCtx::datatype_field_select(&p, 1, None);
+    let y = select_field_val(&p, 1, None);
     assert!(y.is_some());
     let y = y.unwrap();
     assert!(y.sort().is_bitvec());
@@ -36,7 +36,7 @@ fn test_datatype_field_select_out_of_bounds() {
     let p = Expr::var("p", point_sort_prefixed());
 
     // Field index 5 is out of bounds
-    let result = ChcCtx::datatype_field_select(&p, 5, None);
+    let result = select_field_val(&p, 5, None);
     assert!(result.is_none());
 }
 
@@ -44,7 +44,7 @@ fn test_datatype_field_select_out_of_bounds() {
 fn test_datatype_field_select_non_datatype() {
     // Field selection on non-datatype should return None
     let x = Expr::var("x", Sort::bitvec(32));
-    let result = ChcCtx::datatype_field_select(&x, 0, None);
+    let result = select_field_val(&x, 0, None);
     assert!(result.is_none());
 }
 
@@ -56,7 +56,7 @@ fn test_datatype_field_update_struct() {
     let new_x = Expr::bitvec_const(42, 32);
 
     // Update field 0 (x) with new value
-    let updated = ChcCtx::datatype_field_update(&p, 0, None, new_x);
+    let updated = update_field_val(&p, 0, None, new_x);
     assert!(updated.is_some());
     let updated = updated.unwrap();
     assert!(updated.sort().is_datatype());
@@ -69,7 +69,7 @@ fn test_datatype_field_update_sort_mismatch() {
     let p = Expr::var("p", point_sort_prefixed());
     let wrong_sort = Expr::bool_const(true); // Bool instead of BV32
 
-    let result = ChcCtx::datatype_field_update(&p, 0, None, wrong_sort);
+    let result = update_field_val(&p, 0, None, wrong_sort);
     assert!(result.is_none());
 }
 
@@ -79,7 +79,7 @@ fn test_datatype_field_update_unwraps_single_field_rhs() {
     let tuple_sort = struct_sort("Tuple_bv32", [("fld_0", Sort::bitvec(32))]);
     let wrapped = Expr::var("_wrapped", tuple_sort);
 
-    let result = ChcCtx::datatype_field_update(&p, 0, None, wrapped.clone());
+    let result = update_field_val(&p, 0, None, wrapped.clone());
     assert!(result.is_some(), "single-field datatype rhs should be unwrapped for field update");
 
     let updated = result.expect("field update should succeed");
@@ -102,7 +102,7 @@ fn test_datatype_field_select_enum_with_downcast() {
     let opt = Expr::var("opt", option_sort);
 
     // Select field 0 from constructor 1 (Some.value)
-    let value = ChcCtx::datatype_field_select(&opt, 0, Some(1));
+    let value = select_field_val(&opt, 0, Some(1));
     assert!(value.is_some());
     let value = value.unwrap();
     assert_eq!(value.sort().bitvec_width(), Some(32));
@@ -127,7 +127,7 @@ fn test_datatype_field_select_option_ite_reconstruction_returns_payload() {
     let none = Expr::datatype_constructor("Option_i16", "None_Option_i16", vec![], option_sort);
     let reconstructed = Expr::ite(is_some, some, none);
 
-    let value = ChcCtx::datatype_field_select(&reconstructed, 0, Some(1));
+    let value = select_field_val(&reconstructed, 0, Some(1));
     assert!(value.is_some(), "expected payload extraction from reconstructed option ITE");
     assert_eq!(value.unwrap().to_string(), payload.to_string());
 }
@@ -145,7 +145,7 @@ fn test_datatype_field_select_option_nested_ite_avoids_selector_over_ite() {
     let nested = Expr::ite(Expr::var("cond_b", Sort::bool()), opt_a, opt_b);
     let reconstructed = Expr::ite(Expr::var("cond_a", Sort::bool()), none, nested);
 
-    let value = ChcCtx::datatype_field_select(&reconstructed, 0, Some(1));
+    let value = select_field_val(&reconstructed, 0, Some(1));
     assert!(value.is_some(), "expected payload extraction from nested option ITE");
     let value = value.unwrap();
     assert!(
@@ -187,7 +187,7 @@ fn test_datatype_field_select_ite_coerces_structurally_matching_constructor_arg(
     let symbolic_wrapper = Expr::var("wrapper_sym", wrapper_sort);
     let container = Expr::ite(Expr::var("cond", Sort::bool()), mismatched_ctor, symbolic_wrapper);
 
-    let selected = ChcCtx::datatype_field_select(&container, 0, None)
+    let selected = select_field_val(&container, 0, None)
         .expect("ITE field select should coerce structurally matching constructor args");
 
     assert_eq!(
@@ -210,7 +210,7 @@ fn test_datatype_field_select_enum_missing_downcast() {
     let opt = Expr::var("opt", option_sort);
 
     // Missing constructor index - should fail
-    let result = ChcCtx::datatype_field_select(&opt, 0, None);
+    let result = select_field_val(&opt, 0, None);
     assert!(result.is_none());
 }
 
@@ -219,7 +219,7 @@ fn test_datatype_field_select_bv64_transparent_wrapper() {
     // Transparent wrapper encoded as bv64 should return underlying value for Field(0)
     let ptr = Expr::var("ptr", Sort::bitvec(POINTER_WIDTH));
 
-    let result = ChcCtx::datatype_field_select(&ptr, 0, None);
+    let result = select_field_val(&ptr, 0, None);
     assert!(result.is_some());
     let result = result.unwrap();
     assert!(result.sort().is_bitvec());
@@ -232,7 +232,7 @@ fn test_datatype_field_select_bv64_with_cons_idx() {
     // Transparent wrapper should only apply when cons_idx is None
     let ptr = Expr::var("ptr", Sort::bitvec(POINTER_WIDTH));
 
-    let result = ChcCtx::datatype_field_select(&ptr, 0, Some(0));
+    let result = select_field_val(&ptr, 0, Some(0));
     assert!(result.is_none());
 }
 
@@ -241,7 +241,7 @@ fn test_datatype_field_select_bv64_wrong_width() {
     // Non-pointer-width bitvec should not be treated as transparent wrapper
     let ptr = Expr::var("ptr32", Sort::bitvec(32));
 
-    let result = ChcCtx::datatype_field_select(&ptr, 0, None);
+    let result = select_field_val(&ptr, 0, None);
     assert!(result.is_none());
 }
 
@@ -249,7 +249,7 @@ fn test_datatype_field_select_bv64_wrong_width() {
 fn test_datatype_field_select_bv128_downcast_passthrough() {
     // Flattened enum payload select (Downcast+Field(0)) should pass through bv128 unchanged.
     let payload = Expr::var("payload", Sort::bitvec(128));
-    let result = ChcCtx::datatype_field_select(&payload, 0, Some(1));
+    let result = select_field_val(&payload, 0, Some(1));
     assert!(result.is_some());
     assert_eq!(result.unwrap().to_string(), payload.to_string());
 }
@@ -258,7 +258,7 @@ fn test_datatype_field_select_bv128_downcast_passthrough() {
 fn test_datatype_field_select_bv128_layout_size_extracts_upper_half() {
     // Layout(size, align) is packed as concat(size:bv64, align:bv64).
     let layout = Expr::var("layout", Sort::bitvec(128));
-    let result = ChcCtx::datatype_field_select(&layout, 0, None);
+    let result = select_field_val(&layout, 0, None);
     assert!(result.is_some());
     let result = result.unwrap();
     assert_eq!(result.sort().bitvec_width(), Some(64));
@@ -270,7 +270,7 @@ fn test_datatype_field_select_bv128_layout_size_extracts_upper_half() {
 fn test_datatype_field_select_bv128_layout_align_extracts_lower_half() {
     // Layout(size, align) is packed as concat(size:bv64, align:bv64).
     let layout = Expr::var("layout", Sort::bitvec(128));
-    let result = ChcCtx::datatype_field_select(&layout, 1, None);
+    let result = select_field_val(&layout, 1, None);
     assert!(result.is_some());
     let result = result.unwrap();
     assert_eq!(result.sort().bitvec_width(), Some(64));
@@ -281,7 +281,7 @@ fn test_datatype_field_select_bv128_layout_align_extracts_lower_half() {
 #[test]
 fn test_datatype_field_select_bv128_layout_out_of_bounds() {
     let layout = Expr::var("layout", Sort::bitvec(128));
-    let result = ChcCtx::datatype_field_select(&layout, 2, None);
+    let result = select_field_val(&layout, 2, None);
     assert!(result.is_none());
 }
 
@@ -291,7 +291,7 @@ fn test_datatype_field_update_bv64_transparent_wrapper() {
     let ptr = Expr::var("ptr", Sort::bitvec(POINTER_WIDTH));
     let new_val = Expr::bitvec_const(7, POINTER_WIDTH);
 
-    let result = ChcCtx::datatype_field_update(&ptr, 0, None, new_val.clone());
+    let result = update_field_val(&ptr, 0, None, new_val.clone());
     assert!(result.is_some());
     assert_eq!(result.unwrap().to_string(), new_val.to_string());
 }
@@ -302,7 +302,7 @@ fn test_datatype_field_update_bv64_with_cons_idx() {
     let ptr = Expr::var("ptr", Sort::bitvec(POINTER_WIDTH));
     let new_val = Expr::bitvec_const(7, POINTER_WIDTH);
 
-    let result = ChcCtx::datatype_field_update(&ptr, 0, Some(0), new_val);
+    let result = update_field_val(&ptr, 0, Some(0), new_val);
     assert!(result.is_none());
 }
 
@@ -312,7 +312,7 @@ fn test_datatype_field_update_bv64_sort_mismatch() {
     let ptr = Expr::var("ptr", Sort::bitvec(POINTER_WIDTH));
     let new_val = Expr::bitvec_const(7, 32);
 
-    let result = ChcCtx::datatype_field_update(&ptr, 0, None, new_val);
+    let result = update_field_val(&ptr, 0, None, new_val);
     assert!(result.is_none());
 }
 
@@ -320,7 +320,7 @@ fn test_datatype_field_update_bv64_sort_mismatch() {
 fn test_datatype_field_update_bv128_layout_size_rebuilds_concat() {
     let layout = Expr::var("layout", Sort::bitvec(128));
     let new_size = Expr::bitvec_const(99, 64);
-    let result = ChcCtx::datatype_field_update(&layout, 0, None, new_size.clone());
+    let result = update_field_val(&layout, 0, None, new_size.clone());
     assert!(result.is_some());
     let updated = result.unwrap();
     assert_eq!(updated.sort().bitvec_width(), Some(128));
@@ -332,7 +332,7 @@ fn test_datatype_field_update_bv128_layout_size_rebuilds_concat() {
 fn test_datatype_field_update_bv128_layout_align_rebuilds_concat() {
     let layout = Expr::var("layout", Sort::bitvec(128));
     let new_align = Expr::bitvec_const(8, 64);
-    let result = ChcCtx::datatype_field_update(&layout, 1, None, new_align.clone());
+    let result = update_field_val(&layout, 1, None, new_align.clone());
     assert!(result.is_some());
     let updated = result.unwrap();
     assert_eq!(updated.sort().bitvec_width(), Some(128));
@@ -347,11 +347,11 @@ fn test_datatype_field_update_bv128_layout_rejects_non_bv64_rhs() {
     let bad_sort = Expr::bool_const(true);
 
     assert!(
-        ChcCtx::datatype_field_update(&layout, 0, None, bad_width).is_none(),
+        update_field_val(&layout, 0, None, bad_width).is_none(),
         "bv128 layout update must reject non-bv64 bitvec rhs"
     );
     assert!(
-        ChcCtx::datatype_field_update(&layout, 1, None, bad_sort).is_none(),
+        update_field_val(&layout, 1, None, bad_sort).is_none(),
         "bv128 layout update must reject non-bitvec rhs"
     );
 }
@@ -361,7 +361,7 @@ fn test_datatype_field_update_bv128_downcast_passthrough() {
     let flattened_variant = Expr::var("flattened_variant", Sort::bitvec(128));
     let new_payload = Expr::var("new_payload", Sort::bitvec(128));
 
-    let result = ChcCtx::datatype_field_update(&flattened_variant, 0, Some(1), new_payload.clone());
+    let result = update_field_val(&flattened_variant, 0, Some(1), new_payload.clone());
     assert!(result.is_some(), "bv128 downcast payload update should succeed");
     assert_eq!(result.unwrap().to_string(), new_payload.to_string());
 }
@@ -371,7 +371,7 @@ fn test_datatype_field_update_bv128_downcast_rejects_mismatched_rhs() {
     let flattened_variant = Expr::var("flattened_variant", Sort::bitvec(128));
     let bad_payload = Expr::bitvec_const(7, 64);
 
-    let result = ChcCtx::datatype_field_update(&flattened_variant, 0, Some(1), bad_payload);
+    let result = update_field_val(&flattened_variant, 0, Some(1), bad_payload);
     assert!(result.is_none(), "bv128 downcast payload update must reject non-bv128 rhs");
 }
 
@@ -380,7 +380,7 @@ fn test_datatype_field_select_bv64_nonzero_field() {
     // Field(>0) on bitvec should fall through and return None (not a datatype)
     let ptr = Expr::var("ptr", Sort::bitvec(POINTER_WIDTH));
 
-    let result = ChcCtx::datatype_field_select(&ptr, 1, None);
+    let result = select_field_val(&ptr, 1, None);
     assert!(result.is_none());
 }
 
@@ -389,7 +389,7 @@ fn test_datatype_field_select_bv64_nonzero_field_with_cons_idx() {
     // Nonzero field with cons_idx should still fail for bitvec containers
     let ptr = Expr::var("ptr", Sort::bitvec(POINTER_WIDTH));
 
-    let result = ChcCtx::datatype_field_select(&ptr, 1, Some(0));
+    let result = select_field_val(&ptr, 1, Some(0));
     assert!(result.is_none());
 }
 
@@ -401,7 +401,7 @@ fn test_option_like_struct_field_remap() {
 
     // MIR pattern for Some payload: cons_idx=1, field_idx=0
     // Should remap to struct field 1 (value), not field 0 (is_some)
-    let value = ChcCtx::datatype_field_select(&opt, 0, Some(1));
+    let value = select_field_val(&opt, 0, Some(1));
     assert!(value.is_some());
     let value = value.unwrap();
     // Should get the bitvec value, not the bool is_some
@@ -480,7 +480,7 @@ fn test_datatype_field_update_enum_with_downcast() {
     let new_val = Expr::bitvec_const(123, 32);
 
     // Update Some.value with constructor index 1
-    let result = ChcCtx::datatype_field_update(&opt, 0, Some(1), new_val);
+    let result = update_field_val(&opt, 0, Some(1), new_val);
     assert!(result.is_some());
     let result = result.unwrap();
     assert!(result.sort().is_datatype());
@@ -496,7 +496,7 @@ fn test_option_like_struct_field_update_remap() {
 
     // MIR pattern for updating Some payload: cons_idx=1, field_idx=0
     // Should remap to struct field 1 (value)
-    let result = ChcCtx::datatype_field_update(&opt, 0, Some(1), new_val);
+    let result = update_field_val(&opt, 0, Some(1), new_val);
     assert!(result.is_some());
     let result = result.unwrap();
     assert!(result.sort().is_datatype());
@@ -516,7 +516,7 @@ fn test_datatype_field_update_non_datatype_returns_none() {
     let x = Expr::var("x", Sort::bool());
     let new_val = Expr::bitvec_const(1, 32);
 
-    let result = ChcCtx::datatype_field_update(&x, 0, None, new_val);
+    let result = update_field_val(&x, 0, None, new_val);
     assert!(result.is_none(), "field update on Bool sort should return None");
 }
 
@@ -528,7 +528,7 @@ fn test_datatype_field_update_enum_missing_downcast_returns_none() {
     let opt = Expr::var("opt", option_sort);
     let new_val = Expr::bitvec_const(42, 32);
 
-    let result = ChcCtx::datatype_field_update(&opt, 0, None, new_val);
+    let result = update_field_val(&opt, 0, None, new_val);
     assert!(result.is_none(), "enum update without cons_idx should return None");
 }
 
@@ -540,7 +540,7 @@ fn test_datatype_field_update_constructor_out_of_bounds_returns_none() {
     let new_val = Expr::bitvec_const(42, 32);
 
     // Constructor index 99 is out of bounds (only 0 and 1 exist)
-    let result = ChcCtx::datatype_field_update(&opt, 0, Some(99), new_val);
+    let result = update_field_val(&opt, 0, Some(99), new_val);
     assert!(result.is_none(), "update with constructor OOB should return None");
 }
 
@@ -551,7 +551,7 @@ fn test_datatype_field_select_constructor_out_of_bounds_returns_none() {
     let opt = Expr::var("opt", option_sort);
 
     // Constructor index 99 is out of bounds
-    let result = ChcCtx::datatype_field_select(&opt, 0, Some(99));
+    let result = select_field_val(&opt, 0, Some(99));
     assert!(result.is_none(), "select with constructor OOB should return None");
 }
 
@@ -561,7 +561,7 @@ fn test_datatype_field_update_field_out_of_bounds_returns_none() {
     let new_val = Expr::bitvec_const(42, 32);
 
     // Field index 5 is out of bounds
-    let result = ChcCtx::datatype_field_update(&p, 5, None, new_val);
+    let result = update_field_val(&p, 5, None, new_val);
     assert!(result.is_none(), "update with field OOB should return None");
 }
 
@@ -571,7 +571,7 @@ fn test_datatype_field_update_bv128_field_out_of_bounds_returns_none() {
     let new_val = Expr::bitvec_const(1, 64);
 
     // bv128 Layout has fields 0 (size) and 1 (align); field 2 is OOB
-    let result = ChcCtx::datatype_field_update(&layout, 2, None, new_val);
+    let result = update_field_val(&layout, 2, None, new_val);
     assert!(result.is_none(), "bv128 layout update with field >= 2 should return None");
 }
 
@@ -581,7 +581,7 @@ fn test_datatype_field_update_unsupported_bitvec_width_returns_none() {
     let x = Expr::var("x", Sort::bitvec(16));
     let new_val = Expr::bitvec_const(1, 16);
 
-    let result = ChcCtx::datatype_field_update(&x, 0, None, new_val);
+    let result = update_field_val(&x, 0, None, new_val);
     assert!(result.is_none(), "field update on bv16 should return None (unsupported width)");
 }
 

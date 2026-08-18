@@ -387,7 +387,7 @@ fn test_reset_clears_store_forward_map() {
     // Insert a forwarding entry: obj_id=5, offset=8
     let fwd_key = ((5u64) << 32) | 8u64;
     let value = Expr::bitvec_const(42u128, 32);
-    heap.store_forward_map.insert(fwd_key, (0, value));
+    heap.store_forward_map.insert(fwd_key, (0, value, "u32".into()));
     assert!(heap.store_forward_map.contains_key(&fwd_key));
 
     heap.reset_modified_arrays();

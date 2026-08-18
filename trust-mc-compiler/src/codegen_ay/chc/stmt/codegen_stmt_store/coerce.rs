@@ -13,6 +13,8 @@ mod option_store;
 use ay_bindings::{Expr, Sort};
 use tracing::warn;
 
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{
     SignExtension, coerce_bitvec_width_safe, flatten_datatype_to_bitvec,
 };
@@ -108,18 +110,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 && cons.fields.iter().any(|f| f.name == "fld_ptr")
                 && cons.fields.iter().any(|f| f.name == "fld_vtable")
             {
-                let ptr_expr = value.clone().field_select(
+                // Wave 4: declared roles (`fld_ptr` / `fld_vtable`) reported
+                // to `PtrRepr` as `(Loc, Val)`, which owns the
+                // `[vtable:upper | ptr:lower]` convention. The two operands are
+                // same-sorted and adjacent, so a bare `concat` here is one
+                // transposition away from storing the vtable id in the slot
+                // every consumer reads as the data pointer.
+                let data = Loc::of_address(value.clone().field_select(
                     &dt.name,
                     "fld_ptr",
                     ay_bindings::Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH),
-                );
-                let vtable_expr = value.clone().field_select(
+                ));
+                let meta = Val::of_value(value.clone().field_select(
                     &dt.name,
                     "fld_vtable",
                     ay_bindings::Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH),
-                );
-                // Convention: [vtable:upper | ptr:lower]
-                return vtable_expr.concat(ptr_expr);
+                ));
+                if let Some(packed) = PtrRepr::from_declared_roles(data, meta).into_packed() {
+                    return packed;
+                }
             }
             // Part of #2876, #2244: Datatype → BitVec flattening for nested structs.
             // When translate_ty encodes a struct as a Datatype but memory arrays

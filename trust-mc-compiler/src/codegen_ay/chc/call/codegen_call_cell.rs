@@ -13,10 +13,20 @@
 //! the referent's real memory-mirror address, so constant-address
 //! store-to-load forwarding prunes the memory array and the solver proves fast.
 //!
-//! Address recovery reuses [`ChcCtx::recover_unsafe_cell_referent_address`]
-//! (the shipped fc-interior-mut cascade): the address is always a real
-//! `(obj_id, offset)` or the handler FAILS CLOSED. A store is never emitted to
-//! a fabricated address — the value-as-address false-Safe trap.
+//! Address recovery has two routes and they do NOT carry the same evidence.
+//! Route 1 reuses [`ChcCtx::recover_unsafe_cell_referent_address`] (the shipped
+//! fc-interior-mut cascade), which mints a real `(obj_id, offset)` — a
+//! [`crate::codegen_ay::provenance::Loc`] from a producer, reported as
+//! [`MaybeLoc::Known`]. Route 2 is the closure-inlined-contract fallback and
+//! takes whatever `translate_operand_with_modified` returned for a
+//! pointer-TYPED operand; that function reports nothing about what it produced,
+//! so route 2 answers [`MaybeLoc::Unknown`] and its load/store go through the
+//! `#[deprecated]` untyped shims. The module used to claim "the address is
+//! always a real `(obj_id, offset)` or the handler FAILS CLOSED"; that is true
+//! of route 1 and was never established for route 2, whose filters (MIR type
+//! denotes an address, `T` narrower than a pointer, not a widened narrow datum)
+//! exclude every non-address lane known here but are not a producer's report.
+//! See `recover_cell_referent_address` for the exact split.
 //!
 //! REPRESENTATION COHERENCE (the vacuous-ensures trap): every access this
 //! module models — the mutating stores (`set`/`replace`/`take`/`replace_with`),
@@ -51,6 +61,8 @@ use rustc_public::mir::Operand;
 use rustc_public::ty::{GenericArgKind, RigidTy, Ty, TyKind};
 use tracing::debug;
 
+use crate::codegen_ay::provenance::{MaybeLoc, Val, mir_ty_denotes_address};
+use crate::codegen_ay::ptr_repr::PtrSlot;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::super::heap::is_value_widened_into_address;
@@ -405,27 +417,118 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///    reference value, never a value-as-address fabrication. For `T` at or
     ///    above pointer width, route 2 is skipped (recover-only, else
     ///    fail-closed) since payload and address become width-indistinguishable.
+    ///
+    /// Address-vs-value refactor: route 1 threads a [`Loc`] straight through
+    /// from the producer, so it answers [`MaybeLoc::Known`]. Route 2 has no
+    /// producer to thread from and answers [`MaybeLoc::Unknown`] — see the
+    /// comment on the `.map(MaybeLoc::Unknown)` below for exactly what it does
+    /// and does not establish.
     fn recover_cell_referent_address(
         &mut self,
         arg: &Operand,
         modified_locals: &std::collections::HashSet<usize>,
         value_ty: Ty,
-    ) -> Option<Expr> {
+    ) -> Option<MaybeLoc> {
         if let Some(addr) = self.recover_unsafe_cell_referent_address(arg, modified_locals) {
-            return Some(addr);
+            // Route 1 is an address PRODUCER: `(obj_id, offset)` built by the
+            // encoder's own ref-resolution cascade, threaded through as a `Loc`.
+            return Some(MaybeLoc::Known(addr));
         }
         // Route 2 width gate.
         let t_width = Self::translate_ty(value_ty).and_then(|s| s.bitvec_width());
         if t_width.is_none_or(|w| w >= POINTER_WIDTH) {
             return None;
         }
+        // Route 2 MIR-TYPE PREMISE. The doc above has always *claimed* that the
+        // operand is "address-BY-TYPE" — a `&Cell<T>` receiver — but nothing
+        // checked it, so the tag below rested on a width test alone for any
+        // operand shape the dispatcher happened to route here. The claim is
+        // decidable at exactly this point: the operand's own Rust type either is
+        // a reference / raw pointer / pointer wrapper or it is not, and
+        // `mir_ty_denotes_address` is the whitelist that says so (`provenance.rs`).
+        // A non-pointer operand has no address anywhere in it, and no width test
+        // on its translation could have found one.
+        let arg_ty = arg.ty(self.body.locals()).ok().map(|ty| self.resolve_body_ty(ty))?;
+        if !mir_ty_denotes_address(arg_ty) {
+            debug!(?arg_ty, "cell referent recovery: operand is not pointer-typed — declined");
+            return None;
+        }
+        // Shape half: one machine word, and not a narrow datum that some
+        // earlier coercion widened into that slot. `PtrSlot` states the first
+        // (a classification of the sort, `ptr_repr.rs`) and
+        // `is_value_widened_into_address` the second; neither decides
+        // provenance, which the MIR-type requirement above supplies.
         let is_thin_ptr = |expr: &Expr| {
-            expr.sort().bitvec_width() == Some(POINTER_WIDTH)
+            PtrSlot::of_sort(expr.sort()) == Some(PtrSlot::Thin)
                 && !is_value_widened_into_address(expr)
         };
+        // WHY THIS IS `Unknown` AND NOT A `Loc`.
+        //
+        // Established here: (1) the operand's MIR type denotes an address (just
+        // required above); (2) `T` is strictly narrower than `POINTER_WIDTH`
+        // (the gate above), so the two known ways this path can be handed a
+        // NON-address are excluded by shape — the fc-interior-mut lane
+        // dematerializes `&Cell<T>` into the referent's flattened `bvN` payload,
+        // and `resolve_ref_operand` returns the REFERENT (`Cell<T>`, i.e. that
+        // same `bvN`), neither of which can be `bv64` when `T` is narrower;
+        // (3) the term is not a widened narrow datum (`is_value_widened_into_address`).
+        //
+        // NOT established, and not establishable at this site:
+        // `translate_operand_with_modified` serves every operand in the encoder
+        // and reports nothing about what it returned, so a lane other than those
+        // two that yields a pointer-width non-address from a pointer-TYPED
+        // operand still passes. Three facts and a shape test are a strong
+        // *filter*; they are not a producer's report, and `Loc::of_address` here
+        // would assert one — the laundering this campaign exists to remove. The
+        // answer is therefore `MaybeLoc::Unknown`: the caller gets exactly the
+        // term it got before and the encoding is unchanged, but the doubt now
+        // travels with it and its load/store sit on the `#[deprecated]` untyped
+        // shims, which is the campaign's marker for "no honest `Loc` exists
+        // here" (see `codegen_ay/provenance.rs`, "Two shims are alive on
+        // purpose" — this operand-translator tail is named there).
+        //
+        // Closing it needs the operand translator itself to return a `MaybeLoc`
+        // (§4 item 10), not a wider guard here. Refusing instead is a coverage
+        // change, not a retyping: `recover_cell_referent_address` returning
+        // `None` declines the whole interception into the fail-closed Cell
+        // quarantine, so it has to be measured against the burndown.
         self.translate_operand_with_modified(arg, modified_locals)
             .filter(is_thin_ptr)
             .or_else(|| self.resolve_ref_operand(arg, modified_locals).filter(is_thin_ptr))
+            .map(MaybeLoc::Unknown)
+    }
+
+    /// Load a cell referent through an address whose provenance may be
+    /// unreported.
+    ///
+    /// Route 1 ([`MaybeLoc::Known`]) takes the typed keystone. Route 2
+    /// ([`MaybeLoc::Unknown`]) stays on the `#[deprecated]` untyped entry on
+    /// purpose: re-tagging it as a [`Loc`] would launder a claim
+    /// `translate_operand_with_modified` never made.
+    fn cell_load_through(&mut self, addr: &MaybeLoc, value_ty: Ty) -> Option<Expr> {
+        match addr {
+            MaybeLoc::Known(loc) => {
+                self.load_from_memory(loc.clone(), value_ty).map(Val::into_expr)
+            }
+            MaybeLoc::Unknown(expr) =>
+            {
+                #[allow(deprecated)]
+                self.load_from_memory_untyped(expr.clone(), value_ty)
+            }
+        }
+    }
+
+    /// Store to a cell referent through an address whose provenance may be
+    /// unreported. Same split, and same reason, as [`Self::cell_load_through`].
+    fn cell_store_through(&mut self, addr: &MaybeLoc, value: Expr, value_ty: Ty) -> Option<Expr> {
+        match addr {
+            MaybeLoc::Known(loc) => self.build_memory_store(loc.clone(), value, value_ty),
+            MaybeLoc::Unknown(expr) =>
+            {
+                #[allow(deprecated)]
+                self.build_memory_store_untyped(expr.clone(), value, value_ty)
+            }
+        }
     }
 
     /// Drain the heap-access checks queued by a call-terminator load/store into
@@ -447,11 +550,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
-        addr: Expr,
+        addr: MaybeLoc,
         value_ty: Ty,
     ) -> bool {
         let dest_local = ecx.destination.local;
-        let Some(loaded) = self.load_from_memory(addr, value_ty) else {
+        let Some(loaded) = self.cell_load_through(&addr, value_ty) else {
             self.drain_cell_pending_checks(ecx);
             debug!(bb_idx, "cell::get load failed — fail-closed");
             return false;
@@ -490,7 +593,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// a constant stack pointer; if the bind is refused (narrow-to-pointer
     /// widening guard), the destination stays havoced and downstream checks
     /// remain fail-closed — never a value-as-address fabrication.
-    fn emit_cell_as_ptr(&mut self, bb_idx: usize, ecx: &CallEmitContext<'_>, addr: Expr) -> bool {
+    fn emit_cell_as_ptr(
+        &mut self,
+        bb_idx: usize,
+        ecx: &CallEmitContext<'_>,
+        addr: MaybeLoc,
+    ) -> bool {
         let dest_local = ecx.destination.local;
         let Some((_, dest_var)) = self.resolve_destination(dest_local) else {
             return false;
@@ -498,7 +606,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let s = dest_var.sort().clone();
         let Some(eq) = self.make_coerced_eq_constraint(
             &dest_var,
-            addr.clone(),
+            addr.as_addr_expr().clone(),
             &s,
             dest_local,
             "cell::as_ptr",
@@ -509,7 +617,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Pin concrete stack provenance (no-op unless `addr` is a constant naming
         // a tracked stack object) so the `*dest` deref resolves the identical
         // (obj_id, offset) instead of re-deriving it symbolically.
-        self.record_known_stack_addr_expr(dest_local, addr, "cell_as_ptr_referent_recovery");
+        self.record_known_stack_addr_expr(
+            dest_local,
+            addr.into_addr_expr(),
+            "cell_as_ptr_referent_recovery",
+        );
         let out = self.build_output_args(ecx.modified_locals, &[dest_local]);
         self.emit_goto_rule_extra(ecx.from_app, ecx.target, &out, ecx.stmt_constraints, [eq]);
         debug!(bb_idx, dest_local, "cell::as_ptr modeled as referent-address identity");
@@ -521,7 +633,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
-        addr: Expr,
+        addr: MaybeLoc,
         value_ty: Ty,
     ) -> bool {
         let Some(value) = ecx
@@ -541,7 +653,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
-        addr: Expr,
+        addr: MaybeLoc,
         value_ty: Ty,
     ) -> bool {
         let Some(value) = ecx
@@ -554,7 +666,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         // Load the OLD value BEFORE accumulating the store, so the returned
         // value reflects pre-store memory.
-        let Some(old) = self.load_from_memory(addr.clone(), value_ty) else {
+        let Some(old) = self.cell_load_through(&addr, value_ty) else {
             self.drain_cell_pending_checks(ecx);
             debug!(bb_idx, "cell::replace old-load failed — fail-closed");
             return false;
@@ -576,7 +688,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
-        addr: Expr,
+        addr: MaybeLoc,
         value_ty: Ty,
     ) -> bool {
         // `Default::default()` is `0` only for integer/bool T. Any other T is
@@ -585,7 +697,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             debug!(bb_idx, "cell::take non-zeroable T — fail-closed");
             return false;
         };
-        let Some(old) = self.load_from_memory(addr.clone(), value_ty) else {
+        let Some(old) = self.cell_load_through(&addr, value_ty) else {
             self.drain_cell_pending_checks(ecx);
             debug!(bb_idx, "cell::take old-load failed — fail-closed");
             return false;
@@ -606,7 +718,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
-        addr: Expr,
+        addr: MaybeLoc,
         value_ty: Ty,
     ) -> bool {
         let Some(closure_arg) = ecx.args.get(1) else {
@@ -614,7 +726,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         // Load OLD before the store; it is both the closure's `&mut T` argument
         // (Deref-as-identity in the inline walker) and the returned value.
-        let Some(old) = self.load_from_memory(addr.clone(), value_ty) else {
+        let Some(old) = self.cell_load_through(&addr, value_ty) else {
             self.drain_cell_pending_checks(ecx);
             debug!(bb_idx, "cell::replace_with old-load failed — fail-closed");
             return false;
@@ -660,7 +772,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
-        addr: Expr,
+        addr: MaybeLoc,
         value: Expr,
         value_ty: Ty,
         old: Option<Expr>,
@@ -669,7 +781,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let dest_local = ecx.destination.local;
         // Accumulate the store into heap store chains (returns None on success;
         // constraints are flushed via drain_pending_updates below).
-        self.build_memory_store(addr, value, value_ty);
+        // `build_memory_store` is still `(Expr, Expr)` — wave 13 retypes it to
+        // `(Loc, Val)`, which is what makes the address/value swap at this
+        // adjacent-argument site a compile error instead of a silent defect.
+        self.cell_store_through(&addr, value, value_ty);
 
         let mut extra = Vec::new();
         // Bind the value-returning result (`dest = old`) for replace/take/

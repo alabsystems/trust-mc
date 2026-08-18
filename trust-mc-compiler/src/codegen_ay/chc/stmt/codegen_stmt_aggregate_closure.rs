@@ -8,8 +8,11 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use crate::args::ChcTrackLevel;
 use crate::codegen_ay::coroutine_layout::build_coroutine_sort_info;
 use crate::codegen_ay::names::struct_sort;
+use crate::codegen_ay::provenance::{Val, is_value_widened_into_address};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::rustc_public_bridge::IndexedVal;
 use rustc_public::mir::Operand;
 use rustc_public::ty::{ClosureDef, CoroutineDef, GenericArgs, RigidTy, TyKind};
@@ -17,7 +20,7 @@ use tracing::{debug, warn};
 
 use ay_bindings::{Expr, Sort};
 
-use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort};
+use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width_safe, ptr_sort};
 
 use super::codegen_ctx::globals::declare_pending_var;
 use super::codegen_types::CodegenTypes;
@@ -181,11 +184,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         modified_locals: &HashSet<usize>,
     ) {
         for (i, op) in operands.iter().enumerate() {
-            let addr = match field_exprs.get(i) {
-                Some(expr) if expr.sort().bitvec_width() == Some(POINTER_WIDTH) => expr,
-                _ => continue,
-            };
-
+            // Address-vs-value (wave 1): the ADDRESS evidence is resolved FIRST,
+            // and it is not a width test. `ref_targets` is populated at the
+            // `&place` that created the reference, so a hit here is a recorded
+            // fact — this capture operand is a reference-holding local — rather
+            // than the inference "it is 64 bits wide, so it is probably a
+            // pointer". The guards below are pure lookups, so hoisting them
+            // above the sort test does not change which captures are bridged.
+            //
             // Get the operand's local index (the reference-holding local).
             let ref_local = match op {
                 Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
@@ -201,15 +207,58 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
             let referent_local = ref_target.local;
 
+            // RETIRED: the width test is no longer what decides that this
+            // capture term is an address. The fact it was standing in for is
+            // recorded one layer down, in the TRACK LEVEL, which selects the
+            // reference model for the whole encoding:
+            //
+            //   * `Mem`  — `Rvalue::Ref`/`AddressOf` goes through
+            //              `translate_ref_to_address` (the wave-11 `Loc`
+            //              producer), or through the `&*ptr` lane that hands
+            //              back the base pointer's own datum. Either way a
+            //              reference-typed local holds a POINTER.
+            //   * `Ptr`  — `&local` is `get_or_create_local_address`, likewise
+            //              an address.
+            //   * `Reg`  — no heap model at all: `&local` is VALUE semantics and
+            //              yields the referent's datum, which is precisely the
+            //              term this site must never store through.
+            //
+            // Combined with the `ref_targets` hit above — a recorded `&local`
+            // with no projections, so the local's Rust type is a reference — the
+            // Reg exclusion is what establishes the address; `PtrRepr` then
+            // supplies only the SHAPE (a thin pointer, as a sized referent's
+            // reference must be), which is the division of labour it documents.
+            //
+            // The widening refusal stays: the capture is coerced to the declared
+            // upvar sort a few lines above (`coerce_bitvec_width_safe`), and a
+            // narrow datum zero-extended into a pointer-width slot would arrive
+            // here already at `POINTER_WIDTH`. Refusing it by name keeps the tag
+            // off a fabricated address (obj_id forced to 0, the null object) that
+            // is used below as a `build_memory_store` DESTINATION.
+            if self.track_level < ChcTrackLevel::Ptr {
+                continue;
+            }
+            let addr = match field_exprs.get(i) {
+                Some(expr) if !is_value_widened_into_address(expr) => {
+                    match PtrRepr::thin_address(expr) {
+                        Some(loc) => loc,
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+
             // Get the referent local's current SSA value.
-            let referent_value =
-                match self.local_expr_with_modified(referent_local, modified_locals) {
-                    Some(v) => v,
-                    None => continue,
-                };
+            let referent_value = match self
+                .local_expr_with_modified(referent_local, modified_locals)
+                .map(Val::of_value)
+            {
+                Some(v) => v,
+                None => continue,
+            };
 
             // Only bridge DT-sorted values (Vec, struct). Scalar BV locals don't need this.
-            if !referent_value.sort().is_datatype() {
+            if !referent_value.as_expr().sort().is_datatype() {
                 continue;
             }
 
@@ -223,10 +272,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 capture_idx = i,
                 ref_local,
                 referent_local,
-                referent_sort = ?referent_value.sort(),
+                referent_sort = ?referent_value.as_expr().sort(),
                 "bridge_closure_capture_dt_stores: emitting typed memory store (#4057)"
             );
-            self.build_memory_store(addr.clone(), referent_value, referent_ty);
+            // (Wave 13 retypes `build_memory_store` itself to `(Loc, Val)`; the
+            // two arguments are already distinguished here so the swap that
+            // shape invites cannot be written by accident at this site.)
+            self.build_memory_store(addr, referent_value.into_expr(), referent_ty);
         }
     }
 

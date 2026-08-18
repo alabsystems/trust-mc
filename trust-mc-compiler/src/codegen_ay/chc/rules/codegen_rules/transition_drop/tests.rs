@@ -127,7 +127,10 @@ fn test_restore_dyn_drop_d2_candidate_baseline_clears_candidate_heap_residue() {
             chc_ctx.heap_state.drained_store_chain_seeds.insert("candidate_a".into(), store);
             chc_ctx.heap_state.metadata_arrays_modified = true;
             chc_ctx.heap_state.mirror_base_addrs.insert("candidate_a".into(), addr);
-            chc_ctx.heap_state.store_forward_map.insert(0, (0, Expr::bitvec_const(9, 32)));
+            chc_ctx
+                .heap_state
+                .store_forward_map
+                .insert(0, (0, Expr::bitvec_const(9, 32), "u32".into()));
 
             restore_dyn_drop_d2_candidate_baseline(
                 &mut chc_ctx,

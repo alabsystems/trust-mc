@@ -68,8 +68,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return true;
         };
 
-        // Navigate through field projections to extract the array.
-        let mut array_in = container_in.clone();
+        // Navigate through field projections to extract the array. `container_in`
+        // is the aggregate's state variable — the local's contents, a value — and
+        // each selected field of a value is again a value.
+        let mut array_in = crate::codegen_ay::provenance::Val::of_value(container_in.clone());
         for fp in field_projs {
             let Some(selected) = Self::datatype_field_select(&array_in, fp.field_idx, fp.cons_idx)
             else {
@@ -95,6 +97,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return true;
         };
 
+        let array_in = array_in.into_expr();
         let coerced_rhs =
             Self::coerce_store_value(array_in.sort(), rhs_expr, false, &self.diagnostics);
         let new_array = array_in.store(index_expr, coerced_rhs);
@@ -288,10 +291,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
 
         // Extract the array from the container through ref_target field projections.
-        let mut array_in = container_in.clone();
+        // Same provenance as above: state variable in, field values out.
+        let mut array_in = crate::codegen_ay::provenance::Val::of_value(container_in.clone());
         for fp in &ref_field_projs {
             array_in = Self::datatype_field_select(&array_in, fp.field_idx, fp.cons_idx)?;
         }
+        let array_in = array_in.into_expr();
 
         // Resolve the index expression.
         let index_expr = Self::resolve_index_expr(self, lhs_index, acc)?;

@@ -143,15 +143,17 @@ fn capture_inline_return_local_value(
             // extract(63,0, zero_extend(64, alloc_ptr)).  try_extract_constant_addr
             // only recognises BvConcat patterns, so unwrap the
             // extract(zero_extend(...)) to recover the original BV64 constant.
-            ChcCtx::try_extract_constant_addr(&ptr).or_else(|| {
+            ChcCtx::try_extract_constant_addr(ptr.as_expr()).or_else(|| {
                 use ay_bindings::ExprValue;
-                if let ExprValue::BvExtract { expr: inner, high: 63, low: 0 } = ptr.value() {
+                if let ExprValue::BvExtract { expr: inner, high: 63, low: 0 } =
+                    ptr.as_expr().value()
+                {
                     if let ExprValue::BvZeroExtend { expr: core_expr, .. } = inner.value() {
                         return ChcCtx::try_extract_constant_addr(&core_expr);
                     }
                 }
                 // Also handle direct zero_extend without extract wrapper.
-                if let ExprValue::BvZeroExtend { expr: core_expr, .. } = ptr.value() {
+                if let ExprValue::BvZeroExtend { expr: core_expr, .. } = ptr.as_expr().value() {
                     return ChcCtx::try_extract_constant_addr(&core_expr);
                 }
                 None

@@ -81,10 +81,39 @@ pub(in crate::codegen_ay) fn inline_aggregate_to_expr<'tcx, 'body>(
         return None;
     }
 
-    // Translate all operands.
+    // Translate all operands ONCE — `inline_operand_to_expr` can declare pending
+    // vars, so it must not be run twice for the same operand.
+    let mut operand_exprs = Vec::with_capacity(operands.len());
+    for op in operands {
+        operand_exprs.push(inline_operand_to_expr(ctx, op, local_exprs, resolver, locals)?);
+    }
+
+    // TRANSPARENT WRAPPER PASS-THROUGH.
+    //
+    // `translate_ty` collapses payload-shaped wrappers — `MaybeUninit<T>`,
+    // `ManuallyDrop<T>`, `#[repr(transparent)]` newtypes — onto the sort of the
+    // PAYLOAD, so `MaybeUninit<AscII>` and `AscII` are the same sort. An
+    // aggregate that *builds the wrapper* (`_0 = MaybeUninit::<AscII> { value:
+    // move _2 }`, a union aggregate whose one operand is already an `AscII`)
+    // must therefore hand the payload straight back. Feeding it to the loop
+    // below instead matches it against the payload's OWN field list and
+    // re-wraps it: `AscII_mk(<AscII>)`, whose argument sort is `AscII` where
+    // the constructor declares `fld_inner: BitVec 8`. Nothing rejects that
+    // term at construction; it travels until a consumer asks for the declared
+    // field sort — `reinterpret_fixed_layout_expr` selects `fld_inner`, gets
+    // the datatype back from ay's selector-over-constructor fold, and aborts
+    // codegen in `Expr::extract` (#3312 raw_ptr).
+    //
+    // A genuine one-field struct cannot be mistaken for this: its field sort is
+    // a strict component of its own sort, so `operand.sort() == sort` is
+    // exactly the wrapper case.
+    if operand_exprs.len() == 1 && *operand_exprs[0].sort() == sort {
+        debug!(dt_name = %dt.name, "inline_aggregate: transparent wrapper, passing payload through");
+        return operand_exprs.pop();
+    }
+
     let mut field_values = Vec::with_capacity(operands.len());
-    for (i, op) in operands.iter().enumerate() {
-        let expr = inline_operand_to_expr(ctx, op, local_exprs, resolver, locals)?;
+    for (i, expr) in operand_exprs.into_iter().enumerate() {
         let field_sort = &cons.fields[i].sort;
 
         // Coerce BV width if needed (e.g., u32 operand into usize field).

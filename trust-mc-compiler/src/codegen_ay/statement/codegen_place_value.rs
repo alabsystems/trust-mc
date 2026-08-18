@@ -13,6 +13,36 @@ use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+/// Which lane of [`StatementCodegen::get_value_through_ref`] produced the
+/// expression it returned?
+///
+/// # Address-vs-value: the producer reports, the consumer stops guessing
+///
+/// `get_value_through_ref` is asked for the POINTEE of a reference operand and
+/// has four lanes, two of which do not return a pointee at all. Collapsed to a
+/// bare `Expr` the four are indistinguishable, so `codegen_raw_eq` re-derived
+/// "did the deref actually happen?" from the result's WIDTH — a test its own
+/// comment recorded as wrong in both directions, since `&usize` / `&[u64; 1]`
+/// dereference to a legitimately 64-bit value.
+///
+/// Three of the four lanes know the answer and now state it. The fourth is a
+/// genuine unknown and says so, which is what keeps this an honest report rather
+/// than a relabelled guess: see [`RefValueSource::Unreported`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RefValueSource {
+    /// The pointee's own SSA value, read through `ref_pointees` (or the operand
+    /// itself when it is not a reference at all). A VALUE — the deref happened.
+    Value,
+    /// `codegen_place` on the synthesized `*place`. Usually the pointee's value,
+    /// but the typed-memory array lane inside it can hand back a base ADDRESS and
+    /// does not report which — so this lane genuinely does not know, and callers
+    /// must keep whatever conservative test they had.
+    Unreported,
+    /// The final fallback: `codegen_operand` on a reference-typed operand, whose
+    /// result is the reference's own POINTER. The deref did **not** happen.
+    Reference,
+}
+
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     // Call dispatch functions moved to dispatch.rs - Part of #1354.
     // Moved: try_codegen_std_intrinsic, resolve_callee_path, try_codegen_stdlib_stub_call, codegen_closure_call
@@ -121,6 +151,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Part of #409: Fix raw_eq to compare array content, not pointer addresses.
     /// Updated for #431: Use projection-aware ref_base for references in projected locations.
     pub(super) fn get_value_through_ref(&mut self, operand: &Operand) -> Option<Expr> {
+        self.get_value_through_ref_source(operand).map(|(expr, _)| expr)
+    }
+
+    /// [`Self::get_value_through_ref`], with the producing lane reported.
+    ///
+    /// Callers that need to know whether the deref actually happened — rather
+    /// than inferring it from the result's width — take this entry point. See
+    /// [`RefValueSource`].
+    pub(super) fn get_value_through_ref_source(
+        &mut self,
+        operand: &Operand,
+    ) -> Option<(Expr, RefValueSource)> {
         debug!("get_value_through_ref: called with operand={:?}", operand);
         match operand {
             Operand::Copy(place) | Operand::Move(place) => {
@@ -147,9 +189,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             &pointee_base,
                             &pointee_expr,
                         ) {
-                            return Some(reconstructed);
+                            return Some((reconstructed, RefValueSource::Value));
                         }
-                        return Some(pointee_expr);
+                        return Some((pointee_expr, RefValueSource::Value));
                     }
                     debug!("get_value_through_ref: pointee not in env");
                 } else {
@@ -168,14 +210,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             &pointee_base,
                             &pointee_expr,
                         ) {
-                            return Some(reconstructed);
+                            return Some((reconstructed, RefValueSource::Value));
                         }
-                        return Some(pointee_expr);
+                        return Some((pointee_expr, RefValueSource::Value));
                     }
                 }
 
                 // Fallback: if this is a reference type, construct a deref place and codegen it (#409)
                 // This handles cases where ref_pointees doesn't have the mapping (e.g., raw_eq on enum fields)
+                let operand_is_reference =
+                    place.ty(self.body.locals()).into_option().is_some_and(|ty| {
+                        matches!(
+                            ty.kind(),
+                            TyKind::RigidTy(RigidTy::Ref(..))
+                                | TyKind::RigidTy(RigidTy::RawPtr(..))
+                        )
+                    });
                 if let Some(ty) = place.ty(self.body.locals()).into_option() {
                     debug!(
                         "get_value_through_ref: checking type for {:?}, ty={:?}",
@@ -197,18 +247,28 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                                 "get_value_through_ref: deref succeeded, sort={:?}",
                                 expr.sort()
                             );
-                            return Some(expr);
+                            return Some((expr, RefValueSource::Unreported));
                         }
                         debug!("get_value_through_ref: deref failed for {:?}", deref_place);
                     }
                 }
 
-                // Final fallback: codegen_operand (returns pointer value for references)
-                self.codegen_operand(operand)
+                // Final fallback: codegen_operand, which for a reference-typed
+                // operand returns the REFERENCE's own pointer — the deref did not
+                // happen, and this lane is the one place that knows it. For a
+                // non-reference operand the same call returns the place's value.
+                let source = if operand_is_reference {
+                    RefValueSource::Reference
+                } else {
+                    RefValueSource::Value
+                };
+                self.codegen_operand(operand).map(|expr| (expr, source))
             }
             Operand::Constant(_) => {
-                // For constant operands, codegen directly
-                self.codegen_operand(operand)
+                // For constant operands, codegen directly. A constant reference
+                // (a promoted static) yields its pointer here, so this lane does
+                // not claim to have dereferenced anything.
+                self.codegen_operand(operand).map(|expr| (expr, RefValueSource::Unreported))
             }
         }
     }

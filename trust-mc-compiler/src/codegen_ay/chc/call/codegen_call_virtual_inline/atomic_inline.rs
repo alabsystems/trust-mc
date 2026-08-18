@@ -26,6 +26,7 @@ use super::super::codegen_call_atomic::{AtomicKind, detect_atomic_intrinsic};
 use super::super::codegen_call_atomic_rmw::compute_rmw_value;
 use super::super::inline_shared::{PlaceResolver, inline_operand_to_expr};
 use super::super::ptr_receiver_mem;
+use crate::codegen_ay::provenance::{MaybeLoc, Val};
 
 /// Handle atomic operations (fetch_add, load, store, etc.) inside an inlined
 /// function body.
@@ -95,7 +96,12 @@ pub(super) fn try_handle_atomic_call_inline<'tcx, 'body>(
     match kind {
         AtomicKind::Load => {
             // Load: read from memory at receiver address.
-            ptr_receiver_mem::load_from_memory(ctx, receiver_addr, pointee_ty)
+            ptr_receiver_mem::load_from_memory(
+                ctx,
+                &MaybeLoc::Unknown(receiver_addr.clone()),
+                pointee_ty,
+            )
+            .map(Val::into_expr)
         }
 
         AtomicKind::Store => {
@@ -104,7 +110,7 @@ pub(super) fn try_handle_atomic_call_inline<'tcx, 'body>(
                 return None;
             }
             let value = translated_args[1].clone();
-            ctx.build_memory_store(receiver_addr.clone(), value, pointee_ty);
+            ctx.build_memory_store_untyped(receiver_addr.clone(), value, pointee_ty);
             // Store returns () — produce a dummy value.
             Some(Expr::bitvec_const(0u64, crate::codegen_ay::types::POINTER_WIDTH))
         }
@@ -124,7 +130,14 @@ pub(super) fn try_handle_atomic_call_inline<'tcx, 'body>(
             if !matches!(kind, AtomicKind::Exchange) && translated_args.len() < 2 {
                 return None;
             }
-            let old_value = ptr_receiver_mem::load_from_memory(ctx, receiver_addr, pointee_ty)?;
+            // A translated call argument: `translate_operand` reports nothing about
+            // what it produced, so the ignorance is stated, not papered over.
+            let old_value = ptr_receiver_mem::load_from_memory(
+                ctx,
+                &MaybeLoc::Unknown(receiver_addr.clone()),
+                pointee_ty,
+            )?
+            .into_expr();
 
             let new_value = if matches!(kind, AtomicKind::Exchange) {
                 if translated_args.len() < 2 {
@@ -136,7 +149,7 @@ pub(super) fn try_handle_atomic_call_inline<'tcx, 'body>(
                 compute_rmw_value(&kind, old_value.clone(), operand)
             };
 
-            ctx.build_memory_store(receiver_addr.clone(), new_value, pointee_ty);
+            ctx.build_memory_store_untyped(receiver_addr.clone(), new_value, pointee_ty);
             debug!(?kind, "atomic_inline: RMW completed, old_value returned (#4023)");
             Some(old_value)
         }

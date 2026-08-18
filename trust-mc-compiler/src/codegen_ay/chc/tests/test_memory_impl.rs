@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use super::common::*;
+use crate::codegen_ay::provenance::{Loc, MaybeLoc, Val};
 
 #[test]
 fn test_get_or_create_local_address_is_stable_and_distinct() {
@@ -79,13 +80,17 @@ fn test_load_ptr_from_memory_returns_pointer_sort() {
             .load_ptr_from_memory(addr, ptr_ty)
             .expect("pointer load should produce expression");
 
+        // The typed-array lane is the one that KNOWS it produced an address.
+        let MaybeLoc::Known(loaded_ptr) = loaded_ptr else {
+            panic!("typed-array pointer load should report Known address provenance");
+        };
         assert_eq!(
-            loaded_ptr.sort().bitvec_width(),
+            loaded_ptr.as_expr().sort().bitvec_width(),
             Some(64),
             "pointer load should produce pointer-width bitvector"
         );
         assert!(
-            loaded_ptr.to_string().contains("select"),
+            loaded_ptr.as_expr().to_string().contains("select"),
             "pointer load should be encoded as array select"
         );
     });
@@ -117,14 +122,17 @@ fn test_build_memory_store_then_load_uses_store_chain() {
         let addr = Expr::bitvec_const(0x2_0000_0008u128, 64);
         let value = Expr::bitvec_const(123u128, 32);
 
-        let store_result = chc_ctx.build_memory_store(addr.clone(), value, scalar_ty);
+        let store_result =
+            chc_ctx.build_memory_store(Loc::of_address(addr.clone()), value, scalar_ty);
         assert!(
             store_result.is_none(),
             "stores are accumulated and emitted at block end, not returned immediately"
         );
 
-        let loaded =
-            chc_ctx.load_from_memory(addr, scalar_ty).expect("load should succeed after store");
+        let loaded = chc_ctx
+            .load_from_memory(Loc::of_address(addr), scalar_ty)
+            .map(Val::into_expr)
+            .expect("load should succeed after store");
         assert_eq!(
             loaded.sort().bitvec_width(),
             Some(32),
@@ -174,7 +182,8 @@ fn test_zst_array_memory_store_and_load_use_canonical_value() {
         assert!(value.sort().is_array(), "fixture should reproduce array-shaped ZST payload");
 
         let before_gap = chc_ctx.diagnostics.aggregate_encoding_gap.get();
-        let store_result = chc_ctx.build_memory_store(addr.clone(), value, array_ty);
+        let store_result =
+            chc_ctx.build_memory_store(Loc::of_address(addr.clone()), value, array_ty);
         assert!(
             store_result.is_none(),
             "stores are accumulated and emitted at block end, not returned immediately"
@@ -197,8 +206,10 @@ fn test_zst_array_memory_store_and_load_use_canonical_value() {
             "typed heap stores ZST arrays through a canonical Bool cell"
         );
 
-        let loaded =
-            chc_ctx.load_from_memory(addr, array_ty).expect("ZST array load should succeed");
+        let loaded = chc_ctx
+            .load_from_memory(Loc::of_address(addr), array_ty)
+            .map(Val::into_expr)
+            .expect("ZST array load should succeed");
         assert_eq!(
             loaded.sort(),
             &pointee_sort,
@@ -238,7 +249,7 @@ fn test_build_memory_store_suppresses_fresh_alloc_write_checks() {
             "probe_scalar_arg_baseline_store_checks",
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
-        baseline_ctx.build_memory_store(addr.clone(), value.clone(), scalar_ty);
+        baseline_ctx.build_memory_store(Loc::of_address(addr.clone()), value.clone(), scalar_ty);
         assert!(
             !baseline_ctx.heap_state.pending_checks.is_empty(),
             "ordinary stores should enqueue heap access checks"
@@ -251,7 +262,7 @@ fn test_build_memory_store_suppresses_fresh_alloc_write_checks() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
         suppressed_ctx.suppress_heap_store_checks = true;
-        suppressed_ctx.build_memory_store(addr, value, scalar_ty);
+        suppressed_ctx.build_memory_store(Loc::of_address(addr), value, scalar_ty);
         assert!(
             suppressed_ctx.heap_state.pending_checks.is_empty(),
             "suppressed fresh-allocation stores must not enqueue heap access checks"
@@ -286,11 +297,13 @@ fn test_load_from_memory_forwarding_is_same_block_only() {
         let stored_value = Expr::bitvec_const(123u128, 32);
         let stored_value_smt = stored_value.to_string();
 
-        let store_result = chc_ctx.build_memory_store(addr.clone(), stored_value, scalar_ty);
+        let store_result =
+            chc_ctx.build_memory_store(Loc::of_address(addr.clone()), stored_value, scalar_ty);
         assert!(store_result.is_none(), "stores remain block-accumulated");
 
         let same_block = chc_ctx
-            .load_from_memory(addr.clone(), scalar_ty)
+            .load_from_memory(Loc::of_address(addr.clone()), scalar_ty)
+            .map(Val::into_expr)
             .expect("same-block load should succeed");
         let same_block_smt = same_block.to_string();
         assert!(
@@ -302,7 +315,8 @@ fn test_load_from_memory_forwarding_is_same_block_only() {
         chc_ctx.current_encode_bb += 1;
 
         let next_block = chc_ctx
-            .load_from_memory(addr, scalar_ty)
+            .load_from_memory(Loc::of_address(addr), scalar_ty)
+            .map(Val::into_expr)
             .expect("cross-block load should still succeed");
         let next_block_smt = next_block.to_string();
         assert!(
@@ -343,13 +357,25 @@ fn test_load_ptr_from_memory_forwarding_is_same_block_only() {
         let stored_ptr = Expr::bitvec_const(0x1234_5678u128, 64);
         let stored_ptr_smt = stored_ptr.to_string();
 
-        let store_result = chc_ctx.build_memory_store(addr.clone(), stored_ptr, ptr_ty);
+        let store_result =
+            chc_ctx.build_memory_store(Loc::of_address(addr.clone()), stored_ptr, ptr_ty);
         assert!(store_result.is_none(), "pointer stores remain block-accumulated");
 
         let same_block = chc_ctx
             .load_ptr_from_memory(addr.clone(), ptr_ty)
             .expect("same-block pointer load should succeed");
-        let same_block_smt = same_block.to_string();
+        // The store above declared type `*const u32` and this load reads the
+        // same slot type, so the forwarded datum was written THROUGH the pointer
+        // type array: `Known`, on the same grounds as the typed-array select
+        // lane. `store_forward_map` records the store's type key precisely so
+        // this can be decided instead of guessed from the datum's width — see
+        // `test_load_ptr_forwarding_type_key_mismatch_is_unknown` for the other
+        // half, which is the case that must stay `Unknown`.
+        assert!(
+            matches!(same_block, MaybeLoc::Known(_)),
+            "same-type-key store-to-load forwarding establishes address provenance"
+        );
+        let same_block_smt = same_block.as_addr_expr().to_string();
         assert!(
             same_block_smt.contains(&stored_ptr_smt),
             "same-block pointer load should use forwarding: {same_block_smt}"
@@ -361,7 +387,11 @@ fn test_load_ptr_from_memory_forwarding_is_same_block_only() {
         let next_block = chc_ctx
             .load_ptr_from_memory(addr, ptr_ty)
             .expect("cross-block pointer load should still succeed");
-        let next_block_smt = next_block.to_string();
+        assert!(
+            matches!(next_block, MaybeLoc::Known(_)),
+            "the typed-array fallback lane is a Loc producer"
+        );
+        let next_block_smt = next_block.as_addr_expr().to_string();
         assert!(
             next_block_smt.contains("select"),
             "cross-block pointer load should fall back to array select, got: {next_block_smt}"
@@ -369,6 +399,53 @@ fn test_load_ptr_from_memory_forwarding_is_same_block_only() {
         assert!(
             !next_block_smt.contains(&stored_ptr_smt),
             "cross-block pointer load must not reuse stale forwarded value: {next_block_smt}"
+        );
+    });
+}
+
+/// The other half of the forwarding-provenance split: a datum written through a
+/// DIFFERENT type array is not an address, and `load_ptr_from_memory` must keep
+/// reporting `Unknown` for it.
+///
+/// This is the exact shape the old blanket `Unknown` existed to protect against
+/// — a `u64` stored at some address, then read back through a pointer-typed slot
+/// — and it is the shape `recover_unsafe_cell_referent_address` used to admit on
+/// a width test, since a `u64` is `POINTER_WIDTH` wide.
+#[test]
+fn test_load_ptr_forwarding_type_key_mismatch_is_unknown() {
+    const SOURCE: &str = r#"
+        #![allow(dead_code)]
+
+        pub fn probe_ptr_forward_mismatch(p: *const u32, v: u64) -> usize {
+            p as usize + v as usize
+        }
+    "#;
+
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let fn_sig = fn_sig_by_suffix(ctx.tcx, "probe_ptr_forward_mismatch");
+        let ptr_ty = fn_sig.inputs()[0];
+        let scalar_ty = fn_sig.inputs()[1];
+
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_ptr_forward_mismatch");
+        let body = instance.body().expect("function body");
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_ptr_forward_mismatch",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+
+        let addr = Expr::bitvec_const(17u128, 32).concat(Expr::bitvec_const(24u128, 32));
+        // Stored as a `u64` VALUE — pointer-width, so no width test can reject it.
+        let stored_value = Expr::bitvec_const(0x0BAD_F00Du128, 64);
+        chc_ctx.build_memory_store(Loc::of_address(addr.clone()), stored_value, scalar_ty);
+
+        let loaded = chc_ctx
+            .load_ptr_from_memory(addr, ptr_ty)
+            .expect("same-block load should still forward the datum");
+        assert!(
+            matches!(loaded, MaybeLoc::Unknown(_)),
+            "a datum stored through the `u64` array must not be reported as an address"
         );
     });
 }
@@ -406,11 +483,13 @@ fn test_symbolic_store_invalidates_forwarding_same_block() {
         let const_addr = Expr::bitvec_const(11u128, 32).concat(Expr::bitvec_const(8u128, 32));
         let stored_value = Expr::bitvec_const(999u128, 32);
         let stored_value_smt = stored_value.to_string();
-        chc_ctx.build_memory_store(const_addr.clone(), stored_value, scalar_ty);
+        chc_ctx.build_memory_store(Loc::of_address(const_addr.clone()), stored_value, scalar_ty);
 
         // Verify forwarding works before symbolic store
-        let before_symbolic =
-            chc_ctx.load_from_memory(const_addr.clone(), scalar_ty).expect("load should succeed");
+        let before_symbolic = chc_ctx
+            .load_from_memory(Loc::of_address(const_addr.clone()), scalar_ty)
+            .map(Val::into_expr)
+            .expect("load should succeed");
         assert!(
             before_symbolic.to_string().contains(&stored_value_smt),
             "before symbolic store, forwarding should work"
@@ -419,14 +498,15 @@ fn test_symbolic_store_invalidates_forwarding_same_block() {
         // Step 2: Symbolic-address store — should invalidate all forwarding
         let symbolic_addr = Expr::var("_symbolic_ptr", ay_bindings::Sort::bitvec(64));
         let new_value = Expr::bitvec_const(777u128, 32);
-        chc_ctx.build_memory_store(symbolic_addr, new_value, scalar_ty);
+        chc_ctx.build_memory_store(Loc::of_address(symbolic_addr), new_value, scalar_ty);
 
         // Step 3: Load from same constant address — must NOT use stale forwarding.
         // With forwarding, the result would be the direct constant (e.g., "#x000003e7").
         // Without forwarding, the result is a select over the store chain, which is
         // correct — the solver evaluates whether the symbolic address aliases.
         let after_symbolic = chc_ctx
-            .load_from_memory(const_addr, scalar_ty)
+            .load_from_memory(Loc::of_address(const_addr), scalar_ty)
+            .map(Val::into_expr)
             .expect("load should succeed after symbolic store");
         let after_smt = after_symbolic.to_string();
         assert!(
@@ -469,7 +549,7 @@ fn test_build_memory_store_ptr_mirrors_nonnull_alias_chain() {
 
         let addr = Expr::bitvec_const(0x6_0000_0008u128, 64);
         let value = Expr::bitvec_const(0x1234u128, 64);
-        let store_result = chc_ctx.build_memory_store(addr.clone(), value, ptr_ty);
+        let store_result = chc_ctx.build_memory_store(Loc::of_address(addr.clone()), value, ptr_ty);
         assert!(store_result.is_none(), "store should be accumulated into store chain");
 
         let nonnull_key = ChcCtx::type_key_for_ty(nonnull_ty).into_owned();
@@ -481,7 +561,8 @@ fn test_build_memory_store_ptr_mirrors_nonnull_alias_chain() {
         );
 
         let loaded = chc_ctx
-            .load_from_memory(addr, nonnull_ty)
+            .load_from_memory(Loc::of_address(addr), nonnull_ty)
+            .map(Val::into_expr)
             .expect("load through NonNull alias should succeed");
         let load_smt = loaded.to_string();
         // Part of #3608: constant-address forwarding may bypass store chain
@@ -522,7 +603,8 @@ fn test_build_memory_store_nonnull_mirrors_ptr_alias_chain() {
 
         let addr = Expr::bitvec_const(0x7_0000_0008u128, 64);
         let value = Expr::bitvec_const(0x55u128, 64);
-        let store_result = chc_ctx.build_memory_store(addr.clone(), value, nonnull_ty);
+        let store_result =
+            chc_ctx.build_memory_store(Loc::of_address(addr.clone()), value, nonnull_ty);
         assert!(store_result.is_none(), "store should be accumulated into store chain");
 
         let ptr_key = ChcCtx::type_key_for_ty(ptr_ty).into_owned();
@@ -533,8 +615,10 @@ fn test_build_memory_store_nonnull_mirrors_ptr_alias_chain() {
             "NonNull store should mirror into ptr alias store chain; ptr_key={ptr_key} store_keys={store_keys:?}"
         );
 
-        let loaded =
-            chc_ctx.load_from_memory(addr, ptr_ty).expect("load through ptr alias should succeed");
+        let loaded = chc_ctx
+            .load_from_memory(Loc::of_address(addr), ptr_ty)
+            .map(Val::into_expr)
+            .expect("load through ptr alias should succeed");
         let load_smt = loaded.to_string();
         // Part of #3608: constant-address forwarding may bypass store chain
         let uses_forwarding = !load_smt.contains("select");
@@ -588,7 +672,8 @@ fn test_build_memory_store_uses_declared_type_array_sort() {
 
         let addr = Expr::bitvec_const(0x3_0000_0008u128, 64);
         let value = Expr::bitvec_const(7u128, 32);
-        let store_result = chc_ctx.build_memory_store(addr.clone(), value, scalar_ty);
+        let store_result =
+            chc_ctx.build_memory_store(Loc::of_address(addr.clone()), value, scalar_ty);
         assert!(store_result.is_none(), "store should be accumulated into store chain");
 
         let constraints = chc_ctx.heap_state.drain_store_chains(&chc_ctx.diagnostics);
@@ -599,7 +684,8 @@ fn test_build_memory_store_uses_declared_type_array_sort() {
         );
 
         let loaded = chc_ctx
-            .load_from_memory(addr, scalar_ty)
+            .load_from_memory(Loc::of_address(addr), scalar_ty)
+            .map(Val::into_expr)
             .expect("load should use declared type-array sort");
         assert_eq!(
             loaded.sort().bitvec_width(),
@@ -640,7 +726,8 @@ fn test_load_from_memory_datatype_pointee_falls_back_to_type_key_sort() {
 
         let addr = Expr::bitvec_const(0x4_0000_0010u128, 64);
         let loaded = chc_ctx
-            .load_from_memory(addr, pair_ty)
+            .load_from_memory(Loc::of_address(addr), pair_ty)
+            .map(Val::into_expr)
             .expect("load should succeed with datatype pointee fallback");
 
         let type_key = ChcCtx::type_key_for_ty(pair_ty);
@@ -702,7 +789,7 @@ fn test_build_memory_store_datatype_pointee_falls_back_to_type_key_sort() {
 
         let addr = Expr::bitvec_const(0x5_0000_0010u128, 64);
         let value = Expr::bitvec_const(7u128, 32);
-        let store_result = chc_ctx.build_memory_store(addr, value, pair_ty);
+        let store_result = chc_ctx.build_memory_store(Loc::of_address(addr), value, pair_ty);
         assert!(store_result.is_none(), "store should be accumulated into store chain");
 
         let constraints = chc_ctx.heap_state.drain_store_chains(&chc_ctx.diagnostics);
@@ -769,8 +856,10 @@ fn test_load_from_memory_zeroed_bv8_region_returns_typed_zero_without_upgrade() 
         chc_ctx.heap_state.mark_heap_obj_zeroed(obj_id);
 
         let addr = Expr::bitvec_const(obj_id as u128, 32).concat(Expr::bitvec_const(0u128, 32));
-        let loaded =
-            chc_ctx.load_from_memory(addr, scalar_ty).expect("zeroed region load should succeed");
+        let loaded = chc_ctx
+            .load_from_memory(Loc::of_address(addr), scalar_ty)
+            .map(Val::into_expr)
+            .expect("zeroed region load should succeed");
 
         assert_eq!(loaded, Expr::bitvec_const(0u128, 32), "zeroed typed load should be bv32 zero");
         let (_region_name, _region_out_name, region_sort) =
@@ -818,7 +907,8 @@ fn test_load_from_memory_zeroed_bv8_region_written_still_upgrades() {
 
         let addr = Expr::bitvec_const(obj_id as u128, 32).concat(Expr::bitvec_const(0u128, 32));
         let loaded = chc_ctx
-            .load_from_memory(addr, scalar_ty)
+            .load_from_memory(Loc::of_address(addr), scalar_ty)
+            .map(Val::into_expr)
             .expect("written zeroed region load should succeed");
 
         assert!(
@@ -870,14 +960,15 @@ fn test_load_from_memory_zeroed_bv8_region_ignores_unrelated_type_array_write() 
             Expr::bitvec_const(written_obj_id as u128, 32).concat(Expr::bitvec_const(0u128, 32));
         let value = Expr::bitvec_const(42u128, 32);
         assert!(
-            chc_ctx.build_memory_store(write_addr, value, scalar_ty).is_none(),
+            chc_ctx.build_memory_store(Loc::of_address(write_addr), value, scalar_ty).is_none(),
             "typed store should accumulate into heap state"
         );
 
         let load_addr =
             Expr::bitvec_const(zeroed_obj_id as u128, 32).concat(Expr::bitvec_const(0u128, 32));
         let loaded = chc_ctx
-            .load_from_memory(load_addr, scalar_ty)
+            .load_from_memory(Loc::of_address(load_addr), scalar_ty)
+            .map(Val::into_expr)
             .expect("zeroed region load should succeed");
 
         assert_eq!(
@@ -929,14 +1020,15 @@ fn test_load_from_memory_unrelated_type_array_write_still_upgrades_region() {
             Expr::bitvec_const(written_obj_id as u128, 32).concat(Expr::bitvec_const(0u128, 32));
         let value = Expr::bitvec_const(42u128, 32);
         assert!(
-            chc_ctx.build_memory_store(write_addr, value, scalar_ty).is_none(),
+            chc_ctx.build_memory_store(Loc::of_address(write_addr), value, scalar_ty).is_none(),
             "typed store should accumulate into heap state"
         );
 
         let load_addr =
             Expr::bitvec_const(loaded_obj_id as u128, 32).concat(Expr::bitvec_const(0u128, 32));
         let loaded = chc_ctx
-            .load_from_memory(load_addr, scalar_ty)
+            .load_from_memory(Loc::of_address(load_addr), scalar_ty)
+            .map(Val::into_expr)
             .expect("load from unrelated region should succeed");
 
         let (region_in, _region_out, region_sort) =
@@ -997,7 +1089,8 @@ fn test_load_from_memory_region_array_matching_sort() {
 
         // Load from memory using the region array path.
         let loaded = chc_ctx
-            .load_from_memory(addr, scalar_ty)
+            .load_from_memory(Loc::of_address(addr), scalar_ty)
+            .map(Val::into_expr)
             .expect("load via region array should succeed");
 
         // The result should be a `select` on the region array, not a type array.
@@ -1048,7 +1141,8 @@ fn test_build_memory_store_region_array_matching_sort() {
         let addr = Expr::bitvec_const(obj_id as u128, 32).concat(Expr::bitvec_const(0x20u128, 32));
 
         let value = Expr::bitvec_const(42u128, 32);
-        let store_result = chc_ctx.build_memory_store(addr.clone(), value, scalar_ty);
+        let store_result =
+            chc_ctx.build_memory_store(Loc::of_address(addr.clone()), value, scalar_ty);
         assert!(store_result.is_none(), "region stores are accumulated, not returned");
 
         // The region key should have an accumulated store chain.
@@ -1072,7 +1166,8 @@ fn test_build_memory_store_region_array_matching_sort() {
         // Load-after-store should return the stored value, either via
         // store-to-load forwarding (literal) or via store/select chain.
         let loaded = chc_ctx
-            .load_from_memory(addr, scalar_ty)
+            .load_from_memory(Loc::of_address(addr), scalar_ty)
+            .map(Val::into_expr)
             .expect("load-after-store via region should succeed");
 
         let load_smt = loaded.to_string();

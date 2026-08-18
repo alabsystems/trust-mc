@@ -11,7 +11,7 @@ use rustc_public::CrateDef;
 use rustc_public::ty::{GenericArgKind, RigidTy, Ty, TyKind};
 
 use crate::codegen_ay::chc::ChcCtx;
-use crate::codegen_ay::types::POINTER_WIDTH;
+use crate::codegen_ay::ptr_repr::PtrSlot;
 
 use super::loop_replay::InlineWalkCtx;
 
@@ -67,11 +67,31 @@ pub(super) fn is_pointer_destination(
     false
 }
 
+/// Build the over-approximated result of a call the walker could not inline.
+///
+/// # What is and is not decided here
+///
+/// `is_pointer_like` is a **type** fact, computed by [`is_pointer_destination`]
+/// from the destination's Rust type — that is what says the havoc denotes an
+/// address. The other half of the test asks how wide `translate_ty` made the
+/// destination slot, which is a question about a **declared sort**, so it goes
+/// through [`PtrSlot`] rather than an inline width comparison. Same predicate,
+/// same accepted set; the two questions are just no longer spelled the same way.
+///
+/// # Residual (§4 item 6, `docs/addr-vs-value-conversion-queue.md`)
+///
+/// When both hold, the havoc is *shaped* as a pointer — a non-zero object id
+/// with a zero offset — which is a guess in the dangerous direction: an
+/// unmodelled call may return either an address or a datum, and shaping it as
+/// an address hands downstream provenance it never established. Closing that
+/// needs `Prov::Unknown` propagated into the havoc and consumed fail-closed,
+/// which is a coverage change and has to be measured against the burndown, not
+/// smuggled into a retyping wave. Deliberately left as-is.
 pub(super) fn build_nested_call_fallback_expr(
     effective_sort: ay_bindings::Sort,
     is_pointer_like: bool,
 ) -> Expr {
-    if effective_sort.bitvec_width() == Some(POINTER_WIDTH) && is_pointer_like {
+    if PtrSlot::of_sort(&effective_sort) == Some(PtrSlot::Thin) && is_pointer_like {
         let upper = super::super::declare_pending_var(
             super::super::chc_fresh_name("__nested_call_overapprox"),
             ay_bindings::Sort::bitvec(32),
@@ -106,10 +126,7 @@ pub(super) fn build_nested_call_fallback_expr_for_test(
 /// allocation), so a Vec with genuinely-invalid provenance is not marked valid.
 fn is_valid_backing_collection_ctor(callee_path: &str) -> bool {
     let method = callee_path.rsplit("::").next().unwrap_or(callee_path);
-    matches!(
-        method,
-        "into_vec" | "to_vec" | "bounded_any" | "exact_any" | "any_vec" | "exact_vec"
-    )
+    matches!(method, "into_vec" | "to_vec" | "bounded_any" | "exact_any" | "any_vec" | "exact_vec")
 }
 
 /// Give the over-approximated return of a provably-allocating collection
@@ -165,8 +182,7 @@ pub(super) fn try_build_valid_collection_backing_fallback<'tcx, 'body>(
         super::super::chc_fresh_name("__nested_call_overapprox"),
         effective_sort.clone(),
     );
-    let valid_ptr =
-        Expr::bitvec_const(i128::from(obj_id), 32).concat(Expr::bitvec_const(0u64, 32));
+    let valid_ptr = Expr::bitvec_const(i128::from(obj_id), 32).concat(Expr::bitvec_const(0u64, 32));
     let args: Vec<Expr> = fields
         .iter()
         .map(|f| {

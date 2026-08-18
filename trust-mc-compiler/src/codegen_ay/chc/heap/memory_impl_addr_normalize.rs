@@ -4,42 +4,39 @@
 
 //! Shared pointer-address normalization helpers for CHC Mem-track deref paths.
 
-use ay_bindings::{Expr, ExprValue};
+use ay_bindings::Expr;
 use tracing::warn;
 
+use crate::codegen_ay::provenance::{Loc, is_value_widened_into_address};
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 
 use super::ChcCtx;
 
-/// True when `expr` is a symbolic sub-pointer-width VALUE widened into
-/// pointer width (`zero_extend`/`sign_extend` of a narrow non-constant).
-///
-/// fc-interior-mut: such expressions are never real storage addresses — the
-/// split-pointer model's obj_id (upper 32 bits) is forced to 0/sign-fill,
-/// i.e. the null object. They arise when ref-dematerialization launders a
-/// flattened referent VALUE (e.g. a Cell<u32> payload) through a
-/// pointer-sorted local. Constant widenings are exempt: literal addresses
-/// (e.g. `0 as *const T`) keep the legacy null-deref check behavior.
-pub(in crate::codegen_ay::chc) fn is_value_widened_into_address(expr: &Expr) -> bool {
-    match expr.value() {
-        ExprValue::BvZeroExtend { expr: inner, .. }
-        | ExprValue::BvSignExtend { expr: inner, .. } => {
-            inner.sort().bitvec_width().is_some_and(|w| w < POINTER_WIDTH)
-                && !matches!(inner.value(), ExprValue::BitVecConst { .. })
-        }
-        _ => false,
-    }
-}
-
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Reduce wide or wrapped pointer expressions to the thin storage-address
     /// lane used by Mem-track byte-offset arithmetic.
+    ///
+    /// This is one of the encoder's `Loc` PRODUCERS (address-vs-value refactor,
+    /// wave 2 — see `codegen_ay/provenance.rs`). Every value-shaped input is
+    /// rejected below rather than widened, so a `Some` result denotes storage,
+    /// never a datum.
+    ///
+    /// GUARANTEE relied upon by callers: the returned [`Loc`] is **exactly**
+    /// [`POINTER_WIDTH`] bits wide. Callers must not re-derive that fact with
+    /// another width test — that re-test is the address-recovery heuristic this
+    /// refactor removes.
     pub(in crate::codegen_ay::chc) fn normalize_deref_address_expr(
         &self,
         pointer_expr: Expr,
         pointer_ty: rustc_public::ty::Ty,
-    ) -> Option<Expr> {
-        let addr_expr = self.extract_pointer_storage_expr(&pointer_expr).unwrap_or(pointer_expr);
+    ) -> Option<Loc> {
+        // `extract_pointer_storage_expr` is a `Loc` producer as of wave 4; this
+        // function re-tags at its own return, so unwrap to the bare expression
+        // for the width/shape refusals below rather than tagging twice.
+        let addr_expr = self
+            .extract_pointer_storage_expr(&pointer_expr)
+            .map(Loc::into_expr)
+            .unwrap_or(pointer_expr);
         let Some(addr_width) = addr_expr.sort().bitvec_width() else {
             warn!(
                 ?pointer_ty,
@@ -78,12 +75,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             );
             return None;
         }
-        Some(if addr_width == POINTER_WIDTH {
+        Some(Loc::of_address(if addr_width == POINTER_WIDTH {
             addr_expr
         } else {
             // Wider-than-pointer (fat-pointer wrappers): keep the existing
             // thin-lane extraction behavior.
             coerce_bitvec_width_safe(addr_expr, POINTER_WIDTH, SignExtension::ZeroExtend)
-        })
+        }))
     }
 }

@@ -17,6 +17,8 @@ use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
 use crate::codegen_ay::chc::expr::codegen_expr_heap_bv_eval::const_bv_value;
+use crate::codegen_ay::chc::expr::codegen_expr_signedness::ExprSignedness;
+use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort};
 
 use super::pointer_step::step_split_pointer;
@@ -160,7 +162,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         let ptr = coerce_bitvec_width_safe(lhs, POINTER_WIDTH, SignExtension::ZeroExtend);
-        let count = coerce_bitvec_width_safe(rhs, POINTER_WIDTH, SignExtension::SignExtend);
+        // `BinOp::Offset`'s RHS is the element COUNT: an integer VALUE, never an
+        // address. It is sign-extended to pointer width purely so the arithmetic
+        // below is well-typed against `ptr` — that coercion is why every later
+        // "is this 64 bits wide?" test on `count` is uninformative.
+        let count =
+            Val::of_value(coerce_bitvec_width_safe(rhs, POINTER_WIDTH, SignExtension::SignExtend));
 
         // Resolve pointee size (same logic as translate_pointer_offset_with_modified).
         let pointee_size = lhs_op.ty(self.body.locals()).ok().and_then(|ty| match ty.kind() {
@@ -178,11 +185,34 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Constant-count fast-path: fold the count-only checks numerically so
         // fully-concrete offsets don't leave live error rules (static discharge).
-        let const_count_checks = Self::const_fold_offset_count_checks(
-            &count,
-            /* count_is_signed = */ true,
-            pointee_size as u64,
-        );
+        //
+        // SOUNDNESS (#4118): the signedness must come from the count OPERAND's
+        // own type, not a hardcoded `true`. `in_range` is
+        // `count_is_signed || value <= isize_max`, so pinning it to `true` made
+        // every 64-bit two's-complement value "in range" — check 1 was VACUOUS
+        // for all concrete counts. `ptr.add(count: usize)` lowers to MIR
+        // `Offset` with an UNSIGNED count, whose real obligation is
+        // `count <= isize::MAX`; that is exactly the check Kani's
+        // `to_isize.safety_check` performs. `unwrap_or(false)` matches the
+        // KaniModel twin (codegen_call_kani_model.rs) and fails closed: unknown
+        // signedness is treated as unsigned, i.e. the check is emitted.
+        let count_signedness = self.operand_signedness(rhs_op);
+        if count_signedness.is_none() {
+            // Neither reading is safe to assume when the count's type is
+            // unknown: one 64-bit pattern is a huge positive under the unsigned
+            // reading and a small negative under the signed one. Asserting the
+            // unsigned bound would FABRICATE a violation for `ptr.offset(-1)`;
+            // asserting the signed range is vacuous. So skip the obligation and
+            // fail closed instead — an unaudited reason hits the catch-all
+            // `FallbackSoundness::FailClose` and stays UNACCOUNTED, so no Safe
+            // verdict can rest on the range check being skipped here.
+            self.record_sound_fallback_reason("offset_count_signedness_unknown");
+        }
+        // Signed on the unknown path so the fold cannot manufacture a failure;
+        // the demotion above is what keeps that case honest.
+        let count_is_signed = count_signedness.unwrap_or(true);
+        let const_count_checks =
+            Self::const_fold_offset_count_checks(&count, count_is_signed, pointee_size as u64);
 
         // Check 1: offset value within isize bounds. KINDED (PointerOverflow +
         // Kani's exact message) via pending_kinded_checks so the failing check
@@ -190,22 +220,41 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // lane attributes the CTREX Genuine — instead of the anonymous
         // aggregate `chc.0` that classified as CtrexCategory::Unknown
         // (Overflow/pointer_overflow_fail, expected/pointer-overflow).
-        match const_count_checks {
-            Some((true, _)) => {}
-            Some((false, _)) => self.heap_state.pending_kinded_checks.push((
-                Expr::bool_const(false),
-                trust_mc_core::violation::PropertyKind::PointerOverflow,
-                Some("Offset value overflows isize".to_string()),
-            )),
-            None => {
-                let count_in_range =
-                    count.clone().bvsle(isize_max).and(count.clone().bvsge(isize_min));
-                self.heap_state.pending_kinded_checks.push((
-                    count_in_range,
+        //
+        // ZST-EXEMPT (#3896, #4118): `offset` accepts a `count` past isize::MAX
+        // for ZSTs, because the byte offset is `count * 0 == 0`. Kani's oracle
+        // in expected/offset-overflows-isize pins this exactly — `test_zst` and
+        // `test_non_zst` pass the SAME `(isize::MAX as usize) + 1`, and only the
+        // non-ZST one fails — so this obligation must be skipped when the
+        // pointee is zero-sized. (Check 4 below is deliberately NOT exempt.)
+        if pointee_size != 0 {
+            match const_count_checks {
+                Some((true, _)) => {}
+                Some((false, _)) => self.heap_state.pending_kinded_checks.push((
+                    Expr::bool_const(false),
                     trust_mc_core::violation::PropertyKind::PointerOverflow,
                     Some("Offset value overflows isize".to_string()),
-                ));
-                debug!("CHC: generated offset_value_overflow safety check (#3300)");
+                )),
+                None => {
+                    // An unsigned count needs the UNSIGNED bound: every 64-bit
+                    // value satisfies the signed range, so `bvsle/bvsge` would
+                    // be vacuous here for the same reason the fold was.
+                    let count_in_range = if count_is_signed {
+                        count
+                            .as_expr()
+                            .clone()
+                            .bvsle(isize_max)
+                            .and(count.as_expr().clone().bvsge(isize_min))
+                    } else {
+                        count.as_expr().clone().bvule(isize_max)
+                    };
+                    self.heap_state.pending_kinded_checks.push((
+                        count_in_range,
+                        trust_mc_core::violation::PropertyKind::PointerOverflow,
+                        Some("Offset value overflows isize".to_string()),
+                    ));
+                    debug!("CHC: generated offset_value_overflow safety check (#3300)");
+                }
             }
         }
 
@@ -241,9 +290,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 )),
                 None => {
                     let size_expr = Expr::bitvec_const(pointee_size as u128, POINTER_WIDTH);
-                    let offset = count.clone().bvmul(size_expr.clone());
+                    let offset = count.as_expr().clone().bvmul(size_expr.clone());
                     let div_back = offset.bvsdiv(size_expr);
-                    let no_mul_overflow = div_back.eq(count.clone());
+                    let no_mul_overflow = div_back.eq(count.as_expr().clone());
                     self.heap_state.pending_kinded_checks.push((
                         no_mul_overflow,
                         trust_mc_core::violation::PropertyKind::PointerOverflow,
@@ -288,8 +337,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // offset 0 stepping 0 <= k <= cap cannot wrap and cannot change
         // objects.
         if count_checks_fold_clean
-            && let Some(vec_bound) =
-                self.projected_vec_offset_bound_for_operand(lhs_op, &count, modified_locals)
+            && let Some(vec_bound) = self.projected_vec_offset_bound_for_operand(
+                lhs_op,
+                count.as_expr(),
+                modified_locals,
+            )
         {
             checks.push(vec_bound);
             debug!("CHC: generated projected-Vec offset_alloc_bound safety check (P4-3)");
@@ -307,8 +359,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // product, and the folded end offset lies in `[0, size]` — such a
         // step cannot wrap and cannot change objects.
         if count_checks_fold_clean
-            && let Some(bound) =
-                self.anchored_alloc_offset_bound_for_operand(lhs_op, &count, pointee_size as u64)
+            && let Some(bound) = self.anchored_alloc_offset_bound_for_operand(
+                lhs_op,
+                count.as_expr(),
+                pointee_size as u64,
+            )
         {
             checks.push(bound);
             debug!("CHC: folded anchored raw-alloc offset_alloc_bound (raw-alloc route)");
@@ -318,18 +373,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Check 3: result pointer doesn't wrap around address space.
         // Part of #3921: use split-pointer step for same-object preservation.
         let byte_offset = if pointee_size > 1 {
-            count.clone().bvmul(Expr::bitvec_const(pointee_size as u128, POINTER_WIDTH))
+            count.as_expr().clone().bvmul(Expr::bitvec_const(pointee_size as u128, POINTER_WIDTH))
         } else {
-            count.clone()
+            count.as_expr().clone()
         };
         let step = step_split_pointer(ptr.clone(), byte_offset);
         let result_ptr = step.result;
 
         // If offset positive and result < ptr → wrapped forward.
-        let positive_offset = count.clone().bvsge(zero.clone());
+        let positive_offset = count.as_expr().clone().bvsge(zero.clone());
         let wrapped_forward = positive_offset.and(result_ptr.clone().bvult(ptr.clone()));
         // If offset negative and result > ptr → wrapped backward.
-        let negative_offset = count.clone().bvslt(zero);
+        let negative_offset = count.as_expr().clone().bvslt(zero);
         let wrapped_backward = negative_offset.and(result_ptr.clone().bvugt(ptr.clone()));
         let no_ptr_wrap = wrapped_forward.or(wrapped_backward).not();
         checks.push(no_ptr_wrap);
@@ -546,11 +601,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// prover does not fold `bvsdiv`, so a fully-concrete harness would keep
     /// a live error rule and lose whole-harness collapse to `false => error`.
     pub(in crate::codegen_ay::chc) fn const_fold_offset_count_checks(
-        count: &Expr,
+        count: &Val,
         count_is_signed: bool,
         pointee_size: u64,
     ) -> Option<(bool, bool)> {
-        let (value, width) = const_bv_value(count)?;
+        let (value, width) = const_bv_value(count.as_expr())?;
+        // Address-vs-value (wave 1): `count` is a VALUE, so this is NOT the
+        // "is it a pointer?" test it used to read as. It is a genuine
+        // precondition of the fold ITSELF — every constant below (`1 << 64`,
+        // `1 << 63`, the isize bound) is 64-bit two's-complement arithmetic, so
+        // a differently-sized constant simply cannot be folded here and must
+        // fall through to the symbolic obligation. RETAINED deliberately:
+        // widening it would mean folding at other widths, which is a semantic
+        // change, not a retyping. See the conversion queue, wave 1.
         if width != 64 {
             return None;
         }
@@ -1361,37 +1424,50 @@ mod tests {
     use ay_bindings::{Expr, Sort};
 
     use super::ChcCtx;
+    use crate::codegen_ay::provenance::Val;
 
     #[test]
     fn const_count_checks_fold_small_positive_count() {
         let count = Expr::bitvec_const(10u128, 64);
-        assert_eq!(ChcCtx::const_fold_offset_count_checks(&count, true, 4), Some((true, true)));
+        assert_eq!(
+            ChcCtx::const_fold_offset_count_checks(&Val::of_value(count), true, 4),
+            Some((true, true))
+        );
     }
 
     #[test]
     fn const_count_checks_detect_byte_offset_mul_overflow() {
         // 2^62 elements of size 4 wrap the signed 64-bit byte offset.
         let count = Expr::bitvec_const(1u128 << 62, 64);
-        assert_eq!(ChcCtx::const_fold_offset_count_checks(&count, true, 4), Some((true, false)));
+        assert_eq!(
+            ChcCtx::const_fold_offset_count_checks(&Val::of_value(count), true, 4),
+            Some((true, false))
+        );
     }
 
     #[test]
     fn const_count_checks_unsigned_count_exceeding_isize_max() {
         let count = Expr::bitvec_const(1u128 << 63, 64);
-        assert_eq!(ChcCtx::const_fold_offset_count_checks(&count, false, 1), Some((false, true)));
+        assert_eq!(
+            ChcCtx::const_fold_offset_count_checks(&Val::of_value(count), false, 1),
+            Some((false, true))
+        );
     }
 
     #[test]
     fn const_count_checks_negative_count_folds_exactly() {
         // -1 (two's complement) with size 4: product -4, div-back -1 == count.
         let count = Expr::bitvec_const(u64::MAX as u128, 64);
-        assert_eq!(ChcCtx::const_fold_offset_count_checks(&count, true, 4), Some((true, true)));
+        assert_eq!(
+            ChcCtx::const_fold_offset_count_checks(&Val::of_value(count), true, 4),
+            Some((true, true))
+        );
     }
 
     #[test]
     fn const_count_checks_symbolic_count_does_not_fold() {
         let count = Expr::var("sym_count", Sort::bitvec(64));
-        assert_eq!(ChcCtx::const_fold_offset_count_checks(&count, true, 4), None);
+        assert_eq!(ChcCtx::const_fold_offset_count_checks(&Val::of_value(count), true, 4), None);
     }
 
     #[test]

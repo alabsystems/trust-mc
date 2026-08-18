@@ -121,7 +121,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Pre-declares type-indexed memory arrays for local variable assignments.
     ///
     /// Covers Vector 1 of the late-creation bug (#2258): plain local assignments
-    /// at Mem level call `build_memory_store(addr, value, local_ty)` which may
+    /// at Mem level call `build_memory_store(loc, value, local_ty)` which may
     /// create type arrays via `get_or_create_type_array`. Pre-declaring them
     /// ensures they appear in relation signatures and `declare-var` statements.
     ///

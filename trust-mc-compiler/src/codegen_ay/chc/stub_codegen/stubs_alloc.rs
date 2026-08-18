@@ -6,6 +6,7 @@
 use super::stubs::StubKind;
 use super::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort};
 use super::{AllocCallResult, ChcCtx, StubTranslateArgs};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use ay_bindings::{Expr, ExprValue, Sort};
 use rustc_public::mir::Operand;
 use std::collections::HashSet;
@@ -151,9 +152,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(layout);
         }
 
-        if raw_expr.sort().bitvec_width() == Some(POINTER_WIDTH)
-            && let Some(op_ty) = operand.ty(self.body.locals()).ok()
-        {
+        // The MIR type decides whether this operand is a pointer — it is a
+        // `&Layout` / `*const Layout` or it is not, and that is knowable without
+        // looking at the term. The width test that used to lead this condition
+        // decided the same thing by measuring the term, which is the inference
+        // this campaign deletes; `PtrRepr::thin_address` now supplies only the
+        // *shape* (the same predicate, in the register where it is honest) and
+        // hands back a `Loc` for the load.
+        if let Some(op_ty) = operand.ty(self.body.locals()).ok() {
             let pointee_ty = match op_ty.kind() {
                 rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, inner, _))
                 | rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::RawPtr(inner, _)) => {
@@ -162,10 +168,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 _ => None, // external enum: TyKind
             };
             if let Some(inner) = pointee_ty
-                && let Some(loaded) = self.load_from_memory(raw_expr.clone(), inner)
-                && loaded.sort().bitvec_width() == Some(128)
+                && let Some(layout_addr) = PtrRepr::thin_address(&raw_expr)
+                && let Some(loaded) = self.load_from_memory(layout_addr, inner)
+                && loaded.as_expr().sort().bitvec_width() == Some(128)
             {
-                return Some(loaded);
+                return Some(loaded.into_expr());
             }
         }
 

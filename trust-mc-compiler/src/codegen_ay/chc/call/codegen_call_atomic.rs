@@ -22,8 +22,10 @@ use super::codegen_call_atomic_rmw::{
     codegen_atomic_compare_exchange, codegen_atomic_cxchg, codegen_atomic_rmw,
 };
 use super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto};
-use super::codegen_call_misc::CallMisc;
+use super::codegen_call_misc::Referent;
 use super::codegen_rules::CodegenRules;
+use crate::codegen_ay::provenance::{MaybeLoc, Val};
+use crate::codegen_ay::ptr_repr::PtrSlot;
 
 // ---------------------------------------------------------------------------
 // Atomic kind detection
@@ -220,6 +222,30 @@ fn extract_atomic_ptr_local(arg: &Operand) -> Option<usize> {
     }
 }
 
+/// The referent DATUM an atomic load may bind directly, when one is
+/// ESTABLISHED — never when it merely looks like one.
+///
+/// Two independent establishing facts, and no guess:
+///
+/// * [`Referent::Value`] — the resolver reports that a tier dereferenced, so
+///   the term IS the referent's datum. This is the fact §4 item 1 was missing.
+/// * [`Referent::Unreported`] whose SORT has no pointer slot at all
+///   ([`PtrSlot::of_sort`] answers `None`): the memory model addresses storage
+///   by a pointer-slot bitvector and nothing else, so a term of any other sort
+///   cannot be an address in it and can only be the datum. That is a
+///   representation fact about a DECLARED sort — nothing widens a sort — and it
+///   is what the retired `bitvec_width() != Some(64)` disjunct was reaching
+///   for. A `Thin` or `Wide` unreported term is exactly the ambiguous case and
+///   gets `None`: it goes to the Mem-load lane, or to the sound fallback.
+fn atomic_referent_datum(referent: &Referent) -> Option<Val> {
+    match referent {
+        Referent::Value(val) => Some(val.clone()),
+        Referent::Unreported(expr) => {
+            PtrSlot::of_sort(expr.sort()).is_none().then(|| Val::of_value(expr.clone()))
+        }
+    }
+}
+
 /// Emit the sound fallback for atomic call terminators after flushing any
 /// deferred pointer-safety checks queued on the shared memory path.
 fn emit_atomic_sound_fallback_goto(
@@ -267,10 +293,11 @@ fn codegen_atomic_load(
         mark_atomic_ptr_forwarded(ctx, &dcx.args[0]);
     }
 
-    // Resolve what the pointer points to. For stack-local pointers this
-    // returns the dereferenced value; for heap-backed pointers Tier 5
-    // returns the BV64 address (not the value).
-    let resolved = ctx.resolve_ref_or_const_referent(&dcx.args[0], dcx.modified_locals);
+    // Resolve what the pointer points to, and keep WHICH TIER answered.
+    // Tiers 1-4.5 dereference and hand back the referent's datum
+    // ([`Referent::Value`]); tiers 5-6 hand back the operand's own term, which
+    // for a reference operand is the pointer ([`Referent::Unreported`]).
+    let resolved = ctx.resolve_ref_or_const_referent_tagged(&dcx.args[0], dcx.modified_locals);
 
     // Determine the pointee type for Mem-level fallback.
     let pointee_ty = dcx.args[0].ty(ctx.body.locals()).ok().and_then(|ty| match ty.kind() {
@@ -279,30 +306,58 @@ fn codegen_atomic_load(
         _ => None,
     });
 
-    // Choose between ref_target value and Mem-level load.
-    // Part of #3452: Relaxed sort check for stable API calls.
-    // AtomicBool wraps u8 (via UnsafeCell), so ref_target resolution returns
-    // BV8 (the AtomicBool local's sort) while the load destination is Bool.
-    // The strict sort == check rejected this valid resolution path. Accept any
-    // non-pointer resolved value — make_coerced_eq_constraint handles BV↔Bool.
+    // Choose between the resolved referent datum and a Mem-level load.
     //
-    // Part of #3710: Only use resolved as a value when ref_target exists.
-    // Without a ref_target, resolve_ref_or_const_referent Tier 5 returns
-    // the pointer address (BV64), not the dereferenced value. Using the
-    // address as the loaded value produces incorrect constraints.
-    let loaded = if has_ref_target
-        && let Some(ref val) = resolved
-        && let Some((_, ref dest_var)) = ctx.resolve_destination(dest_local)
-        && (val.sort() == dest_var.sort() || val.sort().bitvec_width() != Some(64))
+    // §4 item 1 (`docs/addr-vs-value-conversion-queue.md`) RESOLVED, and the
+    // fix is not the one that item asked for. The comment that stood here said
+    // the partition "cannot be resolved" because an `AtomicUsize` holds either
+    // a pointer bit-pattern or an integer depending on run-time history, and
+    // proposed an `AtomicCell` tag written by the last store. That information
+    // does not exist and would not have helped: `store_forward_map` records the
+    // store's DECLARED type key, which is `usize` under either reading.
+    //
+    // The question the partition actually asks is not "what does the atomic
+    // hold?" but "did the resolver dereference, or hand back the pointer?" —
+    // and that is a compile-time fact about which of six tiers answered, known
+    // at the producer and previously discarded. `Referent` carries it, so the
+    // `bitvec_width() == Some(64)` guess is DELETED rather than narrowed:
+    //
+    // * `Value` — a tier that resolved THROUGH the reference (or a by-value
+    //   operand whose MIR type is not an address). It is the referent's datum,
+    //   whatever its width, so an `AtomicUsize` datum no longer loses to its own
+    //   width. Part of #3452's relaxed sort check is subsumed: `AtomicBool`
+    //   resolves to BV8 against a Bool destination and
+    //   `make_coerced_eq_constraint` handles the BV<->Bool crossing.
+    // * `Unreported` — tier 5/6 handed back the operand's own term. For a
+    //   reference operand that is the POINTER (the #3710 hazard), so this lane
+    //   loads THROUGH it, and the address stays `MaybeLoc::Unknown` because
+    //   `translate_operand_with_modified` still reports nothing about it.
+    //
+    // See `atomic_referent_datum` for the one case where an `Unreported` term
+    // is still bound directly, and why that is a representation fact rather
+    // than the width guess it replaces.
+    //
+    // `has_ref_target` is no longer consulted for the partition. It was a proxy
+    // for "did a dereferencing tier run", asked of a different function
+    // (`resolve_ptr_target_local`) that can disagree with the tier that actually
+    // answered; the tag is the fact it was approximating. It still gates the
+    // #3761 call-forwarding registration above, which is a different question.
+    let loaded: Val = if let Some(ref referent) = resolved
+        && ctx.resolve_destination(dest_local).is_some()
+        && let Some(datum) = atomic_referent_datum(referent)
     {
-        // Sort matches or value is a non-pointer scalar — use as the dereferenced value.
-        debug!(dest_local, "atomic_load: ref_target resolved");
-        resolved.expect("invariant: resolved is Some in this branch")
-    } else if let Some(addr) = resolved.as_ref().filter(|a| a.sort().bitvec_width() == Some(64))
+        debug!(dest_local, "atomic_load: referent datum established");
+        datum
+    } else if let Some(Referent::Unreported(ref addr)) = resolved
+        && matches!(PtrSlot::of_sort(addr.sort()), Some(PtrSlot::Thin))
         && let Some(pty) = pointee_ty
     {
-        // BV64 pointer address — Mem-level load with repr(transparent) aliasing (#3452, #3710).
-        let mem_val = atomic_load_from_memory(ctx, addr, pty);
+        // Unreported term in a shape the memory model can be addressed by —
+        // Mem-level load with repr(transparent) aliasing (#3452, #3710).
+        // `PtrSlot::Thin` is a REPRESENTATION test (does this sort fit the
+        // memory model's address slot?), not evidence of addresshood; the
+        // provenance is `Unknown` and says so.
+        let mem_val = atomic_load_from_memory(ctx, &MaybeLoc::Unknown(addr.clone()), pty);
         if let Some(mem_val) = mem_val {
             debug!(dest_local, bb_idx = dcx.bb_idx, "atomic_load: Mem-level load");
             mem_val
@@ -345,6 +400,7 @@ fn codegen_atomic_load(
     // The destination sort is Bool. Without unwrapping, coercion sees
     // Datatype→Bool which is unsupported. Unwrapping yields BV8, then
     // BV8→Bool coercion (BV8 != 0) succeeds via make_coerced_eq_constraint.
+    let loaded = loaded.into_expr();
     let loaded = unwrap_single_field_datatype(&loaded).unwrap_or(loaded);
 
     if let Some((_, dest_var)) = ctx.resolve_destination(dest_local) {
@@ -429,7 +485,15 @@ fn codegen_atomic_store(
 
     let mem_tgt = atomic_receiver_mem_target(ctx, &dcx.args[0], dcx.modified_locals);
     if let Some((addr, pointee_ty)) = mem_tgt
-        && emit_atomic_mem_store_transition(ctx, dcx, target, new_value, addr, pointee_ty)
+        // The stored datum is the call's second operand: `atomic_store(ptr, val)`.
+        && emit_atomic_mem_store_transition(
+            ctx,
+            dcx,
+            target,
+            Val::of_value(new_value),
+            addr,
+            pointee_ty,
+        )
     {
         debug!(dest_local, bb_idx = dcx.bb_idx, "atomic_store: Mem-level store");
         return;

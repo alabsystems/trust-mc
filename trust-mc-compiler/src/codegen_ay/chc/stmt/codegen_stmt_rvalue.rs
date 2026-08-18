@@ -71,7 +71,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 self.translate_rvalue_binop(rvalue, op, lhs_op, rhs_op, modified_locals, dest_local)
             }
             Rvalue::UnaryOp(UnOp::PtrMetadata, operand) => {
-                self.translate_ptr_metadata(operand, modified_locals)
+                self.translate_ptr_metadata(operand, modified_locals).map(|meta| meta.into_expr())
             }
             Rvalue::UnaryOp(op, operand) => {
                 // Part of #3043: derive BV width from operand's MIR type.

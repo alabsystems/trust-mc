@@ -230,7 +230,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => inner,
             _ => return None,
         };
-        self.load_from_memory(ptr.clone(), inner_ty)
+        self.load_from_memory_untyped(ptr.clone(), inner_ty)
     }
 
     /// Gets the tracked length variable for a collection local, if available.

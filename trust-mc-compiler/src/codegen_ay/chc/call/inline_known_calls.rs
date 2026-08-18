@@ -34,6 +34,7 @@ use crate::codegen_ay::chc::codegen_expr_array_eq::{
 use crate::codegen_ay::chc::pointer_step::{step_split_pointer, step_split_pointer_sub};
 use crate::codegen_ay::chc::stubs_option_helpers::OptionHelpers;
 use crate::codegen_ay::chc::ty_signedness;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::{
     POINTER_WIDTH, SignExtension, coerce_bitvec_width, unflatten_bitvec_to_datatype,
@@ -194,11 +195,16 @@ fn inline_pointer_utility_expr<'tcx, 'body>(
     }
     match stub {
         StubKind::PtrNull => Some(Expr::bitvec_const(0u64, POINTER_WIDTH)),
-        StubKind::PtrIsNull | StubKind::PtrIsNullRuntime
-            if translated_args.len() == 1
-                && translated_args[0].sort().bitvec_width() == Some(POINTER_WIDTH) =>
-        {
-            Some(translated_args[0].clone().eq(Expr::bitvec_const(0u64, POINTER_WIDTH)))
+        // `<*const T>::is_null` — the provenance is supplied by the CALLEE, not
+        // guessed here: the stub kind says this argument is a pointer. What was
+        // left to decide is only the *shape*, so the bare width test is replaced
+        // by the decoder that answers exactly that and hands back a `Loc`.
+        // `thin_address` accepts precisely `width == POINTER_WIDTH`, so the set
+        // of accepted arguments is unchanged; a wide pointer still falls through
+        // to the walker rather than being null-tested on half of itself.
+        StubKind::PtrIsNull | StubKind::PtrIsNullRuntime if translated_args.len() == 1 => {
+            let addr = PtrRepr::thin_address(&translated_args[0])?;
+            Some(addr.into_expr().eq(Expr::bitvec_const(0u64, POINTER_WIDTH)))
         }
         // Part of #3768: Pointer identity passthrough for inline walker.
         // These are all identity at the BV level — the pointer value doesn't change.

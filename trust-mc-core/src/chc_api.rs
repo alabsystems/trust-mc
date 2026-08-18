@@ -244,6 +244,24 @@ pub enum ChcPdrCexVerification {
     /// satisfiable derivation of the query target and returned its concrete
     /// witness model.
     DirectSmtModel,
+    /// The direct-SMT decision procedure composed a satisfiable derivation of
+    /// the query target on a `k`-bounded unrolling of the (cyclic) lowered CHC
+    /// problem and returned its concrete witness model.
+    ///
+    /// The unrolling is a pure UNDER-approximation built by predicate
+    /// renaming: every unrolled clause is one original clause with its
+    /// predicates re-labeled per level, so erasing the levels maps the
+    /// satisfiable derivation 1:1 onto a derivation of the ORIGINAL problem —
+    /// the witness is real. Traces needing more than `k` back-edge traversals
+    /// are simply unrepresented, so this provenance class is REFUTATION-ONLY:
+    /// exhausting the unrolled prefix without a derivation proves NOTHING
+    /// about deeper traces and must never surface as Proved/Safe. Consumers
+    /// may accept this kind only on the `Refuted` path; every proof-credit
+    /// gate must treat it as inadmissible.
+    BoundedUnrollDirectSmtModel {
+        /// Back-edge traversal budget of the unrolling that found the witness.
+        k: u64,
+    },
 }
 
 /// Producer attestation about the concreteness (havoc-freedom) of the encoding

@@ -15,7 +15,7 @@ We can try to find this bug with a proof harness like this:
 ```
 
 But we've just used a [new attribute](reference/attributes.md#kaniunwindnumber) (`#[kani::unwind(1)]`) that requires some explanation.
-When we run `cargo trust-mc` on this code as we have written it, we see an odd verification failure:
+When we run `targo trust-mc` on this code as we have written it, we see an odd verification failure:
 
 ```
 SUMMARY:
@@ -105,7 +105,7 @@ In that case you can either use `--default-unwind x` to set an unwind bound for 
 Or you can _override_ a harness's bound, but only when running a specific harness:
 
 ```
-cargo trust-mc --harness check_initialize_prefix --unwind 11
+targo trust-mc --harness check_initialize_prefix --unwind 11
 ```
 
 Finally, you might be interested in defaulting the unwind bound to 1, to force termination (and force supplying a bound) on all your proof harnesses.

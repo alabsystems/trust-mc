@@ -14,6 +14,7 @@ use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
 use std::collections::HashMap;
 
 use super::super::codegen_types::CodegenTypes;
+use crate::codegen_ay::provenance::{Loc, MaybeLoc, Val};
 use crate::rustc_public_bridge::IndexedVal;
 
 use super::super::inline_shared::apply_inline_subslice_write;
@@ -68,8 +69,13 @@ pub(super) fn update_inline_value_expr(
                 cons_idx: pending_cons_idx,
                 field_ty: Some(field_ty),
             };
+            // `current` is the inline body's term for the value being written
+            // through; the caller resolved any leading Deref into a loaded value
+            // before getting here, so this is a value, not an address.
+            let current = crate::codegen_ay::provenance::Val::of_value(current);
             let field_value =
-                ChcCtx::datatype_field_select(&current, field_proj.field_idx, field_proj.cons_idx)?;
+                ChcCtx::datatype_field_select(&current, field_proj.field_idx, field_proj.cons_idx)?
+                    .into_expr();
             let updated_field = update_inline_value_expr(
                 ctx,
                 field_value,
@@ -79,7 +85,7 @@ pub(super) fn update_inline_value_expr(
                 rhs,
                 local_exprs,
             )?;
-            ChcCtx::apply_projection_update(&current, &[field_proj], updated_field)
+            ChcCtx::apply_projection_update(current.as_expr(), &[field_proj], updated_field)
         }
         ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
             let index_expr = resolve_inline_index_expr(local_exprs, &projections[0])?;
@@ -112,12 +118,17 @@ pub(super) fn update_inline_value_expr(
             // update, then store the result back. The pointer local itself is
             // unchanged -- the write goes to memory.
             let pointee_ty = inline_deref_pointee_ty(ctx, current_ty)?;
-            let pointer_addr = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(&current)
-                .unwrap_or_else(|| current.clone());
-            if pointer_addr.sort().bitvec_width() != Some(POINTER_WIDTH) {
-                return None;
-            }
-            let loaded = load_inline_value_from_memory(ctx, pointer_addr.clone(), pointee_ty)?;
+            // This used to be a second, hand-inlined copy of what
+            // `inline_deref_target_addr` already does — extract the declared
+            // `fld_ptr` role if there is one, else take the term as it stands,
+            // then check it is in a shape the memory model can address. Two
+            // copies of one decision is exactly how a read side and a write
+            // side drift apart, so this now calls the shared helper and keeps
+            // the `MaybeLoc` it returns — including which of its two lanes
+            // answered, so the load and the store below agree on that too.
+            let pointer_addr =
+                super::projected_assign::inline_deref_target_addr(&current, Some(pointee_ty))?;
+            let loaded = load_inline_value_from_memory(ctx, &pointer_addr, pointee_ty)?;
             let updated = update_inline_value_expr(
                 ctx,
                 loaded,
@@ -127,8 +138,8 @@ pub(super) fn update_inline_value_expr(
                 rhs,
                 local_exprs,
             )?;
-            ctx.build_memory_store(pointer_addr.clone(), updated.clone(), pointee_ty);
-            mirror_static_state_var_update(ctx, &pointer_addr, &updated);
+            inline_store_through(ctx, &pointer_addr, updated.clone(), pointee_ty);
+            mirror_static_state_var_update(ctx, pointer_addr.as_addr_expr(), &updated);
             // Return original pointer unchanged -- the write went to memory.
             Some(current)
         }
@@ -155,13 +166,72 @@ pub(super) fn update_inline_value_expr(
     }
 }
 
+/// Load through an inline-walker deref target whose provenance may be
+/// unreported.
+///
+/// The [`MaybeLoc::Known`] arm is `inline_deref_target_addr`'s ESTABLISHED lane
+/// and takes the typed keystone. The [`MaybeLoc::Unknown`] arm is its
+/// UNRESOLVED WALL lane, and it deliberately stays on the `#[deprecated]`
+/// untyped entry: re-tagging an `Unknown` as a [`Loc`] here would launder a
+/// claim the producer never made, which is the exact failure this campaign
+/// exists to prevent. The deprecation warning IS the residual marker — see
+/// `codegen_ay/provenance.rs` ("Two shims are alive on purpose").
+pub(super) fn inline_load_through(
+    ctx: &mut ChcCtx<'_, '_>,
+    addr: &MaybeLoc,
+    ty: rustc_public::ty::Ty,
+) -> Option<Expr> {
+    match addr {
+        MaybeLoc::Known(loc) => ctx.load_from_memory(loc.clone(), ty).map(Val::into_expr),
+        MaybeLoc::Unknown(expr) =>
+        {
+            #[allow(deprecated)]
+            ctx.load_from_memory_untyped(expr.clone(), ty)
+        }
+    }
+}
+
+/// Store through an inline-walker deref target whose provenance may be
+/// unreported. Same split, and same reason, as [`inline_load_through`].
+pub(super) fn inline_store_through(
+    ctx: &mut ChcCtx<'_, '_>,
+    addr: &MaybeLoc,
+    value: Expr,
+    ty: rustc_public::ty::Ty,
+) -> Option<Expr> {
+    match addr {
+        MaybeLoc::Known(loc) => ctx.build_memory_store(loc.clone(), value, ty),
+        MaybeLoc::Unknown(expr) =>
+        {
+            #[allow(deprecated)]
+            ctx.build_memory_store_untyped(expr.clone(), value, ty)
+        }
+    }
+}
+
+/// Add a byte offset to a deref target, preserving whether its provenance was
+/// reported. Offsetting an address yields an address; offsetting an unreported
+/// term yields an equally unreported one — the operation cannot manufacture the
+/// evidence the base was missing.
+fn offset_inline_deref_target(addr: &MaybeLoc, byte_offset: u64) -> MaybeLoc {
+    if byte_offset == 0 {
+        return addr.clone();
+    }
+    let bumped =
+        addr.as_addr_expr().clone().bvadd(Expr::bitvec_const(byte_offset as i64, POINTER_WIDTH));
+    match addr {
+        MaybeLoc::Known(_) => MaybeLoc::Known(Loc::of_address(bumped)),
+        MaybeLoc::Unknown(_) => MaybeLoc::Unknown(bumped),
+    }
+}
+
 pub(super) fn load_inline_value_from_memory(
     ctx: &mut ChcCtx<'_, '_>,
-    addr: Expr,
+    addr: &MaybeLoc,
     ty: rustc_public::ty::Ty,
 ) -> Option<Expr> {
     let ty = ctx.resolve_body_ty(ty);
-    let loaded = ctx.load_from_memory(addr.clone(), ty)?;
+    let loaded = inline_load_through(ctx, addr, ty)?;
     let expected_sort = ChcCtx::translate_ty(ty)?;
     if *loaded.sort() == expected_sort || !expected_sort.is_datatype() {
         return Some(loaded);
@@ -171,7 +241,7 @@ pub(super) fn load_inline_value_from_memory(
 
 fn rebuild_inline_datatype_from_memory(
     ctx: &mut ChcCtx<'_, '_>,
-    base_addr: Expr,
+    base_addr: &MaybeLoc,
     ty: rustc_public::ty::Ty,
     sort: Sort,
 ) -> Option<Expr> {
@@ -186,12 +256,8 @@ fn rebuild_inline_datatype_from_memory(
     let mut field_exprs = Vec::with_capacity(field_tys.len());
     for (field_idx, field_ty) in field_tys.iter().enumerate() {
         let field_offset = ctx.get_field_offset(ty, field_idx)?;
-        let field_addr = if field_offset > 0 {
-            base_addr.clone().bvadd(Expr::bitvec_const(field_offset as i64, POINTER_WIDTH))
-        } else {
-            base_addr.clone()
-        };
-        field_exprs.push(load_inline_value_from_memory(ctx, field_addr, *field_ty)?);
+        let field_addr = offset_inline_deref_target(base_addr, field_offset);
+        field_exprs.push(load_inline_value_from_memory(ctx, &field_addr, *field_ty)?);
     }
 
     Some(Expr::datatype_constructor(&*dt.name, &*ctor.name, field_exprs, sort))
@@ -276,7 +342,7 @@ pub(super) fn record_inline_loaded_value_vtable_forward(
     let Some(vtable_expr) = rhs_vtable else {
         return;
     };
-    let Some(loaded) = ctx.load_from_memory(addr.clone(), pointee_ty) else {
+    let Some(loaded) = ctx.load_from_memory_untyped(addr.clone(), pointee_ty) else {
         return;
     };
     record_inline_heap_vtable_forward(ctx, &loaded, Some(vtable_expr.clone()));
@@ -286,12 +352,12 @@ pub(super) fn record_inline_loaded_value_vtable_forward(
         && variant.fields().len() == 1
     {
         let field_ty = ctx.resolve_body_ty(variant.fields()[0].ty_with_args(&args));
-        if let Some(field_loaded) = ctx.load_from_memory(addr.clone(), field_ty) {
+        if let Some(field_loaded) = ctx.load_from_memory_untyped(addr.clone(), field_ty) {
             record_inline_heap_vtable_forward(ctx, &field_loaded, Some(vtable_expr.clone()));
         }
     }
     if let Some(ptr_expr) = ctx.extract_pointer_storage_expr(&loaded) {
-        record_inline_heap_vtable_forward(ctx, &ptr_expr, Some(vtable_expr));
+        record_inline_heap_vtable_forward(ctx, ptr_expr.as_expr(), Some(vtable_expr));
     }
 }
 

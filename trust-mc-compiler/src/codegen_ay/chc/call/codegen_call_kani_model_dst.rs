@@ -9,6 +9,7 @@ use ay_bindings::{Expr, Sort};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{
     CtorFieldExt, POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe,
 };
@@ -541,15 +542,22 @@ pub(in crate::codegen_ay::chc) fn extract_fat_ptr_len(
     // Part of #4163: MIR trace before BV128 — precise metadata for array-loaded fat ptrs.
     if let Some(len) = ctx.translate_ptr_metadata(operand, modified_locals) {
         debug!("extract_fat_ptr_len: resolved from translate_ptr_metadata");
-        return Some(len);
+        return Some(len.into_expr());
     }
 
-    // BV128 fat pointer high-bits extraction as last resort.
-    if let Some(ptr_expr) = ctx.translate_operand_with_modified(operand, modified_locals) {
-        if ptr_expr.sort().bitvec_width() == Some(128) {
-            debug!("extract_fat_ptr_len: resolved from BV128 extraction");
-            return Some(ptr_expr.extract(127, 64));
-        }
+    // Fat pointer metadata half as last resort.
+    //
+    // This branch used to re-test the width (`== Some(128)`) and extract the high
+    // half unconditionally, which silently UNDID the refusal `translate_ptr_metadata`
+    // had just made one block above: a widened thin pointer fell through there and
+    // was fabricated into a length here. `PtrRepr` gives both blocks the same
+    // answer, and `metadata()` simply has nothing to return for a widened thin
+    // pointer, so the two can no longer disagree.
+    if let Some(ptr_expr) = ctx.translate_operand_with_modified(operand, modified_locals)
+        && let Some(meta) = PtrRepr::classify(&ptr_expr).and_then(PtrRepr::into_metadata)
+    {
+        debug!("extract_fat_ptr_len: resolved from fat pointer metadata half");
+        return Some(meta.into_expr());
     }
 
     debug!("extract_fat_ptr_len: FAILED to resolve fat pointer length");

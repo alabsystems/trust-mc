@@ -45,7 +45,7 @@ Symptom:
   crate that is listed under `[dev-dependencies]`.
 
 Diagnosis:
-- `cargo trust-mc` without `--tests` builds the library target alone, so
+- `targo trust-mc` without `--tests` builds the library target alone, so
   `dev-dependencies` are not resolved.
 - This is the current documented workaround shape, tracked under
   [#4302](https://github.com/alabsystems/trust-mc/issues/4302) and
@@ -53,7 +53,7 @@ Diagnosis:
 
 Fix:
 - Gate the proof with `#[cfg(all(kani, test))]`, not just `#[cfg(kani)]`.
-- Run `cargo trust-mc --tests`.
+- Run `targo trust-mc --tests`.
 - See the worked example in [usage.md](./usage.md#using-dev-dependencies-in-library-proofs).
 
 ### 3. `UNKNOWN`: `≥2 Array-sorted state parameters`
@@ -197,9 +197,12 @@ Diagnosis:
   portfolio, or a trust-mc integration mismatch against the new AY revision.
 
 Fix:
-- Run `./scripts/ay-bump-canary.sh` first; it is the repository guardrail for AY
-  rev bumps.
-- If the failure reproduces on the canary suite, keep the reduced artifact and
+- Run the AY bump guardrails first: `scripts/check-ay-pin.sh`, then
+  `cargo check -p trust-mc-driver --all-targets --features "ay,ay-chc-native"`,
+  then the corpus suites (`scripts/ay-compiletest.sh`,
+  `scripts/ay-soundness-gate.sh`). The single `ay-bump-canary.sh` wrapper for
+  this ceremony is planned but NOT yet implemented (roadmap item 6.1).
+- If the failure reproduces on the corpus suites, keep the reduced artifact and
   file a AY issue with the same reproducer.
-- If it only reproduces in trust-mc and not in the canary flow, file it in trust-mc as
+- If it only reproduces in trust-mc and not in the corpus flow, file it in trust-mc as
   a backend-integration regression.

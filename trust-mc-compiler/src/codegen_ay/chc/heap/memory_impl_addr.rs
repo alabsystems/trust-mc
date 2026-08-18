@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 use crate::rustc_public_bridge::IndexedVal;
 use ay_bindings::{Expr, Sort};
 
+use crate::codegen_ay::provenance::{Loc, MaybeLoc};
 use crate::codegen_ay::types::{
     POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort, unflatten_bitvec_to_datatype,
 };
@@ -39,11 +40,31 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// including `&(*ptr).field` which requires following the pointer.
     ///
     /// Part of #869: Mem-level Ref/AddressOf encoding with Deref support.
+    ///
+    /// # This is one of the encoder's two address PRODUCERS (Wave 11)
+    ///
+    /// `translate_ref_to_address` is address-of on a MIR [`Place`]: the one
+    /// operation the provenance module names as a legal way to obtain a
+    /// [`Loc`]. Every lane below either starts from
+    /// `get_or_create_local_address` (an allocation) or from another `Loc`, and
+    /// the projections are byte-offset arithmetic on an address — so the result
+    /// is an address *by construction*, not by inspection. Returning [`Loc`]
+    /// states that once, here, instead of leaving 26 call sites to re-derive it.
+    ///
+    /// ENSURES: every `Some` result is exactly [`POINTER_WIDTH`] bits wide. The
+    /// base is `get_or_create_local_address` (a `concat(bv32, bv32)`), each
+    /// Deref lane yields a pointer-width address by construction
+    /// (`known_stack_addr_expr` is a canonical constant concat,
+    /// `normalize_deref_address_expr` returns a [`Loc`] of exactly that width,
+    /// and the ref-target recovery lane is this function itself), and every
+    /// projection is a width-preserving `bvadd` with a `POINTER_WIDTH`
+    /// constant. Callers must NOT re-test the width of the result — doing so is
+    /// the address-recovery heuristic the `Val`/`Loc` refactor removes.
     pub(in crate::codegen_ay::chc) fn translate_ref_to_address(
         &mut self,
         place: &Place,
         modified_locals: &HashSet<usize>,
-    ) -> Option<Expr> {
+    ) -> Option<Loc> {
         let local_idx: usize = place.local;
 
         // Get base address for the local
@@ -52,7 +73,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // If no projections, return base address directly
         if place.projection.is_empty() {
-            return Some(current_addr);
+            return Some(Loc::of_address(current_addr));
         }
 
         // Track active variant for Downcast→Field projection chains.
@@ -81,6 +102,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // system always carries the correct value from the previous block.
                     let loaded_addr = if at_base_local {
                         self.known_stack_addr_expr(local_idx)
+                            // `record_known_stack_addr_expr` only ever stores a
+                            // canonical `concat(obj_id const, offset const)`
+                            // naming a TRACKED stack object — a structural
+                            // proof of address-ness (and of pointer width),
+                            // not a width guess.
+                            .map(Loc::of_address)
                             .or_else(|| {
                                 // fc-interior-mut: resolve the TRUE referent
                                 // address through ref-resolution BEFORE the
@@ -101,36 +128,50 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 )
                             })
                             .or_else(|| {
-                            self.try_resolve_local_expr(local_idx, modified_locals).and_then(
-                                |expr| {
-                                // State vars must normalize to a thin storage address before
-                                // later Field/Index byte-offset arithmetic.
-                                let addr_expr =
-                                    self.normalize_deref_address_expr(expr, current_ty)?;
-                                if addr_expr.sort().bitvec_width() == Some(POINTER_WIDTH) {
-                                    debug!(
-                                        local_idx,
-                                        "CHC: translate_ref_to_address - Deref via state var (Part of #3495)"
-                                    );
-                                    Some(addr_expr)
-                                } else {
-                                    None
-                                }
-                                },
-                            )
-                        })
+                                self.try_resolve_local_expr(local_idx, modified_locals).and_then(
+                                    |expr| {
+                                        // State vars must normalize to a thin storage address
+                                        // before later Field/Index byte-offset arithmetic.
+                                        // `normalize_deref_address_expr` returns a `Loc` that is
+                                        // POINTER_WIDTH by construction, so the width re-test
+                                        // that used to guard this lane is gone.
+                                        let addr = self
+                                            .normalize_deref_address_expr(expr, current_ty)?;
+                                        debug!(
+                                            local_idx,
+                                            "CHC: translate_ref_to_address - Deref via state var (Part of #3495)"
+                                        );
+                                        Some(addr)
+                                    },
+                                )
+                            })
                             .or_else(|| {
+                                // Both lanes are re-normalized here regardless of
+                                // the Known/Unknown split: `normalize_deref_address_expr`
+                                // is the shared refusal (non-bitvec, sub-pointer-width,
+                                // pre-widened value-as-address) and the `Known` lane
+                                // passes it by construction, so dropping the tag on the
+                                // way in changes nothing and keeps one normalizer.
                                 self.load_ptr_from_memory(current_addr.clone(), current_ty)
-                                    .and_then(|expr| {
-                                        self.normalize_deref_address_expr(expr, current_ty)
+                                    .and_then(|loaded| {
+                                        self.normalize_deref_address_expr(
+                                            loaded.into_addr_expr(),
+                                            current_ty,
+                                        )
                                     })
                             })
                     } else {
                         // After projections — must use memory load
-                        self.load_ptr_from_memory(current_addr.clone(), current_ty)
-                            .and_then(|expr| self.normalize_deref_address_expr(expr, current_ty))
+                        self.load_ptr_from_memory(current_addr.clone(), current_ty).and_then(
+                            |loaded| {
+                                self.normalize_deref_address_expr(
+                                    loaded.into_addr_expr(),
+                                    current_ty,
+                                )
+                            },
+                        )
                     }?;
-                    current_addr = loaded_addr;
+                    current_addr = loaded_addr.into_expr();
                     current_ty = pointee_ty;
                     active_variant = None; // Deref resets variant context
                     debug!(?current_ty, "CHC: translate_ref_to_address - Deref load");
@@ -280,7 +321,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             at_base_local = false;
         }
 
-        Some(current_addr)
+        // ADDRESS-OF a place: the base came from `get_or_create_local_address`
+        // (an allocation) or from a `Loc`-returning deref lane, and every
+        // projection above is byte-offset arithmetic on that address.
+        Some(Loc::of_address(current_addr))
     }
 
     /// fc-interior-mut: recover the TRUE (obj_id, offset) address behind a
@@ -305,7 +349,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         local_idx: usize,
         modified_locals: &HashSet<usize>,
-    ) -> Option<Expr> {
+    ) -> Option<Loc> {
         // Pointer-arithmetic offsets invalidate place-level identity.
         if self.ref_resolution.subslice_offset.contains_key(&local_idx) {
             return None;
@@ -334,18 +378,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     return None;
                 }
                 let referent = Place { local: rt.local, projection: rt.projections };
+                // ADDRESS-OF a known referent place: `translate_ref_to_address`
+                // is the encoder's address producer, so its result IS a `Loc`
+                // — as of Wave 11 that is its return type, not a comment.
+                // The width re-test that used to gate this lane was an
+                // address-recovery heuristic re-deriving a fact the producer
+                // already guarantees (see the ENSURES on
+                // `translate_ref_to_address`); it is deleted, and the
+                // invariant is asserted in debug builds instead.
                 let addr = self.translate_ref_to_address(&referent, modified_locals)?;
-                if addr.sort().bitvec_width() == Some(POINTER_WIDTH) {
-                    debug!(
-                        local_idx,
-                        referent = rt.local,
-                        "CHC: translate_ref_to_address - Deref via ref-target recovery \
-                         (fc-interior-mut)"
-                    );
-                    Some(addr)
-                } else {
-                    None
-                }
+                debug_assert_eq!(
+                    addr.as_expr().sort().bitvec_width(),
+                    Some(POINTER_WIDTH),
+                    "translate_ref_to_address must mint POINTER_WIDTH addresses"
+                );
+                debug!(
+                    local_idx,
+                    referent = rt.local,
+                    "CHC: translate_ref_to_address - Deref via ref-target recovery \
+                     (fc-interior-mut)"
+                );
+                Some(addr)
             })
         };
         self.deref_resolve_depth -= 1;
@@ -356,11 +409,45 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// Used by `translate_ref_to_address` for Deref projections.
     /// Part of #869: Deref chain support.
+    ///
+    /// # Which lane produced the term is the missing fact
+    ///
+    /// Callers used to get a bare `Expr` back and re-derive "is this an
+    /// address?" from its width. That test is *vacuous* on one of the two live
+    /// lanes and a *guess* on the other, and nothing in the return type said
+    /// which one had run:
+    ///
+    /// * **typed-array select** — `select(<ptr-sorted type array>, addr)`. The
+    ///   array's element sort is `ptr_sort()` by construction and it is keyed
+    ///   by `pointer_ty`, so the term is the pointer datum held by a slot of
+    ///   that Rust type. That is an address by the memory model's own
+    ///   definition, and the width is `POINTER_WIDTH` for the same reason —
+    ///   hence [`MaybeLoc::Known`].
+    /// * **store-to-load forwarding (#3608)** — the last value stored at this
+    ///   constant address *in this block*. `store_forward_map` is keyed by
+    ///   `(obj_id, offset)` alone, across every type array, and
+    ///   `build_memory_store` deliberately leaves its value operand untyped
+    ///   (see the wave-13 note in `provenance.rs`). So the forwarded datum can
+    ///   be a `u64` stored through a different type key — which is why this
+    ///   lane used to report [`MaybeLoc::Unknown`] unconditionally, and why its
+    ///   one discriminating consumer then re-tagged the term on a width test.
+    ///   The entry now carries the type key the store wrote through, so the two
+    ///   cases are separated: key match → [`MaybeLoc::Known`], on the same
+    ///   grounds as the typed-array lane above; key mismatch → still
+    ///   [`MaybeLoc::Unknown`], because that is precisely the `u64`-read-as-an-
+    ///   address case. What is recorded is the *declared type of the store*,
+    ///   not a provenance tag on the datum, so the wave-13 decision to leave
+    ///   the value operand untyped is unaffected.
+    ///
+    /// The third lane (`region_pointer_forwards`, #3871) has **no writer
+    /// anywhere in the crate** — the map is only ever constructed, cleared,
+    /// snapshotted and read — so it is unreachable today. It is classified
+    /// `Unknown` on the same grounds as #3608 rather than being trusted.
     pub(in crate::codegen_ay::chc) fn load_ptr_from_memory(
         &mut self,
         addr: Expr,
         pointer_ty: rustc_public::ty::Ty,
-    ) -> Option<Expr> {
+    ) -> Option<MaybeLoc> {
         let pointer_ty = self.resolve_body_ty(pointer_ty);
         // Get or create the pointer type array
         let ptr_bv = ptr_sort();
@@ -391,15 +478,37 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3608: Store-to-load forwarding for pointer loads.
         if let Some((obj_id, offset)) = Self::try_extract_constant_addr(&addr) {
             let fwd_key = ((obj_id as u64) << 32) | (offset as u64);
-            if let Some((store_bb, forwarded_value)) =
+            if let Some((store_bb, forwarded_value, store_type_key)) =
                 self.heap_state.store_forward_map.get(&fwd_key).cloned()
                 && store_bb == self.current_encode_bb
             {
                 debug!(
                     obj_id,
-                    offset, "CHC: load_ptr_from_memory - store-to-load forwarding (#3608)"
+                    offset,
+                    %store_type_key,
+                    %type_key,
+                    "CHC: load_ptr_from_memory - store-to-load forwarding (#3608)"
                 );
-                return Some(forwarded_value);
+                // The forwarding lane's provenance is now DECIDED rather than
+                // unreported. `store_forward_map` is keyed by `(obj_id, offset)`
+                // across every type array, so the datum sitting at this address
+                // may have been written through any Rust type — which is why
+                // this lane could not answer before. The store now records the
+                // type key it wrote through, and when that key is the one this
+                // load is reading (`ptr_T` / `ref_T`, since `pointer_ty` is the
+                // slot's pointer type), the datum is a pointer datum by exactly
+                // the argument that makes the typed-array select below a `Loc`
+                // producer: the array is keyed by that Rust type.
+                //
+                // A key MISMATCH is the case the old blanket `Unknown` was
+                // protecting against — a `u64` stored here and read back as an
+                // address — and it stays `Unknown`, i.e. the caller must not
+                // treat it as an address without evidence of its own.
+                return Some(if *store_type_key == *type_key {
+                    MaybeLoc::Known(Loc::of_address(forwarded_value))
+                } else {
+                    MaybeLoc::Unknown(forwarded_value)
+                });
             }
             // Part of #3871: Cross-block persistent pointer forwarding.
             if let Some(forwarded_ptr) =
@@ -409,7 +518,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     obj_id,
                     offset, "CHC: load_ptr_from_memory - cross-block pointer forwarding (#3871)"
                 );
-                return Some(forwarded_ptr);
+                return Some(MaybeLoc::Unknown(forwarded_ptr));
             }
         }
 
@@ -417,7 +526,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         debug!("CHC: load_ptr_from_memory - pointer dereference");
 
-        Some(result)
+        Some(MaybeLoc::Known(Loc::of_address(result)))
     }
 
     /// Gets or creates a symbolic address for a local variable.

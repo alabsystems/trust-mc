@@ -13,6 +13,8 @@ use ay_bindings::Expr;
 use rustc_public::mir::{Operand, Place, Rvalue, StatementKind, TerminatorKind};
 use rustc_public::ty::{RigidTy, TyKind};
 
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width_safe};
 
 use super::super::ChcCtx;
@@ -131,7 +133,7 @@ fn raw_pointer_order_components_from_operand(
     operand: &Operand,
     expr: &Expr,
     modified_locals: &std::collections::HashSet<usize>,
-) -> Option<(Expr, Option<Expr>)> {
+) -> Option<(Loc, Option<Val>)> {
     if let Some((addr, metadata)) =
         resolve_raw_pointer_order_key_from_operand(ctx, operand, modified_locals)
     {
@@ -144,8 +146,12 @@ fn resolve_raw_pointer_order_key_from_operand(
     ctx: &mut ChcCtx<'_, '_>,
     operand: &Operand,
     modified_locals: &std::collections::HashSet<usize>,
-) -> Option<(Expr, Option<Expr>)> {
+) -> Option<(Loc, Option<Val>)> {
     let (source_place, raw_ptr_operand) = resolve_raw_pointer_source_place(ctx, operand, 8)?;
+    // `translate_ref_to_address` is address-of on a place — one of the two
+    // functions that MINT addresses in this encoder — and as of wave 11 it
+    // says so in its return type, so this site no longer re-tags.
+    // `translate_ptr_metadata` already hands back a `Val`.
     let addr = ctx.translate_ref_to_address(&source_place, modified_locals)?;
     let metadata = if raw_pointer_operand_has_metadata(&raw_ptr_operand, ctx.body.locals()) {
         ctx.translate_ptr_metadata(&raw_ptr_operand, modified_locals)
@@ -288,11 +294,12 @@ fn raw_pointer_operand_has_metadata(
 }
 
 fn raw_pointer_cmp_expr_from_components(
-    lhs_ptr: Expr,
-    lhs_meta: Option<Expr>,
-    rhs_ptr: Expr,
-    rhs_meta: Option<Expr>,
+    lhs_ptr: Loc,
+    lhs_meta: Option<Val>,
+    rhs_ptr: Loc,
+    rhs_meta: Option<Val>,
 ) -> Option<Expr> {
+    let (lhs_ptr, rhs_ptr) = (lhs_ptr.into_expr(), rhs_ptr.into_expr());
     let ptr_width = ChcCtx::max_bitvec_width(&lhs_ptr, &rhs_ptr)?;
     let lhs_ptr = coerce_bitvec_width_safe(lhs_ptr, ptr_width, SignExtension::ZeroExtend);
     let rhs_ptr = coerce_bitvec_width_safe(rhs_ptr, ptr_width, SignExtension::ZeroExtend);
@@ -301,6 +308,7 @@ fn raw_pointer_cmp_expr_from_components(
     let tie_cmp = match (lhs_meta, rhs_meta) {
         (None, None) => Expr::bitvec_const(0, 32),
         (Some(lhs_meta), Some(rhs_meta)) => {
+            let (lhs_meta, rhs_meta) = (lhs_meta.into_expr(), rhs_meta.into_expr());
             let meta_width = ChcCtx::max_bitvec_width(&lhs_meta, &rhs_meta)?;
             let lhs_meta =
                 coerce_bitvec_width_safe(lhs_meta, meta_width, SignExtension::ZeroExtend);
@@ -324,24 +332,24 @@ fn raw_pointer_cmp_expr_from_components(
     ))
 }
 
-fn raw_pointer_order_components(expr: &Expr) -> Option<(Expr, Option<Expr>)> {
-    if let Some(width) = expr.sort().bitvec_width() {
-        if width == crate::codegen_ay::types::POINTER_WIDTH {
-            return Some((expr.clone(), None));
-        }
-        if width == 2 * crate::codegen_ay::types::POINTER_WIDTH {
-            // Part of #4030: call-produced raw wide-pointer locals (Ord::min/max/clamp)
-            // can no longer be traced to a single provenance source place. Preserve
-            // their data/metadata structure in the raw-expression fallback instead of
-            // collapsing BV128 to a thin pointer key.
-            return Some((
-                expr.clone().extract(crate::codegen_ay::types::POINTER_WIDTH - 1, 0),
-                Some(expr.clone().extract(
-                    2 * crate::codegen_ay::types::POINTER_WIDTH - 1,
-                    crate::codegen_ay::types::POINTER_WIDTH,
-                )),
-            ));
-        }
+/// Splits a raw-pointer expression into its address and (optional) metadata.
+///
+/// Wave 4 of the address-vs-value conversion. Part of #4030: call-produced raw
+/// wide-pointer locals (`Ord::min`/`max`/`clamp`) can no longer be traced to a
+/// single provenance source place, so their data/metadata structure has to be
+/// recovered from the expression itself rather than collapsed to a thin key.
+///
+/// The two width tests that used to do that recovery are deleted. Reading bits
+/// 127..64 as metadata "because the expression is double-width" cannot tell a
+/// real fat pointer from a thin one widened into a BV128 slot, and ordering two
+/// pointers on padding produces an arbitrary but *stable-looking* answer — the
+/// worst kind. `PtrRepr` decodes the shape structurally and reports no metadata
+/// for `WidenedThin`, which routes the comparison to its address-only lane.
+///
+/// The datatype arm reports DECLARED roles (`fld_ptr` / `fld_len` / ...).
+fn raw_pointer_order_components(expr: &Expr) -> Option<(Loc, Option<Val>)> {
+    if let Some(repr) = PtrRepr::classify(expr) {
+        return Some(repr.into_parts());
     }
 
     let dt = expr.sort().datatype_sort()?;
@@ -353,7 +361,11 @@ fn raw_pointer_order_components(expr: &Expr) -> Option<(Expr, Option<Expr>)> {
     if !ptr_field.sort.is_bitvec() {
         return None;
     }
-    let ptr = expr.clone().field_select(&dt.name, &ptr_field.name, ptr_field.sort.clone());
+    let ptr = Loc::of_address(expr.clone().field_select(
+        &dt.name,
+        &ptr_field.name,
+        ptr_field.sort.clone(),
+    ));
     let metadata = cons
         .fields
         .iter()
@@ -361,6 +373,8 @@ fn raw_pointer_order_components(expr: &Expr) -> Option<(Expr, Option<Expr>)> {
             (field.name == "fld_len" || field.name == "fld_vtable" || field.name == "fld_meta")
                 && field.sort.is_bitvec()
         })
-        .map(|field| expr.clone().field_select(&dt.name, &field.name, field.sort.clone()));
+        .map(|field| {
+            Val::of_value(expr.clone().field_select(&dt.name, &field.name, field.sort.clone()))
+        });
     Some((ptr, metadata))
 }

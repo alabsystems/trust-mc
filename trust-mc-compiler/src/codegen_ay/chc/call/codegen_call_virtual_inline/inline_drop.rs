@@ -25,6 +25,7 @@ use super::inline_shared_drop::try_handle_inline_shared_pointer_drop;
 use super::walker::{InlineWalkCtx, translate_virtual_body_inline};
 use crate::codegen_ay::chc::rules::codegen_rules::transition_drop::collect_box_dyn_dealloc_effects;
 use crate::codegen_ay::chc::rules::codegen_rules_helpers::CodegenRulesHelpers;
+use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 /// Handle a Drop terminator encountered during inline body walking.
@@ -224,7 +225,10 @@ fn try_handle_inline_box_dyn_drop<'tcx, 'body>(
             let bv_ptr = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(&box_expr)?;
             let known_alloc_id =
                 inline_alloc_id_for_unprojected_drop_place(inline_alloc_ids, place);
-            let dealloc_effects = collect_box_dyn_dealloc_effects(ctx, bv_ptr, known_alloc_id)?;
+            // The deallocation helper is still `Expr`-taking; tag dropped
+            // at that boundary.
+            let dealloc_effects =
+                collect_box_dyn_dealloc_effects(ctx, bv_ptr.into_expr(), known_alloc_id)?;
             ctx.heap_state.pending_checks.extend(dealloc_effects.pending_checks);
             ctx.heap_state.pending_updates.extend(dealloc_effects.pending_updates);
             return Some(Expr::bool_const(true));
@@ -234,7 +238,8 @@ fn try_handle_inline_box_dyn_drop<'tcx, 'body>(
     let box_expr = resolve_place(ctx, local_exprs, place, &walk_ctx.resolver, walk_ctx.locals)?;
     let ptr_expr = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(&box_expr)?;
     let known_alloc_id = inline_alloc_id_for_unprojected_drop_place(inline_alloc_ids, place);
-    let dealloc_effects = collect_box_dyn_dealloc_effects(ctx, ptr_expr, known_alloc_id)?;
+    let dealloc_effects =
+        collect_box_dyn_dealloc_effects(ctx, ptr_expr.into_expr(), known_alloc_id)?;
 
     let vtable_expr = if place.projection.is_empty() {
         inline_vtable_ids.get(&place.local).cloned()
@@ -244,7 +249,7 @@ fn try_handle_inline_box_dyn_drop<'tcx, 'body>(
     .or_else(|| {
         place.projection.is_empty().then(|| ctx.known_vtable_expr_for_local(place.local)).flatten()
     })
-    .or_else(|| ctx.extract_embedded_vtable_expr(&box_expr))
+    .or_else(|| ctx.extract_embedded_vtable_expr(&box_expr).map(Val::into_expr))
     .or_else(|| {
         crate::codegen_ay::chc::dyn_coercion::extract_dyn_trait_def_id(ctx, inner_dyn_ty).map(
             |trait_def_id| {
@@ -348,12 +353,20 @@ fn try_handle_inline_dyn_drop<'tcx, 'body>(
                 place_root_expr.as_ref().and_then(|expr| forwarded_heap_vtable_for_expr(ctx, expr))
             })
             .or_else(|| {
-                place_root_expr.as_ref().and_then(|expr| ctx.extract_embedded_vtable_expr(expr))
+                place_root_expr
+                    .as_ref()
+                    .and_then(|expr| ctx.extract_embedded_vtable_expr(expr))
+                    .map(Val::into_expr)
             })
             .or_else(|| {
                 place_expr.as_ref().and_then(|expr| forwarded_heap_vtable_for_expr(ctx, expr))
             })
-            .or_else(|| place_expr.as_ref().and_then(|expr| ctx.extract_embedded_vtable_expr(expr)))
+            .or_else(|| {
+                place_expr
+                    .as_ref()
+                    .and_then(|expr| ctx.extract_embedded_vtable_expr(expr))
+                    .map(Val::into_expr)
+            })
             .or_else(|| {
                 crate::codegen_ay::chc::dyn_coercion::extract_dyn_trait_def_id(ctx, drop_ty).map(
                     |trait_def_id| {

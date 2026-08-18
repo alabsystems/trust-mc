@@ -33,13 +33,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         constraints: &mut Vec<Expr>,
     ) {
         let local_place = Place { local: lhs_local, projection: vec![] };
-        let Some(addr_expr) = self.translate_ref_to_address(&local_place, modified_locals) else {
+        let Some(addr_loc) = self.translate_ref_to_address(&local_place, modified_locals) else {
             return;
         };
+        // Address by construction (wave-11 producer). Wave 13 typed the store
+        // keystone, so the tag now survives all the way into it instead of
+        // being dropped one line after it was minted; the three mirror helpers
+        // that still take a bare `Expr` borrow through `as_expr` rather than
+        // consuming the tag.
+        let addr_expr = addr_loc.as_expr().clone();
         let prev_suppress = self.suppress_heap_store_checks;
         self.suppress_heap_store_checks = true;
         if let Some(store_constraint) =
-            self.build_memory_store(addr_expr.clone(), coerced_rhs.clone(), local_ty)
+            self.build_memory_store(addr_loc, coerced_rhs.clone(), local_ty)
         {
             constraints.push(store_constraint);
         }
@@ -84,7 +90,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let prev_suppress = self.suppress_heap_store_checks;
         self.suppress_heap_store_checks = true;
         if let Some(store_constraint) =
-            self.build_memory_store(addr_expr.clone(), value_expr.clone(), value_ty)
+            self.build_memory_store_untyped(addr_expr.clone(), value_expr.clone(), value_ty)
         {
             constraints.push(store_constraint);
         }

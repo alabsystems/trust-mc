@@ -15,6 +15,8 @@ use rustc_public::ty::{RigidTy, TyKind};
 use tracing::warn;
 
 use super::{IntoOption, StatementCodegen};
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 pub(super) struct EnumDiscrInfo {
@@ -75,47 +77,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
         }
 
-        let sdt = eff_dt;
-        if sdt.constructors.len() == 1
-            && let Some(c) = sdt.constructors.first()
-            && c.fields.len() >= 2
-        {
-            let named_ptr = c
-                .fields
-                .iter()
-                .find(|x| matches!(x.name.as_str(), "ptr" | "fld_ptr" | "data" | "fld_data"));
-            let named_meta = c.fields.iter().find(|x| {
-                matches!(
-                    x.name.as_str(),
-                    "len" | "fld_len" | "meta" | "fld_meta" | "vtable" | "fld_vtable"
-                )
-            });
-            let ptr_and_meta = if let (Some(ptr_field), Some(meta_field)) = (named_ptr, named_meta)
-            {
-                Some((ptr_field, meta_field))
-            } else if (sdt.name.starts_with("Slice_") || sdt.name.starts_with("Dyn_"))
-                && c.fields.len() >= 2
-            {
-                Some((&c.fields[0], &c.fields[1]))
-            } else {
-                None
-            };
-
-            if let Some((ptr_field, meta_field)) = ptr_and_meta
-                && let SortInner::BitVec(pb) = ptr_field.sort.inner()
-                && let SortInner::BitVec(mb) = meta_field.sort.inner()
-                && pb.width == POINTER_WIDTH
-                && mb.width == POINTER_WIDTH
-            {
-                let ptr_expr =
-                    expr.clone().field_select(&*sdt.name, &*ptr_field.name, ptr_field.sort.clone());
-                if pb.width == dst_width {
-                    return Some(ptr_expr);
-                } else if pb.width < dst_width {
-                    return Some(ptr_expr.zero_extend(dst_width - pb.width));
-                }
-                return Some(ptr_expr.extract(dst_width - 1, 0));
+        // Fat-pointer datatype → the DATA ADDRESS. `dt_fat_pointer_repr` reads the
+        // two field roles off the declaration and hands back a `PtrRepr`, so what
+        // is selected here is a `Loc` by construction — not "field 0, because it
+        // happened to be bv64".
+        if let Some(repr) = Self::dt_fat_pointer_repr(expr, eff_dt) {
+            let ptr_expr = repr.into_data().into_expr();
+            if POINTER_WIDTH == dst_width {
+                return Some(ptr_expr);
+            } else if POINTER_WIDTH < dst_width {
+                return Some(ptr_expr.zero_extend(dst_width - POINTER_WIDTH));
             }
+            return Some(ptr_expr.extract(dst_width - 1, 0));
         }
 
         if dt.constructors.len() > 1 || (dt.constructors.len() == 1 && enum_discrs.is_some()) {
@@ -219,5 +192,78 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         );
         self.ctx.unsupported("Cast", format!("DT→BV fallback: {} → bv{}", dt.name, dst_width));
         None
+    }
+
+    /// Reads the `(data, metadata)` field roles off a fat-pointer datatype.
+    ///
+    /// Nothing is inferred here — both role sources are **declarations**:
+    ///
+    /// * field NAMES. A field literally called `fld_ptr` / `data` is the address
+    ///   and one called `fld_len` / `fld_vtable` is the metadata. The declaration
+    ///   states the roles; this function only reports them, which is why the
+    ///   `Loc` and `Val` minted below are genuine producers and not guesses.
+    /// * the datatype NAME. `Slice_*` / `Dyn_*` datatypes carry the positional
+    ///   convention "field 0 is data, field 1 is metadata". This half is
+    ///   `docs/addr-vs-value-conversion-queue.md` §4 item 7: the declaration
+    ///   carries **no** field roles, so a naming convention is standing in for
+    ///   one and no type can check it. Closing it needs the per-datatype
+    ///   field-role table — the same keystone as the slot-layout authority — not
+    ///   this refactor. It is left exactly as narrow as it was: the convention is
+    ///   not extended to any other datatype, and no predicate here is widened.
+    ///
+    /// The `POINTER_WIDTH` tests are retained on purpose. They are no longer
+    /// deciding address-vs-value (the declared names did that); they check that
+    /// the declared roles are actually pointer-shaped before the roles are
+    /// trusted, which is a narrowing and not a guess.
+    pub(super) fn dt_fat_pointer_repr(
+        expr: &Expr,
+        sdt: &ay_bindings::DatatypeSort,
+    ) -> Option<PtrRepr> {
+        if sdt.constructors.len() != 1 {
+            return None;
+        }
+        let c = sdt.constructors.first()?;
+        if c.fields.len() < 2 {
+            return None;
+        }
+
+        let named_ptr = c
+            .fields
+            .iter()
+            .find(|x| matches!(x.name.as_str(), "ptr" | "fld_ptr" | "data" | "fld_data"));
+        let named_meta = c.fields.iter().find(|x| {
+            matches!(
+                x.name.as_str(),
+                "len" | "fld_len" | "meta" | "fld_meta" | "vtable" | "fld_vtable"
+            )
+        });
+        let (ptr_field, meta_field) = match (named_ptr, named_meta) {
+            (Some(ptr_field), Some(meta_field)) => (ptr_field, meta_field),
+            _ if sdt.name.starts_with("Slice_") || sdt.name.starts_with("Dyn_") => {
+                (&c.fields[0], &c.fields[1])
+            }
+            _ => return None,
+        };
+
+        let (SortInner::BitVec(pb), SortInner::BitVec(mb)) =
+            (ptr_field.sort.inner(), meta_field.sort.inner())
+        else {
+            return None;
+        };
+        if pb.width != POINTER_WIDTH || mb.width != POINTER_WIDTH {
+            return None;
+        }
+
+        let data = Loc::of_address(expr.clone().field_select(
+            &*sdt.name,
+            &*ptr_field.name,
+            ptr_field.sort.clone(),
+        ));
+        let meta = Val::of_value(expr.clone().field_select(
+            &*sdt.name,
+            &*meta_field.name,
+            meta_field.sort.clone(),
+        ));
+        Some(PtrRepr::from_declared_roles(data, meta))
     }
 }

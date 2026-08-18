@@ -7,7 +7,7 @@
 
 //! Per-crate unsoundness count extraction from project metadata (#3458).
 //!
-//! These functions extract unsoundness counters from [`trust-mc_metadata::KaniMetadata`]
+//! These functions extract unsoundness counters from [`trust_mc_metadata::KaniMetadata`]
 //! into per-crate maps consumed by [`crate::unsoundness_counts::UnsoundnessCounts::from_project`].
 
 use std::collections::BTreeMap;
@@ -230,7 +230,7 @@ pub(crate) fn kani_mem_overapprox_per_harness_by_crate(
 /// categories (#3303, #3715). Returns crate_name -> (harness_name -> [(category, count)]).
 ///
 /// Built from the `UnsoundnessCategory` registry — a new sound-approximation category
-/// added to `trust-mc_metadata` is automatically included here if it has `per_harness` data.
+/// added to `trust_mc_metadata` is automatically included here if it has `per_harness` data.
 ///
 /// CTREX results from harnesses with nonzero sound-approximation counts are unreliable:
 /// the over-approximation (unconstrained symbolic variables) allows the solver to find

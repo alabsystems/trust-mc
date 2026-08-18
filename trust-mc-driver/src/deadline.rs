@@ -123,7 +123,10 @@ mod tests {
 
     #[test]
     fn expired_deadline_clamps_everything_to_zero() {
-        let d = Deadline { end: Instant::now() - Duration::from_secs(5) };
+        let end = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("five seconds must fit in the monotonic clock range");
+        let d = Deadline { end };
         assert!(d.is_expired());
         assert_eq!(d.clamp(Duration::from_secs(600)), Duration::ZERO);
         assert_eq!(d.remaining(), Duration::ZERO);

@@ -30,27 +30,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         args: &[Operand],
         modified_locals: &HashSet<usize>,
     ) -> Option<AllocCallResult> {
-        // Fix #3184: Same &self detection as translate_rust_dealloc.
-        let first_is_self_ref =
-            args.first().and_then(|arg| arg.ty(self.body.locals()).ok()).is_some_and(|ty| {
-                use rustc_public::ty::{RigidTy, TyKind};
-                matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(..)))
-            });
-        let first_expr =
-            args.first().and_then(|arg| self.translate_operand_with_modified(arg, modified_locals));
-        let second_expr =
-            args.get(1).and_then(|arg| self.translate_operand_with_modified(arg, modified_locals));
-        let is_first_pointer = !first_is_self_ref
-            && first_expr.as_ref().is_some_and(|e| e.sort().bitvec_width() == Some(POINTER_WIDTH));
-        let is_second_pointer =
-            second_expr.as_ref().is_some_and(|e| e.sort().bitvec_width() == Some(POINTER_WIDTH));
-        let (old_ptr_expr, size_start) = if is_first_pointer {
-            (first_expr, 1)
-        } else if is_second_pointer {
-            (second_expr, 2)
-        } else {
-            (first_expr, 1)
+        // Address-vs-value: which argument is the OLD POINTER is read off the
+        // Rust types in MIR (see `allocator_pointer_arg_idx`), never off a width.
+        //
+        // The retired test asked `bitvec_width() == POINTER_WIDTH` of arg[0] and
+        // then of arg[1], with only a `Ref` veto above it. Both questions are
+        // unanswerable that way: a `&self` allocator receiver, a `*mut u8` and a
+        // `usize` size are all `bv64`. Picking the wrong arm does not merely
+        // misname the pointer that realloc's move/free model is built on — it
+        // shifts the whole `(old_size, align, new_size)` window with it, so the
+        // size-mismatch and alignment obligations are then asserted about the
+        // wrong operands as well.
+        let Some(ptr_arg_idx) = self.allocator_pointer_arg_idx(args) else {
+            warn!(
+                "RustRealloc: no pointer-typed argument in MIR; falling back to unconstrained call"
+            );
+            self.record_sound_fallback_reason("realloc_pointer_arg_unresolved");
+            return None;
         };
+        let size_start = ptr_arg_idx + 1;
+        let old_ptr_expr = args
+            .get(ptr_arg_idx)
+            .and_then(|arg| self.translate_operand_with_modified(arg, modified_locals));
 
         let raw_old_size_or_layout_expr = args
             .get(size_start)
@@ -146,7 +147,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3273: When the expression-level extraction fails (symbolic CHC
         // variable), trace the pointer operand through MIR assignments back to the
         // original alloc result local to recover the concrete obj_id.
-        let ptr_arg_idx = if size_start > 0 { size_start - 1 } else { 0 };
         let old_id_resolved = old_concrete_id
             .or_else(|| args.get(ptr_arg_idx).and_then(|arg| self.trace_arg_to_alloc_id(arg)));
         if let Some(old_id) = old_id_resolved {

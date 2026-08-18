@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 
 # Limit parallel crate compilation to reduce peak memory usage.
-# Default parallelism can consume substantial memory while building the
-# compiler and rustc-driver integration crates.
-# Issue #3061: OOM on M2 Max during concurrent build/verification.
+# Issue #3061: OOM on M2 Max during concurrent build/verification — that cap
+# was 3. Raised 2026-08-01 for the m21 host (M5 Max, 18 cores, 128 GB); the
+# mem pressure the old number guarded against does not exist there. Override
+# per-invocation with CARGO_BUILD_JOBS if a smaller host returns.
 [build]
-jobs = 3
+jobs = 12
 
 # Git authentication: use system git client instead of libgit2.
 [net]
@@ -28,6 +29,17 @@ RAYON_NUM_THREADS = { value = "2", force = true }
 RUST_TEST_THREADS = { value = "2", force = true }
 [target.'cfg(all())']
 rustflags = [ # Global lints/warnings. Need to use underscore instead of -.
+    # PIN-COUPLED FLAG, currently disabled: the pin reverted to
+    # nightly-2025-12-03 on 2026-08-01 (see rust-toolchain.toml — trust's
+    # rustc-dev closure is incomplete), and upstream nightly rejects the flag
+    # as an unknown unstable option, killing every rustc invocation including
+    # `--print` probes. REINSTATE the line below when the pin returns to
+    # `trust`: its verifier is FAIL-CLOSED by default and tries to prove
+    # panic-freedom for EVERY unit including third-party build scripts —
+    # without it the build dies in `libc`'s build script. SPELLING must match
+    # the INSTALLED stage2 (wave-2 deleted `-Zno-trust-verify=yes`).
+    # Probe: `rustc +trust -Z help | grep trust-verify`.
+    # "-Ztrust-verify=off",
 
     # Purposefully disabled lints
     "-Aclippy::expect_fun_call",

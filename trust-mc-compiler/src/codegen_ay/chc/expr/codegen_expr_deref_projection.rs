@@ -25,6 +25,7 @@ use rustc_public::mir::{Place, ProjectionElem};
 use tracing::{debug, warn};
 
 use crate::codegen_ay::chc::dyn_coercion;
+use crate::codegen_ay::provenance::Loc;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 use crate::rustc_public_bridge::IndexedVal;
 
@@ -263,7 +264,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     }
 
                     if let Some(ptr_expr) = dyn_coercion::extract_pointer_expr(&current_expr) {
-                        current_expr = ptr_expr;
+                        // `current_expr` is the projection walker's running term
+                        // and holds VALUES on other iterations, so the slot
+                        // cannot be typed; the tag ends at this crossing.
+                        current_expr = ptr_expr.into_expr();
                     }
 
                     // current_expr is a pointer, check for following Field projections
@@ -276,6 +280,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             return None;
                         }
                     };
+
+                    // THE address-of for this whole arm, minted once.
+                    //
+                    // Evidence, and it is not a width test: `deref_pointee_ty`
+                    // just succeeded, so `current_ty` is a `&T`/`&mut T`/`*const
+                    // T`/`*mut T`/`Box<T>` — the MIR type says this term is a
+                    // pointer, and we are standing on the `Deref` that consumes
+                    // it. Everything below this line already treated it as an
+                    // address (the provenance bound checks, the field-offset
+                    // byte arithmetic, the whole-struct load); the tag states
+                    // that shared premise once instead of leaving each consumer
+                    // to re-derive it from `bitvec_width()`.
+                    //
+                    // The running `current_expr` slot itself stays untyped: it
+                    // carries VALUES on the Field/Index/Downcast iterations, and
+                    // the reassignment at the end of this arm puts a loaded
+                    // datum back into it. The `Loc` lives exactly as long as the
+                    // fact does.
+                    let deref_loc = Loc::of_address(current_expr.clone());
 
                     // Offset-deref stack-provenance keystone: for a RAW-pointer
                     // base local whose allocation resolves via the fail-closed
@@ -292,7 +315,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         )
                     {
                         let checks = self.provenance_deref_bound_checks(
-                            &current_expr,
+                            deref_loc.as_expr(),
                             pointee_ty,
                             local_idx,
                         );
@@ -303,7 +326,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // Delegated to try_deref_field_offset_load (codegen_expr_deref_field_offset.rs).
                     let remaining_projs = &place.projection[proj_idx + 1..];
                     match self.try_deref_field_offset_load(
-                        current_expr.clone(),
+                        deref_loc.clone(),
                         pointee_ty,
                         remaining_projs,
                     ) {
@@ -331,8 +354,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
                     // Fallback: Load whole struct and extract fields.
                     // Dyn-tail normalization is handled inside load_from_memory (#3974).
-                    current_expr = match self.load_from_memory(current_expr, pointee_ty) {
-                        Some(expr) => expr,
+                    current_expr = match self.load_from_memory(deref_loc, pointee_ty) {
+                        Some(val) => val.into_expr(),
                         None => {
                             // Part of #3447: Fallback whole-struct load failed.
                             self.record_aggregate_gap("deref_whole_struct_load_failed");
@@ -395,11 +418,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             // instead of bailing — mirrors apply_field_projection's
                             // union arm, so `(*static_ref).field` reads work for
                             // union statics pinned by the zero-fill lane.
-                            if let Some(coerced) = Self::union_bv_field_coerce(
-                                &field_root,
-                                current_ty,
-                                *field_ty,
-                            ) {
+                            if let Some(coerced) =
+                                Self::union_bv_field_coerce(&field_root, current_ty, *field_ty)
+                            {
                                 coerced
                             } else {
                                 // Part of #3447: Field selection failed in deref chain.

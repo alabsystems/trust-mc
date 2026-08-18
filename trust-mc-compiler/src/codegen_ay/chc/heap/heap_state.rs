@@ -186,8 +186,28 @@ pub(in crate::codegen_ay::chc) struct ChcHeapState {
     pub(in crate::codegen_ay::chc) metadata_accessed_blocks: HashSet<usize>,
 
     /// Part of #3608: Block-scoped store-to-load forwarding. Key: `(obj_id << 32) | offset`.
-    /// Value: `(store_bb, stored_expr)`. Invalidated on symbolic stores (#3664).
-    pub(in crate::codegen_ay::chc) store_forward_map: HashMap<u64, (usize, Expr)>,
+    /// Value: `(store_bb, stored_expr, store_type_key)`. Invalidated on symbolic
+    /// stores (#3664).
+    ///
+    /// # Why the type key is recorded
+    ///
+    /// The map is keyed by `(obj_id, offset)` ALONE, across every type array, so
+    /// the forwarded datum can have been written through a completely different
+    /// Rust type than the one now reading it. `load_ptr_from_memory` used to
+    /// report every forwarded term as [`crate::codegen_ay::provenance::MaybeLoc::Unknown`]
+    /// for exactly that reason, and its one discriminating consumer
+    /// (`recover_unsafe_cell_referent_address`) then re-tagged it as an address
+    /// on a width test — a `u64` stored at the same address passes.
+    ///
+    /// The store side does know which type array it wrote, and that is the same
+    /// evidence the typed-array select lane calls provenance: an array keyed by
+    /// `ptr_T`/`ref_T` holds pointer data by the memory model's own definition.
+    /// Recording it lets the load compare keys and answer `Known` when they
+    /// match and `Unknown` when they do not, instead of guessing from a width.
+    /// The value operand itself stays untyped (the wave-13 note in
+    /// `provenance.rs`); this is the *declared type of the store*, not a tag on
+    /// the datum.
+    pub(in crate::codegen_ay::chc) store_forward_map: HashMap<u64, (usize, Expr, Arc<str>)>,
 
     /// Part of #3871: Persistent cross-block pointer forwarding for nested
     /// heap allocations (Box<Box<T>>). Key: `(obj_id << 32) | offset`.
@@ -220,7 +240,7 @@ pub(in crate::codegen_ay::chc) struct HeapTransientRuleState {
     pub(super) drained_store_chain_seeds: HashMap<Arc<str>, Expr>,
     pub(super) metadata_arrays_modified: bool,
     pub(super) mirror_base_addrs: HashMap<Arc<str>, Expr>,
-    pub(super) store_forward_map: HashMap<u64, (usize, Expr)>,
+    pub(super) store_forward_map: HashMap<u64, (usize, Expr, Arc<str>)>,
     pub(super) region_pointer_forwards: HashMap<u64, Expr>,
     pub(super) region_vtable_forwards: HashMap<u64, Expr>,
     pub(super) region_vtable_forward_exprs: HashMap<String, Expr>,

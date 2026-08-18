@@ -396,7 +396,7 @@ mod task78 {
             complete,
             accounted,
             approximated_vars: vec!["_freed".to_string()],
-            dependent_by_id: deps.iter().cloned().collect::<HashMap<u32, Option<bool>>>(),
+            dependent_by_id: deps.iter().copied().collect::<HashMap<u32, Option<bool>>>(),
         }
     }
 

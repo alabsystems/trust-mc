@@ -213,8 +213,9 @@ pub(super) fn try_inline_adt_variant_assign_expr<'tcx, 'body>(
         return None;
     }
 
-    let mut field_values = Vec::with_capacity(operands.len());
-    for (i, operand) in operands.iter().enumerate() {
+    // Translate operands ONCE — `inline_operand_to_expr` declares pending vars.
+    let mut operand_exprs = Vec::with_capacity(operands.len());
+    for operand in operands {
         let Some(expr) = inline_operand_to_expr(ctx, operand, local_exprs, resolver, locals) else {
             if let Some(tag_expr) = try_inline_bool_tag_set_discriminant_expr(dest_ty, *variant) {
                 debug!(
@@ -225,6 +226,37 @@ pub(super) fn try_inline_adt_variant_assign_expr<'tcx, 'body>(
             }
             return None;
         };
+        operand_exprs.push(expr);
+    }
+
+    // TRANSPARENT WRAPPER PASS-THROUGH.
+    //
+    // `translate_ty` collapses payload-shaped wrappers — `MaybeUninit<T>`,
+    // `ManuallyDrop<T>`, `#[repr(transparent)]` newtypes — onto the sort of the
+    // PAYLOAD, so the aggregate that BUILDS the wrapper (`_0 =
+    // MaybeUninit::<AscII> { value: move _2 }`, whose one operand is already an
+    // `AscII`) is holding a value of the destination sort and has to hand it
+    // back unchanged. Matching it against the payload's own field list instead
+    // re-wraps it as `AscII_mk(<AscII>)`, whose argument sort contradicts the
+    // declared `fld_inner: BitVec 8`. Nothing rejects that at construction: it
+    // survives until a consumer believes the declared sort — for #3312's
+    // `raw_ptr` that is `reinterpret_fixed_layout_expr`, which selects
+    // `fld_inner`, gets the datatype straight back from ay's
+    // selector-over-constructor fold, and aborts codegen inside
+    // `Expr::extract`.
+    //
+    // A genuine one-field struct or enum variant can never match: its field
+    // sort is a strict component of its own sort.
+    if operand_exprs.len() == 1 && *operand_exprs[0].sort() == sort {
+        debug!(
+            dt_name = %dt.name,
+            "inline ADT aggregate: transparent wrapper, passing payload through"
+        );
+        return operand_exprs.pop();
+    }
+
+    let mut field_values = Vec::with_capacity(operands.len());
+    for (i, expr) in operand_exprs.into_iter().enumerate() {
         let field_sort = &cons.fields[i].sort;
         let coerced = if *expr.sort() == *field_sort {
             expr

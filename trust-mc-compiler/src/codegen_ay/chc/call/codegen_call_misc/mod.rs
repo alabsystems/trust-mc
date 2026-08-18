@@ -15,6 +15,7 @@ mod primitive_ops;
 mod rawvec_extra_checks;
 mod rawvec_try;
 mod referent_resolve;
+pub(in crate::codegen_ay::chc) use referent_resolve::Referent;
 mod referent_resolve_chain;
 
 use ay_bindings::{Expr, Sort};
@@ -166,7 +167,10 @@ impl<'tcx, 'body> CallMisc for ChcCtx<'tcx, 'body> {
             .as_ref()
             .map(|b| b.len.clone())
             .or_else(|| {
-                cx.args.first().and_then(|arg| self.translate_ptr_metadata(arg, cx.modified_locals))
+                cx.args
+                    .first()
+                    .and_then(|arg| self.translate_ptr_metadata(arg, cx.modified_locals))
+                    .map(|len| len.into_expr())
             })
             .or_else(|| {
                 if let Some(Operand::Copy(p) | Operand::Move(p)) = cx.args.first() {

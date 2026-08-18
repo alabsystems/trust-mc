@@ -19,6 +19,7 @@ use rustc_public::CrateDef;
 use rustc_public::ty::{AdtDef, AdtKind, GenericArgKind, GenericArgs, RigidTy, TyKind};
 use tracing::debug;
 
+use crate::codegen_ay::field_roles;
 use crate::codegen_ay::types::{bool_sort, bv8_sort, flatten_dt_array_element, ptr_sort};
 
 use super::ChcCtx;
@@ -201,6 +202,17 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                             } else {
                                 Self::option_like_sort_name(def, &args, payload_ty)
                             };
+                            // §4 item 7 records NO role for this arm, on
+                            // purpose. `extract_pointer_expr` reads the FIRST
+                            // constructor, which for an Option-like enum is the
+                            // empty `None_*` one, so the payload role has no
+                            // reader — and this is also the arm that MINTS the
+                            // collision the table is built to survive
+                            // (`Option<*mut u8>` and `Option<usize>` both name
+                            // their sort `Option_bv64`), so recording it would
+                            // poison an entry nobody consults. Record it here
+                            // when a consumer for it appears, and re-run the
+                            // dual wall then.
                             return Some(enum_sort(
                                 &option_name,
                                 names::option_constructors(&option_name, payload_sort),
@@ -279,7 +291,15 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                         }
                     })?
                 };
-                fields.push((names::adt_struct_field_name(&field.name), sort));
+                // Part of §4 item 7: this is the moment the encoder knows what
+                // the field HOLDS. `concrete_ty` decides it outright — a `&T` /
+                // `*mut T` / `Box` / `NonNull` / `Rc` field is an address, and
+                // everything else on `bv64` is a datum. Recording it here is
+                // what lets `extract_pointer_expr` read the role off the
+                // declaration instead of re-deriving it from `fld_*`'s width.
+                let field_name = names::adt_struct_field_name(&field.name);
+                field_roles::declare_field_role_from_mir_ty(&adt_name, &field_name, concrete_ty);
+                fields.push((field_name, sort));
             }
 
             return Some(struct_sort(adt_name, fields));
@@ -318,7 +338,16 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                             None
                         }
                     })?;
-                    fields.push((names::variant_field_name(&v_name, idx), sort));
+                    // Same fact, same moment, for enum payloads: the role comes
+                    // from the field's own MIR type, never from `use_deref`'s
+                    // choice of sort. See §4 item 7.
+                    let field_name = names::variant_field_name(&v_name, idx);
+                    field_roles::declare_field_role_from_mir_ty(
+                        &adt_name,
+                        &field_name,
+                        concrete_ty,
+                    );
+                    fields.push((field_name, sort));
                 }
                 // Part of #2549: Scope Option constructor names.
                 constructors.push((names::scope_option_ctor(v_name, &adt_name), fields));

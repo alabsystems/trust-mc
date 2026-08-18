@@ -766,10 +766,10 @@ fn soundness_oracle_no_false_proofs() {
     // many actually-total programs the verifier fails to prove SAFE — rung-1's target).
     let mut results: Vec<(String, Verdict, bool)> = Vec::new();
 
-    let mut eval = |name: String,
-                    module: &Module,
-                    param_tys: &[Ty],
-                    results: &mut Vec<(String, Verdict, bool)>| {
+    let eval = |name: String,
+                module: &Module,
+                param_tys: &[Ty],
+                results: &mut Vec<(String, Verdict, bool)>| {
         let verdict = verify(module);
         // A crash isn't a proof; don't compute ground truth (it can't be a violation).
         let panics = if verdict == Verdict::Crashed {

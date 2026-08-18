@@ -487,7 +487,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
             // Strategy 3: use the wide-pointer metadata path for `&[T]`.
             if let Some(len) = self.translate_ptr_metadata(receiver, cx.modified_locals) {
-                return Some(len);
+                return Some(len.into_expr());
             }
 
             // Strategy 4: read `fld_len` from the resolved slice referent.

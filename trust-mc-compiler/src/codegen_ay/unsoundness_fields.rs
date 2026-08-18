@@ -30,13 +30,14 @@ use super::{
     get_chc_store_dropped_transition_count, take_aggregate_encoding_gap_by_fn,
     take_aggregate_encoding_gap_count, take_chc_coerce_eq_dropped_constraint_count,
     take_chc_coerce_eq_dropped_constraint_counts_by_fn, take_chc_diverging_call_drop_count,
-    take_chc_offset_provenance_unresolved_count, take_offset_provenance_unresolved_by_fn,
-    take_fp_bitvector_encoding_by_fn, take_fp_bitvector_encoding_count,
-    take_inferable_predicate_count, take_kani_mem_overapprox_by_fn, take_kani_mem_overapprox_count,
-    take_ptr_metadata_unconstrained_by_fn, take_ptr_metadata_unconstrained_count,
-    take_rounding_assertion_bypass_count, take_sort_harmonize_fresh_var_count,
-    take_static_init_incomplete_by_fn, take_static_init_incomplete_count, take_store_dropped_by_fn,
-    take_stub_approximation_by_fn, take_stub_approximation_count,
+    take_chc_offset_provenance_unresolved_count, take_fp_bitvector_encoding_by_fn,
+    take_fp_bitvector_encoding_count, take_inferable_predicate_count,
+    take_kani_mem_overapprox_by_fn, take_kani_mem_overapprox_count,
+    take_offset_provenance_unresolved_by_fn, take_ptr_metadata_unconstrained_by_fn,
+    take_ptr_metadata_unconstrained_count, take_rounding_assertion_bypass_count,
+    take_sort_harmonize_fresh_var_count, take_static_init_incomplete_by_fn,
+    take_static_init_incomplete_count, take_store_dropped_by_fn, take_stub_approximation_by_fn,
+    take_stub_approximation_count,
 };
 
 /// Collected unsoundness counter values from codegen (#2679).
@@ -317,28 +318,49 @@ pub(crate) fn collect_unsoundness_fields() -> UnsoundnessFields {
     });
 
     let offset_provenance_unresolved_count = take_chc_offset_provenance_unresolved_count();
-    // marker: offset_isize_overflow_precise. Drain the per-fn attribution map
-    // so the driver charges each demotion to the harness that produced it,
-    // instead of the crate total (`per_harness.is_empty()` fallback) which
-    // would leak an isize-overflowing offset harness's doubt onto its siblings.
-    let offset_provenance_unresolved_per_harness = take_offset_provenance_unresolved_by_fn();
-    let offset_provenance_unresolved =
-        (offset_provenance_unresolved_count > 0 || !offset_provenance_unresolved_per_harness.is_empty())
-            .then(|| {
-                warn!(
-                    offset_provenance_unresolved_count,
-                    per_harness_entries = offset_provenance_unresolved_per_harness.len(),
-                    "CHC pointer offset/deref: alloc-bound check skipped on unresolved provenance"
-                );
-                OffsetProvenanceUnresolvedInfo {
-                    count: offset_provenance_unresolved_count,
-                    per_harness: offset_provenance_unresolved_per_harness,
-                }
-            });
+    // marker: offset_isize_overflow_precise. Charge each demotion to the harness
+    // that produced it, instead of the crate total (`per_harness.is_empty()`
+    // fallback) which would leak an isize-overflowing offset harness's doubt onto
+    // its siblings.
+    //
+    // The map is now HARNESS-keyed: `absorb_fn_keyed_for_harness` folds the
+    // per-FUNCTION recorder output onto the owning harness at its codegen
+    // boundary. Previously this used the raw per-FUNCTION map, whose keys name
+    // no proof harness — and the driver's fail-closed `attributable_to_harness`
+    // charges such keys against EVERY harness, which is precisely the sibling
+    // leak this comment says it wants to avoid. Any residual fn-keyed entries
+    // (a writer path outside a per-harness codegen window) are still merged in,
+    // so the fail-closed behaviour is preserved for genuinely unattributable
+    // records rather than discarded.
+    let mut offset_provenance_unresolved_per_harness =
+        std::mem::take(&mut ph.offset_provenance_unresolved);
+    for (k, v) in take_offset_provenance_unresolved_by_fn() {
+        *offset_provenance_unresolved_per_harness.entry(k).or_default() += v;
+    }
+    let offset_provenance_unresolved = (offset_provenance_unresolved_count > 0
+        || !offset_provenance_unresolved_per_harness.is_empty())
+    .then(|| {
+        warn!(
+            offset_provenance_unresolved_count,
+            per_harness_entries = offset_provenance_unresolved_per_harness.len(),
+            "CHC pointer offset/deref: alloc-bound check skipped on unresolved provenance"
+        );
+        OffsetProvenanceUnresolvedInfo {
+            count: offset_provenance_unresolved_count,
+            per_harness: offset_provenance_unresolved_per_harness,
+        }
+    });
 
     // Part of #3165: kani::mem over-approximation counter with per-harness granularity.
     let kani_mem_count = take_kani_mem_overapprox_count();
-    let kani_mem_per_harness = take_kani_mem_overapprox_by_fn();
+    // HARNESS-keyed (see the offset-provenance note above): folded onto the
+    // owning harness by `absorb_fn_keyed_for_harness`, with any residual
+    // fn-keyed entries merged in so the driver's fail-closed attribution still
+    // covers genuinely unattributable records.
+    let mut kani_mem_per_harness = std::mem::take(&mut ph.kani_mem_overapprox);
+    for (k, v) in take_kani_mem_overapprox_by_fn() {
+        *kani_mem_per_harness.entry(k).or_default() += v;
+    }
     let kani_mem_overapprox = (kani_mem_count > 0).then(|| {
         debug!(
             kani_mem_count,

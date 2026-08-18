@@ -28,10 +28,9 @@ pub(in crate::codegen_ay::chc) use globals::{
     record_aggregate_gap_reason_for_fn, record_drop_fallback_reason_for_fn,
     record_fp_bitvector_encoding_for_fn, record_inferable_summary_name_for_fn,
     record_kani_mem_overapprox_for_fn, record_offset_provenance_unresolved_for_fn,
-    record_ptr_metadata_unconstrained_for_fn,
-    record_signedness_fallback_for_fn, record_static_init_incomplete_for_fn,
-    record_sound_havoc_drop_for_fn, record_store_dropped_for_fn, record_stub_approximation_for_fn,
-    record_translation_drop_for_fn,
+    record_ptr_metadata_unconstrained_for_fn, record_signedness_fallback_for_fn,
+    record_sound_havoc_drop_for_fn, record_static_init_incomplete_for_fn,
+    record_store_dropped_for_fn, record_stub_approximation_for_fn, record_translation_drop_for_fn,
     record_translation_drop_site_reason_for_fn, record_type_sort_fallback,
     record_type_sort_fallback_for_fn, record_unhandled_call_for_fn, set_chc_fallback_count_for_fn,
 };
@@ -55,9 +54,8 @@ pub(in crate::codegen_ay) use globals::{
     take_inferable_predicate_count, take_inferable_summary_names_by_fn,
     take_kani_mem_overapprox_by_fn, take_kani_mem_overapprox_count,
     take_known_stdlib_unconstrained_count, take_offset_provenance_unresolved_by_fn,
-    take_ptr_metadata_unconstrained_by_fn,
-    take_ptr_metadata_unconstrained_count, take_signedness_fallback_by_fn,
-    take_sound_havoc_drop_by_fn, take_static_init_incomplete_by_fn,
+    take_ptr_metadata_unconstrained_by_fn, take_ptr_metadata_unconstrained_count,
+    take_signedness_fallback_by_fn, take_sound_havoc_drop_by_fn, take_static_init_incomplete_by_fn,
     take_static_init_incomplete_count, take_store_dropped_by_fn, take_translation_drop_by_fn,
     take_translation_drop_site_reasons_by_fn, take_type_sort_fallback_by_fn,
     take_type_sort_fallback_count, take_undef_counter, take_unhandled_call_by_fn,
@@ -238,6 +236,8 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// Int sort, letting PDR synthesize invariants in LIA instead of BV theory.
     /// Part of #112: designs/2026-03-03-loop-invariant-synthesis.md Direction 2.
     pub(in crate::codegen_ay::chc) int_lift: bool,
+    /// Narrow each block relation's frame to backward-live columns (`ChcConfig`).
+    pub(in crate::codegen_ay::chc) frame_narrowing: bool,
 
     /// Basic block indices identified as loop headers (back-edge targets).
     /// Populated during fragment analysis or block relation declaration.
@@ -314,6 +314,9 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
 
     /// Emit arithmetic overflow error rules.
     pub(in crate::codegen_ay::chc) overflow_checks: bool,
+
+    /// Emit NaN-generation obligations for float binops (`--nan-check`).
+    pub(in crate::codegen_ay::chc) nan_checks: bool,
 
     /// Emit error rules for reachable undefined foreign function calls.
     pub(in crate::codegen_ay::chc) undefined_function_checks: bool,
@@ -661,12 +664,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let global_assignment_map = Self::build_global_assignment_map(body);
         let step_mode = cfg.step_mode;
         let int_lift = cfg.int_lift;
+        let frame_narrowing = cfg.frame_narrowing;
         let wide_mem = cfg.wide_mem;
         let extra_pointer_checks = cfg.extra_pointer_checks;
         let prove_safety_only = cfg.prove_safety_only;
         let uninit_checks = cfg.uninit_checks;
         let memory_safety_checks = cfg.memory_safety_checks;
         let overflow_checks = cfg.overflow_checks;
+        let nan_checks = cfg.nan_checks;
         let undefined_function_checks = cfg.undefined_function_checks;
         let recursive_unwind_depth = cfg.recursive_unwind_depth;
         let unwinding_assertions = cfg.unwinding_assertions;
@@ -753,6 +758,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             track_level,
             step_mode,
             int_lift,
+            frame_narrowing,
             loop_headers: HashSet::new(),
             int_lifted_vars: HashMap::new(),
             fragment_analysis: None,
@@ -769,6 +775,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             contract_static_havoc,
             memory_safety_checks,
             overflow_checks,
+            nan_checks,
             undefined_function_checks,
             dyn_vtable_ids: HashMap::new(),
             vtable_state_vars: HashMap::new(),

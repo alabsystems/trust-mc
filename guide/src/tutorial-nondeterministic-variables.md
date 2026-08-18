@@ -32,7 +32,7 @@ We included an extra assertion that the value returned by `kani::any()` here was
 If we run this, you'll notice that verification succeeds.
 
 ```bash
-cargo trust-mc --harness safe_update
+targo trust-mc --harness safe_update
 ```
 
 `kani::any()` is safe Rust, and so trust-mc only implements it for types where type invariants are enforced.

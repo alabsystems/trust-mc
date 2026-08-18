@@ -21,7 +21,10 @@ pub(in crate::codegen_ay::chc) mod heap_store_chains;
 mod memory_impl;
 mod memory_impl_addr;
 mod memory_impl_addr_normalize;
-pub(in crate::codegen_ay::chc) use memory_impl_addr_normalize::is_value_widened_into_address;
+// The predicate moved next to the `Loc` tag it guards (`codegen_ay::provenance`)
+// so the BMC statement path can make the same refusal; re-exported here so the
+// existing `super::super::heap::is_value_widened_into_address` imports still resolve.
+pub(in crate::codegen_ay::chc) use crate::codegen_ay::provenance::is_value_widened_into_address;
 mod memory_impl_addr_stack;
 mod memory_impl_layout;
 mod memory_impl_layout_query;

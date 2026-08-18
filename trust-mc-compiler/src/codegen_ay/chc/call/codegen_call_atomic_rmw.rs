@@ -27,6 +27,7 @@ use super::codegen_call_misc::CallMisc;
 use super::codegen_call_result_mem::build_call_result_memory_bridge_constraints;
 use super::codegen_rules::CodegenRules;
 use super::ptr_receiver_mem::{mark_atomic_ptr_forwarded, resolve_ptr_target_local};
+use crate::codegen_ay::provenance::Val;
 
 /// Coerce Bool↔BV operands to same sort for atomic ops. AtomicBool stores as
 /// BV8 but args may be Bool; BV ops require matching sorts. Part of #3452.
@@ -414,7 +415,10 @@ pub(in crate::codegen_ay::chc) fn codegen_atomic_rmw(
     let old_value = if referent_local.is_some() {
         ctx.resolve_ref_or_const_referent(&dcx.args[0], dcx.modified_locals)
     } else if let Some((addr, pointee_ty)) = mem_target.as_ref() {
-        atomic_load_from_memory(ctx, addr, *pointee_ty)
+        // A load is the legal `Loc -> Val` crossing; the referent lane above is
+        // NOT tagged, because `resolve_ref_or_const_referent` does not report
+        // whether it dereferenced or handed back the pointer (§4 item 1).
+        atomic_load_from_memory(ctx, addr, *pointee_ty).map(Val::into_expr)
     } else {
         None
     };

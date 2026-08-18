@@ -7,6 +7,7 @@
 //! Extracted from `place.rs` as part of #2246 decomposition.
 
 use super::{Expr, IndexedVal, Place, ProjectionElem, Sort, StatementCodegen};
+use crate::codegen_ay::provenance::is_transparent_pointer_wrapper_repr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH};
 use tracing::debug;
 
@@ -62,8 +63,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 ProjectionElem::Downcast(variant_idx) => {
                     // Part of #1100: Allow Downcast on bv64 from Try::branch stubs.
                     if !expr.sort().is_datatype() {
-                        if expr.sort().is_bitvec()
-                            && expr.sort().bitvec_width() == Some(POINTER_WIDTH)
+                        if is_transparent_pointer_wrapper_repr(expr.sort())
                             && variant_idx.to_index() == 0
                         {
                             active_variant = Some(0);
@@ -85,8 +85,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 ProjectionElem::Field(field, _ty) => {
                     // Part of #944: Handle transparent wrapper bv64 (NonNull/Unique).
                     // Part of #1100: Also allow active_variant == Some(0) for ControlFlow::Continue.
-                    if expr.sort().is_bitvec()
-                        && expr.sort().bitvec_width() == Some(POINTER_WIDTH)
+                    // Shares the one documented representation predicate with the CHC
+                    // select/update pair, so all four copies of this test move together.
+                    if is_transparent_pointer_wrapper_repr(expr.sort())
                         && *field == 0
                         && (active_variant.is_none() || active_variant == Some(0))
                     {

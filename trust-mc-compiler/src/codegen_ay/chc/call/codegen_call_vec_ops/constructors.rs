@@ -12,6 +12,7 @@ use rustc_public::mir::Operand;
 
 use crate::codegen_ay::chc::call::call_accumulator::CallAccumulator;
 use crate::codegen_ay::names::vec_layout;
+use crate::codegen_ay::provenance::{Loc, Val};
 use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH, ptr_sort};
 
@@ -29,25 +30,48 @@ pub(in crate::codegen_ay::chc) struct VecOpNewContext<'a> {
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// The capacity operand of `Vec::new` / `Vec::with_capacity`.
+    ///
+    /// A [`Val`] by the callee's signature: `Vec::with_capacity(capacity: usize)`
+    /// takes a COUNT, and the `Vec::new` lane is the literal `0`. Neither is an
+    /// address, which is the fact the consumer below used to re-derive from the
+    /// width of the term.
     fn vec_new_cap_expr(
         &mut self,
         stub: StubKind,
         args: &[Operand],
         modified_locals: &HashSet<usize>,
-    ) -> Expr {
-        if stub == StubKind::VecWithCapacity && !args.is_empty() {
+    ) -> Val {
+        Val::of_value(if stub == StubKind::VecWithCapacity && !args.is_empty() {
             self.translate_operand_with_modified(&args[0], modified_locals)
                 .unwrap_or_else(|| Expr::bitvec_const(0u64, POINTER_WIDTH))
         } else {
             Expr::bitvec_const(0u64, POINTER_WIDTH)
-        }
+        })
     }
 
+    /// Dangling-pointer + provenance-invalidation constraints for the CHC
+    /// `Vec::new` / `Vec::with_capacity` lane.
+    ///
+    /// Address-vs-value: this is the CHC twin of
+    /// `statement/collections/vec.rs::add_vec_dangling_provenance_constraints`,
+    /// which wave 1 converted; both lanes are live and only one had been done.
+    /// The two payload parameters were adjacent bare `Expr`s — `cap` is the
+    /// CAPACITY (a `usize` count) and `ptr` is the buffer's allocation base (an
+    /// address) — so transposing them type-checked. They are now different types
+    /// and the swap is a compile error.
+    ///
+    /// The retired guard was `cap_expr.sort().bitvec_width() == Some(POINTER_WIDTH)`,
+    /// which reads as "is the capacity a pointer?". It is not. The real
+    /// precondition is that `cap` is comparable with the `zero` constant it is
+    /// about to be equated to, so the test is written against `zero`'s own width;
+    /// `zero` is built at `POINTER_WIDTH`, so exactly the same expressions are
+    /// accepted as before.
     fn emit_vec_dangling_provenance_constraints(
         &mut self,
         stub: StubKind,
-        cap_expr: &Expr,
-        ptr: &Expr,
+        cap: &Val,
+        ptr: &Loc,
         extra_constraints: &mut Vec<Expr>,
     ) {
         if !self.extra_pointer_checks || self.int_lift {
@@ -57,12 +81,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
         let (dangling_cond, conditional) = if stub == StubKind::VecNew {
             (Expr::bool_const(true), false)
-        } else if cap_expr.sort().bitvec_width() == Some(POINTER_WIDTH) {
-            (cap_expr.clone().eq(zero.clone()), true)
+        } else if cap.as_expr().sort().bitvec_width() == zero.sort().bitvec_width() {
+            (cap.as_expr().clone().eq(zero.clone()), true)
         } else {
             return;
         };
 
+        let ptr = ptr.as_expr();
         let ptr_nonzero = ptr.clone().bvugt(zero);
         if conditional {
             extra_constraints.push(Expr::ite(
@@ -101,10 +126,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         // Capacity tracking: set to 0 (VecNew) or arg (VecWithCapacity). Part of #2877.
         if let Some(cap_var_name) = self.collections.len_state.get_cap_var(dest_local).cloned() {
-            self.collection_cap_set(&cap_var_name, cap_expr.clone(), acc);
+            self.collection_cap_set(&cap_var_name, cap_expr.as_expr().clone(), acc);
             // Part of #1037 V2: cap >= len background invariant on sidecar path.
             Self::emit_cap_ge_len(
-                cap_expr.clone(),
+                cap_expr.as_expr().clone(),
                 Expr::bitvec_const(0u64, POINTER_WIDTH),
                 acc.constraints,
             );
@@ -161,7 +186,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .get(dest_vec_idx + vec_layout::IDX_DATA)
                 .and_then(|(_, s)| s.array_sort())
                 .and_then(|arr| Self::sort_byte_width(&arr.element_sort));
-            let concrete_ptr = Self::const_usize_from_expr(&cap_expr)
+            let concrete_ptr = Self::const_usize_from_expr(cap_expr.as_expr())
                 .filter(|cap| *cap > 0)
                 .zip(elem_byte_width)
                 .and_then(|(cap, elem)| u32::try_from(cap.checked_mul(elem)?).ok())
@@ -176,7 +201,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     Some(Expr::bitvec_const((obj_id as u64) << 32, POINTER_WIDTH))
                 });
             // Part of #2267: pre-allocate instead of format!().
-            let ptr = concrete_ptr.unwrap_or_else(|| {
+            // Both lanes MINT this Vec's buffer base here: either the offset-0
+            // base of the heap object just registered above, or a freshly
+            // declared pointer-sorted variable standing for the (dangling)
+            // allocation. An ADDRESS by construction — nothing downstream has to
+            // re-derive it.
+            let ptr = Loc::of_address(concrete_ptr.unwrap_or_else(|| {
                 declare_pending_var(
                     {
                         let mut n = String::with_capacity(ptr_name.len() + 10);
@@ -186,7 +216,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     },
                     ptr_sort,
                 )
-            });
+            }));
             // Part of #4287: initialize `data` as a concrete const_array rather
             // than a fresh symbolic. The sidecar-length store in VecPush (at
             // old_len=0) must agree with the Index::index read of v[0]. A fresh
@@ -222,10 +252,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
             self.emit_vec_dangling_provenance_constraints(stub, &cap_expr, &ptr, acc.constraints);
             // Part of #1037 V2: cap >= len background invariant.
-            Self::emit_cap_ge_len(cap_expr.clone(), zero_len.clone(), acc.constraints);
+            Self::emit_cap_ge_len(cap_expr.as_expr().clone(), zero_len.clone(), acc.constraints);
             if !self.constrain_projected_vec_fields_for_call(
                 dest_local,
-                ProjectedVecState { ptr, len: zero_len, cap: cap_expr, data },
+                ProjectedVecState {
+                    ptr: ptr.into_expr(),
+                    len: zero_len,
+                    cap: cap_expr.into_expr(),
+                    data,
+                },
                 acc.constraints,
                 acc.dests,
             ) {
@@ -245,7 +280,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let mut ptr_name = String::with_capacity(out_name.len() + 9);
             ptr_name.push_str(&out_name);
             ptr_name.push_str("_init_ptr");
-            let ptr = declare_pending_var(ptr_name, ptr_sort());
+            // Minted here, same as the projected lane above: an ADDRESS.
+            let ptr = Loc::of_address(declare_pending_var(ptr_name, ptr_sort()));
             let data_sort = dt
                 .constructors
                 .first()
@@ -257,10 +293,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let data = declare_pending_var(data_name, data_sort);
             self.emit_vec_dangling_provenance_constraints(stub, &cap_expr, &ptr, acc.constraints);
             // Part of #1037 V2: cap >= len background invariant.
-            Self::emit_cap_ge_len(cap_expr.clone(), zero_len.clone(), acc.constraints);
+            Self::emit_cap_ge_len(cap_expr.as_expr().clone(), zero_len.clone(), acc.constraints);
             acc.constraints.push(Self::build_vec_datatype_eq(
                 dt_name,
-                vec![ptr, zero_len, cap_expr, data],
+                vec![ptr.into_expr(), zero_len, cap_expr.into_expr(), data],
                 &out_name,
                 &out_sort,
             ));

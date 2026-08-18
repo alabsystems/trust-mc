@@ -21,17 +21,26 @@ use super::PlaceResolver;
 use super::field_map_projection;
 use super::subslice::{apply_inline_subslice, array_element_ty};
 use crate::codegen_ay::chc::dyn_coercion;
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 /// Captured-ref walk gap: true when `expr` already IS the pointee VALUE for a
 /// `Deref` step — the walker seeded the local (a closure env passed by
 /// reference into contract ensures/requires closures) with the pointee's
 /// translated Datatype value rather than an address. Deref must then be
-/// identity. Without this gate, `extract_pointer_expr` fabricates a "pointer"
-/// from the env DT's first BV64 field (`cap_0`), destroying the env and
+/// identity. Without this gate, `extract_pointer_expr` peels the env DT's
+/// `cap_0` and hands it back as the base address, destroying the env and
 /// failing every subsequent capture Field read
 /// (`rvalue_gap_Use_root_projected` → walk failure → dropped side-channel
 /// checks).
+///
+/// Wave 18 sharpened rather than retired this guard. `cap_0` is no longer
+/// peeled on a shape guess — a closure sort now DECLARES which captures are
+/// addresses, from the upvar's MIR type — so a closure that captures a `&T`
+/// answers `extract_pointer_expr` with a genuine address. It is still the wrong
+/// address here: the walker's term is the pointee VALUE, not the env, so the
+/// capture slot named by the declaration is not the thing being dereferenced.
 ///
 /// Scope is deliberately CLOSURE-ENV ONLY (`Closure_{id}` sorts from
 /// `closure_sort_name`, deterministic per ClosureDef): pointer-representation
@@ -58,13 +67,60 @@ pub(in crate::codegen_ay) fn deref_is_identity_on_value_dt(
     }
 }
 
+/// What `&place` / `&raw place` resolved to inside an inline body.
+///
+/// The two lanes are different facts, and flattening them to a bare `Expr` is
+/// what let the address lane below run on data. `Rvalue::Ref` is translated one
+/// of two ways here, and only one of them produces an address:
+///
+/// * the root local really does hold a pointer, so the reference is that
+///   pointer's address advanced by the projection's byte offsets — an address
+///   the encoder *mints*;
+/// * or references are transparent in the CHC encoding, so `&x` is modelled by
+///   `x`'s own term and nothing is minted at all.
+///
+/// Naming the lanes is the point: a caller can no longer receive the second and
+/// treat it as the first.
+#[derive(Clone, Debug)]
+pub(in crate::codegen_ay) enum InlineRefExpr {
+    /// A genuine address: the root pointer's address plus the projection's
+    /// field byte offsets. Minted only when the root local's MIR type says it
+    /// holds a pointer *and* that pointer's term decodes as thin.
+    Address(Loc),
+    /// The referenced place's own term, handed back unchanged, because
+    /// references are transparent in this encoding: `&x` is modelled by `x`'s
+    /// term and `&raw const (*p)` by `p`'s.
+    ///
+    /// Deliberately **untagged**. Whether that term is an address or a datum
+    /// depends on the place's type — a `Box`/`NonNull` place's term is an
+    /// address, a `u32` place's term is a datum — and `resolve_place` does not
+    /// carry the type needed to say which. Tagging it here would be the exact
+    /// laundering this campaign exists to avoid; typing it belongs to the waves
+    /// that convert the place resolvers themselves.
+    Transparent(Expr),
+}
+
+impl InlineRefExpr {
+    /// Collapses back to a bare `Expr` for the inline walker's `local_exprs`
+    /// map, which is still `HashMap<usize, Expr>`.
+    ///
+    /// Every caller of this is a boundary the campaign has not reached yet, not
+    /// a place where the distinction was found not to matter.
+    pub(in crate::codegen_ay) fn into_expr(self) -> Expr {
+        match self {
+            Self::Address(loc) => loc.into_expr(),
+            Self::Transparent(expr) => expr,
+        }
+    }
+}
+
 pub(in crate::codegen_ay) fn inline_ref_place_to_expr<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
     local_exprs: &HashMap<usize, Expr>,
     place: &Place,
     resolver: &PlaceResolver<'_>,
     locals: &[LocalDecl],
-) -> Option<Expr> {
+) -> Option<InlineRefExpr> {
     // Part of #4003: Use `if let Some` instead of `?` so that when local 1
     // (closure env) is not in local_exprs, we fall through to resolve_place
     // which routes through PlaceResolver::Captures. The previous `?` caused
@@ -88,7 +144,8 @@ pub(in crate::codegen_ay) fn inline_ref_place_to_expr<'tcx, 'body>(
             // the projection transparently on the value (references are
             // transparent in the CHC encoding).
             if current_ty_opt.is_some_and(|p| deref_is_identity_on_value_dt(root, p)) {
-                return resolve_place(ctx, local_exprs, place, resolver, locals);
+                return resolve_place(ctx, local_exprs, place, resolver, locals)
+                    .map(InlineRefExpr::Transparent);
             }
             // Part of #4030: `&raw const (*wide_ptr)` inside inline bodies must
             // preserve the full fat-pointer value. Pulling out only `fld_ptr`
@@ -96,21 +153,59 @@ pub(in crate::codegen_ay) fn inline_ref_place_to_expr<'tcx, 'body>(
             // Also covers BV128 fat pointers (slice/str/custom DST) where the
             // metadata lives in the high 64 bits. extract_pointer_expr would
             // strip those bits, losing the length for downstream PtrMetadata.
+            //
+            // Which term is preserved is decided by two facts, neither of them a
+            // width guess. The MIR type says whether a metadata half must exist
+            // at all (`is_unsized_pointee`), and `PtrRepr` says structurally
+            // whether this TERM actually carries one. The retired test was
+            // `root.sort().bitvec_width() == Some(2 * POINTER_WIDTH)`, which
+            // cannot tell a genuine `(data, metadata)` pair from a thin pointer
+            // that was widened into the same bv128 slot — the two are
+            // bit-identical, and preserving the widened one preserves a
+            // *fabricated* length (reliably 0, which makes `size_of_val` /
+            // bounds obligations trivially satisfiable: a manufactured proof,
+            // not merely a spurious counterexample). `PtrRepr::Fat` is the only
+            // shape that has metadata to preserve; `WidenedThin` falls through
+            // to the lanes below, which mint an address or resolve the place
+            // transparently rather than carrying padding forward as a length.
+            // A datatype root keeps its own arm: its halves are DECLARED fields
+            // (`fld_ptr`/`fld_len`, `fld_vtable`), not bits to be re-measured.
             let is_unsized_pointee = current_ty_opt
                 .map(|ty| ty.layout().ok().is_some_and(|layout| layout.shape().is_unsized()))
                 .unwrap_or(false);
-            let is_fat_sort =
-                root.sort().is_datatype() || root.sort().bitvec_width() == Some(2 * POINTER_WIDTH);
+            let carries_metadata = root.sort().is_datatype()
+                || matches!(PtrRepr::classify(root), Some(PtrRepr::Fat { .. }));
             let preserve_fat_pointer =
-                place.projection.len() == 1 && is_fat_sort && is_unsized_pointee;
+                place.projection.len() == 1 && carries_metadata && is_unsized_pointee;
             if preserve_fat_pointer {
-                return Some(root.clone());
+                return Some(InlineRefExpr::Transparent(root.clone()));
             }
-            let base_addr =
-                dyn_coercion::extract_pointer_expr(root).unwrap_or_else(|| root.clone());
-            if base_addr.sort().bitvec_width() == Some(POINTER_WIDTH) {
-                let mut addr = base_addr;
-                if let Some(mut current_ty) = current_ty_opt {
+            // The address lane. `current_ty_opt` is `Some` exactly when the root
+            // local is declared `&T` / `*const T`, so THAT is what licenses
+            // reading `root` as a pointer — a fact taken from the MIR type, at
+            // the only place it is available. It used to be tested second, after
+            // a width check that had already committed to the address reading.
+            if let Some(mut current_ty) = current_ty_opt {
+                // `extract_pointer_expr` reads a DECLARED `fld_ptr` role off a
+                // pointer-representation datatype, or hands a bare pointer
+                // bitvector straight back; `thin_address` then decides only the
+                // SHAPE, and declines a wide pointer instead of half-splitting
+                // it at a byte-offset site.
+                //
+                // The old `.unwrap_or_else(|| root.clone())` fallback — take the
+                // whole term as the base ADDRESS when no pointer field was found
+                // — is deleted. It was address recovery by hope: the shapes that
+                // reached it are exactly the ones `extract_pointer_expr` refuses
+                // (a non-bitvector, or a datatype with no pointer-shaped field),
+                // none of which can pass the pointer-shape test below, so it
+                // never contributed an address and only made it look as though a
+                // value could become one.
+                if let Some(base) = dyn_coercion::extract_pointer_expr(root)
+                    .as_ref()
+                    .map(Loc::as_expr)
+                    .and_then(PtrRepr::thin_address)
+                {
+                    let mut addr = base.into_expr();
                     let mut resolved_all = true;
                     for proj in &place.projection.as_slice()[1..] {
                         match proj {
@@ -137,13 +232,16 @@ pub(in crate::codegen_ay) fn inline_ref_place_to_expr<'tcx, 'body>(
                         }
                     }
                     if resolved_all {
-                        return Some(addr);
+                        // Offsetting a known address by a field's byte offset
+                        // yields an address; that is the one place in this
+                        // function where the encoder mints one.
+                        return Some(InlineRefExpr::Address(Loc::of_address(addr)));
                     }
                 }
             }
         }
     }
-    resolve_place(ctx, local_exprs, place, resolver, locals)
+    resolve_place(ctx, local_exprs, place, resolver, locals).map(InlineRefExpr::Transparent)
 }
 
 /// Translate a MIR Operand to a AY Expr within an inline body context.
@@ -246,7 +344,9 @@ fn resolve_local_projections(
                 // Identity in BV model — references are transparent in CHC encoding.
                 if !identity_value_deref {
                     if let Some(ptr_expr) = dyn_coercion::extract_pointer_expr(&current) {
-                        current = ptr_expr;
+                        // Same as the identity lane above: `current` is the
+                        // walker's running term, a VALUE on the other branch.
+                        current = ptr_expr.into_expr();
                     }
                 }
 
@@ -256,37 +356,47 @@ fn resolve_local_projections(
                 // Without this load, the inline walker returns the BV64 address
                 // instead of the value, causing CTREX in pointer-wrapper harnesses
                 // (e.g., Container<T> wrapping NonNull<T>).
-                if is_raw_ptr_deref {
-                    if let Some(pty) = pointee_ty {
-                        if current.sort().bitvec_width() == Some(POINTER_WIDTH) {
-                            if let Some(loaded) = ctx.load_from_memory(current.clone(), pty) {
-                                current = loaded;
-                            }
-                        }
-                    }
+                //
+                // `is_raw_ptr_deref` comes from the MIR type and is what makes
+                // `current` an address: raw pointers are never modelled
+                // transparently, so the term of a `*const T` place is the
+                // pointer itself. `thin_address` supplies only the shape.
+                if is_raw_ptr_deref
+                    && let Some(pty) = pointee_ty
+                    && let Some(addr) = PtrRepr::thin_address(&current)
+                    && let Some(loaded) = ctx.load_from_memory(addr, pty)
+                {
+                    current = loaded.into_expr();
                 }
 
                 // Part of #4207: For reference derefs where the expression is
-                // still a BV64 pointer (memory address) and the pointee is an
+                // still a pointer (memory address) and the pointee is an
                 // ADT/tuple, load from typed memory. This happens when a struct
                 // was stored to heap (e.g., via Rc/Arc) and the drop shim
                 // passes a &mut ref — the ref is transparent in CHC encoding
                 // but the value lives in the typed memory array, not a DT expr.
                 // Without this load, subsequent Field projections fail because
                 // resolve_dt_field requires a Datatype expression.
+                //
+                // What decides that `current` is an ADDRESS here is a
+                // SORT-vs-TYPE mismatch, not its width: an ADT/tuple pointee
+                // translates to a Datatype, so a term that is a bare bitvector
+                // cannot be the transparently-seeded pointee datum, and the only
+                // other thing a reference's term can be is its address. The type
+                // test therefore leads and `thin_address` follows, supplying the
+                // shape it is entitled to decide.
                 if !is_raw_ptr_deref
-                    && current.sort().bitvec_width() == Some(POINTER_WIDTH)
                     && let Some(pty) = pointee_ty
                     && matches!(
                         ctx.resolve_body_ty(pty).kind(),
                         TyKind::RigidTy(RigidTy::Adt(..)) | TyKind::RigidTy(RigidTy::Tuple(_))
                     )
+                    && let Some(addr) = PtrRepr::thin_address(&current)
+                    && let Some(loaded) = ctx.load_from_memory(addr, pty)
+                    && (loaded.as_expr().sort().is_datatype()
+                        || !loaded.as_expr().sort().is_bitvec())
                 {
-                    if let Some(loaded) = ctx.load_from_memory(current.clone(), pty) {
-                        if loaded.sort().is_datatype() || !loaded.sort().is_bitvec() {
-                            current = loaded;
-                        }
-                    }
+                    current = loaded.into_expr();
                 }
 
                 current_ty = pointee_ty;
@@ -372,8 +482,15 @@ fn resolve_dt_field(
     downcast_variant: &mut Option<usize>,
 ) -> Option<Expr> {
     let cons_idx = downcast_variant.take();
-    if let Some(selected) = ChcCtx::datatype_field_select(current, idx, cons_idx) {
-        return Some(selected);
+    // `current` is the running place term (a local expression or a loaded
+    // pointee), i.e. a value; the fallbacks below build field accessors over
+    // that same value.
+    if let Some(selected) = ChcCtx::datatype_field_select(
+        &crate::codegen_ay::provenance::Val::of_value(current.clone()),
+        idx,
+        cons_idx,
+    ) {
+        return Some(selected.into_expr());
     }
 
     if let ay_bindings::SortInner::Datatype(dt) = current.sort().inner() {
@@ -425,12 +542,19 @@ pub(super) fn try_transparent_field_passthrough(
     if let TyKind::RigidTy(RigidTy::RawPtr(..)) | TyKind::RigidTy(RigidTy::Ref(..)) =
         resolved.kind()
     {
-        let bv_width = current.sort().bitvec_width().unwrap_or(0);
-        if bv_width == 2 * POINTER_WIDTH {
-            // Fat pointer: BV128.
+        // The MIR type has just established that this term is a pointer. What
+        // it does NOT establish is that a double-width term carries metadata:
+        // `coerce_bitvec_width_safe` widens thin pointers into the same slot,
+        // and the width test that used to lead this arm handed bits 127..64 of
+        // such a term back as `Field(1)` — the pointer's length or vtable id —
+        // when they are zero-extension padding. `PtrRepr::data` is total (every
+        // shape points somewhere), so `Field(0)` is unchanged; metadata comes
+        // back for a genuine `Fat` only, and the widened shape declines to the
+        // walker's existing bail-closed lane instead of reporting a length of 0.
+        if let Some(repr) = PtrRepr::classify(current).filter(|r| !matches!(r, PtrRepr::Thin(_))) {
             return match field_idx {
-                0 => Some(current.clone().extract(POINTER_WIDTH - 1, 0)),
-                1 => Some(current.clone().extract(2 * POINTER_WIDTH - 1, POINTER_WIDTH)),
+                0 => Some(repr.into_data().into_expr()),
+                1 => repr.into_metadata().map(Val::into_expr),
                 _ => None,
             };
         }
@@ -603,6 +727,8 @@ mod tests {
         pub fn probe_transparent_wrapper(w: TransparentPtr) -> TransparentPtr { w }
 
         pub fn probe_nontransparent_wrapper(w: NonTransparent) -> NonTransparent { w }
+
+        pub fn probe_plain_value(x: u64) -> u64 { x }
     "#;
 
     fn with_arg_ty(
@@ -735,6 +861,51 @@ mod tests {
                 !deref_is_identity_on_value_dt(&fat, closure_ty),
                 "non-Closure DT must not claim identity deref"
             );
+        });
+    }
+
+    /// The wave-6 claim, pinned: `&*_1` mints an [`InlineRefExpr::Address`]
+    /// only when local 1's MIR **type** is a pointer.
+    ///
+    /// Both cases below hand the walker the *same* `bv64` expression, so no
+    /// width test can separate them — which is the whole defect. `probe_thin_ptr`
+    /// declares `*const u8`, so its term is an address and the reference is that
+    /// address. `probe_plain_value` declares `u64`, so its term is a datum, and
+    /// the walker must fall through to the transparent lane instead of turning
+    /// data into a base address for byte-offset arithmetic.
+    #[test]
+    fn test_inline_ref_place_mints_an_address_only_for_a_pointer_typed_local() {
+        with_test_ay_ctx_for_source(PASSTHROUGH_SOURCE, |ctx| {
+            for (fn_name, expect_address) in
+                [("probe_thin_ptr", true), ("probe_plain_value", false)]
+            {
+                let instance = find_instance_by_suffix(ctx.tcx, fn_name);
+                let body = instance.body().expect("function body");
+                let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, fn_name, ChcConfig::default());
+
+                // The identical term for both: a bare pointer-width bitvector.
+                let local_exprs =
+                    HashMap::from([(1usize, Expr::var("_1", Sort::bitvec(POINTER_WIDTH)))]);
+                let place =
+                    rustc_public::mir::Place { local: 1, projection: vec![ProjectionElem::Deref] };
+                let captures: [Expr; 0] = [];
+                let resolver = PlaceResolver::Captures(&captures);
+
+                let resolved = inline_ref_place_to_expr(
+                    &mut chc_ctx,
+                    &local_exprs,
+                    &place,
+                    &resolver,
+                    body.locals(),
+                );
+                let minted_address = matches!(resolved, Some(InlineRefExpr::Address(_)));
+                assert_eq!(
+                    minted_address,
+                    expect_address,
+                    "{fn_name}: `&*_1` should {} an address for this local's declared type",
+                    if expect_address { "mint" } else { "NOT mint" }
+                );
+            }
         });
     }
 

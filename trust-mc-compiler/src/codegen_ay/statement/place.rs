@@ -15,7 +15,7 @@ use super::place_deref_first::DerefFirstResult;
 use super::place_post_deref::DerefProjectionResult;
 use super::{Expr, IntoOption, Place, ProjectionElem, Sort, StatementCodegen};
 use crate::codegen_ay::names::struct_sort;
-use crate::codegen_ay::types::POINTER_WIDTH;
+use crate::codegen_ay::provenance::is_transparent_pointer_wrapper_repr;
 use rustc_public::ty::{RigidTy, TyKind};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -226,8 +226,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         for proj in &place.projection[1..] {
                             if let ProjectionElem::Field(nested_field, _) = proj {
                                 // Part of #944: Handle transparent wrapper bv64.
-                                if result.sort().is_bitvec()
-                                    && result.sort().bitvec_width() == Some(POINTER_WIDTH)
+                                // Same REPRESENTATION predicate as the CHC
+                                // select/update pair and the post-deref walker
+                                // (`provenance::is_transparent_pointer_wrapper_repr`)
+                                // — "was a wrapper flattened to this bv?", NOT
+                                // "is this bv an address?". Sharing it is what
+                                // stops this walker from deciding field 0 lives
+                                // in a different slot than the write side does.
+                                if is_transparent_pointer_wrapper_repr(result.sort())
                                     && *nested_field == 0
                                 {
                                     // Transparent wrapper - field(0) returns value unchanged
@@ -285,8 +291,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     for proj in &place.projection[1..] {
                         if let ProjectionElem::Field(nested_field, _) = proj {
                             // Part of #944: Handle transparent wrapper bv64.
-                            if result.sort().is_bitvec()
-                                && result.sort().bitvec_width() == Some(POINTER_WIDTH)
+                            // Shared representation predicate — see the note on
+                            // the `flattened_tuples` copy above.
+                            if is_transparent_pointer_wrapper_repr(result.sort())
                                 && *nested_field == 0
                             {
                                 // Transparent wrapper - field(0) returns value unchanged

@@ -108,7 +108,7 @@ fn test_extract_pointer_expr_from_slice_datatype() {
     let result = extract_pointer_expr(&dt_expr);
     assert!(result.is_some(), "extract_pointer_expr should handle Slice_bv8 Datatype");
 
-    let ptr = result.unwrap();
+    let ptr = result.unwrap().into_expr();
     assert!(ptr.sort().is_bitvec(), "extracted pointer should be BV64, got {:?}", ptr.sort());
     assert_eq!(ptr.sort().bitvec_width(), Some(64), "extracted pointer should be 64-bit");
 }
@@ -122,7 +122,7 @@ fn test_extract_pointer_expr_bv64_passthrough() {
     let bv_expr = Expr::var("ptr", Sort::bitvec(64));
     let result = extract_pointer_expr(&bv_expr);
     assert!(result.is_some(), "BV64 should pass through extract_pointer_expr");
-    assert_eq!(result.unwrap().sort().bitvec_width(), Some(64));
+    assert_eq!(result.unwrap().as_expr().sort().bitvec_width(), Some(64));
 }
 
 // =============================================================================

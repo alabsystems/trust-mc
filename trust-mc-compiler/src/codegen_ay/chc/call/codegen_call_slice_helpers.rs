@@ -14,6 +14,8 @@ use rustc_public::CrateDef;
 use rustc_public::mir::{Operand, ProjectionElem, Rvalue, StatementKind};
 use rustc_public::ty::{RigidTy, TyKind};
 
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH, ptr_sort};
 
 use super::codegen_call_misc::CallMisc;
@@ -21,10 +23,28 @@ use super::codegen_ctx::globals::declare_pending_var;
 use super::stubs_option_helpers::OptionHelpers;
 use super::{ChcCtx, chc_fresh_name};
 
+/// A slice resolved down to storage the encoder can index.
+///
+/// # All three fields are VALUES, and that is the point
+///
+/// `resolve_slice_backing` is the encoder's answer to "what does this slice
+/// operand actually hold?", and the answer is never an address: `data` is the
+/// element storage itself (an `Array`-sorted term, or the `fld_data` field of a
+/// `Vec`/`String` datatype), `len` is an element count and `offset` is an
+/// element index into `data`. When resolution has to go *through* a pointer it
+/// performs the load first — see the `PtrRepr` lane in
+/// [`ChcCtx::resolve_slice_backing`] — so the `Loc -> Val` crossing happens
+/// inside the resolver, exactly once, at a real load.
+///
+/// Typing the fields [`Val`] states that, so consumers stop re-deriving it. It
+/// also pins down the one place a caller *can* still be handed an address for a
+/// slice operand (the `resolve_ref_or_const_referent` fallback in
+/// `codegen_call_slice_index`), instead of leaving four producers merged into
+/// one anonymous `Option<Expr>` that has to be width-tested afterwards.
 pub(in crate::codegen_ay::chc) struct ResolvedSliceBacking {
-    pub(in crate::codegen_ay::chc) data: Expr,
-    pub(in crate::codegen_ay::chc) len: Expr,
-    pub(in crate::codegen_ay::chc) offset: Expr,
+    pub(in crate::codegen_ay::chc) data: Val,
+    pub(in crate::codegen_ay::chc) len: Val,
+    pub(in crate::codegen_ay::chc) offset: Val,
 }
 
 pub(in crate::codegen_ay::chc) const SLICE_BACKING_REBASE_MAX_ELEMS: usize = 32;
@@ -202,13 +222,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(backing);
         }
 
-        // Part of #4179: When the resolved value is a BV64 pointer (heap allocation
-        // via Box), load the actual array data from the memory model. This handles
-        // `&(*box_ptr)[start..end]` where `box_ptr` is a heap-allocated array.
-        // The existing resolution chain resolves to the raw pointer (BV64) because
-        // Box stores data in the heap. We dereference through load_from_memory to
-        // get the actual Array sort expression.
-        if value.sort().bitvec_width() == Some(POINTER_WIDTH) {
+        // Part of #4179: When the resolved value is a pointer, load the actual
+        // array data from the memory model. This handles `&(*box_ptr)[start..end]`
+        // where `box_ptr` is a heap-allocated array: the resolution chain stops at
+        // the raw pointer because Box stores its data in the heap, so we
+        // dereference through `load_from_memory` to get the Array-sorted expression.
+        //
+        // This used to be TWO copies of the same block, partitioned by width — one
+        // for a BV64 thin pointer, one for a BV128 fat pointer that extracted the
+        // low half first. The only thing the width test decided was *where the data
+        // address lives inside the expression*, which is exactly what `PtrRepr`
+        // answers: `data()` is total, so both shapes take one path. (After Unsize
+        // coercion a `Box<[u16; 2]>` reference resolves to `(zero_extend 64 ptr)` —
+        // a widened thin pointer whose data half is still perfectly good; only its
+        // metadata half is fabricated, and this block never reads that.)
+        if let Some(data_ptr) = PtrRepr::classify(&value).map(|repr| repr.into_data().into_expr()) {
             let pointee_ty = arg.ty(self.body.locals()).ok().and_then(|ty| {
                 let ty = self.resolve_body_ty(ty);
                 match ty.kind() {
@@ -232,50 +260,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     } else {
                         pointee_ty
                     };
-                if let Some(loaded) = self.load_from_memory(value.clone(), effective_ty) {
-                    if let Some(backing) =
-                        self.slice_backing_from_expr(loaded, len_hint.clone(), zero.clone())
-                    {
-                        tracing::debug!(
-                            fn_name = %self.fn_name,
-                            "resolve_slice_backing: resolved Box-backed array via memory load (#4179)"
-                        );
-                        return Some(backing);
-                    }
-                }
-            }
-        }
-
-        // Part of #4179: When the resolved value is BV128 (fat pointer: data||len),
-        // extract the lower 64-bit data pointer and try loading the array from
-        // memory. This handles `&obj[1..2]` where `obj: Box<[u16; 2]>` -- after
-        // Unsize coercion the reference resolves to a BV128 fat pointer
-        // `(zero_extend 64 ptr)`, not a BV64 thin pointer. Extract the data
-        // pointer from the lower 64 bits and load the backing array from the heap.
-        if value.sort().bitvec_width() == Some(2 * POINTER_WIDTH) {
-            let data_ptr = value.extract(POINTER_WIDTH - 1, 0);
-            let pointee_ty = arg.ty(self.body.locals()).ok().and_then(|ty| {
-                let ty = self.resolve_body_ty(ty);
-                match ty.kind() {
-                    TyKind::RigidTy(RigidTy::Ref(_, inner, _))
-                    | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => {
-                        Some(self.resolve_body_ty(inner))
-                    }
-                    _ => None,
-                }
-            });
-            if let Some(pointee_ty) = pointee_ty {
-                let effective_ty =
-                    if matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::Slice(_))) {
-                        self.trace_box_inner_sized_array_ty(arg).unwrap_or(pointee_ty)
-                    } else {
-                        pointee_ty
-                    };
-                if let Some(loaded) = self.load_from_memory(data_ptr, effective_ty) {
+                if let Some(loaded) = self.load_from_memory_untyped(data_ptr, effective_ty) {
                     if let Some(backing) = self.slice_backing_from_expr(loaded, len_hint, zero) {
                         tracing::debug!(
                             fn_name = %self.fn_name,
-                            "resolve_slice_backing: resolved fat-ptr-backed array via BV128 extract + memory load (#4179)"
+                            "resolve_slice_backing: resolved pointer-backed array via memory load (#4179)"
                         );
                         return Some(backing);
                     }
@@ -286,11 +275,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         None
     }
 
+    /// The `slice::as_ptr` data address for `arg`.
+    ///
+    /// Wave 11: every lane below is an address by construction — a promoted
+    /// constant's `concat(obj_id, 0)` allocation base, `translate_ref_to_address`
+    /// (address-of a place), the decoded data half of a wide pointer, or
+    /// `extract_pointer_expr` — and the tail is byte-offset arithmetic on that
+    /// address. So the function is a derived address producer and says so.
     pub(in crate::codegen_ay::chc) fn slice_as_ptr_data_expr(
         &mut self,
         arg: &Operand,
         modified_locals: &HashSet<usize>,
-    ) -> Option<Expr> {
+    ) -> Option<Loc> {
         let (Operand::Copy(place) | Operand::Move(place)) = arg else {
             return None;
         };
@@ -301,7 +297,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let base = if let Some(promoted_obj_id) =
             self.ref_resolution.const_ref_promoted_obj_ids.get(&place.local).copied()
         {
-            self.heap_state.promoted_const_address_for(promoted_obj_id)
+            // ALLOCATION: `promoted_const_address_for` is literally
+            // `concat(obj_id const, 0)` — the split-pointer base of a promoted
+            // constant object, an address by construction.
+            Loc::of_address(self.heap_state.promoted_const_address_for(promoted_obj_id))
         } else if let Some(ref_target) = self.ref_resolution.ref_targets.get(&place.local).cloned()
         {
             let target_place = rustc_public::mir::Place {
@@ -311,10 +310,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.translate_ref_to_address(&target_place, modified_locals)?
         } else {
             let value = self.translate_operand_with_modified(arg, modified_locals)?;
-            if value.sort().bitvec_width() == Some(2 * POINTER_WIDTH) {
-                value.extract(POINTER_WIDTH - 1, 0)
-            } else {
-                return super::super::dyn_coercion::extract_pointer_expr(&value);
+            // Wide pointer -> its data half, decoded rather than measured. A thin
+            // pointer (and anything not pointer-shaped) still goes to
+            // `extract_pointer_expr`, which is Wave 11's address producer and owns
+            // that case; the partition is exactly the one the width test made.
+            match PtrRepr::classify(&value) {
+                Some(repr @ (PtrRepr::Fat { .. } | PtrRepr::WidenedThin(_))) => repr.into_data(),
+                _ => return super::super::dyn_coercion::extract_pointer_expr(&value),
             }
         };
 
@@ -330,7 +332,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } else {
             offset.bvmul(Expr::bitvec_const(elem_size as u128, POINTER_WIDTH))
         };
-        Some(base.bvadd(byte_offset))
+        // ADDRESS ARITHMETIC on a `Loc` stays a `Loc`.
+        Some(Loc::of_address(base.into_expr().bvadd(byte_offset)))
     }
 
     pub(in crate::codegen_ay::chc) fn propagate_slice_as_ptr_metadata(
@@ -604,10 +607,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         offset: Expr,
     ) -> Option<ResolvedSliceBacking> {
         let len_hint = len_hint.and_then(|len| self.coerce_to_pointer_width(len));
-        let offset = self.coerce_to_pointer_width(offset)?;
+        let offset = Val::of_value(self.coerce_to_pointer_width(offset)?);
 
+        // `expr` is element storage by the time it reaches here: an array-sorted
+        // term, or a collection datatype whose `fld_data` is one. Both halves
+        // below select a datum out of it, never an address.
         if expr.sort().array_sort().is_some() {
-            return Some(ResolvedSliceBacking { data: expr, len: len_hint?, offset });
+            return Some(ResolvedSliceBacking {
+                data: Val::of_value(expr),
+                len: Val::of_value(len_hint?),
+                offset,
+            });
         }
 
         let dt_name = expr.sort().datatype_name()?.to_owned();
@@ -616,7 +626,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .and_then(|len| self.coerce_to_pointer_width(len))
             .or(len_hint)?;
         let data = expr.field_select(&dt_name, "fld_data", data_sort);
-        Some(ResolvedSliceBacking { data, len, offset })
+        Some(ResolvedSliceBacking { data: Val::of_value(data), len: Val::of_value(len), offset })
     }
 
     pub(in crate::codegen_ay::chc) fn is_zero_pointer_width_bitvec(expr: &Expr) -> bool {
@@ -631,18 +641,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         max_elems: usize,
     ) -> Option<Expr> {
         let target_arr = target_sort.array_sort()?;
-        let _source_arr = backing.data.sort().array_sort()?;
+        let data = backing.data.as_expr();
+        let offset = backing.offset.as_expr();
+        let _source_arr = data.sort().array_sort()?;
 
-        if backing.data.sort() == target_sort && Self::is_zero_pointer_width_bitvec(&backing.offset)
-        {
-            return Some(backing.data.clone());
+        if data.sort() == target_sort && Self::is_zero_pointer_width_bitvec(offset) {
+            return Some(data.clone());
         }
 
         let mut rebased = declare_pending_var(chc_fresh_name(fresh_prefix), target_sort.clone());
         for i in 0..max_elems {
             let idx = Expr::bitvec_const(i as u64, POINTER_WIDTH);
-            let src_idx = Self::slice_rebase_source_index(&backing.offset, idx.clone(), i);
-            let elem = backing.data.clone().select(src_idx);
+            let src_idx = Self::slice_rebase_source_index(offset, idx.clone(), i);
+            let elem = data.clone().select(src_idx);
             let elem = self.coerce_value_to_sort(elem, &target_arr.element_sort, false)?;
             rebased = rebased.store(idx, elem);
         }
@@ -703,19 +714,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         lhs: &ResolvedSliceBacking,
         rhs: &ResolvedSliceBacking,
     ) -> Option<Expr> {
-        if *lhs.data.sort() != *rhs.data.sort() {
+        if *lhs.data.as_expr().sort() != *rhs.data.as_expr().sort() {
             return None;
         }
 
         let idx_name = chc_fresh_name("slice_eq_idx");
         let idx_sort = ptr_sort();
         let idx = Expr::var(&idx_name, idx_sort.clone());
-        let lhs_idx = lhs.offset.clone().bvadd(idx.clone());
-        let rhs_idx = rhs.offset.clone().bvadd(idx.clone());
-        let elems_eq = lhs.data.clone().select(lhs_idx).eq(rhs.data.clone().select(rhs_idx));
-        let in_bounds = idx.bvult(lhs.len.clone());
+        let lhs_idx = lhs.offset.as_expr().clone().bvadd(idx.clone());
+        let rhs_idx = rhs.offset.as_expr().clone().bvadd(idx.clone());
+        let elems_eq = lhs.data.as_expr().clone().select(lhs_idx).eq(rhs
+            .data
+            .as_expr()
+            .clone()
+            .select(rhs_idx));
+        let in_bounds = idx.bvult(lhs.len.as_expr().clone());
         let content_eq = Expr::forall(vec![(idx_name, idx_sort)], in_bounds.implies(elems_eq));
-        Some(lhs.len.clone().eq(rhs.len.clone()).and(content_eq))
+        Some(lhs.len.as_expr().clone().eq(rhs.len.as_expr().clone()).and(content_eq))
     }
 
     /// Part of #4179 (fix): Trace backward through MIR to find a sized array

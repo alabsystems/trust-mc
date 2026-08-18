@@ -69,7 +69,7 @@ Running `benchcomp` invokes `run`, `collate`, and `visualize` behind the scenes.
 If you have previously run `benchcomp`, then running `benchcomp visualize` will emit the visualizations in the config file using the previous `result.yaml`.
 
 In the diagram above, two different suites (1 and 2) are both run using two *variants*---combinations of command, working directory, and environment variables.
-Benchmark suite 2 requires a totally different command line to suite 1---for example, `suite_1` might contain trust-mc harnesses invoked through `cargo trust-mc`, while `suite_2` might contain CBMC harnesses invoked through `run_cbmc_proofs.py`.
+Benchmark suite 2 requires a totally different command line to suite 1---for example, `suite_1` might contain trust-mc harnesses invoked through `targo trust-mc`, while `suite_2` might contain CBMC harnesses invoked through `run_cbmc_proofs.py`.
 Users would therefore define different variants (`c` and `d`) for invoking `suite_2`, and also specify a different parser to parse the results.
 No matter how different the benchmark suites are, the `collate` stage combines their results so that they can later be compared.
 > **NOTE**: CBMC is not installed by default. For CBMC variants, install it with

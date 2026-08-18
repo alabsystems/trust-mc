@@ -116,10 +116,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // exact. Do NOT taint the CTREX with diverging_call_drop so it certifies
         // as Genuine (parity for oracle=fail tests) instead of EncodingGap.
         // SOUND: error() is fail-closed regardless; this changes only attribution.
-        if callee_path
-            .as_deref()
-            .is_some_and(crate::codegen_ay::chc::call::codegen_call::is_known_diverging_panic_intrinsic)
-        {
+        if callee_path.as_deref().is_some_and(
+            crate::codegen_ay::chc::call::codegen_call::is_known_diverging_panic_intrinsic,
+        ) {
             warn!(
                 route,
                 bb_idx = ?bb_idx,

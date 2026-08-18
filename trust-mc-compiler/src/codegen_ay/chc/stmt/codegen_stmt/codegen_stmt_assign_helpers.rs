@@ -269,7 +269,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // — deref loads through &T produce spurious CTREX.
         if self.track_level >= ChcTrackLevel::Mem {
             let local_place = Place { local: lhs.local, projection: vec![] };
-            if let Some(addr_expr) = self.translate_ref_to_address(&local_place, modified) {
+            if let Some(addr_loc) = self.translate_ref_to_address(&local_place, modified) {
+                // Address by construction (wave-11 producer); the store
+                // keystone and the two mirror helpers below are wave-13 and
+                // still untyped, so the tag is dropped once, here.
+                let addr_expr = addr_loc.into_expr();
                 if let Some(rhs_expr) = rhs_expr {
                     let local_ty = self.body.locals()[local_idx].ty;
                     let memory_store_value = self
@@ -277,9 +281,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         .unwrap_or_else(|| rhs_expr.clone());
                     let prev_suppress = self.suppress_heap_store_checks;
                     self.suppress_heap_store_checks = true;
-                    if let Some(store_constraint) =
-                        self.build_memory_store(addr_expr.clone(), memory_store_value, local_ty)
-                    {
+                    if let Some(store_constraint) = self.build_memory_store_untyped(
+                        addr_expr.clone(),
+                        memory_store_value,
+                        local_ty,
+                    ) {
                         constraints.push(store_constraint);
                     }
                     self.mirror_aggregate_field_stores_to_memory(

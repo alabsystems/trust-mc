@@ -144,7 +144,7 @@ fn test_normalize_deref_address_refuses_narrow_value() {
         let thin = Expr::var("test_thin_ptr", ay_bindings::Sort::bitvec(64));
         let normalized = chc_ctx.normalize_deref_address_expr(thin, ptr_ty);
         assert_eq!(
-            normalized.and_then(|e| e.sort().bitvec_width()),
+            normalized.and_then(|loc| loc.as_expr().sort().bitvec_width()),
             Some(64),
             "pointer-width address must pass through"
         );
@@ -192,10 +192,10 @@ fn test_recover_referent_address_via_ref_targets() {
         let recovered = chc_ctx.recover_unsafe_cell_referent_address(&operand, &modified);
         let addr = recovered.expect("tracked reference must recover a referent address");
         assert_eq!(
-            addr.sort().bitvec_width(),
+            addr.as_expr().sort().bitvec_width(),
             Some(64),
             "recovered referent address must be pointer-width, got {:?}",
-            addr.sort()
+            addr.as_expr().sort()
         );
 
         // Untracked local: no fabrication — recovery must fail closed.
@@ -307,10 +307,10 @@ fn test_recover_referent_address_via_projected_slot() {
         let recovered = chc_ctx.recover_unsafe_cell_referent_address(&operand, &modified);
         let addr = recovered.expect("pointer-typed slot must recover via typed-memory load");
         assert_eq!(
-            addr.sort().bitvec_width(),
+            addr.as_expr().sort().bitvec_width(),
             Some(64),
             "slot-recovered pointer must be pointer-width, got {:?}",
-            addr.sort()
+            addr.as_expr().sort()
         );
     });
 }

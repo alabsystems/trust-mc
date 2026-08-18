@@ -88,15 +88,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // `Break_field_0(cf)` — a DatatypeSelector — or a bare Var), fall back to
         // decomposing via datatype ACCESSORS (tester + field selectors), which is
         // the exact semantic inverse of construction (no over-approximation).
-        let (tag, payload) = match decompose_dt_ite_to_scalars(
-            result_expr,
-            dt,
-            payload_slots,
-            &layout,
-        ) {
-            Some(tp) => tp,
-            None => self.decompose_datatype_via_accessors(result_expr, dt, payload_slots, &layout)?,
-        };
+        let (tag, payload) =
+            match decompose_dt_ite_to_scalars(result_expr, dt, payload_slots, &layout) {
+                Some(tp) => tp,
+                None => {
+                    self.decompose_datatype_via_accessors(result_expr, dt, payload_slots, &layout)?
+                }
+            };
 
         // Part of #3768: graceful fallback instead of panic
         let vec_idx = self.try_state_idx_for_local(dest_local)?;
@@ -215,10 +213,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // convention `tag = (ctor_idx == true_variant)`.
         let true_variant = layout.true_variant.unwrap_or(1) as usize;
         let true_ctor = dt.constructors.get(true_variant)?;
-        let tag = result_expr
-            .clone()
-            .try_is_constructor(dt.name.clone(), true_ctor.name.clone())
-            .ok()?;
+        let tag =
+            result_expr.clone().try_is_constructor(dt.name.clone(), true_ctor.name.clone()).ok()?;
 
         let mut payload: Vec<Option<Expr>> = vec![None; payload_slots];
         for (ctor_idx, ctor) in dt.constructors.iter().enumerate() {

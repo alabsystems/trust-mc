@@ -20,6 +20,7 @@ use super::super::codegen_ctx::types::RefTarget;
 use super::super::codegen_rules::CodegenRules;
 use super::super::dyn_coercion::extract_pointer_expr;
 use crate::codegen_ay::names::{self, struct_sort};
+use crate::codegen_ay::provenance::Loc;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -446,7 +447,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let data_expr = args.first().and_then(|arg| {
             self.translate_operand_with_modified(arg, modified_locals)
                 .or_else(|| self.resolve_ref_operand(arg, modified_locals))
-                .map(|expr| extract_pointer_expr(&expr).unwrap_or(expr))
+                // `from_raw_parts` re-packs this half into the destination's
+                // pointer DATUM, so the wave-11 tag ends at this crossing.
+                .map(|expr| extract_pointer_expr(&expr).map(Loc::into_expr).unwrap_or(expr))
         });
         let metadata_expr = self
             .translate_operand_with_modified(metadata_operand, modified_locals)

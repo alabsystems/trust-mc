@@ -32,7 +32,8 @@ use crate::translate::{TranslateOptions, const_to_expr, trust_ir_to_bmc_vc, ty_t
 use crate::{
     NativeTrustMcBundleError, SEMANTICS_COVERAGE, SemanticsFamily, SemanticsStatus,
     TrustIrChcUnsupportedReason, coverage_for_family, family_for_inst,
-    trust_ir_to_chc_translation_outputs, trust_ir_to_chc_vc, trust_mc_bmc_vcs_from_native_bundle,
+    trust_ir_function_to_chc_translation_output, trust_ir_to_chc_translation_outputs,
+    trust_ir_to_chc_vc, trust_mc_bmc_vcs_from_native_bundle,
     trust_mc_chc_pdr_obligations_from_native_bundle,
 };
 
@@ -1195,6 +1196,71 @@ fn call_summary_fails_closed_on_self_recursion_with_obligation() {
     assert!(
         declined,
         "a self-recursive callee WITH a per-level obligation must fail-close, not be summarized safe"
+    );
+}
+
+#[test]
+fn call_summary_fails_closed_on_unsummarizable_panicking_callee() {
+    // SOUNDNESS GUARD for the interprocedural panic-freedom seam (the 2211
+    // `UnsupportedDirectCallSummary` path in `translate_call`). A caller of an
+    // IN-CRATE callee whose body CANNOT be value-summarized — here a `Load`
+    // through a `&mut self`-style `Ptr`, which is EXACTLY why `Lcg::next_u64`
+    // declines the summary — AND which can PANIC (an `assert(false)`) must fail
+    // CLOSED: the caller's CHC MUST carry a reachable `error` rule. Modeling the
+    // call as havoc-with-no-error would make the caller's panic-freedom CHC
+    // trivially-safe, which the complete-by-construction native translator
+    // accepts as a GENUINE panic-freedom proof (native `Proved`) — bypassing the
+    // compiler-side `all_calls_target_proven_panic_free` seam, so a caller of a
+    // genuinely-panicking in-crate callee would FALSELY prove panic-free. Locks
+    // the boundary any "drop the in-crate-call error edge" relaxation must never
+    // cross.
+    let mut mb = ModuleBuilder::new("test_unsummarizable_panicking_callee");
+    let g_ft = mb.add_func_type(vec![Ty::Ptr], vec![]);
+    let f_ft = mb.add_func_type(vec![Ty::Ptr], vec![]);
+
+    // callee g(p): assert(false) — an unconditional panic — then a `Load` through
+    // p, which the value-summary interpreter has no arm for, so the whole summary
+    // DECLINES and the caller falls to the fail-closed 2211 path.
+    let g_id = {
+        let mut fb = mb.function("unsummarizable_panicking_callee", g_ft);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let p = fb.add_block_param(entry, Ty::Ptr);
+        let zero = fb.iconst(Ty::U32, 0);
+        let one = fb.iconst(Ty::U32, 1);
+        let never = fb.icmp(ICmpOp::Eq, Ty::U32, zero, one); // 0 == 1 => false
+        fb.assert(never); // assert(false): the callee always panics
+        let _v = fb.load(Ty::U32, p); // unmodeled by the summary => declines
+        fb.ret(vec![]);
+        fb.build()
+    };
+
+    // caller f(p): g(p)
+    let f_id = {
+        let mut fb = mb.function("unsummarizable_panicking_caller", f_ft);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let p = fb.add_block_param(entry, Ty::Ptr);
+        let _ = fb.call(g_id, vec![p]);
+        fb.ret(vec![]);
+        fb.build()
+    };
+
+    let module = mb.build();
+    let caller = crate::trust_ir_function_to_chc_translation_output(
+        &module,
+        f_id,
+        &TranslateOptions::default(),
+    )
+    .expect("caller function exists");
+
+    assert!(
+        caller.vc.rules.iter().any(|rule| rule.head.name == "error"),
+        "a caller of an unsummarizable, panicking in-crate callee MUST fail closed \
+         with a reachable error rule; modeling the call as havoc-no-error is a false \
+         structural panic-freedom proof (bypasses the all_calls_target_proven_panic_free seam)"
     );
 }
 
@@ -2417,6 +2483,231 @@ fn pointer_parts_roundtrip_lowers_without_unsupported_diagnostics() {
         outputs[0].diagnostics.is_empty(),
         "PtrFromParts facts should make local PtrData/PtrMetadata lowering precise in CHC"
     );
+}
+
+/// Slice-length metadata is DETERMINISTIC per SSA fat value: two `PtrMetadata`
+/// reads of the SAME `ValueId` must resolve to ONE symbol. A fresh symbol per
+/// read makes any producer-asserted exact length (trust-ir-bridge's faithful
+/// `&str` constant: `Assume(PtrMetadata(v) == len)`) silently inert — the fact
+/// constrains one symbol while the `s.len()` read mints another. Reuse is
+/// sound in both directions: the real metadata IS a function of the value, so
+/// linking same-value reads only removes valuations with two readings for one
+/// value; distinct values keep independent symbols (asserted by the negative
+/// half below).
+#[test]
+fn typed_chc_translation_reuses_one_length_symbol_per_fat_value() {
+    let fat_str = Ty::FatPtr(FatPtrKind::Str);
+
+    // Same value read twice -> one slice_len symbol.
+    let mut mb = ModuleBuilder::new("test_deterministic_slice_len");
+    let ft = mb.add_func_type(vec![fat_str.clone()], vec![Ty::U64, Ty::U64]);
+    let mut fb = mb.function("len_twice", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let v = fb.add_block_param(entry, fat_str.clone());
+    let len_a = fb.ptr_metadata(fat_str.clone(), Ty::U64, v);
+    let len_b = fb.ptr_metadata(fat_str.clone(), Ty::U64, v);
+    fb.ret(vec![len_a, len_b]);
+    fb.build();
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].diagnostics.is_empty(), "modeled U64 metadata must not fail closed");
+    let slice_len_syms = outputs[0]
+        .vc
+        .vars()
+        .iter()
+        .filter(|var| var.name.contains("_slice_len_"))
+        .count();
+    assert_eq!(
+        slice_len_syms, 1,
+        "two PtrMetadata reads of one SSA value must share one length symbol"
+    );
+
+    // Distinct values -> independent symbols (no cross-value equality).
+    let mut mb = ModuleBuilder::new("test_independent_slice_len");
+    let ft = mb.add_func_type(vec![fat_str.clone(), fat_str.clone()], vec![Ty::U64, Ty::U64]);
+    let mut fb = mb.function("len_of_each", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let v1 = fb.add_block_param(entry, fat_str.clone());
+    let v2 = fb.add_block_param(entry, fat_str.clone());
+    let len_1 = fb.ptr_metadata(fat_str.clone(), Ty::U64, v1);
+    let len_2 = fb.ptr_metadata(fat_str, Ty::U64, v2);
+    fb.ret(vec![len_1, len_2]);
+    fb.build();
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].diagnostics.is_empty());
+    let slice_len_syms = outputs[0]
+        .vc
+        .vars()
+        .iter()
+        .filter(|var| var.name.contains("_slice_len_"))
+        .count();
+    assert_eq!(
+        slice_len_syms, 2,
+        "distinct fat values must keep independent length symbols"
+    );
+}
+
+/// A `NonNull`-shaped single-pointer-newtype struct for the cast-leg tests.
+fn nonnull_shaped_struct(mb: &mut ModuleBuilder) -> Ty {
+    let id = StructId::new(0);
+    mb.add_struct(StructDef {
+        repr: Default::default(),
+        id,
+        name: "NonNullShaped".to_owned(),
+        fields: vec![FieldDef { name: "pointer".to_owned(), ty: Ty::Ptr, offset: None }],
+        size: None,
+        align: None,
+    });
+    Ty::Struct(id)
+}
+
+#[test]
+fn typed_chc_usize_newtype_pack_unpack_lowers_exactly() {
+    // The `fmt::Arguments` bit-packing: usize -> NonNull -> usize. Both legs are
+    // bit-identity at the pinned 64-bit target, so the round trip must translate
+    // with NO unsupported diagnostic and NO havoc stand-in — the unpacked value
+    // is the packed operand itself. (Value-level falsification — the round trip
+    // proves `== x` and refutes `== x + 1` — lives in the trust-mc-driver solve
+    // tests; this pins the translation never falls to the fail-closed Cast arm.)
+    let mut mb = ModuleBuilder::new("test_usize_newtype_pack_unpack");
+    let newtype = nonnull_shaped_struct(&mut mb);
+    let ft = mb.add_func_type(vec![Ty::U64], vec![Ty::U64]);
+    let mut fb = mb.function("pack_unpack", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let x = fb.add_block_param(entry, Ty::U64);
+    let packed = fb.cast(CastOp::Bitcast, Ty::U64, newtype.clone(), x);
+    let bits = fb.cast(CastOp::Bitcast, newtype, Ty::U64, packed);
+    fb.ret(vec![bits]);
+    fb.build();
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    assert!(
+        outputs[0].diagnostics.is_empty(),
+        "the usize<->newtype bit-identity legs must not fail closed: {:?}",
+        outputs[0].diagnostics
+    );
+    let havoc_stand_ins = outputs[0]
+        .vc
+        .vars()
+        .iter()
+        .filter(|var| var.name.contains("unsupported_result"))
+        .count();
+    assert_eq!(havoc_stand_ins, 0, "neither leg may degrade to a havoc cast result");
+}
+
+#[test]
+fn typed_chc_narrow_int_newtype_pack_stays_fail_closed() {
+    // Only the POINTER-WIDTH unsigned spellings are bit-identical to the
+    // newtype's address leaf. A `u32` pack is a genuine value reinterpretation
+    // and must keep the fail-closed Cast refusal.
+    let mut mb = ModuleBuilder::new("test_narrow_int_newtype_pack");
+    let newtype = nonnull_shaped_struct(&mut mb);
+    let ft = mb.add_func_type(vec![Ty::U32], vec![]);
+    let mut fb = mb.function("narrow_pack", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let x = fb.add_block_param(entry, Ty::U32);
+    let _packed = fb.cast(CastOp::Bitcast, Ty::U32, newtype, x);
+    fb.ret(vec![]);
+    fb.build();
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].diagnostics.len(), 1);
+    assert_eq!(outputs[0].diagnostics[0].reason, TrustIrChcUnsupportedReason::Cast);
+}
+
+#[test]
+fn typed_chc_same_type_fat_bitcast_forwards_deterministic_metadata() {
+    // `&str -> &[u8]` lowers as a same-type fat Bitcast. The real cast does not
+    // change the fat pointer, so a metadata read through the cast result must
+    // share the ORIGINAL value's deterministic `slice_len` symbol — one symbol,
+    // not two (two symbols would let the solver give one real length two
+    // readings, making a producer-asserted exact length inert).
+    let fat_str = Ty::FatPtr(FatPtrKind::Str);
+    let mut mb = ModuleBuilder::new("test_fat_bitcast_metadata_forwarding");
+    let ft = mb.add_func_type(vec![fat_str.clone()], vec![Ty::U64, Ty::U64]);
+    let mut fb = mb.function("len_through_cast", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let v = fb.add_block_param(entry, fat_str.clone());
+    let len_direct = fb.ptr_metadata(fat_str.clone(), Ty::U64, v);
+    let cast = fb.cast(CastOp::Bitcast, fat_str.clone(), fat_str.clone(), v);
+    let len_via_cast = fb.ptr_metadata(fat_str, Ty::U64, cast);
+    fb.ret(vec![len_direct, len_via_cast]);
+    fb.build();
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].diagnostics.is_empty(), "{:?}", outputs[0].diagnostics);
+    let slice_len_syms = outputs[0]
+        .vc
+        .vars()
+        .iter()
+        .filter(|var| var.name.contains("_slice_len_"))
+        .count();
+    assert_eq!(
+        slice_len_syms, 1,
+        "a metadata read through a same-type fat Bitcast must reuse the operand's symbol"
+    );
+}
+
+#[test]
+fn typed_chc_mismatched_fat_bitcast_stays_fail_closed() {
+    // A fat->fat cast BETWEEN different fat types is not the identity shape; it
+    // must keep the fail-closed Cast refusal (no metadata forwarding either).
+    let mut mb = ModuleBuilder::new("test_fat_bitcast_mismatch");
+    let elem = mb.add_type(Ty::U32);
+    let fat_str = Ty::FatPtr(FatPtrKind::Str);
+    let fat_slice = Ty::FatPtr(FatPtrKind::Slice(elem));
+    let ft = mb.add_func_type(vec![fat_str.clone()], vec![]);
+    let mut fb = mb.function("fat_mismatch", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let v = fb.add_block_param(entry, fat_str.clone());
+    let _cast = fb.cast(CastOp::Bitcast, fat_str, fat_slice, v);
+    fb.ret(vec![]);
+    fb.build();
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].diagnostics.len(), 1);
+    assert_eq!(outputs[0].diagnostics[0].reason, TrustIrChcUnsupportedReason::Cast);
+}
+
+#[test]
+fn typed_chc_fat_to_thin_bitcast_is_the_data_lane() {
+    // `*const [u8] -> *const u8` (the `as_ptr` leg): a fat value's SSA
+    // expression IS its data lane, so the thin result translates exactly with
+    // no unsupported diagnostic and no havoc stand-in.
+    let fat_str = Ty::FatPtr(FatPtrKind::Str);
+    let mut mb = ModuleBuilder::new("test_fat_to_thin_bitcast");
+    let ft = mb.add_func_type(vec![fat_str.clone()], vec![Ty::Ptr]);
+    let mut fb = mb.function("data_lane", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let v = fb.add_block_param(entry, fat_str.clone());
+    let thin = fb.cast(CastOp::Bitcast, fat_str, Ty::Ptr, v);
+    fb.ret(vec![thin]);
+    fb.build();
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].diagnostics.is_empty(), "{:?}", outputs[0].diagnostics);
+    let havoc_stand_ins = outputs[0]
+        .vc
+        .vars()
+        .iter()
+        .filter(|var| var.name.contains("unsupported_result"))
+        .count();
+    assert_eq!(havoc_stand_ins, 0);
 }
 
 #[test]
@@ -6381,4 +6672,155 @@ fn bounded_output_module(ret_ty: Ty, lo: f64, hi: f64) -> trust_ir::Module {
     func.blocks.push(block);
     module.add_function(func);
     module
+}
+
+/// Count `error`-headed rules in a CHC VC. Every unsupported construct and every
+/// real violation feeds the same nullary `error` relation, which is exactly why
+/// whole-function translation lets one unmodeled construct sink the function.
+fn count_error_rules(vc: &trust_mc_core::chc::ChcVc) -> usize {
+    vc.rules.iter().filter(|rule| rule.head.name == "error").count()
+}
+
+/// Diamond CFG with an unsupported construct on ONE arm:
+///
+///        entry
+///        /   \
+///   A(bad)    B          A holds a relocatable SymbolAddr const (unsupported)
+///        \   /
+///        Join
+///
+/// Returns (module, func, target_the_site_CANNOT_precede, target_it_CAN).
+/// `B` is the first: reachable from entry, but NOT from A. `Join` is the second.
+fn narrowing_fixture_module()
+-> (trust_ir::Module, trust_ir::value::FuncId, trust_ir::value::BlockId, trust_ir::value::BlockId) {
+    use trust_ir::value::{BlockId, FuncId, ValueId};
+    let mut module = trust_ir::Module::new("test_chc_narrowing");
+    let ft = module.add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false });
+    let (entry, a, b, join) = (BlockId::new(0), BlockId::new(1), BlockId::new(2), BlockId::new(3));
+    let cond = ValueId::new(0);
+    let bad = ValueId::new(1);
+    let mut func = trust_ir::Function::new(FuncId::new(0), "narrowing_fixture", ft, entry);
+
+    let mut e = trust_ir::Block::new(entry);
+    e.body.push(
+        trust_ir::node::InstrNode::new(trust_ir::Inst::Const {
+            ty: Ty::Bool,
+            value: trust_ir::constant::Constant::Int(1),
+        })
+        .with_result(cond),
+    );
+    e.body.push(trust_ir::node::InstrNode::new(trust_ir::Inst::CondBr {
+        cond,
+        then_target: a,
+        then_args: vec![],
+        else_target: b,
+        else_args: vec![],
+    }));
+    func.blocks.push(e);
+
+    // A: the unsupported construct, then join.
+    let mut ba = trust_ir::Block::new(a);
+    ba.body.push(
+        trust_ir::node::InstrNode::new(trust_ir::Inst::Const {
+            ty: Ty::Ptr,
+            value: trust_ir::constant::Constant::SymbolAddr {
+                symbol: "static_i32".to_string(),
+                addend: 0,
+            },
+        })
+        .with_result(bad),
+    );
+    ba.body.push(trust_ir::node::InstrNode::new(trust_ir::Inst::Br { target: join, args: vec![] }));
+    func.blocks.push(ba);
+
+    // B: clean sibling arm. NOT reachable from A.
+    let mut bb = trust_ir::Block::new(b);
+    bb.body.push(trust_ir::node::InstrNode::new(trust_ir::Inst::Br { target: join, args: vec![] }));
+    func.blocks.push(bb);
+
+    let mut bj = trust_ir::Block::new(join);
+    bj.body.push(trust_ir::node::InstrNode::new(trust_ir::Inst::Return { values: vec![] }));
+    func.blocks.push(bj);
+
+    let id = func.id;
+    module.functions.push(func);
+    (module, id, b, join)
+}
+
+// ---------------------------------------------------------------------------
+// PER-OBLIGATION CHC NARROWING
+//
+// Whole-function mode routes every unsupported construct's error rule into the
+// single nullary `error` relation, so ONE unmodeled construct anywhere sinks
+// EVERY trust-mc obligation of that function. `narrow_to_target_block` scopes
+// that: a construct provably off every entry ->* site ->* target path cannot
+// influence the states reaching `target`, so its rule is dropped for THAT
+// obligation only.
+//
+// The pair is the point. `narrowing_keeps_rule_when_site_precedes_target` is the
+// FAIL-CLOSED guard: if it ever stops seeing the error rule, the narrowing has
+// begun dropping rules that CAN affect the obligation, which is a false PROVE.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn narrowing_drops_rule_for_unreachable_site() {
+    let (module, func, target_after, _site_only) = narrowing_fixture_module();
+    let mut opts = TranslateOptions::default();
+
+    // Whole-function: the rule is present, so the obligation is sunk.
+    let wide =
+        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
+    let wide_errors = count_error_rules(&wide.vc);
+
+    // Narrowed to a target the unsupported site CANNOT precede.
+    opts.narrow_to_target_block = Some(target_after);
+    let narrow =
+        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
+    let narrow_errors = count_error_rules(&narrow.vc);
+
+    assert!(
+        narrow_errors < wide_errors,
+        "narrowing must drop at least one error rule for a site off every \
+         entry->target path (wide={wide_errors}, narrow={narrow_errors})"
+    );
+}
+
+#[test]
+fn narrowing_keeps_rule_when_site_precedes_target() {
+    // FAIL-CLOSED GUARD. A site that CAN lie on an entry->target path must keep
+    // its rule. If this ever passes with a dropped rule, the narrowing is
+    // masking a construct that can affect the obligation -> false PROVE.
+    let (module, func, _target_after, site_reachable_target) = narrowing_fixture_module();
+    let mut opts = TranslateOptions::default();
+    let wide =
+        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
+    opts.narrow_to_target_block = Some(site_reachable_target);
+    let narrow =
+        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
+    assert_eq!(
+        count_error_rules(&narrow.vc),
+        count_error_rules(&wide.vc),
+        "a site that can precede the target MUST keep its error rule"
+    );
+}
+
+#[test]
+fn narrowing_invalid_target_keeps_unsupported_rule() {
+    let (module, func, _, _) = narrowing_fixture_module();
+    let wide =
+        trust_ir_function_to_chc_translation_output(&module, func, &TranslateOptions::default())
+            .expect("translates");
+
+    let opts = TranslateOptions {
+        narrow_to_target_block: Some(trust_ir::value::BlockId::new(99)),
+        ..TranslateOptions::default()
+    };
+    let narrow =
+        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
+
+    assert_eq!(
+        count_error_rules(&narrow.vc),
+        count_error_rules(&wide.vc),
+        "a missing target is Unknown, not proof that the unsupported site is irrelevant"
+    );
 }

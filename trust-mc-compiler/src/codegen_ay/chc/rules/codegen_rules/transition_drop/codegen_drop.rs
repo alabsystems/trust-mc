@@ -89,8 +89,13 @@ pub(in crate::codegen_ay::chc::rules::codegen_rules) fn codegen_drop(
             let drop_instance = Instance::resolve_drop_in_place(drop_ty);
             if !drop_instance.is_empty_shim() {
                 let body_and_addr = drop_instance.body().map(|body| {
+                    // The address lane is a `Loc`; the fallback lane is a fresh
+                    // havoc var of genuinely unknown provenance (queue §4
+                    // item 6), so the slot cannot be typed as an address and
+                    // the tag is dropped here rather than fabricated there.
                     let self_expr = ctx
                         .translate_ref_to_address(place, tctx.modified_locals)
+                        .map(crate::codegen_ay::provenance::Loc::into_expr)
                         .unwrap_or_else(|| {
                             crate::codegen_ay::chc::declare_pending_var(
                                 crate::codegen_ay::chc::chc_fresh_name("__drop_self"),

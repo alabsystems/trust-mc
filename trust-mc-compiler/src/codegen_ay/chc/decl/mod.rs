@@ -37,7 +37,7 @@ pub(in crate::codegen_ay) mod codegen_decl_state_vars_enum_layout;
 mod codegen_decl_state_vars_locals;
 mod codegen_decl_state_vars_locals_flatten;
 pub(in crate::codegen_ay::chc) mod codegen_decl_static;
-mod codegen_decl_static_alloc;
+pub(in crate::codegen_ay::chc) mod codegen_decl_static_alloc;
 mod codegen_decl_static_callee;
 mod codegen_decl_static_init;
 mod codegen_decl_static_metadata;
@@ -47,3 +47,7 @@ mod codegen_decl_vtable;
 pub(in crate::codegen_ay::chc) mod codegen_types;
 pub(in crate::codegen_ay::chc) mod codegen_types_adt;
 pub(in crate::codegen_ay::chc) mod codegen_types_adt_sort;
+
+pub(in crate::codegen_ay::chc) use codegen_decl_liveness::{
+    reset_dropped_frame_columns, take_dropped_frame_columns,
+};

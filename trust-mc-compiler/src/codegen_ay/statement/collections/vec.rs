@@ -13,6 +13,7 @@
 //! Part of #1628: Array backing for slice indexing.
 
 use crate::codegen_ay::names::{self, struct_sort};
+use crate::codegen_ay::provenance::{Loc, Val};
 use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::{POINTER_WIDTH, bool_sort, flatten_dt_array_element, ptr_sort};
 use ay_bindings::{Expr, ExprValue, Sort};
@@ -24,11 +25,25 @@ use super::super::StatementCodegen;
 // extraction helpers moved to vec_fields.rs per #4206.
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
+    /// Dangling-pointer + provenance constraints for `Vec::new` /
+    /// `Vec::with_capacity`.
+    ///
+    /// Address-vs-value (wave 1): the two payload parameters used to be two
+    /// adjacent bare `Expr`s — trivially swappable, and the caller's only
+    /// protection was that nobody had swapped them yet. `cap` is the CAPACITY
+    /// (a `usize` value), `ptr` is the Vec's allocation base (an address); they
+    /// are now different types, so the swap is a compile error.
+    ///
+    /// The old `cap.sort().bitvec_width() == Some(POINTER_WIDTH)` guard read as
+    /// "is the capacity a pointer?". It is not; the real precondition is that
+    /// `cap` is comparable with the `zero` constant it is about to be equated
+    /// to, so it is now written against `zero`'s own width. `zero` is built at
+    /// `POINTER_WIDTH`, so the two tests accept exactly the same expressions.
     fn add_vec_dangling_provenance_constraints(
         &mut self,
         stub_kind: StubKind,
-        cap: &Expr,
-        ptr: &Expr,
+        cap: &Val,
+        ptr: &Loc,
     ) {
         if !self.ctx.config.extra_pointer_checks {
             return;
@@ -36,8 +51,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
         if stub_kind == StubKind::VecNew {
-            self.ctx.assert(ptr.clone().bvugt(zero));
-            self.ctx.heap_invalidate_no_provenance(ptr.clone());
+            self.ctx.assert(ptr.as_expr().clone().bvugt(zero));
+            self.ctx.heap_invalidate_no_provenance(ptr.as_expr().clone());
             return;
         }
 
@@ -45,25 +60,25 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // invalidate (same as VecNew). For symbolic cap, assert the pointer
         // is non-null on the cap==0 lane via ITE.
         let is_static_zero = matches!(
-            cap.value(),
+            cap.as_expr().value(),
             ExprValue::BitVecConst { value, .. } if value == &0u8.into()
         );
         if is_static_zero {
-            self.ctx.assert(ptr.clone().bvugt(zero));
-            self.ctx.heap_invalidate_no_provenance(ptr.clone());
-        } else if cap.sort().bitvec_width() == Some(POINTER_WIDTH) {
+            self.ctx.assert(ptr.as_expr().clone().bvugt(zero));
+            self.ctx.heap_invalidate_no_provenance(ptr.as_expr().clone());
+        } else if cap.as_expr().sort().bitvec_width() == zero.sort().bitvec_width() {
             // Symbolic cap: conditionally assert ptr > 0 when cap == 0.
-            let cap_is_zero = cap.clone().eq(zero.clone());
+            let cap_is_zero = cap.as_expr().clone().eq(zero.clone());
             self.ctx.assert(Expr::ite(
                 cap_is_zero.clone(),
-                ptr.clone().bvugt(zero),
+                ptr.as_expr().clone().bvugt(zero),
                 Expr::bool_const(true),
             ));
             // Conditional provenance invalidation: when cap == 0, the pointer
             // has no backing allocation, so its provenance is invalid.
             // Mirrors the unconditional heap_invalidate_no_provenance in the
             // static-zero branch above.
-            self.ctx.heap_invalidate_no_provenance_if(ptr.clone(), cap_is_zero);
+            self.ctx.heap_invalidate_no_provenance_if(ptr.as_expr().clone(), cap_is_zero);
         }
     }
 
@@ -102,13 +117,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
                 let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
                 let ptr_name = self.ctx.fresh_name("vec_ptr");
-                let ptr = self.ctx.declare_var(&ptr_name, ptr_sort());
+                // Freshly declared allocation base for this Vec: an ADDRESS by
+                // construction (this is the site that mints it).
+                let ptr = Loc::of_address(self.ctx.declare_var(&ptr_name, ptr_sort()));
 
-                let cap = if stub_kind == VecWithCapacity && !args.is_empty() {
+                // `Vec::with_capacity(n)`'s argument is a `usize` COUNT, and the
+                // `Vec::new` case is the literal 0: a VALUE either way.
+                let cap = Val::of_value(if stub_kind == VecWithCapacity && !args.is_empty() {
                     self.codegen_operand(&args[0]).unwrap_or(zero.clone())
                 } else {
                     zero.clone()
-                };
+                });
                 self.add_vec_dangling_provenance_constraints(stub_kind, &cap, &ptr);
 
                 // Initialize data array with symbolic default value
@@ -121,7 +140,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let vec = Expr::datatype_constructor(
                     vec_sort_name,
                     ctor_name,
-                    vec![ptr, zero, cap, data],
+                    vec![ptr.into_expr(), zero, cap.into_expr(), data],
                     vec_sort,
                 );
                 self.assign_value_to_place(destination, vec);

@@ -48,9 +48,15 @@ pub(in crate::codegen_ay::chc) fn build_call_result_memory_bridge_constraints(
     } else {
         result_expr.clone()
     };
-    let Some(addr_expr) = ctx.translate_ref_to_address(&local_place, &bridge_modified) else {
+    let Some(addr_loc) = ctx.translate_ref_to_address(&local_place, &bridge_modified) else {
         return Vec::new();
     };
+    // `translate_ref_to_address` is a wave-11 address producer, so this local
+    // is an address by construction. The three consumers below
+    // (`build_memory_store` and the two field-decomposition helpers) are
+    // wave-13 territory and still take a bare `Expr`, so the tag is dropped
+    // exactly once, here, instead of being re-derived by each of them.
+    let addr_expr = addr_loc.into_expr();
 
     let local_ty = ctx.body.locals()[dest_local].ty;
     let mut mem_constraints = Vec::new();
@@ -59,7 +65,9 @@ pub(in crate::codegen_ay::chc) fn build_call_result_memory_bridge_constraints(
     // codegen_stmt_memory_bridge.rs).
     let prev_suppress = ctx.suppress_heap_store_checks;
     ctx.suppress_heap_store_checks = true;
-    if let Some(store) = ctx.build_memory_store(addr_expr.clone(), bridge_value.clone(), local_ty) {
+    if let Some(store) =
+        ctx.build_memory_store_untyped(addr_expr.clone(), bridge_value.clone(), local_ty)
+    {
         mem_constraints.push(store);
     }
     // Part of #3962: decompose struct/enum fields into their type-indexed memory
@@ -163,7 +171,7 @@ pub(in crate::codegen_ay::chc) fn try_decompose_flattened_enum_field_stores(
                 .unwrap_or(raw_field_ty),
             _ => raw_field_ty,
         };
-        constraints.extend(ctx.build_memory_store(field_addr, field_expr, field_ty));
+        constraints.extend(ctx.build_memory_store_untyped(field_addr, field_expr, field_ty));
     }
 
     // Store the discriminant tag byte.
@@ -189,7 +197,7 @@ pub(in crate::codegen_ay::chc) fn try_decompose_flattened_enum_field_stores(
             };
 
             let u8_ty = rustc_public::ty::Ty::unsigned_ty(rustc_public::ty::UintTy::U8);
-            constraints.extend(ctx.build_memory_store(discr_addr, discr_bv8, u8_ty));
+            constraints.extend(ctx.build_memory_store_untyped(discr_addr, discr_bv8, u8_ty));
         }
     }
 

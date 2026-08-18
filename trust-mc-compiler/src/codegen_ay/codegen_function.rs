@@ -394,8 +394,18 @@ pub(in crate::codegen_ay) fn body_has_contract_dispatch(body: &rustc_public::mir
     })
 }
 
+/// Whether a `#[kani::loop_decreases]` register call survives on a REACHABLE
+/// path of the body (unsupported measure shapes leave it in place).
+///
+/// Only live blocks count — see [`reachable_blocks`]: the contract-mode fold
+/// strands a verbatim copy of the loop, decreases breadcrumb included, in the
+/// arms this harness did not select.
 fn body_has_loop_decreases_call(body: &rustc_public::mir::Body) -> bool {
-    body.blocks.iter().any(|bb| {
+    let reachable = reachable_blocks(body);
+    body.blocks.iter().enumerate().any(|(bb_idx, bb)| {
+        if !reachable[bb_idx] {
+            return false;
+        }
         let TerminatorKind::Call { func, .. } = &bb.terminator.kind else {
             return false;
         };
@@ -411,11 +421,56 @@ fn body_has_loop_decreases_call(body: &rustc_public::mir::Body) -> bool {
     })
 }
 
+/// Blocks reachable from the entry block by following terminator successors.
+///
+/// `FunctionWithContractPass` selects one contract mode per harness and folds
+/// `kani_contract_mode()` to a constant, which strands the arms this harness did
+/// not select. For a `#[kani::requires]`/`#[kani::ensures]` function those
+/// stranded arms contain a VERBATIM COPY of the original body — loop included,
+/// with its own role-0 `kani_register_loop_contract` breadcrumb and its own
+/// nested register `fn` (`f::kani_register_loop_contract_<id>` alongside the
+/// live `f::{closure#N}::…::kani_register_loop_contract_<id>`). The stranded
+/// blocks have no predecessor, so `LoopContractPass`' control-flow-ordered walk
+/// never rewrites them, and the CHC inliner copies whole block lists, carrying
+/// them into the harness body.
+///
+/// Breadcrumb scans therefore have to look at the LIVE CFG only: a call that no
+/// execution can reach imposes no obligation to discharge, so treating it as an
+/// unsupported construct fabricates a verdict instead of deriving one.
+fn reachable_blocks(body: &rustc_public::mir::Body) -> Vec<bool> {
+    let mut reachable = vec![false; body.blocks.len()];
+    if body.blocks.is_empty() {
+        return reachable;
+    }
+    reachable[0] = true;
+    let mut worklist = vec![0usize];
+    while let Some(bb) = worklist.pop() {
+        for succ in body.blocks[bb].terminator.successors() {
+            if let Some(seen) = reachable.get_mut(succ)
+                && !*seen
+            {
+                *seen = true;
+                worklist.push(succ);
+            }
+        }
+    }
+    reachable
+}
+
 /// Whether loop-contract lowering left an original (`_transformed == 0`)
-/// register call in the body. The lowering pass deliberately retains this
-/// breadcrumb when an invariant capture cannot be represented soundly.
+/// register call on a REACHABLE path of the body. The lowering pass
+/// deliberately retains this breadcrumb when an invariant capture cannot be
+/// represented soundly.
+///
+/// Only live blocks count — see [`reachable_blocks`]. The live latch call the
+/// successful lowering emits carries `_transformed == 1`, so a role-0 call that
+/// is still reachable really does mean an un-lowered invariant.
 fn body_has_untransformed_loop_contract_call(body: &rustc_public::mir::Body) -> bool {
-    body.blocks.iter().any(|bb| {
+    let reachable = reachable_blocks(body);
+    body.blocks.iter().enumerate().any(|(bb_idx, bb)| {
+        if !reachable[bb_idx] {
+            return false;
+        }
         let TerminatorKind::Call { func, args, .. } = &bb.terminator.kind else {
             return false;
         };
@@ -483,7 +538,8 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
         let mut failing_vc = trust_mc_core::chc::ChcVc::new();
         failing_vc.add_relation(RelationDecl::nullary("error_p1"));
         failing_vc.add_relation(RelationDecl::nullary("error"));
-        failing_vc.add_rule(Rule::new(RuleBody::new(None, vec![]), RelationApp::nullary("error_p1")));
+        failing_vc
+            .add_rule(Rule::new(RuleBody::new(None, vec![]), RelationApp::nullary("error_p1")));
         failing_vc.add_rule(Rule::new(
             RuleBody::new(Some(RelationApp::nullary("error_p1")), vec![]),
             RelationApp::nullary("error"),
@@ -494,9 +550,7 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
             kind: trust_mc_core::violation::PropertyKind::LoopDecreases,
             bb: 0,
             relation: "error_p1".to_string(),
-            message: Some(
-                "loop `decreases` ranking not proven (termination measure)".to_string(),
-            ),
+            message: Some("loop `decreases` ranking not proven (termination measure)".to_string()),
             location: None,
             approximation_dependent: Some(false),
         });
@@ -510,6 +564,7 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
     // mutable borrow on ay_ctx is not held across the unwind boundary.
     let tcx = ay_ctx.tcx;
     let chc_cfg = ChcConfig {
+        frame_narrowing: false,
         track_level: ay_ctx.config.chc_track_level,
         step_mode: ay_ctx.config.chc_step_mode,
         int_lift: ay_ctx.config.chc_int_lift,
@@ -519,6 +574,7 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
         prove_safety_only: ay_ctx.config.prove_safety_only,
         memory_safety_checks: ay_ctx.config.memory_safety_checks,
         overflow_checks: ay_ctx.config.overflow_checks,
+        nan_checks: ay_ctx.config.nan_checks,
         undefined_function_checks: ay_ctx.config.undefined_function_checks,
         recursive_unwind_depth: if ay_ctx.config.has_explicit_unwind {
             ay_ctx.config.unwind_depth

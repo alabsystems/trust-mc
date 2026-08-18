@@ -3,21 +3,26 @@
 At present, trust-mc can used in two ways:
 
  * [On a single crate](#usage-on-a-single-crate) with the `trust-mc` command.
- * [On a Cargo package](#usage-on-a-package) with the `cargo trust-mc` command.
+ * [On a Cargo package](#usage-on-a-package) with the `targo trust-mc` command.
 
-If you plan to integrate trust-mc in your projects, the recommended approach is to use `cargo trust-mc`.
-If you're already using cargo, this will handle dependencies automatically, and it can be configured (if needed) in `Cargo.toml`.
+If you plan to integrate trust-mc in your projects, the recommended approach is to use `targo trust-mc`.
+This will handle dependencies automatically, and it can be configured (if needed) in `Cargo.toml`.
 But `trust-mc` is useful for small examples/tests.
+
+> **Back-compat:** `targo trust-mc` remains a working alias for `targo trust-mc`
+> — the tool ships both a `targo-trust-mc` and a `cargo-trust-mc` proxy, so every
+> existing script and command line keeps working. New docs use the Trust-native
+> `targo trust-mc` spelling.
 
 ## Usage on a package
 
-trust-mc is integrated with `cargo` and can be invoked from a package as follows:
+trust-mc is integrated with `targo` and can be invoked from a package as follows:
 
 ```bash
-cargo trust-mc [OPTIONS]
+targo trust-mc [OPTIONS]
 ```
 
-This works like `cargo test` except that it will analyze all proof harnesses instead of running all test harnesses.
+This works like `targo test` except that it will analyze all proof harnesses instead of running all test harnesses.
 The proof source surface is Kani-compatible: keep using `#[kani::proof]`,
 `#[kani::proof_for_contract]`, `kani::any()`, and `kani::assume()`. The
 execution path is trust-mc through AY; there is no Rust execution fallback that can
@@ -25,22 +30,22 @@ turn a harness into replacement evidence.
 
 ## Common command line flags
 
-Common to both `trust-mc` and `cargo trust-mc` are many command-line flags:
+Common to both `trust-mc` and `targo trust-mc` are many command-line flags:
 
  * `--concrete-playback=[print|inplace]`: _Experimental_ feature that generates a Rust unit test case
  that plays back a failing proof harness using a concrete counterexample.
  If used with `print`, trust-mc will only print the unit test to stdout.
  If used with `inplace`, trust-mc will automatically add the unit test to the user's source code, next to the proof harness. For more detailed instructions, see the [concrete playback](./reference/experimental/concrete-playback.md) section.
 
- * `--tests`: Build in "[test mode](https://doc.rust-lang.org/rustc/tests/index.html)", i.e. with `cfg(test)` set and `dev-dependencies` available (when using `cargo trust-mc`).
+ * `--tests`: Build in "[test mode](https://doc.rust-lang.org/rustc/tests/index.html)", i.e. with `cfg(test)` set and `dev-dependencies` available (when using `targo trust-mc`).
 
  * `--harness <name>`: By default, trust-mc checks all proof harnesses it finds.
    You can switch to checking a single harness using this flag.
 
  * `--harnesses`: List contracts and proof harnesses using the default terminal
    table, then exit. This is a shortcut for the pretty form of the `list`
-   subcommand: use `cargo trust-mc list --format json` or
-   `cargo trust-mc list --format markdown` for machine-readable or file-oriented
+   subcommand: use `targo trust-mc list --format json` or
+   `targo trust-mc list --format markdown` for machine-readable or file-oriented
    listing output.
 
  * `--backend=<auto|ay>`: Select the verification backend. `auto` (default) resolves
@@ -100,7 +105,7 @@ The AY backend is trust-mc's default verification backend. These options configu
 For more details on CHC solver configuration, see [CHC Solver Paths](./chc-solver-paths.md).
 For debugging slow proofs with solver selection, see [Debugging Slow Proofs](./debugging-slow-proofs.md).
 
-Run `cargo trust-mc --help` to see a complete list of arguments.
+Run `targo trust-mc --help` to see a complete list of arguments.
 
 ## Usage on a single crate
 
@@ -152,7 +157,7 @@ flags = { default-unwind = "2" }
 unstable = { function-contracts = true }
 ```
 
-The options here are the same as on the command line (`cargo trust-mc --help`), and flags (that is, command line arguments that don't take a value) are enabled by setting them to `true`.
+The options here are the same as on the command line (`targo trust-mc --help`), and flags (that is, command line arguments that don't take a value) are enabled by setting them to `true`.
 
 Starting with Rust 1.80 (or nightly-2024-05-05), every reachable #[cfg] will be automatically checked that they match the expected config names and values.
 To avoid warnings on `cfg(kani)`, we recommend adding the `check-cfg` lint config in your crate's `Cargo.toml` as follows:
@@ -229,11 +234,11 @@ mod verification {
 Then invoke trust-mc with `--tests`:
 
 ```bash
-cargo trust-mc --tests
+targo trust-mc --tests
 ```
 
 **Why is this necessary?** Cargo only resolves `[dev-dependencies]` when at
-least one test, bench, or example target is in the build graph. `cargo trust-mc`
+least one test, bench, or example target is in the build graph. `targo trust-mc`
 without `--tests` builds the library alone (`cargo rustc --lib`), which does
 not pull in dev-deps — so `use unicode_width::...` fails with
 `error[E0432]: unresolved import unicode_width` even though the crate is

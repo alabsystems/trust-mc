@@ -33,6 +33,7 @@ SOUNDNESS_FILES=(
     tests/ay/memory_safety_size_mismatch_fail.rs
     tests/ay/memory_safety_double_free_fail.rs
     tests/ay/realloc_stale_pointer_fail.rs
+    tests/ay/offset_symbolic_count_byte_wrap_fail.rs
 )
 
 PASS=0
@@ -47,6 +48,24 @@ export AY_SOLVER AY_TEST_TIMEOUT
 
 echo "[soundness-gate] AY_SOLVER=${AY_SOLVER}"
 echo "[soundness-gate] AY_TEST_TIMEOUT=${AY_TEST_TIMEOUT}"
+
+# PRECONDITION: the driver resolves its SMT backend with `which::which("ay")`
+# (trust-mc-driver/src/args/solver.rs), so without `ay` on PATH every harness
+# exits instantly with "AY solver not found in PATH". compiletest's
+# `kani-verify-fail` accepts ANY nonzero exit as the expected failure, so the
+# run reports "ok" in 0.01s and this gate then reports all N files VACUOUS —
+# technically fail-closed, but indistinguishable from a real regression. Check
+# it up front and say so, so a missing PATH is never mistaken for a soundness
+# finding. `AY_BIN` does NOT satisfy this: it is read by the kani-domination
+# harness, not by the driver's backend resolution.
+if ! command -v ay >/dev/null 2>&1; then
+    echo "[soundness-gate] ERROR: no \`ay\` on PATH — the driver would exit instantly on"
+    echo "[soundness-gate]        every file and this gate would report VACUOUS for all of"
+    echo "[soundness-gate]        them. Put the AY binary on PATH, e.g.:"
+    echo "[soundness-gate]            PATH=\"\$PWD/../ay/target/release:\$PATH\" $0"
+    exit 2
+fi
+echo "[soundness-gate] ay on PATH: $(command -v ay) ($(ay --version 2>/dev/null | head -1))"
 echo ""
 
 # Build the verifier ONCE; per-file runs then use --skip-build. The ledgered

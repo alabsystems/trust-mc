@@ -98,10 +98,10 @@ fn try_emit_nonnull_ref_cast(
     let Some((_, dest_var)) = ctx.resolve_destination(dest_local) else {
         return false;
     };
-    let ptr_obj_id = try_extract_data_obj_id(&ptr);
+    let ptr_obj_id = try_extract_data_obj_id(ptr.as_expr());
     let Some(eq) = ctx.make_coerced_eq_constraint(
         &dest_var,
-        ptr.clone(),
+        ptr.as_expr().clone(),
         dest_var.sort(),
         dest_local,
         "codegen_call_nonnull_ref_cast",

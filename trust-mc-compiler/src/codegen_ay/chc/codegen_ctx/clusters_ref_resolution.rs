@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::types::RefTarget;
+use crate::codegen_ay::provenance::Loc;
 
 /// Reference resolution state for deref chain, BigInt/BigRational, static,
 /// and const-ref lookups.
@@ -204,7 +205,12 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// When two subslice operations share the same provenance and start offset,
     /// they reuse the same data address, preserving fat pointer identity.
     /// Part of #4030: source-derived addresses for pointer comparison.
-    pub(in crate::codegen_ay::chc) subslice_addr_cache: HashMap<(usize, u64), Expr>,
+    ///
+    /// The value is a [`Loc`]: every entry is written from a
+    /// `SubsliceMaterialization::fresh_addr`, which is an address by
+    /// construction, and every read feeds one straight back in as the next
+    /// materialization's `addr_override`.
+    pub(in crate::codegen_ay::chc) subslice_addr_cache: HashMap<(usize, u64), Loc>,
 
     /// Memory array initializations for static variables.
     /// Each entry: (type_key, elem_sort, init_value, addr_expr) for mirroring

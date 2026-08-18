@@ -1567,25 +1567,21 @@ mod bridge_elimination_tests {
         match expr {
             ay_chc::ChcExpr::Int(_) => true,
             ay_chc::ChcExpr::Var(var) => var.sort == ay_chc::ChcSort::Int,
-            ay_chc::ChcExpr::Op(op, _)
-                if matches!(
-                    op,
-                    ay_chc::ChcOp::Int2Bv(_)
-                        | ay_chc::ChcOp::Bv2Nat
-                        | ay_chc::ChcOp::Add
-                        | ay_chc::ChcOp::Sub
-                        | ay_chc::ChcOp::Mul
-                        | ay_chc::ChcOp::Div
-                        | ay_chc::ChcOp::Mod
-                        | ay_chc::ChcOp::Neg
-                        | ay_chc::ChcOp::Lt
-                        | ay_chc::ChcOp::Le
-                        | ay_chc::ChcOp::Gt
-                        | ay_chc::ChcOp::Ge
-                ) =>
-            {
-                true
-            }
+            ay_chc::ChcExpr::Op(
+                ay_chc::ChcOp::Int2Bv(_)
+                | ay_chc::ChcOp::Bv2Nat
+                | ay_chc::ChcOp::Add
+                | ay_chc::ChcOp::Sub
+                | ay_chc::ChcOp::Mul
+                | ay_chc::ChcOp::Div
+                | ay_chc::ChcOp::Mod
+                | ay_chc::ChcOp::Neg
+                | ay_chc::ChcOp::Lt
+                | ay_chc::ChcOp::Le
+                | ay_chc::ChcOp::Gt
+                | ay_chc::ChcOp::Ge,
+                _,
+            ) => true,
             _ => chc_expr_children(expr).iter().any(|child| mentions_int_or_bridge(child)),
         }
     }
@@ -1912,20 +1908,16 @@ mod producer_shape_bridge_tests {
         match expr {
             ay_chc::ChcExpr::Int(_) => true,
             ay_chc::ChcExpr::Var(var) => var.sort == ay_chc::ChcSort::Int,
-            ay_chc::ChcExpr::Op(op, _)
-                if matches!(
-                    op,
-                    ay_chc::ChcOp::Int2Bv(_)
-                        | ay_chc::ChcOp::Bv2Nat
-                        | ay_chc::ChcOp::Sub
-                        | ay_chc::ChcOp::Lt
-                        | ay_chc::ChcOp::Le
-                        | ay_chc::ChcOp::Gt
-                        | ay_chc::ChcOp::Ge
-                ) =>
-            {
-                true
-            }
+            ay_chc::ChcExpr::Op(
+                ay_chc::ChcOp::Int2Bv(_)
+                | ay_chc::ChcOp::Bv2Nat
+                | ay_chc::ChcOp::Sub
+                | ay_chc::ChcOp::Lt
+                | ay_chc::ChcOp::Le
+                | ay_chc::ChcOp::Gt
+                | ay_chc::ChcOp::Ge,
+                _,
+            ) => true,
             _ => chc_expr_children(expr).iter().any(|c| has_int_or_bridge(c)),
         }
     }

@@ -14,6 +14,11 @@ mod context;
 mod coroutine_layout;
 pub(crate) mod diagnostics;
 mod emitter;
+// The per-datatype field-role table (`docs/addr-vs-value-conversion-queue.md`
+// §4 item 7): the declaration records which fields hold ADDRESSES, from the MIR
+// type it was built out of, so consumers read the fact instead of guessing it
+// off the field's sort.
+mod field_roles;
 mod float_arithmetic;
 mod float_arithmetic_pure;
 mod float_compare;
@@ -24,6 +29,15 @@ mod loop_invariant;
 mod loop_unroll;
 mod names;
 mod option_like_eq;
+// Wave 1 of the address-vs-value conversion converted its first entry points;
+// the remaining accessors stay allowed until the later waves consume them.
+#[allow(dead_code)]
+mod provenance;
+// Wave 3 of the address-vs-value conversion: the fat-pointer decoder. A wide
+// pointer is an address AND a value packed together, and the packed form is
+// bit-identical to a widened thin one — `Val`/`Loc` alone cannot express that,
+// so `PtrRepr` decodes it structurally, once.
+mod ptr_repr;
 mod shadow_mem;
 mod shared;
 mod statement;

@@ -411,7 +411,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // in #4014. Mirrors the Rc::new fix in codegen_rc_arc_new.
             self.try_decompose_struct_store(ptr_expr, &value_expr, store_ty, extra_constraints);
             if let Some(store_constraint) =
-                self.build_memory_store(ptr_expr.clone(), value_expr.clone(), store_ty)
+                self.build_memory_store_untyped(ptr_expr.clone(), value_expr.clone(), store_ty)
             {
                 extra_constraints.push(store_constraint);
             }
@@ -523,7 +523,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         {
             // Part of #3980: Promoted &fn-item payload store for dyn dispatch.
             let store_ty = self.resolve_boxnew_store_ty(bb_idx, arg0, arg_ty);
-            if let Some(store) = self.build_memory_store(ptr_expr.clone(), callable_expr, store_ty)
+            if let Some(store) =
+                self.build_memory_store_untyped(ptr_expr.clone(), callable_expr, store_ty)
             {
                 extra_constraints.push(store);
             }
@@ -844,7 +845,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         );
         self.try_decompose_struct_store(ptr_expr, &concrete_value, concrete_ty, extra_constraints);
         if let Some(store_constraint) =
-            self.build_memory_store(ptr_expr.clone(), concrete_value, concrete_ty)
+            self.build_memory_store_untyped(ptr_expr.clone(), concrete_value, concrete_ty)
         {
             extra_constraints.push(store_constraint);
         }

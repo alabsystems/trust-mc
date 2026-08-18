@@ -96,7 +96,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // mismatch that leaves the load unconstrained, producing spurious CTREX.
             self.try_decompose_struct_store(&field_addr, &field_expr, field_ty, constraints);
             if let Some(store_constraint) =
-                self.build_memory_store(field_addr, field_expr, field_ty)
+                self.build_memory_store_untyped(field_addr, field_expr, field_ty)
             {
                 constraints.push(store_constraint);
             }
@@ -186,7 +186,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.try_decompose_struct_store(&elem_addr, &elem_value, elem_ty, constraints);
 
             if let Some(store_constraint) =
-                self.build_memory_store(elem_addr.clone(), elem_value.clone(), elem_ty)
+                self.build_memory_store_untyped(elem_addr.clone(), elem_value.clone(), elem_ty)
             {
                 constraints.push(store_constraint);
             }
@@ -194,7 +194,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Part of #4086: Store element to the SIMD ADT's own typed heap.
             // elem_value is BV64 and mem_i64x2 element sort is BV64, so sorts match.
             if is_simd_adt {
-                if let Some(adt_store) = self.build_memory_store(elem_addr, elem_value, array_ty) {
+                if let Some(adt_store) =
+                    self.build_memory_store_untyped(elem_addr, elem_value, array_ty)
+                {
                     constraints.push(adt_store);
                 }
             }

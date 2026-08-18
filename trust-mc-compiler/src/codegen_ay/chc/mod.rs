@@ -118,6 +118,9 @@ use decl::codegen_types;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 use decl::codegen_types_adt;
 use decl::codegen_types_adt_sort;
+pub(in crate::codegen_ay::chc) use decl::{
+    reset_dropped_frame_columns, take_dropped_frame_columns,
+};
 mod dyn_coercion;
 mod dyn_coercion_resolve;
 mod error_property;
@@ -241,8 +244,8 @@ pub(in crate::codegen_ay) use codegen_ctx::take_fp_bitvector_encoding_count;
 pub(in crate::codegen_ay) use codegen_ctx::take_inferable_predicate_count;
 pub(in crate::codegen_ay) use codegen_ctx::take_kani_mem_overapprox_by_fn;
 pub(in crate::codegen_ay) use codegen_ctx::take_kani_mem_overapprox_count;
-pub(in crate::codegen_ay) use codegen_ctx::take_offset_provenance_unresolved_by_fn;
 pub(in crate::codegen_ay) use codegen_ctx::take_known_stdlib_unconstrained_count;
+pub(in crate::codegen_ay) use codegen_ctx::take_offset_provenance_unresolved_by_fn;
 pub(in crate::codegen_ay) use codegen_ctx::take_ptr_metadata_unconstrained_by_fn;
 pub(in crate::codegen_ay) use codegen_ctx::take_ptr_metadata_unconstrained_count;
 pub(in crate::codegen_ay) use codegen_ctx::take_signedness_fallback_by_fn;
@@ -347,5 +350,7 @@ pub(super) use translate::MemPromoteAction;
 pub(in crate::codegen_ay) use translate::block_relation_apps_consistent;
 pub(in crate::codegen_ay) use translate::block_relation_slot_names_consistent;
 pub(in crate::codegen_ay) use translate::canonicalize_block_relation_apps;
+pub(in crate::codegen_ay) use translate::constraint_vars_outside_relation_frames;
 pub(in crate::codegen_ay) use translate::fixup_relation_app_arities;
+pub(in crate::codegen_ay) use translate::report_slot_layout;
 pub(in crate::codegen_ay) use translate::reset_chc_session_counters;

@@ -19,7 +19,7 @@ Proof harnesses are similar to test harnesses, especially property-based test ha
 and they may use functions from the trust-mc API (e.g., `kani::any()`).
 A proof harness is the smallest verification unit in trust-mc.
 
-When trust-mc is run, either through `trust-mc` or `cargo trust-mc`, it'll first collect all proof harnesses
+When trust-mc is run, either through `trust-mc` or `targo trust-mc`, it'll first collect all proof harnesses
 (i.e., functions with the attribute `#[kani::proof]`) and then attempt to verify them.
 
 ### Example
@@ -220,7 +220,7 @@ Upstream Kani historically accepted these `<solver>` values:
 
 For the AY backend, use CLI options instead of this attribute:
 - `--ay-solver=<solver>` or `--smt-solver=<solver>`: Select the SMT solver (auto, ay)
-- Example: `cargo trust-mc --ay-solver=ay`
+- Example: `targo trust-mc --ay-solver=ay`
 
 ### Example (accepted for compatibility; no effect in trust-mc)
 

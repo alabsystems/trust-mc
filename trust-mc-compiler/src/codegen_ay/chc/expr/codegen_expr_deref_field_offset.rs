@@ -15,8 +15,10 @@ use std::collections::HashSet;
 
 use ay_bindings::Expr;
 use rustc_public::mir::ProjectionElem;
+use rustc_public::ty::{AdtKind, RigidTy, TyKind};
 use tracing::debug;
 
+use crate::codegen_ay::provenance::Loc;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::ChcCtx;
@@ -44,9 +46,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// Part of #1161: Make load side symmetric with store side.
     /// Part of #2323 Gap 1: Downcast projections fall through (need variant-aware selection).
+    /// The base is the address the enclosing `Deref` consumes — see the tag site
+    /// in `walk_deref_projection_loop`. Taking a [`Loc`] is what lets the byte
+    /// arithmetic below stay an address all the way to the load: an offset added
+    /// to an address is still an address, and the load is the one operation that
+    /// turns it into a datum.
     pub(in crate::codegen_ay::chc) fn try_deref_field_offset_load(
         &mut self,
-        current_expr: Expr,
+        current_expr: Loc,
         pointee_ty: rustc_public::ty::Ty,
         remaining_projs: &[ProjectionElem],
     ) -> DerefFieldOffsetResult {
@@ -65,6 +72,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         for remaining_proj in remaining_projs {
             if let ProjectionElem::Field(field_idx, field_ty) = remaining_proj {
+                // A UNION container is not laid out like a struct, so the
+                // field-offset load is structurally wrong for it. `translate_ty`
+                // lowers a union ADT to a FLAT `Sort::bitvec(size*8)` and the
+                // static/heap mirrors register exactly ONE typed memory array —
+                // keyed by the UNION's own type. Reading field `i` at its byte
+                // offset would select from `mem_<field_ty>` instead, an array no
+                // rule ever writes; after array scalarization that cell is a free
+                // variable, so any assertion over it is trivially refutable
+                // (spurious "Genuine" CTREX). Fall through to the whole-struct
+                // load, whose Field arm is union-aware
+                // (`union_bv_field_coerce`, codegen_expr.rs:472) and reads the
+                // array the entry rule actually constrains. Checked per
+                // container, not just on `pointee_ty`, so nested chains like
+                // `(*p).0.1` with a union in the middle are covered too.
+                if Self::is_union_adt(load_ty) {
+                    debug!(
+                        ?load_ty,
+                        field_idx = *field_idx,
+                        "CHC: Deref+Field offset load not applicable — union container \
+                         (flat-BV model); falling through to union-aware whole-struct load"
+                    );
+                    return DerefFieldOffsetResult::NotApplicable;
+                }
                 if let Some(offset) = self.get_field_offset(load_ty, *field_idx) {
                     total_offset += offset;
                     load_ty = *field_ty;
@@ -84,7 +114,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         // Part of #2007: Guard against non-bitvec sorts.
-        if !current_expr.sort().is_bitvec() {
+        if !current_expr.as_expr().sort().is_bitvec() {
             self.diagnostics.place_translation_drop.inc();
             record_translation_drop_site_reason_for_fn(
                 &self.fn_name,
@@ -96,14 +126,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return DerefFieldOffsetResult::Bail;
         }
 
-        // Compute address with field offset
+        // Compute address with field offset. A byte offset added to an address
+        // is an address, so the tag survives the arithmetic unchanged.
         let addr = if total_offset > 0 {
-            current_expr.bvadd(Expr::bitvec_const(total_offset as i64, POINTER_WIDTH))
+            Loc::of_address(
+                current_expr
+                    .into_expr()
+                    .bvadd(Expr::bitvec_const(total_offset as i64, POINTER_WIDTH)),
+            )
         } else {
             current_expr
         };
 
-        if let Some(expr) = self.try_stack_deref_field_expr(&addr, remaining_projs) {
+        if let Some(expr) = self.try_stack_deref_field_expr(addr.as_expr(), remaining_projs) {
             debug!(
                 offset = total_offset,
                 "CHC: translate_place_with_deref - resolved stack Deref+Field from flattened local"
@@ -114,12 +149,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Load from field-level type array (symmetric with store).
         // Dyn-tail normalization is handled inside load_from_memory (#3974).
         match self.load_from_memory(addr, load_ty) {
-            Some(expr) => {
+            Some(val) => {
                 debug!(
                     offset = total_offset,
                     "CHC: translate_place_with_deref - Deref+Field load at offset"
                 );
-                DerefFieldOffsetResult::Loaded(expr)
+                DerefFieldOffsetResult::Loaded(val.into_expr())
             }
             None => {
                 self.record_aggregate_gap("deref_field_load_failed");
@@ -127,6 +162,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 DerefFieldOffsetResult::Bail
             }
         }
+    }
+
+    /// `true` when `ty` is a union ADT — the one ADT kind whose fields all live
+    /// at offset 0 inside a flat bitvec, so byte-offset field addressing does
+    /// not describe it.
+    fn is_union_adt(ty: rustc_public::ty::Ty) -> bool {
+        matches!(
+            ty.kind(),
+            TyKind::RigidTy(RigidTy::Adt(def, _)) if def.kind() == AdtKind::Union
+        )
     }
 
     fn try_stack_deref_field_expr(

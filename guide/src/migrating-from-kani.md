@@ -8,7 +8,7 @@ trust-mc is Kani's codebase with CBMC replaced by AY. Your proof harnesses and
 source annotations stay the same: keep using `#[kani::proof]`, `kani::any()`,
 `kani::assume()`, and the rest of the `kani::`-prefixed API.
 
-The main workflow change is tooling: use `cargo trust-mc` instead of `cargo kani`.
+The main workflow change is tooling: use `targo trust-mc` instead of `cargo kani`.
 If you already have a working Kani crate, start by swapping the command, then
 adjust how you read trust-mc verdicts and `UNKNOWN` diagnostics.
 
@@ -17,7 +17,7 @@ adjust how you read trust-mc verdicts and `UNKNOWN` diagnostics.
 <!-- dscan:allow(volatile_numbers) -->
 | Aspect | Kani | trust-mc |
 |---|---|---|
-| CLI command | `cargo kani` | `cargo trust-mc` |
+| CLI command | `cargo kani` | `targo trust-mc` |
 | Installer | Kani installer / release flow | Build from source today; see [build-from-source.md](./build-from-source.md) |
 | Default solver backend | CBMC | AY (`--backend=auto` and `--backend=ay` both resolve to AY) |
 | Supported proof patterns | Bounded proofs with unwind control | Same bounded proofs, plus CHC proofs for unbounded loops with `--ay-chc` |
@@ -29,25 +29,25 @@ adjust how you read trust-mc verdicts and `UNKNOWN` diagnostics.
 ## Invocation Translation
 
 The safest migration rule is: keep the harness, swap the command, then only
-reuse flags that exist in `cargo trust-mc`.
+reuse flags that exist in `targo trust-mc`.
 
 | Kani usage | trust-mc usage | Notes |
 |---|---|---|
-| `cargo kani --harness foo` | `cargo trust-mc --harness foo` | Same harness filter flag. |
-| `cargo kani --harnesses` | `cargo trust-mc --harnesses` or `cargo trust-mc list` | `--harnesses` is the Kani-compatible pretty-list shortcut. Use `list` for JSON or Markdown output. See [reference/list.md](./reference/list.md). |
-| `cargo kani --harness foo --unwind 8` | `cargo trust-mc --harness foo --unwind 8` | Same per-harness unwind override. |
-| `cargo kani --default-unwind 8` | `cargo trust-mc --default-unwind 8` | Same global unwind default. |
-| `cargo kani -Z unstable-options --harness-timeout 60s` | `cargo trust-mc -Z unstable-options --harness-timeout 60s` | Same timeout spelling; still experimental. |
-| `cargo kani --output-format terse` | `cargo trust-mc --output-format terse` | trust-mc supports `regular`, `terse`, and `old`. |
-| `cargo kani --tests` | `cargo trust-mc --tests` | Same intent: compile with `cfg(test)` and make `dev-dependencies` available in cargo mode. |
-| `cargo kani -Z source-coverage --coverage --harness foo` | `cargo trust-mc -Z source-coverage --coverage --harness foo` | Same coverage flag, still gated by `-Z source-coverage`. See [coverage.md](./reference/experimental/coverage.md). |
-| `cargo kani -Z concrete-playback --concrete-playback=print` | `cargo trust-mc -Z concrete-playback --concrete-playback=print` | Same playback flag; trust-mc also has `cargo trust-mc playback ...`. |
+| `cargo kani --harness foo` | `targo trust-mc --harness foo` | Same harness filter flag. |
+| `cargo kani --harnesses` | `targo trust-mc --harnesses` or `targo trust-mc list` | `--harnesses` is the Kani-compatible pretty-list shortcut. Use `list` for JSON or Markdown output. See [reference/list.md](./reference/list.md). |
+| `cargo kani --harness foo --unwind 8` | `targo trust-mc --harness foo --unwind 8` | Same per-harness unwind override. |
+| `cargo kani --default-unwind 8` | `targo trust-mc --default-unwind 8` | Same global unwind default. |
+| `cargo kani -Z unstable-options --harness-timeout 60s` | `targo trust-mc -Z unstable-options --harness-timeout 60s` | Same timeout spelling; still experimental. |
+| `cargo kani --output-format terse` | `targo trust-mc --output-format terse` | trust-mc supports `regular`, `terse`, and `old`. |
+| `cargo kani --tests` | `targo trust-mc --tests` | Same intent: compile with `cfg(test)` and make `dev-dependencies` available in cargo mode. |
+| `cargo kani -Z source-coverage --coverage --harness foo` | `targo trust-mc -Z source-coverage --coverage --harness foo` | Same coverage flag, still gated by `-Z source-coverage`. See [coverage.md](./reference/experimental/coverage.md). |
+| `cargo kani -Z concrete-playback --concrete-playback=print` | `targo trust-mc -Z concrete-playback --concrete-playback=print` | Same playback flag; trust-mc also has `targo trust-mc playback ...`. |
 
 ### Not Yet Supported
 
 - `cargo kani --visualize`: there is no `--visualize` flag in
   `trust-mc-driver/src/args/verification.rs`, `trust-mc-driver/src/args/cargo.rs`, or
-  `trust-mc-driver/src/args/mod.rs` in this tree. No backlog item for a `cargo trust-mc`
+  `trust-mc-driver/src/args/mod.rs` in this tree. No backlog item for a `targo trust-mc`
   equivalent was found in the checked-in docs or designs.
 
 ## What's The Same
@@ -126,7 +126,7 @@ fingerprint, harness count, proof inventory SHA, and non-proof closure SHA.
 
 1. Build trust-mc from source. Start with
    [build-from-source.md](./build-from-source.md).
-2. Run `cargo trust-mc` in the crate that already works under Kani.
+2. Run `targo trust-mc` in the crate that already works under Kani.
 3. Read the verdict first, then read any `[AY:UNKNOWN-CATEGORY] ...` tag line
    if the result is `UNKNOWN`.
 4. File trust-mc-specific issues at
@@ -139,7 +139,7 @@ fingerprint, harness count, proof inventory SHA, and non-proof closure SHA.
 - Keep your harness source unchanged unless trust-mc shows a real gap. Most of the
   early migration work is command-line and diagnostics, not annotation churn.
 - If a proof depends on `dev-dependencies` inside `src/`, keep the Kani-style
-  workaround: use `#[cfg(all(kani, test))]` and run `cargo trust-mc --tests`. See
+  workaround: use `#[cfg(all(kani, test))]` and run `targo trust-mc --tests`. See
   [usage.md](./usage.md).
 - For bounded debugging, `--unwind` and `--default-unwind` still work the way a
   Kani user would expect.
@@ -147,7 +147,7 @@ fingerprint, harness count, proof inventory SHA, and non-proof closure SHA.
   bounds.
 - If you want replayable failing inputs, keep using concrete playback:
   `-Z concrete-playback --concrete-playback=print` or `inplace`.
-- If you need a list of harnesses before migrating CI, use `cargo trust-mc list`
+- If you need a list of harnesses before migrating CI, use `targo trust-mc list`
   and switch to `--format json` when you want machine-readable output.
 
 ## Reading trust-mc Output
@@ -157,7 +157,7 @@ When migrating from Kani, focus on three layers of output:
 1. The top-level verdict: `PROOF`, `UNKNOWN`, `CTREX`, or `ERROR`.
 2. The tag lines: `[AY:UNKNOWN-CATEGORY]`, `[AY:CTREX_CAT:...]`,
    `[AY:PROOF_QUALIFIERS:...]`, and similar markers.
-3. Optional follow-on tools: coverage, concrete playback, or `cargo trust-mc list`.
+3. Optional follow-on tools: coverage, concrete playback, or `targo trust-mc list`.
 
 That structure is different from CBMC-centric debugging, but the payoff is that
 trust-mc usually tells you faster whether you are looking at a real counterexample,

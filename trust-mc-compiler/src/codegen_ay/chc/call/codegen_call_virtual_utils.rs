@@ -63,7 +63,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 true
             } else {
                 self.extract_pointer_storage_expr(param_expr)
-                    .is_some_and(|ptr| *ptr.sort() == Sort::bitvec(POINTER_WIDTH))
+                    .is_some_and(|ptr| *ptr.as_expr().sort() == Sort::bitvec(POINTER_WIDTH))
             };
             if !has_pointer_storage {
                 return;

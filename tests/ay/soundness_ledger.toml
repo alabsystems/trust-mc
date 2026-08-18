@@ -70,3 +70,11 @@ file = "tests/ay/realloc_stale_pointer_fail.rs"
 harnesses = ["test_realloc_stale_pointer_should_fail"]
 accepted_verdicts = ["CTREX", "UNKNOWN"]
 notes = "Realloc stale-pointer lineage. Was UNKNOWN, then ERROR at ay 65537dc81; under the CHC lane at ay build.1636 it is FAILED with [AY:CTREX_CAT:Unknown] (ay-chc inconclusive) — fail-closed. Any PROOF is a soundness bug."
+
+[[entry]]
+issues = [4118]
+kind = "false-proof"
+file = "tests/ay/offset_symbolic_count_byte_wrap_fail.rs"
+harnesses = ["offset_symbolic_count_byte_wrap_must_fail"]
+accepted_verdicts = ["CTREX", "UNKNOWN"]
+notes = "Pins the byte-product (mul-overflow) obligation for a SYMBOLIC count: 2^62 <= count < isize::MAX so the isize-range check alone cannot catch it, and count*4 wraps past 2^64. The count_checks_fold_clean gate cites exactly this shape as its reason for refusing to resolve provenance on symbolic counts, so any relaxation of that gate must keep this non-PROOF. Observed CTREX is 'Offset in bytes overflows isize'. Any PROOF is a soundness bug."

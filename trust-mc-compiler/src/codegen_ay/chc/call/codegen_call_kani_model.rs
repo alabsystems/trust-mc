@@ -12,6 +12,7 @@ use tracing::debug;
 use trust_mc_core::violation::PropertyKind;
 
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::provenance::Loc;
 use crate::codegen_ay::shared::IntoOption;
 use crate::codegen_ay::types::{
     POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ty_to_bv_width,
@@ -1281,7 +1282,7 @@ impl<'tcx, 'body> CallKaniModel for ChcCtx<'tcx, 'body> {
         // suppress store-side UB checks like the resolved-place Mem mirror does.
         let prev_suppress = self.suppress_heap_store_checks;
         self.suppress_heap_store_checks = true;
-        if let Some(store_constraint) = self.build_memory_store(addr, fresh, pointee_ty) {
+        if let Some(store_constraint) = self.build_memory_store_untyped(addr, fresh, pointee_ty) {
             extra_constraints.push(store_constraint);
         }
         self.suppress_heap_store_checks = prev_suppress;
@@ -1458,7 +1459,7 @@ impl<'tcx, 'body> CallKaniModel for ChcCtx<'tcx, 'body> {
         };
         let Some(target_local) = self
             .resolve_write_any_slim_target_local(pointer_arg)
-            .or_else(|| self.resolve_local_from_state_expr(&backing.data))
+            .or_else(|| self.resolve_local_from_state_expr(backing.data.as_expr()))
         else {
             self.record_sound_fallback_reason("kani_write_any_slice_target_unresolved");
             return false;
@@ -1477,11 +1478,11 @@ impl<'tcx, 'body> CallKaniModel for ChcCtx<'tcx, 'body> {
             self.record_sound_fallback_reason("kani_write_any_slice_target_not_array");
             return false;
         };
-        if backing.data.sort().array_sort().is_none() {
+        if backing.data.as_expr().sort().array_sort().is_none() {
             self.record_sound_fallback_reason("kani_write_any_slice_backing_not_array");
             return false;
         }
-        let Some(len) = concrete_len_from_expr(&backing.len) else {
+        let Some(len) = concrete_len_from_expr(backing.len.as_expr()) else {
             self.record_sound_fallback_reason("kani_write_any_slice_symbolic_len");
             return false;
         };
@@ -1541,7 +1542,11 @@ impl<'tcx, 'body> CallKaniModel for ChcCtx<'tcx, 'body> {
         if self.track_level >= ChcTrackLevel::Mem
             && let Some(elem_ty) = self.chc_slice_elem_ty(pointer_arg)
             && let Some(elem_size) = self.get_type_size(elem_ty)
-            && let Some(base_addr) = self.slice_as_ptr_data_expr(pointer_arg, dcx.modified_locals)
+            // Address by construction; `build_memory_store` below is the
+            // wave-13 keystone and still takes a bare `Expr`, so the tag is
+            // dropped once here rather than per element.
+            && let Some(base_addr) =
+                self.slice_as_ptr_data_expr(pointer_arg, dcx.modified_locals).map(Loc::into_expr)
         {
             let prev_suppress = self.suppress_heap_store_checks;
             self.suppress_heap_store_checks = true;
@@ -1557,7 +1562,7 @@ impl<'tcx, 'body> CallKaniModel for ChcCtx<'tcx, 'body> {
                     base_addr.clone().bvadd(byte_offset)
                 };
                 if let Some(store_constraint) =
-                    self.build_memory_store(addr, fresh.clone(), elem_ty)
+                    self.build_memory_store_untyped(addr, fresh.clone(), elem_ty)
                 {
                     extra_constraints.push(store_constraint);
                 }
@@ -1594,8 +1599,8 @@ impl<'tcx, 'body> CallKaniModel for ChcCtx<'tcx, 'body> {
         pointer_arg: &Operand,
         backing: &ResolvedSliceBacking,
     ) -> Expr {
-        if !Self::is_zero_pointer_width_bitvec(&backing.offset) {
-            return backing.offset.clone();
+        if !Self::is_zero_pointer_width_bitvec(backing.offset.as_expr()) {
+            return backing.offset.as_expr().clone();
         }
 
         if let Operand::Copy(place) | Operand::Move(place) = pointer_arg
@@ -1617,7 +1622,7 @@ impl<'tcx, 'body> CallKaniModel for ChcCtx<'tcx, 'body> {
 
         let mut alias_offset = None;
         for (local, data) in &self.ref_resolution.const_ref_values {
-            if data != &backing.data {
+            if data != backing.data.as_expr() {
                 continue;
             }
             let Some(offset) = self.ref_resolution.subslice_offset.get(local) else {
@@ -1627,12 +1632,14 @@ impl<'tcx, 'body> CallKaniModel for ChcCtx<'tcx, 'body> {
                 continue;
             }
             if let Some(len) = self.ref_resolution.subslice_len.get(local)
-                && len != &backing.len
+                && len != backing.len.as_expr()
             {
                 continue;
             }
             match &alias_offset {
-                Some(existing) if existing != offset => return backing.offset.clone(),
+                Some(existing) if existing != offset => {
+                    return backing.offset.as_expr().clone();
+                }
                 Some(_) => {}
                 None => alias_offset = Some(offset.clone()),
             }
@@ -1648,14 +1655,16 @@ impl<'tcx, 'body> CallKaniModel for ChcCtx<'tcx, 'body> {
                     continue;
                 }
                 match &alias_offset {
-                    Some(existing) if existing != offset => return backing.offset.clone(),
+                    Some(existing) if existing != offset => {
+                        return backing.offset.as_expr().clone();
+                    }
                     Some(_) => {}
                     None => alias_offset = Some(offset.clone()),
                 }
             }
         }
 
-        alias_offset.unwrap_or_else(|| backing.offset.clone())
+        alias_offset.unwrap_or_else(|| backing.offset.as_expr().clone())
     }
 
     fn resolve_write_any_slim_target_place(&self, pointer_arg: &Operand) -> Option<Place> {
@@ -1962,8 +1971,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(constraint);
         }
 
-        let field_expr = Self::datatype_field_select(&out_var, 0, None)?;
-        let constraint = Self::build_nonzero_constraint(field_expr)?;
+        // Output state variable = the NonZero local's contents: a value.
+        let out_val = crate::codegen_ay::provenance::Val::of_value(out_var);
+        let field_expr = Self::datatype_field_select(&out_val, 0, None)?;
+        let constraint = Self::build_nonzero_constraint(field_expr.into_expr())?;
         debug!(dest_local, "nonzero_nondet_bounds: field output constraint");
         Some(constraint)
     }
@@ -1999,7 +2010,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         let ptr = coerce_bitvec_width_safe(ptr, POINTER_WIDTH, SignExtension::ZeroExtend);
-        let count_is_signed = self.operand_signedness(count_op).unwrap_or(false);
+        // Signedness has THREE cases, not two — mirrors the Rvalue-lane twin in
+        // codegen_stmt_rvalue_offset.rs (#4118).
+        //
+        // `unwrap_or(false)` reads an UNKNOWN-signedness count as UNSIGNED, and the
+        // two readings disagree on the same 64-bit pattern: `ptr.offset(-1)` is
+        // 0xFFFF_FFFF_FFFF_FFFF, a small negative signed but 2^64-1 unsigned. Taking
+        // the unsigned branch there FABRICATES an "Offset value overflows isize"
+        // violation on correct code. Asserting the signed range instead says nothing
+        // (every 64-bit value satisfies it), so neither reading is safe to assume.
+        //
+        // So: skip the obligation and fail closed. An unaudited reason hits the
+        // catch-all `FallbackSoundness::FailClose` and stays UNACCOUNTED, so no Safe
+        // verdict can rest on the range check we are declining to emit.
+        //
+        // Believed unreachable here — `count_op` comes from the intrinsic's call
+        // args, whose type resolves via `ty_signedness_shallow` (Uint -> Some(false),
+        // Int -> Some(true)) — but "believed unreachable" is exactly how the Rvalue
+        // lane's vacuous check survived, so it is handled rather than assumed.
+        let count_signedness = self.operand_signedness(count_op);
+        if count_signedness.is_none() {
+            self.record_sound_fallback_reason("offset_count_signedness_unknown");
+        }
+        let count_is_signed = count_signedness.unwrap_or(true);
         let count = coerce_bitvec_width_safe(
             count,
             POINTER_WIDTH,
@@ -2043,8 +2076,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Constant-count fast-path: fold the count-only checks numerically so
         // fully-concrete offsets don't leave live error rules (static discharge).
-        let const_count_checks =
-            Self::const_fold_offset_count_checks(&count, count_is_signed, pointee_size as u64);
+        // `count` is the intrinsic's element COUNT operand — a value, not an
+        // address (the twin producer in `ptr_offset_overflow_conditions` carries
+        // the same tag from its own coercion site).
+        let const_count_checks = Self::const_fold_offset_count_checks(
+            &crate::codegen_ay::provenance::Val::of_value(count.clone()),
+            count_is_signed,
+            pointee_size as u64,
+        );
 
         let mut checks: Vec<ModelOffsetCheck> = Vec::new();
 
@@ -2063,7 +2102,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 } else {
                     count.clone().bvule(isize_max)
                 };
-                checks.push(ModelOffsetCheck::overflow(count_in_range, "Offset value overflows isize"));
+                checks.push(ModelOffsetCheck::overflow(
+                    count_in_range,
+                    "Offset value overflows isize",
+                ));
             }
         }
 

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Nested call inlining (fn-def, fn-ptr, closure, virtual). Part of #3159, #3335, #3639.
+use crate::codegen_ay::provenance::{Loc, Val};
+
 use super::super::ChcCtx;
 use super::super::codegen_call_cmp_string::misc_intrinsics::{
     MiscIntrinsicKind, detect_misc_intrinsic,
@@ -32,6 +34,7 @@ use super::pointer_wrapper::{
 use super::register_contract::{nested_fn_trait_closure_captures, try_inline_register_contract};
 use super::result_copied::try_inline_result_copied_call;
 use super::{InlineReturn, receiver_base_local};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::shared::{count_effective_blocks, inline_effective_block_limit};
 use crate::codegen_ay::types::POINTER_WIDTH;
 use crate::kani_middle::attributes;
@@ -270,13 +273,16 @@ fn try_inline_slice_as_ptr_call(
         return None;
     }
     let receiver = translated_args[0].clone();
-    let ptr = super::super::dyn_coercion::extract_pointer_expr(&receiver).unwrap_or(receiver);
-    if ptr.sort().bitvec_width() == Some(POINTER_WIDTH) {
-        debug!(%callee_path, "nested call: inline slice::as_ptr/as_mut_ptr as data pointer");
-        Some(InlineReturn::value_only(ptr))
-    } else {
-        None
-    }
+    let ptr = super::super::dyn_coercion::extract_pointer_expr(&receiver)
+        .map(Loc::into_expr)
+        .unwrap_or(receiver);
+    // `<[T]>::as_ptr` returns the slice's data pointer, so the CALLEE supplies
+    // the provenance — this function does not infer it from the width. The only
+    // open question is the shape, which is what the decoder answers; it accepts
+    // exactly `width == POINTER_WIDTH`, so nothing new is admitted.
+    let data_ptr = PtrRepr::thin_address(&ptr)?;
+    debug!(%callee_path, "nested call: inline slice::as_ptr/as_mut_ptr as data pointer");
+    Some(InlineReturn::value_only(data_ptr.into_expr()))
 }
 
 pub(in crate::codegen_ay::chc) fn try_inline_nested_call<'tcx, 'body>(
@@ -933,12 +939,16 @@ fn try_inline_vec_accessor_via_memory(
     }
     let receiver = &translated_args[0];
     debug!(receiver_sort = ?receiver.sort(), "try_inline_vec_accessor_via_memory: receiver sort (#4057)");
-    // Only trigger when receiver is BV64 (pointer), not an already-resolved Vec DT.
-    if receiver.sort().bitvec_width() != Some(POINTER_WIDTH) {
-        return None;
-    }
 
-    // Resolve the pointee type: &Vec<T> → Vec<T>.
+    // Only a thin address can be loaded through here; an already-resolved Vec
+    // datatype receiver is not pointer-shaped at all and declines. This decodes
+    // the SHAPE — what makes the receiver an address is the `Ref`/`RawPtr`
+    // argument type matched out of the MIR just below, not this test. (Kept in
+    // the width test's original position on purpose: `Operand::ty` panics on an
+    // out-of-bounds local, so it must stay behind the cheap shape filter.)
+    let receiver_addr = PtrRepr::thin_address(receiver)?;
+
+    // Resolve the pointee type: `&Vec<T>` -> `Vec<T>`.
     let arg_ty = args.first()?.ty(outer_body.locals()).ok()?;
     let arg_ty = ctx.resolve_body_ty(arg_ty);
     debug!(?arg_ty, "try_inline_vec_accessor_via_memory: arg type (#4057)");
@@ -950,7 +960,7 @@ fn try_inline_vec_accessor_via_memory(
     };
     debug!(?pointee_ty, "try_inline_vec_accessor_via_memory: pointee type (#4057)");
 
-    let loaded = ctx.load_from_memory(receiver.clone(), pointee_ty);
+    let loaded = ctx.load_from_memory(receiver_addr, pointee_ty).map(Val::into_expr);
     debug!(loaded_sort = ?loaded.as_ref().map(|e| e.sort()), "try_inline_vec_accessor_via_memory: memory load result (#4057)");
     let loaded = loaded?;
     let loaded = ctx.try_unflatten_bv_to_datatype(loaded, pointee_ty);

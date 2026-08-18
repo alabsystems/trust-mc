@@ -188,7 +188,36 @@ struct ChcFuncTranslator<'a> {
     // the function's single shared `ERROR` relation and spuriously refute EVERY
     // obligation (notably the otherwise→Unreachable of any field-carrying match).
     valid_ref_ptrs: BTreeSet<ValueId>,
+    // Interior-pointer provenance: for every pointer value derived IN THIS BLOCK
+    // from an `Alloca` result (through `GEP` / `Borrow` / `BorrowMut`), which
+    // alloca it points into and along which constant field lanes. This is what
+    // makes a `Store` through `&mut local.field` reach the alloca's `stack_cell`
+    // instead of being silently dropped (a dropped write is a false-PROVE
+    // generator: the later `Load` of the same alloca returns the PRE-store value).
+    ptr_provenance: BTreeMap<ValueId, PtrProvenance>,
+    // Alloca bases whose interior address reached an operand position this
+    // translator does not model (a call argument, a stored *value*, a `Select`,
+    // an instruction whose reads are not statically enumerable, …). A store
+    // through a pointer with no provenance may alias exactly these, so it
+    // invalidates them. Recorded in instruction order, which is sound because a
+    // cell only exists in the block that allocas it (`stack_cells` is cleared per
+    // block) and promoted cells are alias-free by construction, so a pointer used
+    // by a store cannot have captured an address that escapes only later.
+    escaped_cell_bases: BTreeSet<ValueId>,
     ptr_parts: BTreeMap<ValueId, (Expr, Expr)>,
+    // Deterministic slice-length metadata per SSA fat value: the real
+    // fat-pointer metadata IS a function of the value, so every `PtrMetadata`
+    // read of the SAME `ValueId` must yield the SAME symbol — otherwise a
+    // producer-asserted length fact (e.g. trust-ir-bridge's faithful `&str`
+    // constant, `Assume(PtrMetadata(v) == len)`) constrains one fresh symbol
+    // while a later `s.len()` read of the same value mints another,
+    // unconstrained one, and the fact is silently inert. Keyed by the PTR
+    // value id, so distinct values keep independent symbols (no cross-value
+    // equality is ever asserted) and `ptr_parts`-backed values keep their
+    // exact expression (checked first, unchanged). Sound both ways: reusing
+    // one symbol per value only removes valuations in which one value has two
+    // metadata readings — no real execution is excluded.
+    ptr_metadata_syms: BTreeMap<ValueId, Expr>,
     block_param_bindings: BTreeMap<BlockId, Vec<ValueBinding>>,
     // Immutable function parameters (entry-block params), threaded through every
     // block relation so dominance-scoped uses in downstream blocks resolve to the
@@ -233,6 +262,54 @@ struct AggregateValue {
 struct StackCell {
     ty: Ty,
     value: ValueBinding,
+}
+
+/// Where an interior pointer points: the `Alloca` result it derives from, plus the
+/// aggregate lanes whose declared layout proves exact byte identity. `lanes == None`
+/// means the byte offset cannot be identified with one non-overlapping field (a
+/// symbolic or multi-index `GEP`, a struct with missing/mismatched layout evidence,
+/// or an unsupported aggregate), so the pointer may target ANY part of `base`.
+#[derive(Debug, Clone)]
+struct PtrProvenance {
+    base: ValueId,
+    /// `(field index, the GEP's own `pointee_ty`)` per step. TrustIR GEP is
+    /// single-scale byte arithmetic: `index * size_of(pointee_ty)`, not a generic
+    /// struct-field selector. A step is recorded only when explicit TrustIR layout
+    /// evidence proves that byte offset names exactly that non-overlapping field
+    /// (or when an array's element layout proves the same fact). Any unevidenced
+    /// step degrades to havoc.
+    lanes: Option<Vec<(usize, Ty)>>,
+}
+
+/// What `model_indirect_store` did with a `Store` that `translate_stack_store` could
+/// not apply directly. There is deliberately NO "dropped" variant: dropping a write
+/// while a precise cell for its target survives is the fail-open that lets the
+/// verifier read back a value the function already overwrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndirectStoreOutcome {
+    /// The write landed exactly, on the base cell or on one constant field lane.
+    Exact,
+    /// The write was over-approximated: every cell it could target was reset to a
+    /// fresh unconstrained value. Sound, imprecise.
+    Invalidated,
+    /// The store provably cannot reach any surviving precise cell (no provenance
+    /// into a tracked alloca, and no tracked cell's address has escaped), so there
+    /// is nothing to update or invalidate.
+    NoTrackedTarget,
+}
+
+/// Result of an exact-or-unknown CFG reachability query used by
+/// per-obligation narrowing.
+///
+/// `ProvenUnreachable` is authority-bearing: it is the only result that may
+/// suppress an unsupported-semantics error rule. Missing blocks, dangling
+/// successor ids, duplicate block ids, or malformed/unsupported terminators
+/// produce `Unknown`, which keeps the rule and therefore fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfgReachability {
+    Reachable,
+    ProvenUnreachable,
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -287,7 +364,10 @@ impl<'a> ChcFuncTranslator<'a> {
             stack_cells: BTreeMap::new(),
             stack_ptrs: BTreeSet::new(),
             valid_ref_ptrs: BTreeSet::new(),
+            ptr_provenance: BTreeMap::new(),
+            escaped_cell_bases: BTreeSet::new(),
             ptr_parts: BTreeMap::new(),
+            ptr_metadata_syms: BTreeMap::new(),
             block_param_bindings: BTreeMap::new(),
             threaded_params: Vec::new(),
             block_threaded_params: BTreeMap::new(),
@@ -870,6 +950,8 @@ impl<'a> ChcFuncTranslator<'a> {
         self.aggregates.clear();
         self.stack_cells.clear();
         self.stack_ptrs.clear();
+        self.ptr_provenance.clear();
+        self.escaped_cell_bases.clear();
         // Bind the threaded immutable-parameter prefix first so a block's own
         // params (which redeclare a threaded id on a back-edge) win on conflict.
         if let (Some(threaded), Some(bindings)) = (
@@ -933,6 +1015,7 @@ impl<'a> ChcFuncTranslator<'a> {
         from: &RelationApp,
         path_constraints: &mut Vec<Expr>,
     ) -> bool {
+        self.record_interior_pointer_escapes(&node.inst);
         match &node.inst {
             Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
                 self.translate_integer_binop(*op, ty, *lhs, *rhs, node, from, path_constraints);
@@ -1319,6 +1402,14 @@ impl<'a> ChcFuncTranslator<'a> {
             }
             Inst::Store { ty, ptr, value, volatile, .. } => {
                 if *volatile || !self.translate_stack_store(ty, *ptr, *value) {
+                    // The direct (alloca-keyed) update did not apply. Before any
+                    // suppression is considered, the write must still be MODELED:
+                    // a store through an interior pointer (`&mut local.field`, a
+                    // `GEP` off the alloca, a borrow of either) targets a tracked
+                    // cell that `translate_stack_store` cannot see, and dropping it
+                    // leaves the following `Load` returning the PRE-store value.
+                    let outcome = self.model_indirect_store(*volatile, ty, *ptr, *value);
+
                     // A store annotated `ValidBorrow` is through a SAFE `&mut`
                     // reference: the borrow checker guarantees the access is valid,
                     // so an unknown-address reference store is sound to leave
@@ -1328,9 +1419,34 @@ impl<'a> ChcFuncTranslator<'a> {
                     // checked at its defining instruction. This is what lets
                     // `for x in s.iter_mut() { *x = … }` verify. A raw-pointer store
                     // (no annotation) stays fail-closed.
+                    //
+                    // `ValidBorrow` asserts the BORROW is valid; it is NOT an
+                    // assertion that the WRITE was modeled, and it may not suppress
+                    // the fail-close on that second question. `stale_cell` is the
+                    // enforcement: `NoTrackedTarget` claims no precise cell could
+                    // have been changed, so if one reachable from this pointer is
+                    // nonetheless still standing (holding its PRE-store value), the
+                    // claim is wrong — report unsupported no matter what annotations
+                    // say. `Exact`/`Invalidated` already rewrote the cell.
+                    let stale_cell = outcome == IndirectStoreOutcome::NoTrackedTarget
+                        && self.store_target_cell_survives(*ptr);
                     let valid_reference = node.proofs.contains(&ProofAnnotation::ValidBorrow);
-                    let known_stack = self.stack_ptrs.contains(ptr);
-                    if self.options.check_memory_bounds && !valid_reference && !known_stack {
+                    // Owned stack memory: the alloca itself, or an interior pointer
+                    // whose whole offset is a constant field-lane chain rooted at an
+                    // alloca (in-bounds by construction — the producer derives each
+                    // lane from a type-directed field walk). Recognizing the latter
+                    // is what makes the fail-close depend on whether the WRITE WAS
+                    // MODELED rather than on whether a `ValidBorrow` annotation
+                    // happens to be present. An unknown offset keeps `lanes: None`
+                    // and still fails closed.
+                    let known_stack = self.stack_ptrs.contains(ptr)
+                        || self
+                            .ptr_provenance
+                            .get(ptr)
+                            .is_some_and(|provenance| provenance.lanes.is_some());
+                    if self.options.check_memory_bounds
+                        && (stale_cell || (!valid_reference && !known_stack))
+                    {
                         self.add_unsupported_error(
                             block,
                             instruction_index,
@@ -1368,9 +1484,42 @@ impl<'a> ChcFuncTranslator<'a> {
                 // poisons the function's single shared `ERROR` relation and
                 // false-counterexamples EVERY obligation — e.g. the otherwise→
                 // Unreachable of a field-carrying enum match (derived `Debug::fmt`).
-                let gep_safe = if let Inst::GEP { base, .. } = &node.inst {
+                // An atomic store writes memory like any other store. Its value is
+                // never modeled, but it must still not leave a tracked cell holding
+                // its PRE-store value. The fail-close below is gated on
+                // `check_memory_bounds`; cell invalidation is not, because turning
+                // off a DIAGNOSTIC must never turn on a stale read.
+                if let Inst::AtomicStore { ptr, .. } = &node.inst {
+                    self.invalidate_store_targets(*ptr);
+                }
+                let gep_safe = if let Inst::GEP { base, indices, pointee_ty, .. } = &node.inst {
                     let ptr = self.fresh_symbolic("gep_ptr", &Ty::Ptr);
                     self.bind_first_result(node, ptr);
+                    // Extend the interior-pointer provenance chain. TrustIR GEP is
+                    // `base + sum(indices) * size_of(pointee_ty)`, so a constant
+                    // index names an aggregate lane ONLY when declared layout proves
+                    // its byte offset is exactly one non-overlapping field start (or
+                    // the current aggregate is an array with the matching element
+                    // stride). A missing/mismatched layout, symbolic, multi-index, or
+                    // out-of-range step keeps the base but drops to "unknown offset",
+                    // making a later store havoc the whole cell rather than silently
+                    // update the wrong lane.
+                    if let Some(base_provenance) = self.ptr_provenance.get(base).cloned()
+                        && let Some(result) = node.results.first()
+                    {
+                        let lanes = base_provenance.lanes.and_then(|lanes| {
+                            let [index] = indices[..] else { return None };
+                            let field = self.constant_lane_index(index)?;
+                            self.extend_exact_gep_lanes(
+                                base_provenance.base,
+                                lanes,
+                                field,
+                                pointee_ty,
+                            )
+                        });
+                        self.ptr_provenance
+                            .insert(*result, PtrProvenance { base: base_provenance.base, lanes });
+                    }
                     let safe = self.valid_ref_ptrs.contains(base) || self.stack_ptrs.contains(base);
                     if safe && let Some(result) = node.results.first() {
                         // Propagate safe provenance so nested projections (`&self.a.b`)
@@ -1424,7 +1573,24 @@ impl<'a> ChcFuncTranslator<'a> {
                     // is a realizable length, so this neither over- nor under-approximates.
                     // Gated to `U64` so a `dyn Trait` vtable pointer (Ty::Ptr) is NOT
                     // mis-bounded — it keeps the opaque-unsupported path below.
-                    let metadata = self.fresh_symbolic("slice_len", metadata_ty);
+                    //
+                    // DETERMINISTIC per SSA value (`ptr_metadata_syms`): the real
+                    // metadata is a function of the fat value, so repeated reads
+                    // of the SAME `ValueId` reuse one symbol. This is what lets a
+                    // producer-asserted exact length (`Assume(PtrMetadata(v) ==
+                    // len)`, the faithful `&str`-constant lowering) bind every
+                    // later `s.len()` read of the same value in the same clause
+                    // scope, instead of evaporating against a fresh symbol. The
+                    // isize::MAX bound is (re-)pushed at EVERY read site because
+                    // path constraints are per-clause, not per-symbol.
+                    let metadata = match self.ptr_metadata_syms.get(ptr) {
+                        Some(existing) => existing.clone(),
+                        None => {
+                            let fresh = self.fresh_symbolic("slice_len", metadata_ty);
+                            self.ptr_metadata_syms.insert(*ptr, fresh.clone());
+                            fresh
+                        }
+                    };
                     let isize_max = Expr::bitvec_const(i64::MAX as i128, 64);
                     path_constraints.push(metadata.clone().bvule(isize_max));
                     metadata
@@ -1500,6 +1666,80 @@ impl<'a> ChcFuncTranslator<'a> {
                             return false;
                         }
                     }
+                } else if matches!(op, CastOp::Bitcast)
+                    && is_pointer_width_unsigned_ty(src_ty)
+                    && !is_thin_pointer_ty(dst_ty)
+                {
+                    // usize -> NonNull<T> (the `fmt::Arguments` bit-packing): at the
+                    // pinned 64-bit target both sides are the SAME BV64 bits, so wrap
+                    // the integer as the newtype's address leaf. No validity or
+                    // provenance is asserted — a later deref carries its own
+                    // obligation; only the round-trip bit identity is modeled.
+                    if let Some(path) =
+                        pointer_newtype_field_path(dst_ty, self.module, POINTER_NEWTYPE_FUEL)
+                        && !path.is_empty()
+                    {
+                        let bits = self.resolve(*operand, src_ty);
+                        if let Some(agg) = self.wrap_pointer_newtype(bits, dst_ty, &path) {
+                            self.bind_aggregate_result(node, agg, dst_ty);
+                            return false;
+                        }
+                    }
+                } else if matches!(op, CastOp::Bitcast)
+                    && is_pointer_width_unsigned_ty(dst_ty)
+                    && !is_thin_pointer_ty(src_ty)
+                {
+                    // NonNull<T> -> usize (the unpack): the address leaf IS the
+                    // integer's bits. `!path.is_empty()` keeps a bare thin-pointer
+                    // source out of this leg — its honest spelling stays `PtrToInt`.
+                    if let Some(path) =
+                        pointer_newtype_field_path(src_ty, self.module, POINTER_NEWTYPE_FUEL)
+                        && !path.is_empty()
+                        && let Some(bits) = self.unwrap_pointer_newtype(*operand, src_ty, &path)
+                    {
+                        self.bind_first_result(node, bits);
+                        return false;
+                    }
+                }
+                // Same-type fat->fat reinterpret (`&str -> &[u8]` — identical
+                // trust-ir spelling): identity on the BV64 data value. The
+                // (data, metadata) parts and the deterministic `slice_len`
+                // symbol are FORWARDED so a metadata read through the cast is
+                // the same length as through the original value (true of the
+                // real fat pointer: the cast does not change it). Forwarding
+                // only copies an EXISTING binding — if the operand has none,
+                // both values independently havoc (weaker, still sound).
+                if matches!(op, CastOp::Bitcast | CastOp::PtrToPtr)
+                    && src_ty == dst_ty
+                    && matches!(src_ty, Ty::FatPtr(_))
+                {
+                    let value = self.resolve(*operand, src_ty);
+                    self.bind_first_result(node, value);
+                    if let Some(result) = node.results.first().copied() {
+                        if let Some(parts) = self.ptr_parts.get(operand).cloned() {
+                            self.ptr_parts.insert(result, parts);
+                        }
+                        if let Some(sym) = self.ptr_metadata_syms.get(operand).cloned() {
+                            self.ptr_metadata_syms.insert(result, sym);
+                        }
+                    }
+                    return false;
+                }
+                // Fat -> thin (`*const [u8] -> *const u8`, the `as_ptr` leg): a
+                // fat value's SSA expression IS its data lane (the
+                // `PtrFromParts` convention), so the thin result is exactly
+                // that data pointer. Metadata is dropped, never transferred.
+                if matches!(op, CastOp::Bitcast | CastOp::PtrToPtr)
+                    && matches!(src_ty, Ty::FatPtr(_))
+                    && is_thin_pointer_ty(dst_ty)
+                {
+                    let data = self
+                        .ptr_parts
+                        .get(operand)
+                        .map(|(data, _)| data.clone())
+                        .unwrap_or_else(|| self.resolve(*operand, src_ty));
+                    self.bind_first_result(node, data);
+                    return false;
                 }
                 if let Some(result) = self.eval_cast(*op, src_ty, dst_ty, *operand) {
                     self.bind_first_result(node, result);
@@ -1771,6 +2011,14 @@ impl<'a> ChcFuncTranslator<'a> {
                         self.ptr_parts.insert(*result_id, parts);
                     }
                 }
+                // A borrow is a transparent alias, so it inherits the referent's
+                // interior-pointer provenance verbatim. Without this, `*(&mut local)`
+                // and `*(&mut local.field)` lose their base and the write is dropped.
+                if let Some(provenance) = self.ptr_provenance.get(ptr).cloned()
+                    && let Some(result_id) = node.results.first()
+                {
+                    self.ptr_provenance.insert(*result_id, provenance);
+                }
                 false
             }
             Inst::IsUnique { .. } => {
@@ -1853,6 +2101,9 @@ impl<'a> ChcFuncTranslator<'a> {
         // lets the opaque iterator-adapter structs (`Rev<Iter>`, …) — stored to a
         // stack slot to take the `&mut` for `next()` — not fail closed.
         self.stack_ptrs.insert(result);
+        // Root of the interior-pointer provenance chain: the alloca points at
+        // itself, at the empty lane path (the whole cell).
+        self.ptr_provenance.insert(result, PtrProvenance { base: result, lanes: Some(Vec::new()) });
         if count.is_some() {
             return;
         }
@@ -1901,6 +2152,331 @@ impl<'a> ChcFuncTranslator<'a> {
         };
         cell.value = value_binding;
         true
+    }
+
+    /// The constant field/element lane a `GEP` index denotes, or `None` when the
+    /// index is symbolic (or too large to be a lane).
+    fn constant_lane_index(&self, index: ValueId) -> Option<usize> {
+        match self.values.get(&index)?.value() {
+            ay_bindings::ExprValue::BitVecConst { value, .. } => {
+                value.to_string().parse::<usize>().ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Extend an exact aggregate-lane path by one TrustIR GEP step.
+    ///
+    /// TrustIR GEP is byte arithmetic with one repeated scale, not LLVM-style
+    /// structural field walking. Re-walk the retained path defensively and require
+    /// exact layout evidence at every step; otherwise the caller records an unknown
+    /// offset and a later store havocs the whole cell.
+    fn extend_exact_gep_lanes(
+        &self,
+        base: ValueId,
+        mut lanes: Vec<(usize, Ty)>,
+        field: usize,
+        pointee_ty: &Ty,
+    ) -> Option<Vec<(usize, Ty)>> {
+        let mut lane_ty = self.stack_cells.get(&base)?.ty.clone();
+        for (prior_field, prior_pointee_ty) in &lanes {
+            lane_ty = self.exact_gep_lane_ty(&lane_ty, *prior_field, prior_pointee_ty)?;
+        }
+        self.exact_gep_lane_ty(&lane_ty, field, pointee_ty)?;
+        lanes.push((field, pointee_ty.clone()));
+        Some(lanes)
+    }
+
+    /// Aggregate lane selected exactly by one single-scale GEP step.
+    ///
+    /// Struct precision requires complete declared byte layout: every field must
+    /// have an offset and a layout, every range must fit the struct, no starts may
+    /// alias, and no byte ranges may overlap. The selected field's declared start
+    /// must equal `field * size_of(pointee_ty)`. Missing metadata is not evidence
+    /// and therefore returns `None`. Arrays carry their own exact element stride
+    /// and remain precise when it agrees with the pointee layout.
+    fn exact_gep_lane_ty(&self, aggregate_ty: &Ty, field: usize, pointee_ty: &Ty) -> Option<Ty> {
+        let field_tys = self.aggregate_field_tys(aggregate_ty)?;
+        let field_ty = field_tys.get(field)?;
+        if field_ty != pointee_ty {
+            return None;
+        }
+
+        let pointee_layout = self.module.ty_layout_shape(pointee_ty).ok()?;
+        if pointee_layout.size_bits == 0 || pointee_layout.size_bits % 8 != 0 {
+            return None;
+        }
+        let gep_offset_bits = pointee_layout.size_bits.checked_mul(u64::try_from(field).ok()?)?;
+
+        match aggregate_ty {
+            Ty::Struct(id) => {
+                let aggregate_layout = self.module.ty_layout_shape(aggregate_ty).ok()?;
+                let definition =
+                    self.module.structs.iter().find(|definition| definition.id == *id)?;
+                if definition.fields.len() != field_tys.len() {
+                    return None;
+                }
+
+                let mut ranges = Vec::with_capacity(definition.fields.len());
+                for (index, definition_field) in definition.fields.iter().enumerate() {
+                    if definition_field.ty != field_tys[index] {
+                        return None;
+                    }
+                    let start = definition_field.offset?.checked_mul(8)?;
+                    let size = self.module.ty_layout_shape(&definition_field.ty).ok()?.size_bits;
+                    let end = start.checked_add(size)?;
+                    if end > aggregate_layout.size_bits {
+                        return None;
+                    }
+                    ranges.push((start, end));
+                }
+
+                // The logical field identity must be unique at the selected byte
+                // address and the aggregate binding must not hide byte aliases.
+                for left in 0..ranges.len() {
+                    for right in (left + 1)..ranges.len() {
+                        let (left_start, left_end) = ranges[left];
+                        let (right_start, right_end) = ranges[right];
+                        if left_start == right_start
+                            || (left_start < right_end && right_start < left_end)
+                        {
+                            return None;
+                        }
+                    }
+                }
+
+                if ranges[field].0 != gep_offset_bits {
+                    return None;
+                }
+                Some(field_ty.clone())
+            }
+            Ty::Array(element, len) => {
+                if u64::try_from(field).ok()? >= *len {
+                    return None;
+                }
+                let element_ty = self.module.types.get(element.as_usize())?;
+                if element_ty != pointee_ty {
+                    return None;
+                }
+                let aggregate_layout = self.module.ty_layout_shape(aggregate_ty).ok()?;
+                let trust_ir::TyLayoutKind::Array { stride_bits, .. } = aggregate_layout.kind
+                else {
+                    return None;
+                };
+                if stride_bits != pointee_layout.size_bits {
+                    return None;
+                }
+                Some(field_ty.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Model a `Store` that `translate_stack_store` could not apply directly.
+    ///
+    /// SOUNDNESS CONTRACT — this is the fix for the fail-open that let a write
+    /// through `&mut local.field` be silently dropped while the alloca's precise
+    /// `stack_cell` survived, so the next `Load` of that alloca returned the
+    /// PRE-store aggregate and any obligation over it was discharged against a
+    /// stale value (a false PROVE, emitted with no diagnostic at all).
+    ///
+    /// Every reachable path either writes the cell exactly, resets to fresh
+    /// unconstrained every cell the store could possibly target, or establishes
+    /// that no tracked cell is reachable from the store's pointer. There is no
+    /// path that leaves a tracked cell holding a pre-store value.
+    fn model_indirect_store(
+        &mut self,
+        volatile: bool,
+        ty: &Ty,
+        ptr: ValueId,
+        value: ValueId,
+    ) -> IndirectStoreOutcome {
+        // A volatile store's written value is not the modeled one, so it can only
+        // ever havoc; otherwise try the exact field lane first.
+        if !volatile
+            && let Some(provenance) = self.ptr_provenance.get(&ptr).cloned()
+            && let Some(lanes) = provenance.lanes
+            && self.stack_cells.contains_key(&provenance.base)
+            && self.store_cell_lane(provenance.base, &lanes, ty, value)
+        {
+            return IndirectStoreOutcome::Exact;
+        }
+        self.invalidate_store_targets(ptr)
+    }
+
+    /// Reset every precise cell a store through `ptr` could target. Used when the
+    /// written value cannot be placed exactly — an unknown offset, a mismatched
+    /// type, a volatile or atomic store — and as the fallback of
+    /// `model_indirect_store`.
+    fn invalidate_store_targets(&mut self, ptr: ValueId) -> IndirectStoreOutcome {
+        if let Some(provenance) = self.ptr_provenance.get(&ptr).cloned() {
+            // The referent is known exactly, so nothing else can be affected.
+            if !self.stack_cells.contains_key(&provenance.base) {
+                // Stack memory carrying no precise cell (an opaque aggregate):
+                // there is no tracked value to go stale.
+                return IndirectStoreOutcome::NoTrackedTarget;
+            }
+            self.invalidate_stack_cell(provenance.base);
+            return IndirectStoreOutcome::Invalidated;
+        }
+
+        // The referent is unknown, so the store may alias any cell whose interior
+        // address escaped this translator's model. Reset exactly those. When
+        // nothing escaped, no tracked cell is reachable and leaving the write
+        // unmodeled is sound.
+        let targets: Vec<ValueId> = self
+            .escaped_cell_bases
+            .iter()
+            .copied()
+            .filter(|base| self.stack_cells.contains_key(base))
+            .collect();
+        if targets.is_empty() {
+            return IndirectStoreOutcome::NoTrackedTarget;
+        }
+        for base in targets {
+            self.invalidate_stack_cell(base);
+        }
+        IndirectStoreOutcome::Invalidated
+    }
+
+    /// Write `value` into the constant field lane `lanes` of `base`'s cell.
+    ///
+    /// The lane mapping is revalidated here. It is cross-checked three ways, and
+    /// any disagreement returns `false` so the caller falls back to havoc:
+    ///   1. every GEP step must carry exact declared layout evidence making
+    ///      TrustIR's byte stride coincide with a unique, non-overlapping aggregate
+    ///      lane (or an exact array element stride);
+    ///   2. the cell's type is walked with `aggregate_field_tys` — the SAME table
+    ///      `fresh_stack_cell_value` built the binding from and the `Load`/
+    ///      `ExtractField` path reads it back through;
+    ///   3. the stored type must equal the final lane type, and the binding tree
+    ///      must actually have an aggregate node at every step.
+    fn store_cell_lane(
+        &mut self,
+        base: ValueId,
+        lanes: &[(usize, Ty)],
+        ty: &Ty,
+        value: ValueId,
+    ) -> bool {
+        let Some(cell_ty) = self.stack_cells.get(&base).map(|cell| cell.ty.clone()) else {
+            return false;
+        };
+
+        let mut lane_ty = cell_ty;
+        for (field, pointee_ty) in lanes {
+            let Some(next) = self.exact_gep_lane_ty(&lane_ty, *field, pointee_ty) else {
+                return false;
+            };
+            lane_ty = next;
+        }
+        if lane_ty != *ty {
+            return false;
+        }
+
+        let new_binding = if self.aggregate_field_tys(ty).is_some() {
+            let Some(aggregate) = self.resolve_aggregate(value, ty) else {
+                return false;
+            };
+            ValueBinding::Aggregate(aggregate)
+        } else if is_precise_stack_scalar_ty(ty) {
+            ValueBinding::Scalar(self.resolve(value, ty))
+        } else {
+            return false;
+        };
+
+        let Some(cell) = self.stack_cells.get_mut(&base) else {
+            return false;
+        };
+        let mut slot = &mut cell.value;
+        for (field, _) in lanes {
+            let ValueBinding::Aggregate(aggregate) = slot else {
+                return false;
+            };
+            let Some(next) = aggregate.fields.get_mut(*field) else {
+                return false;
+            };
+            slot = next;
+        }
+        *slot = new_binding;
+        true
+    }
+
+    /// Reset a cell to a fresh unconstrained value (havoc). Keeps the cell PRESENT
+    /// with the same shape when possible, because a promoted cell's binding is part
+    /// of its block relation's signature; only a cell whose type can no longer be
+    /// given a fresh binding is dropped (a later `Load` then havocs anyway).
+    fn invalidate_stack_cell(&mut self, base: ValueId) {
+        let Some(cell_ty) = self.stack_cells.get(&base).map(|cell| cell.ty.clone()) else {
+            return;
+        };
+        match self.fresh_stack_cell_value(&cell_ty) {
+            Some(value) => {
+                if let Some(cell) = self.stack_cells.get_mut(&base) {
+                    cell.value = value;
+                }
+            }
+            None => {
+                self.stack_cells.remove(&base);
+            }
+        }
+    }
+
+    /// Does a store through `ptr` still have a precise cell it could have changed?
+    ///
+    /// This is the enforcement half of the invariant "no store is silently dropped
+    /// while a precise cell for its base survives": `model_indirect_store` is
+    /// supposed to make this false, and the `Store` arm fails CLOSED whenever it is
+    /// still true. A future edit that reintroduces a drop therefore produces a loud
+    /// `MemoryAccessWithoutPreciseModel`, never a quiet stale read.
+    fn store_target_cell_survives(&self, ptr: ValueId) -> bool {
+        match self.ptr_provenance.get(&ptr) {
+            Some(provenance) => self.stack_cells.contains_key(&provenance.base),
+            None => self.escaped_cell_bases.iter().any(|base| self.stack_cells.contains_key(base)),
+        }
+    }
+
+    /// Mark the base of every interior pointer this instruction uses in a position
+    /// the cell model does not follow. Such a pointer may resurface as an unknown
+    /// store target later in the block, so its cell must then be invalidated.
+    ///
+    /// Mirrors `compute_promotable_cells`' alias rule: the `ptr` of a memory op, the
+    /// base of a `GEP`, and the referent of a borrow are TRACKED positions (their
+    /// provenance is propagated); a `Store`'s *value*, a call argument, a `Select`
+    /// operand, a block argument, and every use inside an instruction whose reads
+    /// are not statically enumerable are escapes.
+    fn record_interior_pointer_escapes(&mut self, inst: &Inst) {
+        if self.ptr_provenance.is_empty() {
+            return;
+        }
+        let mut uses = Vec::new();
+        if collect_inst_value_uses(inst, &mut uses) {
+            // Reads not statically enumerable: assume every interior pointer escaped.
+            let all: Vec<ValueId> = self.ptr_provenance.values().map(|p| p.base).collect();
+            self.escaped_cell_bases.extend(all);
+            return;
+        }
+        // Selected POSITIONALLY, not by membership: `store p, p` must still count
+        // the value position as an escape even though the same id is the tracked
+        // pointer operand.
+        let escaping = match inst {
+            // The sole operand is the tracked pointer.
+            Inst::Load { .. }
+            | Inst::AtomicLoad { .. }
+            | Inst::Borrow { .. }
+            | Inst::BorrowMut { .. }
+            | Inst::EndBorrow { .. }
+            | Inst::Dealloc { .. } => Vec::new(),
+            // `ptr` is tracked; the written VALUE puts a pointer into memory.
+            Inst::Store { value, .. } | Inst::AtomicStore { value, .. } => vec![*value],
+            // `base` is tracked; an index is an ordinary operand.
+            Inst::GEP { indices, .. } => indices.clone(),
+            _ => uses,
+        };
+        for used in escaping {
+            if let Some(provenance) = self.ptr_provenance.get(&used) {
+                self.escaped_cell_bases.insert(provenance.base);
+            }
+        }
     }
 
     fn fresh_stack_cell_value(&mut self, ty: &Ty) -> Option<ValueBinding> {
@@ -2913,7 +3489,120 @@ impl<'a> ChcFuncTranslator<'a> {
             reason,
             result_values: node.results.clone(),
         });
+        // PER-OBLIGATION NARROWING. In whole-function mode (narrow_to_target_block
+        // = None, the default everywhere today) this rule is always added, so a
+        // single unmodeled construct makes `error` reachable and sinks EVERY
+        // obligation of the function. When the caller is asking about ONE
+        // obligation whose assertion lives in `target`, an unsupported construct
+        // that cannot lie on an entry ->* site ->* target path cannot influence
+        // the states reaching that assertion — so its error rule would only
+        // poison a sibling obligation, never this one.
+        //
+        // SOUNDNESS: the exclusion fires ONLY when the site is provably OFF every
+        // entry->target path. Any uncertainty (unknown terminator, absent block,
+        // the site IS the target) leaves `site_can_precede_target` = true and the
+        // rule is added — over-approximate, never under. It can only DROP a rule
+        // that is irrelevant to this obligation; it can never mask a real
+        // violation, so it cannot produce a false PROVE.
+        if let Some(target) = self.options.narrow_to_target_block
+            && !self.site_can_precede_target(block, target)
+        {
+            return;
+        }
         self.add_error_rule(from, path_constraints, Expr::true_());
+    }
+
+    /// Can an unsupported construct in `site` lie on an entry ->* site ->* target
+    /// path? True (include the rule) on ANY uncertainty. Only a site provably
+    /// unreachable-to-target OR unreachable-from-entry returns false.
+    fn site_can_precede_target(&self, site: BlockId, target: BlockId) -> bool {
+        let entry = self.func.entry;
+        // The site is irrelevant when EITHER half of
+        // `entry ->* site ->* target` is proven impossible. Unknown is not a
+        // proof: malformed or incomplete CFG information always keeps the rule.
+        !matches!(
+            (Self::cfg_reaches(self.func, entry, site), Self::cfg_reaches(self.func, site, target),),
+            (CfgReachability::ProvenUnreachable, _) | (_, CfgReachability::ProvenUnreachable)
+        )
+    }
+
+    /// Exact-or-unknown forward reachability over the TrustIR CFG.
+    ///
+    /// `ProvenUnreachable` requires a complete traversal of every block
+    /// reachable from `from`, with exactly one known terminator at the end of
+    /// each block and every successor resolving to exactly one block. Any
+    /// malformed or unsupported shape encountered on that reachable frontier
+    /// yields `Unknown`. Finding `to` is conclusive even if another frontier is
+    /// malformed, because narrowing keeps rules for `Reachable` and `Unknown`
+    /// alike.
+    fn cfg_reaches(func: &Function, from: BlockId, to: BlockId) -> CfgReachability {
+        let mut blocks = BTreeMap::new();
+        for block in &func.blocks {
+            if blocks.insert(block.id, block).is_some() {
+                return CfgReachability::Unknown;
+            }
+        }
+        if !blocks.contains_key(&from) || !blocks.contains_key(&to) {
+            return CfgReachability::Unknown;
+        }
+        if from == to {
+            return CfgReachability::Reachable;
+        }
+
+        let mut stack = vec![from];
+        let mut seen = BTreeSet::new();
+        let mut incomplete = false;
+        while let Some(b) = stack.pop() {
+            if !seen.insert(b) {
+                continue;
+            }
+            let Some(block) = blocks.get(&b) else {
+                incomplete = true;
+                continue;
+            };
+
+            let Some((terminator, prefix)) = block.body.split_last() else {
+                incomplete = true;
+                continue;
+            };
+            if prefix.iter().any(|node| node.inst.is_terminator()) {
+                incomplete = true;
+                continue;
+            }
+            let successors = match &terminator.inst {
+                Inst::Br { target, .. } => vec![*target],
+                Inst::CondBr { then_target, else_target, .. } => {
+                    vec![*then_target, *else_target]
+                }
+                Inst::Switch { default, cases, .. } => {
+                    let mut successors = vec![*default];
+                    successors.extend(cases.iter().map(|case| case.target));
+                    successors
+                }
+                Inst::Invoke { normal_dest, unwind_dest, .. } => {
+                    vec![*normal_dest, *unwind_dest]
+                }
+                Inst::Return { .. }
+                | Inst::CoroSuspend { .. }
+                | Inst::Resume { .. }
+                | Inst::Unreachable => Vec::new(),
+                _ => {
+                    incomplete = true;
+                    continue;
+                }
+            };
+            for successor in successors {
+                if successor == to {
+                    return CfgReachability::Reachable;
+                }
+                if blocks.contains_key(&successor) {
+                    stack.push(successor);
+                } else {
+                    incomplete = true;
+                }
+            }
+        }
+        if incomplete { CfgReachability::Unknown } else { CfgReachability::ProvenUnreachable }
     }
 
     fn add_global_unsupported_error(&mut self, reason: TrustIrChcUnsupportedReason) {
@@ -3166,6 +3855,15 @@ impl<'a> ChcFuncTranslator<'a> {
                 | BinOp::FRem
                 | BinOp::FMin
                 | BinOp::FMax => self.fresh_symbolic("float_on_int", ty),
+                // Trust: the BOOLEAN connectives (trust-ir 4b06918) on an INTEGER
+                // type are ill-typed IR -- trust-ir's validator admits them on Bool
+                // (or bool-vector) only. Same fail-closed treatment as float-on-int:
+                // a fresh, unconstrained symbolic, never a plausible bit-level
+                // reading of a program that should have been rejected. Mirrors
+                // `translate::eval_binop`.
+                BinOp::BAnd | BinOp::BOr | BinOp::BXor => {
+                    self.fresh_symbolic("bool_connective_on_int", ty)
+                }
             }
         } else if matches!(ty, Ty::Bool) {
             // `And`/`Or`/`Xor` on a `Bool`-typed value are LOGICAL connectives, not
@@ -3188,7 +3886,24 @@ impl<'a> ChcFuncTranslator<'a> {
                     .clone()
                     .try_ne(rhs.clone())
                     .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
-                _ => self.fresh_symbolic("binop_result", ty),
+// Trust: the DEDICATED boolean connectives (trust-ir 4b06918) -- the same
+                // logical semantics as the `And`/`Or`/`Xor` arms above, which MIR
+                // reaches only through opcode overloading. Explicit arms, not the
+                // catch-all: havocing them to a fresh symbolic would discard exactly
+                // the boolean structure this branch exists to preserve for the CHC.
+                BinOp::BAnd => lhs
+                    .clone()
+                    .try_and(rhs.clone())
+                    .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
+                BinOp::BOr => lhs
+                    .clone()
+                    .try_or(rhs.clone())
+                    .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
+                BinOp::BXor => lhs
+                    .clone()
+                    .try_ne(rhs.clone())
+                    .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
+                                _ => self.fresh_symbolic("binop_result", ty),
             }
         } else {
             self.fresh_symbolic("binop_result", ty)
@@ -3639,6 +4354,98 @@ fn aggregate_field_tys_of(module: &Module, ty: &Ty) -> Option<Vec<Ty>> {
     immediate_aggregate_field_tys(module, ty)
 }
 
+/// Whether proof-grade native ingestion may admit a metadata-less, single-cell
+/// `Alloca` without importing source authority.
+///
+/// This deliberately mirrors the CHC translator's tracked-versus-opaque split.
+/// A precise scalar or trackable aggregate is admitted only when its pointer is
+/// used exclusively in its defining block as the direct operand of same-type,
+/// non-volatile loads and stores with no caller-asserted alignment, and every
+/// load follows a store. That prevents an uninitialized read, alias, volatile
+/// access, unsupported alignment claim, or type-punning write from entering the
+/// proof lane. The same structural restriction is deliberately
+/// retained for opaque aggregates even though their loads are already fresh
+/// havoc: proof-grade ingestion does not silently widen the allocation-lifetime
+/// surface merely because the value model is imprecise. The translator's
+/// independent indirect-store invalidation remains a second line of defense
+/// rather than an admission premise.
+pub fn single_cell_alloca_is_admissible(
+    function: &Function,
+    alloca_result: ValueId,
+    ty: &Ty,
+) -> bool {
+    let aggregate = matches!(
+        ty,
+        Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, _) | Ty::Unit | Ty::Closure(_) | Ty::Enum(_)
+    );
+    if !is_precise_stack_scalar_ty(ty) && !aggregate {
+        return false;
+    }
+
+    let result = alloca_result.index();
+    let Some(definition_block) = function.blocks.iter().find_map(|block| {
+        block
+            .body
+            .iter()
+            .any(|node| {
+                node.results.iter().any(|value| value.index() == result)
+                    && matches!(
+                        &node.inst,
+                        Inst::Alloca { ty: cell_ty, count: None, align: None } if cell_ty == ty
+                    )
+            })
+            .then_some(block.id)
+    }) else {
+        return false;
+    };
+
+    let mut initialized = false;
+    for block in &function.blocks {
+        for node in &block.body {
+            match &node.inst {
+                Inst::Load { ty: access_ty, ptr, volatile, align } => {
+                    if ptr.index() == result
+                        && (block.id != definition_block
+                            || !initialized
+                            || *volatile
+                            || align.is_some()
+                            || access_ty != ty)
+                    {
+                        return false;
+                    }
+                }
+                Inst::Store { ty: access_ty, ptr, value, volatile, align } => {
+                    if ptr.index() == result
+                        && (block.id != definition_block
+                            || *volatile
+                            || align.is_some()
+                            || access_ty != ty)
+                    {
+                        return false;
+                    }
+                    if value.index() == result {
+                        return false;
+                    }
+                    if ptr.index() == result {
+                        initialized = true;
+                    }
+                }
+                other => {
+                    let mut uses = Vec::new();
+                    if collect_inst_value_uses(other, &mut uses) {
+                        // An opaque instruction may read any in-scope pointer.
+                        return false;
+                    }
+                    if uses.iter().any(|value| value.index() == result) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 /// The immediate field types of `ty` viewed as an aggregate, WITHOUT the trackability
 /// or leaf-budget checks. `None` for a non-aggregate (scalar / pointer / enum) leaf.
 fn immediate_aggregate_field_tys(module: &Module, ty: &Ty) -> Option<Vec<Ty>> {
@@ -3860,6 +4667,154 @@ fn bind_call_summary_result(
     Some(())
 }
 
+#[cfg(test)]
+mod narrowing_reachability_tests {
+    use super::*;
+    use trust_ir::value::FuncTyId;
+
+    fn block(id: u32, terminator: Inst) -> Block {
+        let mut block = Block::new(BlockId::new(id));
+        block.body.push(InstrNode::new(terminator));
+        block
+    }
+
+    fn function(entry: u32, blocks: Vec<Block>) -> Function {
+        let mut function = Function::new(
+            FuncId::new(0),
+            "cfg_reachability",
+            FuncTyId::new(0),
+            BlockId::new(entry),
+        );
+        function.blocks = blocks;
+        function
+    }
+
+    fn return_block(id: u32) -> Block {
+        block(id, Inst::Return { values: Vec::new() })
+    }
+
+    #[test]
+    fn invalid_source_and_target_are_unknown() {
+        let function = function(0, vec![return_block(0)]);
+        let missing = BlockId::new(99);
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, missing, BlockId::new(0)),
+            CfgReachability::Unknown
+        );
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), missing),
+            CfgReachability::Unknown
+        );
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, missing, missing),
+            CfgReachability::Unknown,
+            "from == to is not reachable authority when the block does not exist"
+        );
+    }
+
+    #[test]
+    fn dangling_successor_is_unknown() {
+        let function = function(
+            0,
+            vec![
+                block(0, Inst::Br { target: BlockId::new(99), args: Vec::new() }),
+                return_block(1),
+            ],
+        );
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(1)),
+            CfgReachability::Unknown
+        );
+    }
+
+    #[test]
+    fn missing_or_unsupported_terminator_is_unknown() {
+        let empty = function(0, vec![Block::new(BlockId::new(0)), return_block(1)]);
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&empty, BlockId::new(0), BlockId::new(1)),
+            CfgReachability::Unknown
+        );
+
+        let unterminated = function(
+            0,
+            vec![block(0, Inst::Const { ty: Ty::Bool, value: Constant::Int(1) }), return_block(1)],
+        );
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&unterminated, BlockId::new(0), BlockId::new(1)),
+            CfgReachability::Unknown
+        );
+    }
+
+    #[test]
+    fn terminator_before_the_end_is_unknown() {
+        let mut malformed = block(0, Inst::Br { target: BlockId::new(1), args: Vec::new() });
+        malformed.body.push(InstrNode::new(Inst::Return { values: Vec::new() }));
+        let function = function(0, vec![malformed, return_block(1)]);
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(1)),
+            CfgReachability::Unknown
+        );
+    }
+
+    #[test]
+    fn duplicate_block_identity_is_unknown() {
+        let function = function(0, vec![return_block(0), return_block(0), return_block(1)]);
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(1)),
+            CfgReachability::Unknown
+        );
+    }
+
+    #[test]
+    fn cycles_terminate_and_can_still_prove_unreachable() {
+        let function = function(
+            0,
+            vec![
+                block(0, Inst::Br { target: BlockId::new(1), args: Vec::new() }),
+                block(1, Inst::Br { target: BlockId::new(0), args: Vec::new() }),
+                return_block(2),
+            ],
+        );
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(1)),
+            CfgReachability::Reachable
+        );
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(2)),
+            CfgReachability::ProvenUnreachable
+        );
+    }
+
+    #[test]
+    fn complete_diamond_proves_sibling_unreachable() {
+        let function = function(
+            0,
+            vec![
+                block(
+                    0,
+                    Inst::CondBr {
+                        cond: ValueId::new(0),
+                        then_target: BlockId::new(1),
+                        then_args: Vec::new(),
+                        else_target: BlockId::new(2),
+                        else_args: Vec::new(),
+                    },
+                ),
+                return_block(1),
+                return_block(2),
+            ],
+        );
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(2)),
+            CfgReachability::Reachable
+        );
+        assert_eq!(
+            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(1), BlockId::new(2)),
+            CfgReachability::ProvenUnreachable
+        );
+    }
+}
+
 // `is_eq_comparable_ty` / `is_ordered_scalar_ty` moved to `crate::translate`
 // so the BMC lane's `eval_icmp` applies the SAME type gates as this lane.
 
@@ -3874,6 +4829,64 @@ fn is_order_comparable_ty(ty: &Ty, lhs: &Expr, rhs: &Expr) -> bool {
 
 fn is_thin_pointer_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Ptr | Ty::PtrConst(_) | Ty::PtrMut(_) | Ty::Ref(_) | Ty::RefMut(_) | Ty::Rc(_))
+}
+
+/// Pointer-width unsigned integer at the pinned 64-bit target — the ONLY
+/// integer spellings the usize<->pointer-newtype bit-identity legs admit.
+fn is_pointer_width_unsigned_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::U64 | Ty::Usize)
+}
+
+/// Does the proof-grade lane have EXACT (bit-identity) semantics for this cast?
+///
+/// KEPT IN LOCKSTEP with the `Inst::Cast` legs in `translate_instruction` and
+/// `eval_cast_expr`: every shape admitted here is translated value-preservingly
+/// (never havoc, never an unconditional error rule). Consumed by the
+/// trust-mc-driver proof-authority preflight, which refuses every other cast.
+///
+/// The admitted set beyond integer Trunc/ZExt/SExt (checked by the caller):
+/// * `Bitcast`/`PtrToPtr` thin -> thin — identity on the BV64 address.
+/// * `Bitcast` thin <-> single-pointer-NEWTYPE struct (`NonNull`/`Box`
+///   wrap/unwrap) — the address leaf threads through unchanged.
+/// * `Bitcast` usize/u64 <-> single-pointer-NEWTYPE struct (the
+///   `fmt::Arguments` bit-packing) — same 64 bits, no validity asserted.
+/// * `Bitcast`/`PtrToPtr` same-type fat -> fat — identity, metadata forwarded.
+/// * `PtrToInt` thin -> usize/u64 — the address bits as an integer.
+///
+/// Deliberately NOT admitted: `IntToPtr` (a bare integer-to-`Ty::Ptr` forge has
+/// no newtype structure to key on and stays on the refusal pin), fat-source
+/// `PtrToInt`, width-changing `Bitcast` — including fat -> thin, whose honest
+/// spelling is `Inst::PtrData` (the translator's fat->thin leg stays for the
+/// diagnostic lane only; the module validator refuses the cast spelling) —
+/// every float cast, and `Transmute`.
+pub fn proof_grade_cast_is_admissible(
+    module: &Module,
+    op: CastOp,
+    src_ty: &Ty,
+    dst_ty: &Ty,
+) -> bool {
+    let newtype_path_of =
+        |ty: &Ty| pointer_newtype_field_path(ty, module, POINTER_NEWTYPE_FUEL);
+    let is_newtype_struct =
+        |ty: &Ty| !is_thin_pointer_ty(ty) && newtype_path_of(ty).is_some_and(|p| !p.is_empty());
+    match op {
+        CastOp::Bitcast | CastOp::PtrToPtr => {
+            let thin_thin = is_thin_pointer_ty(src_ty) && is_thin_pointer_ty(dst_ty);
+            let fat_same = src_ty == dst_ty && matches!(src_ty, Ty::FatPtr(_));
+            if matches!(op, CastOp::PtrToPtr) {
+                return thin_thin || fat_same;
+            }
+            let thin_wrap = is_thin_pointer_ty(src_ty) && is_newtype_struct(dst_ty);
+            let thin_unwrap = is_newtype_struct(src_ty) && is_thin_pointer_ty(dst_ty);
+            let int_pack = is_pointer_width_unsigned_ty(src_ty) && is_newtype_struct(dst_ty);
+            let int_unpack = is_newtype_struct(src_ty) && is_pointer_width_unsigned_ty(dst_ty);
+            thin_thin || fat_same || thin_wrap || thin_unwrap || int_pack || int_unpack
+        }
+        CastOp::PtrToInt => {
+            is_thin_pointer_ty(src_ty) && is_pointer_width_unsigned_ty(dst_ty)
+        }
+        _ => false,
+    }
 }
 
 const POINTER_NEWTYPE_FUEL: u32 = 8;

@@ -22,6 +22,7 @@ use crate::codegen_ay::chc::rules::codegen_rules::transition_drop::{
     shared_pointer_value_ptr_from_obj_id, try_translate_shared_pointer_inner_drop,
 };
 use crate::codegen_ay::chc::rules::codegen_rules_helpers::rust_dealloc_base_ptr_for_known_alloc_id;
+use crate::codegen_ay::provenance::{Loc, Val};
 use crate::codegen_ay::types::POINTER_WIDTH;
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
@@ -146,7 +147,7 @@ pub(super) fn try_inline_shared_pointer_drop_call<'tcx, 'body>(
                 ctx.heap_state.pending_checks.extend(dealloc_effects.pending_checks);
                 ctx.heap_state.pending_updates.extend(dealloc_effects.pending_updates);
             }
-            let vtable_disc = ctx.extract_embedded_vtable_expr(&wrapper_expr);
+            let vtable_disc = ctx.extract_embedded_vtable_expr(&wrapper_expr).map(Val::into_expr);
             if let Some(dispatch_result) = try_inline_dyn_drop_dispatch_call(
                 ctx,
                 inner_ty,
@@ -203,13 +204,17 @@ pub(super) fn try_inline_dyn_drop_call<'tcx, 'body>(
     if matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
         let dyn_arg =
             inline_operand_to_expr(ctx, args.first()?, local_exprs, resolver, outer_body.locals())?;
+        // The inline callee's `self` PARAMETER is an untyped `Expr` slot, and
+        // the fallback lane hands back the untranslated arg, so the wave-11 tag
+        // ends at this crossing.
         let self_expr = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(&dyn_arg)
+            .map(Loc::into_expr)
             .unwrap_or(dyn_arg.clone());
         let inline_vtable =
             arg_base_local.and_then(|local_idx| inline_vtable_ids.get(&local_idx).cloned());
         let known_vtable =
             arg_base_local.and_then(|local_idx| ctx.known_vtable_expr_for_local(local_idx));
-        let embedded_vtable = ctx.extract_embedded_vtable_expr(&dyn_arg);
+        let embedded_vtable = ctx.extract_embedded_vtable_expr(&dyn_arg).map(Val::into_expr);
         let vtable_disc = inline_vtable.or(known_vtable).or(embedded_vtable);
         return try_inline_dyn_drop_dispatch_call(
             ctx,
@@ -250,12 +255,16 @@ pub(super) fn try_inline_dyn_drop_call<'tcx, 'body>(
         inline_operand_to_expr(ctx, args.first()?, local_exprs, resolver, outer_body.locals())
     })?;
     let bv_ptr = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(&box_expr)?;
+    // Two untyped consumers: the inline `self` parameter slot and the
+    // deallocation helper (itself still `Expr`-taking). Tag dropped once.
+    let bv_ptr = bv_ptr.into_expr();
     let inline_vtable =
         arg_base_local.and_then(|local_idx| inline_vtable_ids.get(&local_idx).cloned());
     let known_vtable =
         arg_base_local.and_then(|local_idx| ctx.known_vtable_expr_for_local(local_idx));
     let embedded_vtable = ctx
         .extract_embedded_vtable_expr(&box_expr)
+        .map(Val::into_expr)
         .or_else(|| forwarded_heap_vtable_for_expr(ctx, &box_expr));
     let vtable_disc = inline_vtable.or(known_vtable).or(embedded_vtable);
     let inline_result = try_inline_dyn_drop_dispatch_call(

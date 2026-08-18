@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
+use crate::codegen_ay::provenance::is_value_widened_into_address;
+use crate::codegen_ay::ptr_repr::{PtrRepr, PtrSlot};
 use crate::codegen_ay::shared::ty_signedness_shallow;
 use crate::codegen_ay::types::{
     CtorFieldExt, POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe,
@@ -449,20 +451,50 @@ impl<'tcx, 'body> CallCoerce for ChcCtx<'tcx, 'body> {
         site: &'static str,
     ) -> Option<Expr> {
         let result_sort = result_expr.sort().clone();
-        // fc-interior-mut: refuse to widen a sub-pointer-width bitvec into a
-        // raw-pointer-typed destination. A narrow result reaching a `*T` dest
-        // is a dematerialized referent VALUE (e.g. the flattened u32 payload
-        // of a Cell routed through contract instrumentation), not an address;
-        // zero/sign-extending it fabricates obj_id=0 provenance whose deref,
-        // alignment, and frame checks are then decided by the cell's
+        // fc-interior-mut: refuse to coerce a bitvec that is not pointer-shaped
+        // into a raw-pointer-typed destination. Such a result reaching a `*T`
+        // dest is a dematerialized referent VALUE (e.g. the flattened u32
+        // payload of a Cell routed through contract instrumentation), not an
+        // address; zero/sign-extending it fabricates obj_id=0 provenance whose
+        // deref, alignment, and frame checks are then decided by the cell's
         // arbitrary payload (spurious Genuine CTREX) — or worse, silently
         // checked against the wrong object (a fail-open surface). Route to
         // the existing dropped-constraint lane: the destination stays havoced
         // (sound over-approximation) and the drop is surfaced through the
         // coerce-eq-dropped diagnostics. Scoped to RawPtr dests: `&T` dests
         // keep the legacy value-forwarding paths (promoted refs).
-        let refused_ptr_widening = out_sort.bitvec_width() == Some(POINTER_WIDTH)
-            && result_sort.bitvec_width().is_some_and(|w| w < POINTER_WIDTH)
+        //
+        // The destination is an ADDRESS slot — that is read off the MIR type,
+        // not guessed. The predicate that decides what may fill it is therefore
+        // "does this term have a pointer SHAPE?", which `PtrRepr` answers
+        // structurally (thin, fat, or widened-thin), rather than the directional
+        // `w < POINTER_WIDTH` test it replaces: that one only ever caught the
+        // narrower half of the non-pointer widths and said nothing about the
+        // rest. Datatype results are unaffected — they are not bitvecs, and the
+        // `fld_ptr` / flatten arms below still own them.
+        //
+        // The shape test alone left the gate open on the case it was written
+        // for. `PtrRepr::classify` calls ANY `bv64` a `Thin` pointer — it has to,
+        // since at `POINTER_WIDTH` there is no structure left to inspect — so a
+        // dematerialized referent VALUE that has already been widened to bv64
+        // (by an earlier `coerce_bitvec_width_safe`, a flattened `Cell<u32>`
+        // payload, a stub's own coercion) passed the classification and landed
+        // in the `*T` destination, which is exactly the fabrication the refusal
+        // exists to stop. [`is_value_widened_into_address`] is the predicate
+        // that recognizes that shape by name, and it is the *only* extra
+        // evidence available here, so the refusal now covers both halves: a
+        // non-pointer shape, or a pointer-shaped term that is provably a widened
+        // narrow value. Refusing routes to the drop lane below — the destination
+        // stays havoced, a sound over-approximation, and the drop is counted.
+        //
+        // The leading term is the DECLARED destination slot, so it asks
+        // `PtrSlot` — the one classification of a declared pointer sort — for
+        // "one word wide", instead of open-coding the width a fifth time. The
+        // scope is unchanged: `Fat` destinations were never refused here.
+        let refused_ptr_widening = PtrSlot::of_sort(out_sort) == Some(PtrSlot::Thin)
+            && result_sort.is_bitvec()
+            && (PtrRepr::classify(&result_expr).is_none()
+                || is_value_widened_into_address(&result_expr))
             && self.body.locals().get(dest_local).is_some_and(|decl| {
                 matches!(
                     decl.ty.kind(),

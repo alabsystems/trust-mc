@@ -318,9 +318,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if !out_sort.is_datatype() {
                 return None;
             }
-            let root_expr = Expr::var(&**out_name, out_sort.clone());
+            // Output state variable = the local's contents after this block: a value.
+            let root_expr = crate::codegen_ay::provenance::Val::of_value(Expr::var(
+                &**out_name,
+                out_sort.clone(),
+            ));
             for &field_idx in &char_field_indices {
                 if let Some(field_expr) = Self::datatype_field_select(&root_expr, field_idx, None) {
+                    let field_expr = field_expr.into_expr();
                     let field_sort = field_expr.sort().clone();
                     if let Some(constraint) = Self::build_char_validity_constraint(
                         field_expr,

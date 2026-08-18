@@ -479,11 +479,12 @@ fn execute_inline_call<'tcx, 'body>(
         // because it is gated on provably-allocating constructors and a Vec
         // from raw/unsafe parts keeps its arbitrary pointer.
         let is_pointer_dest = is_pointer_destination(ctx, walk_ctx, destination);
-        let fallback_var =
-            try_build_valid_collection_backing_fallback(ctx, &effective_sort, callee_path.as_deref())
-                .unwrap_or_else(|| {
-                    build_nested_call_fallback_expr(effective_sort, is_pointer_dest)
-                });
+        let fallback_var = try_build_valid_collection_backing_fallback(
+            ctx,
+            &effective_sort,
+            callee_path.as_deref(),
+        )
+        .unwrap_or_else(|| build_nested_call_fallback_expr(effective_sort, is_pointer_dest));
         if apply_inline_writeback(ctx, walk_ctx, state, destination, fallback_var) {
             return TerminatorStep::ContinueAt(target_bb);
         }

@@ -14,6 +14,7 @@ use rustc_public::ty::{RigidTy, TyKind};
 use super::super::ChcCtx;
 use super::super::codegen_types::CodegenTypes;
 use super::super::ptr_receiver_mem;
+use crate::codegen_ay::provenance::MaybeLoc;
 
 /// Maximum number of array lanes for unrolled lexicographic comparison.
 /// Beyond this, fall back to sound over-approximation.
@@ -229,7 +230,10 @@ pub(in crate::codegen_ay::chc) fn try_load_array_elements(
     for i in 0..len {
         let offset = Expr::bitvec_const(i as u64 * elem_bytes as u64, 64);
         let addr = data_ptr.clone().bvadd(offset);
-        let loaded = ptr_receiver_mem::load_from_memory(ctx, &addr, elem_ty)?;
+        // `data_ptr` is a bare parameter and this is byte arithmetic on it: the
+        // caller never told us it was an address, so say so rather than imply it.
+        let loaded =
+            ptr_receiver_mem::load_from_memory(ctx, &MaybeLoc::Unknown(addr), elem_ty)?.into_expr();
         elements.push(loaded);
     }
     Some(elements)

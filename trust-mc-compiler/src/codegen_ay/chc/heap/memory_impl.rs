@@ -23,6 +23,7 @@ use super::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 use super::{ChcCtx, UNDEF_COUNTER, declare_pending_var, dyn_coercion};
 use crate::codegen_ay::chc::call::canonical_zst_expr_for_sort;
 use crate::codegen_ay::chc::call::codegen_call_kani_model_dst::is_zst_ty;
+use crate::codegen_ay::provenance::{Loc, Val};
 use crate::codegen_ay::shared::ty_signedness_shallow;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -42,13 +43,53 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dyn_coercion::normalize_unique_dyn_tail_ty(self, ty)
     }
 
+    /// Reads the storage a [`Loc`] designates. **The load.**
+    ///
+    /// This is the encoder's only legal `Loc -> Val` crossing: an address names
+    /// storage, and reading that storage is what turns it into a datum. Every
+    /// other route from an address to a value in `codegen_ay` is the defect
+    /// `provenance.rs` exists to prevent, which is why this signature is worth
+    /// more scrutiny than any other in the campaign.
+    ///
+    /// # What the parameter type buys
+    ///
+    /// The untyped body still opens with
+    /// `coerce_bitvec_width_safe(addr, POINTER_WIDTH, ZeroExtend)` — i.e. the
+    /// load itself *launders the width* of whatever it was handed, which is
+    /// precisely why no width test downstream of a load could ever be evidence
+    /// of anything. With a [`Loc`] parameter that coercion is no longer load
+    /// bearing: callers hand over something an address producer minted, and the
+    /// coercion degrades to a no-op on every well-formed input. It is left in
+    /// place deliberately — turning it into an assertion is a behaviour change
+    /// and belongs to the teardown wave, not to a retyping wave.
+    ///
+    /// # The one documented exception
+    ///
+    /// For BigInt-shaped pointees the model uses value semantics: the address
+    /// *is* the value (#545 audit), so the returned [`Val`] wraps the very
+    /// expression the [`Loc`] wrapped. That is §4 item 5 of the conversion
+    /// queue — a site where a type would otherwise force a false tag — and it
+    /// is handled inside the body rather than by any caller.
+    pub(in crate::codegen_ay::chc) fn load_from_memory(
+        &mut self,
+        loc: Loc,
+        pointee_ty: rustc_public::ty::Ty,
+    ) -> Option<Val> {
+        #[allow(deprecated)]
+        self.load_from_memory_untyped(loc.into_expr(), pointee_ty).map(Val::of_value)
+    }
+
     /// Loads a value from memory at the given address.
     ///
     /// Uses region arrays for heap allocations when the obj_id can be statically
     /// determined, falling back to type-indexed arrays otherwise.
     ///
     /// Part of #1443: Region-aware memory operations.
-    pub(in crate::codegen_ay::chc) fn load_from_memory(
+    #[deprecated(
+        note = "address-vs-value: migrate to `load_from_memory(loc: Loc, ty) -> Option<Val>`; \
+                see codegen_ay/provenance.rs and docs/addr-vs-value-conversion-queue.md wave 12"
+    )]
+    pub(in crate::codegen_ay::chc) fn load_from_memory_untyped(
         &mut self,
         addr: Expr,
         pointee_ty: rustc_public::ty::Ty,
@@ -110,7 +151,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3608: Compile-time store-to-load forwarding.
         if let Some((fwd_obj_id, fwd_offset)) = Self::try_extract_constant_addr(&addr) {
             let fwd_key = ((fwd_obj_id as u64) << 32) | (fwd_offset as u64);
-            if let Some((store_bb, forwarded_value)) =
+            if let Some((store_bb, forwarded_value, _store_type_key)) =
                 self.heap_state.store_forward_map.get(&fwd_key).cloned()
                 && store_bb == self.current_encode_bb
             {
@@ -322,7 +363,41 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// determined, falling back to type-indexed arrays otherwise.
     ///
     /// Part of #1443: Region-aware memory operations.
+    ///
+    /// # Writes the storage a [`Loc`] designates
+    ///
+    /// The two leading parameters used to be adjacent, same-typed, bare `Expr`s
+    /// — one an address, one a datum — which is the canonical shape of the
+    /// slot-misalignment defect class: transposing them type-checks, runs, and
+    /// produces a VC that constrains the wrong term. Typing the address makes
+    /// that swap a compile error permanently, and it only takes ONE of the two
+    /// to be typed for the swap to become impossible.
+    ///
+    /// # Why `value` is deliberately still an `Expr`
+    ///
+    /// A store's value operand is a *value by role* — whatever bit pattern it
+    /// carries, it is the datum being written, and a pointer stored into memory
+    /// is a perfectly ordinary datum. Tagging it `Val::of_value` at ~40 call
+    /// sites would therefore always "be right" and would teach the type system
+    /// nothing: the tag would be asserted by the store rather than carried from
+    /// whatever produced the datum, which is precisely the laundering this
+    /// campaign exists to avoid. The value side becomes honest when the value
+    /// PRODUCERS (`translate_operand` and friends) return [`Val`]; until then
+    /// the slot stays untyped on purpose.
     pub(in crate::codegen_ay::chc) fn build_memory_store(
+        &mut self,
+        loc: Loc,
+        value: Expr,
+        pointee_ty: rustc_public::ty::Ty,
+    ) -> Option<Expr> {
+        #[allow(deprecated)]
+        self.build_memory_store_untyped(loc.into_expr(), value, pointee_ty)
+    }
+
+    /// Builds a memory store constraint from an untyped address.
+    #[deprecated(note = "address-vs-value: migrate to `build_memory_store(loc: Loc, value, ty)`; \
+                see codegen_ay/provenance.rs and docs/addr-vs-value-conversion-queue.md wave 13")]
+    pub(in crate::codegen_ay::chc) fn build_memory_store_untyped(
         &mut self,
         addr: Expr,
         value: Expr,
@@ -338,17 +413,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
 
-        if !self.suppress_heap_store_checks {
-            let checks = self.heap_access_checks(addr.clone(), pointee_ty);
-            if !checks.is_empty() {
-                self.mark_heap_metadata_read();
-            }
-            self.heap_state.pending_checks.extend(checks);
-        }
-
         let type_key = self.type_key_for_body_ty(pointee_ty);
         let elem_sort = self.elem_sort_for_memory_array(pointee_ty);
 
+        // A zero-sized store touches no bytes, so it carries no memory-safety
+        // obligation at all: Rust requires a ZST pointer to be non-null and
+        // aligned but explicitly NOT to point into a live allocation
+        // (dangling-but-aligned is legal). The early return below already skips
+        // the write itself; emitting `heap_access_checks` BEFORE it left the
+        // allocation-validity select `obj_valid[obj_id]` behind as a spurious
+        // obligation, which surfaced as a false "memory safety" violation on
+        // ZST stores (e.g. `mem::replace::<()>` in modifies/zst_pass.rs).
+        //
+        // SOUNDNESS: for a ZST that select is the ONLY non-vacuous check this
+        // function produces — the alignment arm takes `Some(_) => {}` because a
+        // ZST's alignment is 1, and the size arm is the trivially-safe
+        // zero-size case. There is no null check here to lose. Non-ZST stores
+        // are unaffected: the block below is the same call, just ordered after
+        // the ZST exit.
         if is_zst_ty(pointee_ty) {
             debug!(
                 type_key = %type_key,
@@ -356,6 +438,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "CHC: build_memory_store - skipped ZST store"
             );
             return None;
+        }
+
+        if !self.suppress_heap_store_checks {
+            let checks = self.heap_access_checks(addr.clone(), pointee_ty);
+            if !checks.is_empty() {
+                self.mark_heap_metadata_read();
+            }
+            self.heap_state.pending_checks.extend(checks);
         }
 
         // FC-06: modifies frame-condition check. Stores executed inside a
@@ -487,9 +577,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 type_key = %type_key,
                 "CHC: build_memory_store - recording store-to-load forwarding (#3608)"
             );
+            // The type key travels with the entry: it is the only record of
+            // WHICH type array this datum was written through, and the map is
+            // keyed by `(obj_id, offset)` across all of them. See the field's
+            // doc comment in `heap_state.rs`.
             self.heap_state
                 .store_forward_map
-                .insert(fwd_key, (self.current_encode_bb, value.clone()));
+                .insert(fwd_key, (self.current_encode_bb, value.clone(), Arc::from(type_key)));
         } else {
             // Part of #3664: symbolic-address store invalidates all forwards.
             self.heap_state.invalidate_store_forwards();

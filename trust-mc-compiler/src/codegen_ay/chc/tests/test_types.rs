@@ -114,10 +114,10 @@ fn test_adt_struct_sort_encoding() {
     assert_eq!(range_sort.datatype_name(), Some("Range"));
     // Verify field selection works — proves the struct is properly constructed
     let range_var = Expr::var("r", range_sort);
-    let start = ChcCtx::datatype_field_select(&range_var, 0, None);
+    let start = select_field_val(&range_var, 0, None);
     assert!(start.is_some(), "Field 0 (start) should be selectable");
     assert_eq!(start.unwrap().sort().bitvec_width(), Some(32));
-    let end = ChcCtx::datatype_field_select(&range_var, 1, None);
+    let end = select_field_val(&range_var, 1, None);
     assert!(end.is_some(), "Field 1 (end) should be selectable");
 }
 
@@ -130,10 +130,10 @@ fn test_adt_option_sort_encoding() {
     assert_eq!(option_sort.datatype_name(), Some("Option"));
     // Verify both fields are accessible with correct sorts
     let opt_var = Expr::var("o", option_sort);
-    let is_some = ChcCtx::datatype_field_select(&opt_var, 0, None);
+    let is_some = select_field_val(&opt_var, 0, None);
     assert!(is_some.is_some());
     assert!(is_some.unwrap().sort().is_bool(), "Field 0 should be Bool (is_some)");
-    let value = ChcCtx::datatype_field_select(&opt_var, 1, None);
+    let value = select_field_val(&opt_var, 1, None);
     assert!(value.is_some());
     assert_eq!(value.unwrap().sort().bitvec_width(), Some(32), "Field 1 should be bv32 (value)");
 }
@@ -153,10 +153,10 @@ fn test_adt_result_like_enum_encoding() {
     assert_eq!(result_sort.datatype_name(), Some("Result"));
     // Verify field selection with constructor downcasts
     let res_var = Expr::var("res", result_sort);
-    let ok_val = ChcCtx::datatype_field_select(&res_var, 0, Some(0));
+    let ok_val = select_field_val(&res_var, 0, Some(0));
     assert!(ok_val.is_some(), "Ok variant field should be selectable");
     assert_eq!(ok_val.unwrap().sort().bitvec_width(), Some(32));
-    let err_val = ChcCtx::datatype_field_select(&res_var, 0, Some(1));
+    let err_val = select_field_val(&res_var, 0, Some(1));
     assert!(err_val.is_some(), "Err variant field should be selectable");
     assert_eq!(err_val.unwrap().sort().bitvec_width(), Some(64));
 }
@@ -170,7 +170,7 @@ fn test_adt_nested_struct_encoding() {
     assert_eq!(index_range_sort.datatype_name(), Some("IndexRange"));
     // Verify the sort can be used in expressions and fields are accessible
     let range_var = Expr::var("range", index_range_sort);
-    let start = ChcCtx::datatype_field_select(&range_var, 0, None);
+    let start = select_field_val(&range_var, 0, None);
     assert!(start.is_some());
     assert_eq!(start.unwrap().sort().bitvec_width(), Some(64));
 }

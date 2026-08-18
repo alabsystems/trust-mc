@@ -17,6 +17,7 @@ use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
 use super::{IntoOption, StatementCodegen, extract_fat_ptr_metadata};
+use crate::codegen_ay::provenance::{Loc, Val};
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 use crate::kani_middle::abi::LayoutOf;
 
@@ -201,7 +202,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     self.assert_guarded(base_in_range);
 
                     // Emit overflow checks for the offset operation.
-                    self.emit_offset_overflow_check(&lhs_expr, &rhs_expr, pointee_size);
+                    //
+                    // `pointee_size_for_offset_ty` already established that the
+                    // lhs operand's MIR type is `*T` / `&T`, so its term is an
+                    // ADDRESS; `BinOp::Offset`'s rhs is an element count, a
+                    // VALUE. That is where the provenance is known — not at the
+                    // check emitter, which used to re-derive it from the width.
+                    let base = Loc::of_address(lhs_expr.clone());
+                    let count = Val::of_value(rhs_expr.clone());
+                    self.emit_offset_overflow_check(&base, &count, pointee_size);
 
                     // Compute byte offset: count * size_of::<T>()
                     let byte_offset = match pointee_size {

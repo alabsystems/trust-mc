@@ -34,7 +34,7 @@ To debug it, there are a couple of options:
 
 To manually compile and run the test, you can use trust-mc's `playback` subcommand:
 ```
-cargo trust-mc playback -Z concrete-playback -- ${unit_test_func_name}
+targo trust-mc playback -Z concrete-playback -- ${unit_test_func_name}
 ```
 
 The output from this command is similar to `cargo test`.
@@ -76,7 +76,7 @@ cause an assertion failure.
 tests. Ordinary verification builds keep that symbol available so generated
 tests can remain in source, but the non-playback implementation is only a
 compile-compatibility stub and will panic if executed. Run generated playback
-tests with `trust-mc playback` or `cargo trust-mc playback`, not from proof harness
+tests with `trust-mc playback` or `targo trust-mc playback`, not from proof harness
 execution in verification mode.
 
 ## Request for comments

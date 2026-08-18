@@ -87,7 +87,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let target_place =
                 Place { local: ref_target.local, projection: ref_target.projections };
             if let Some(addr) = self.translate_ref_to_address(&target_place, modified_locals) {
-                return Some(addr);
+                // This function returns a flattened OPERAND term — usually
+                // `translated`, a value — so the slot is not an address slot
+                // and the wave-11 tag stops here.
+                return Some(addr.into_expr());
             }
         }
 

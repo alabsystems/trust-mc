@@ -357,16 +357,15 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                 // the address bits unflatten with the enum tag at the wrong bit).
                 // The sort guard keeps the scalar recursion-folding win while
                 // preserving referent values for derived `PartialEq::eq` inlines.
-                let expr = if trust_mc_core::chc_const_prop::eval::try_eval_to_const(&expr)
-                    .is_none()
-                {
-                    match self.unique_def_const_operand(arg, 32) {
-                        Some(lit) if lit.sort() == expr.sort() => lit,
-                        _ => expr,
-                    }
-                } else {
-                    expr
-                };
+                let expr =
+                    if trust_mc_core::chc_const_prop::eval::try_eval_to_const(&expr).is_none() {
+                        match self.unique_def_const_operand(arg, 32) {
+                            Some(lit) if lit.sort() == expr.sort() => lit,
+                            _ => expr,
+                        }
+                    } else {
+                        expr
+                    };
                 params.push(expr);
             } else if i == 0 && self.inline_self_field_hints.is_some() {
                 // Fresh symbolic BV64 avoids obj_valid[0] collision (W3:4021).

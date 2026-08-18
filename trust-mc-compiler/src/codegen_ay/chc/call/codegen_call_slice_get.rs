@@ -14,6 +14,7 @@ use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::provenance::Loc;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::ChcCtx;
@@ -106,7 +107,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
             if let Some(len) = self.translate_ptr_metadata(receiver, cx.modified_locals) {
-                return Some(len);
+                return Some(len.into_expr());
             }
             if let Some(expr) = self.resolve_ref_or_const_referent(receiver, cx.modified_locals) {
                 let expr_sort = expr.sort().clone();
@@ -186,8 +187,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             Place { local: ref_target.local, projection: ref_target.projections };
                         if let ExprValue::BitVecConst { value, .. } = idx_expr.value() {
                             if *value == 0u8.into() {
+                                // This closure's other lanes hand back pointer
+                                // VALUES (a bv receiver, an `fld_ptr` select),
+                                // so `elem_ref` is not uniformly an address and
+                                // must not be typed as one; the address lane
+                                // drops its tag here rather than laundering the
+                                // others into `Loc`.
                                 return self
-                                    .translate_ref_to_address(&target_place, cx.modified_locals);
+                                    .translate_ref_to_address(&target_place, cx.modified_locals)
+                                    .map(Loc::into_expr);
                             }
                         }
                         return None;
@@ -353,13 +361,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let slice_backing = self.resolve_slice_backing(slice_arg, modified_locals);
         let slice_value = self.resolve_ref_or_const_referent(slice_arg, modified_locals);
         if let Some(backing) = slice_backing.as_ref() {
-            self.ref_resolution.const_ref_values.insert(dest_local, backing.data.clone());
-            if backing.offset != Expr::bitvec_const(0u64, POINTER_WIDTH) {
-                self.ref_resolution.subslice_offset.insert(dest_local, backing.offset.clone());
+            self.ref_resolution.const_ref_values.insert(dest_local, backing.data.as_expr().clone());
+            if *backing.offset.as_expr() != Expr::bitvec_const(0u64, POINTER_WIDTH) {
+                self.ref_resolution
+                    .subslice_offset
+                    .insert(dest_local, backing.offset.as_expr().clone());
             } else {
                 self.ref_resolution.subslice_offset.remove(&dest_local);
             }
-            self.ref_resolution.subslice_len.insert(dest_local, backing.len.clone());
+            self.ref_resolution.subslice_len.insert(dest_local, backing.len.as_expr().clone());
         }
         // Compute pointer-level value BEFORE the Mem-level bridge so it can be
         // stored into typed memory (which expects BV64 pointer sort, not Array sort).

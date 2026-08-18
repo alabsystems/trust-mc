@@ -14,6 +14,7 @@
 
 use ay_bindings::Expr;
 
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width_safe};
 
@@ -114,20 +115,48 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Part of #4131: Ord::cmp for BV128 packed wide pointers.
     /// Layout: low 64 bits = data pointer, high 64 bits = metadata (length).
     /// Rust semantics: compare data pointer first, metadata as tie-breaker.
+    ///
+    /// # The tie-break may not be read off the width
+    ///
+    /// The caller establishes from the MIR type that both operands are raw
+    /// pointers, and the `target_width == 128` gate that both occupy a wide
+    /// slot. Neither fact says the high half is METADATA: a thin pointer that
+    /// `coerce_bitvec_width_safe` widened into that slot carries extension
+    /// padding there, and ordering two pointers on padding decides `cmp` on a
+    /// value the program never computed. This is the same defect the two
+    /// `raw_pointer_*_components` decoders and
+    /// `try_translate_inline_wide_pointer_binop` already fixed; #4131 added a
+    /// third copy after that sweep.
+    ///
+    /// `PtrRepr` splits the three cases: both `Fat` keeps the tie-break; both
+    /// metadata-free compares the address lane alone (for an extension the high
+    /// halves are equal exactly when the low halves are, so this is the same
+    /// predicate minus the padding terms); mixed has nothing honest to compare
+    /// and declines to the caller's generic lane.
     pub(super) fn compute_bv128_wide_ptr_ord_cmp(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
-        let lhs_ptr = lhs.clone().extract(63, 0);
-        let lhs_meta = lhs.clone().extract(127, 64);
-        let rhs_ptr = rhs.clone().extract(63, 0);
-        let rhs_meta = rhs.clone().extract(127, 64);
+        let (lhs_data, lhs_meta) = PtrRepr::classify(lhs)?.into_parts();
+        let (rhs_data, rhs_meta) = PtrRepr::classify(rhs)?.into_parts();
+        let meta = match (lhs_meta, rhs_meta) {
+            (Some(l), Some(r)) => Some((l.into_expr(), r.into_expr())),
+            (None, None) => None,
+            _ => return None,
+        };
+        let (lhs_ptr, rhs_ptr) = (lhs_data.into_expr(), rhs_data.into_expr());
         let ptr_lt = lhs_ptr.clone().bvult(rhs_ptr.clone());
         let ptr_eq = lhs_ptr.eq(rhs_ptr);
-        let meta_lt = lhs_meta.clone().bvult(rhs_meta.clone());
-        let meta_eq = lhs_meta.eq(rhs_meta);
-        let tie_cmp = Expr::ite(
-            meta_lt,
-            Expr::bitvec_const(-1i128, 32),
-            Expr::ite(meta_eq, Expr::bitvec_const(0, 32), Expr::bitvec_const(1, 32)),
-        );
+        let tie_cmp = match meta {
+            Some((lhs_meta, rhs_meta)) => {
+                let meta_lt = lhs_meta.clone().bvult(rhs_meta.clone());
+                let meta_eq = lhs_meta.eq(rhs_meta);
+                Expr::ite(
+                    meta_lt,
+                    Expr::bitvec_const(-1i128, 32),
+                    Expr::ite(meta_eq, Expr::bitvec_const(0, 32), Expr::bitvec_const(1, 32)),
+                )
+            }
+            // No metadata on either side: equal addresses are equal pointers.
+            None => Expr::bitvec_const(0, 32),
+        };
         Some(Expr::ite(
             ptr_lt,
             Expr::bitvec_const(-1i128, 32),

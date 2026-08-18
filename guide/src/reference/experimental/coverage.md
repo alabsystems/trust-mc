@@ -14,7 +14,7 @@ Fortunately, trust-mc is able to report a coverage metric for each proof harness
 In the `first-steps-v2` directory, try running:
 
 ```
-cargo trust-mc --coverage -Z source-coverage --harness verify_success
+targo trust-mc --coverage -Z source-coverage --harness verify_success
 ```
 
 which verifies the harness, then prints coverage information for each line.

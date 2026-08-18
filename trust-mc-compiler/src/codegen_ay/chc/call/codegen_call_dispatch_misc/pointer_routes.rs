@@ -65,7 +65,10 @@ impl<'tcx, 'body> CallDispatchMiscPointerRoutes for ChcCtx<'tcx, 'body> {
         // ptr-metadata path instead of falling through to `P_inf_*`.
         if callee_path.as_deref().is_some_and(is_ptr_metadata_path) {
             return self.emit_identity_call(dcx, "misc::ptr_metadata", |ctx, d| {
-                d.args.first().and_then(|arg| ctx.translate_ptr_metadata(arg, d.modified_locals))
+                d.args
+                    .first()
+                    .and_then(|arg| ctx.translate_ptr_metadata(arg, d.modified_locals))
+                    .map(|meta| meta.into_expr())
             });
         }
 

@@ -13,7 +13,7 @@ use ay_bindings::Sort;
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::CrateDef;
 use rustc_public::rustc_internal;
-use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
+use rustc_public::ty::{AdtKind, GenericArgKind, RigidTy, TyKind};
 use tracing::{debug, warn};
 
 use super::ChcCtx;
@@ -26,6 +26,38 @@ use super::codegen_types::CodegenTypes;
 use crate::codegen_ay::chc::codegen_ctx::clusters::EnumBvLayout;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Is the `#3215` tag+payload BV encoding a faithful model of `local_ty`?
+    ///
+    /// That encoding replaces the local with a tag state var selecting one of the
+    /// datatype sort's `n` constructors plus unified payload slots, and records an
+    /// [`EnumBvLayout`] whose `ctor_field_slot` / `discriminants` are then used to
+    /// resolve MIR *variant* projections and `Rvalue::Discriminant` reads. That is
+    /// only correct when the MIR type really is an enum whose variants line up with
+    /// the datatype's constructors.
+    ///
+    /// A **struct** (or union) can also reach the arm with `n >= 2`, because the AY
+    /// datatype of a single-field newtype collapses onto its payload: `OnceCell<u32>`
+    /// is `UnsafeCell<Option<u32>>`, so the struct local gets `Option`'s
+    /// two-constructor datatype. Encoding that struct as a tagged enum would make
+    /// every downstream `enum_bv_layouts` consumer resolve the struct's own field
+    /// indices against `ctor_field_slot` (a table built from the *datatype's*
+    /// constructors) and map `Rvalue::Discriminant` through per-variant discriminants
+    /// the struct does not have. It also panics outright today:
+    /// `discriminant_for_variant` asserts `is_enum()` internally, so every `OnceCell`
+    /// harness ICEs with `assertion failed: self.is_enum()`.
+    ///
+    /// Non-ADT locals (coroutines, tuples, references, ...) keep the existing
+    /// behaviour: their tag is positional and there are no MIR variant discriminants
+    /// to disagree with.
+    fn enum_bv_tag_models_ty(local_ty: rustc_public::ty::Ty, n: usize) -> bool {
+        match local_ty.kind() {
+            TyKind::RigidTy(RigidTy::Adt(def, _)) => {
+                def.kind() == AdtKind::Enum && def.variants().len() >= n
+            }
+            _ => true,
+        }
+    }
+
     /// Section 1: Collect scalar locals by translating MIR local types to AY sorts.
     ///
     /// Each MIR local is either flattened (tuple, Range, Option, Result, struct) into
@@ -277,6 +309,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     if let Some(dt) = sort.datatype_sort()
                         && dt.constructors.len() >= 2
                         && is_multi_ctor_flattenable(dt)
+                        && Self::enum_bv_tag_models_ty(local_ty, dt.constructors.len())
                     {
                         if let Some((ctor_field_slots, _ctor_leaf_counts, unified_sorts)) =
                             unify_multi_ctor_leaf_sorts(dt)
@@ -307,6 +340,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             // definition instead of sequential [0, 1, ..., N-1].
                             // Explicit-discriminant enums (e.g., #[repr(u32)] with = 100)
                             // would get wrong tag-to-discriminant mappings otherwise.
+                            // `enum_bv_tag_models_ty` (arm guard above) has already
+                            // established that an ADT `local_ty` here is an enum with
+                            // at least `n` variants, so `discriminant_for_variant`
+                            // cannot trip its internal `is_enum()` assertion.
                             let discriminants: Vec<u64> = match local_ty.kind() {
                                 TyKind::RigidTy(RigidTy::Adt(def, _)) => {
                                     let idef = rustc_internal::internal(self.tcx, def);

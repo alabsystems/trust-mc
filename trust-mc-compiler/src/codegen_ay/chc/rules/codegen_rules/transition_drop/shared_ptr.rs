@@ -21,6 +21,8 @@ use crate::codegen_ay::chc::rules::codegen_rules_helpers::{
     rust_dealloc_base_pointer_guard, rust_dealloc_base_ptr_for_known_alloc_id,
     rust_dealloc_obj_id_expr, rust_dealloc_validity_guard,
 };
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 
 pub(in crate::codegen_ay::chc) struct SharedPointerDeallocEffects {
     pub pending_checks: Vec<ay_bindings::Expr>,
@@ -105,16 +107,28 @@ fn shared_pointer_value_offset(ctx: &ChcCtx<'_, '_>, pointee_ty: rustc_public::t
     if align <= 1 { header_size } else { header_size.div_ceil(align) * align }
 }
 
-fn shared_pointer_storage_expr(wrapper_expr: &ay_bindings::Expr) -> ay_bindings::Expr {
+/// The Rc/Arc header ADDRESS held in the wrapper.
+///
+/// Wave 4: the `width == 2 * POINTER_WIDTH` test this replaces chose which half
+/// of a wide pointer names the allocation that the drop path then FREES, on a
+/// coincidence that a widened thin pointer satisfies just as well as a real fat
+/// one. `PtrRepr` decides it structurally and `into_data` is total, so all three
+/// shapes yield their address half and nothing else changes.
+///
+/// `extract_pointer_expr` is one of the encoder's address producers. Its
+/// `unwrap_or_else` fallback, however, is the RAW wrapper term — nothing
+/// produced it as an address — so when `PtrRepr` cannot decode that term this
+/// function returns `None` instead of tagging it. It used to spell the failure
+/// `map_or_else(|| Loc::of_address(storage), ..)`, which asserted address-ness
+/// of precisely the terms the decoder had just declined to recognize, on a path
+/// that goes on to FREE whatever the tag names. Both callers already fail closed
+/// through `split_pointer`, so `None` costs nothing they were not already
+/// handling.
+fn shared_pointer_storage_expr(wrapper_expr: &ay_bindings::Expr) -> Option<Loc> {
     let storage = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(wrapper_expr)
+        .map(Loc::into_expr)
         .unwrap_or_else(|| wrapper_expr.clone());
-    if storage.sort().is_bitvec()
-        && storage.sort().bitvec_width() == Some(crate::codegen_ay::types::POINTER_WIDTH * 2)
-    {
-        storage.extract(crate::codegen_ay::types::POINTER_WIDTH - 1, 0)
-    } else {
-        storage
-    }
+    PtrRepr::classify(&storage).map(PtrRepr::into_data)
 }
 
 pub(in crate::codegen_ay::chc) fn shared_pointer_value_ptr_for_drop(
@@ -129,7 +143,7 @@ pub(in crate::codegen_ay::chc) fn shared_pointer_value_ptr_for_drop(
         return Some(ptr);
     }
 
-    let storage = shared_pointer_storage_expr(wrapper_expr);
+    let storage = shared_pointer_storage_expr(wrapper_expr)?.into_expr();
     let value_offset = shared_pointer_value_offset(ctx, pointee_ty);
     Some(if value_offset == 0 {
         storage
@@ -151,9 +165,10 @@ pub(in crate::codegen_ay::chc) fn collect_shared_pointer_dealloc_effects(
     };
     use ay_bindings::Expr;
 
-    let storage = known_alloc_id
-        .map(rust_dealloc_base_ptr_for_known_alloc_id)
-        .unwrap_or_else(|| shared_pointer_storage_expr(wrapper_expr));
+    let storage = match known_alloc_id {
+        Some(alloc_id) => rust_dealloc_base_ptr_for_known_alloc_id(alloc_id),
+        None => shared_pointer_storage_expr(wrapper_expr)?.into_expr(),
+    };
     let (raw_obj_id_expr, offset_expr) = ctx.split_pointer(&storage)?;
     let obj_id_expr = rust_dealloc_obj_id_expr(raw_obj_id_expr, known_alloc_id);
 
@@ -313,7 +328,7 @@ fn seed_shared_pointer_inner_drop_vtable(
     }
 
     // Strategy 1b: Extract vtable from the wrapper expression itself.
-    if let Some(vtable_expr) = ctx.extract_embedded_vtable_expr(wrapper_expr) {
+    if let Some(vtable_expr) = ctx.extract_embedded_vtable_expr(wrapper_expr).map(Val::into_expr) {
         for &target_local in &target_locals {
             caller_vtable_ids.entry(target_local).or_insert_with(|| vtable_expr.clone());
         }

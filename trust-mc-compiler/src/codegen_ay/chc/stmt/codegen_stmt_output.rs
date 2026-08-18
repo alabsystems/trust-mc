@@ -231,6 +231,59 @@ pub(in crate::codegen_ay) fn mir_to_chc_with_instance<'tcx>(
     mir_to_chc_internal(tcx, body, Some(instance), fn_name, cfg)
 }
 
+/// Accept a frame-narrowed VC only if it is well-formed; otherwise re-encode with
+/// the full frame.
+///
+/// Frame narrowing (`ChcConfig::frame_narrowing`) drops backward-dead columns from
+/// block relations, which is where the query-size win comes from. But it decides
+/// deadness at DECL time from MIR source-operand liveness, and the encoder reads
+/// state through channels MIR cannot see — `ref_targets` deref chains with
+/// projections, `subslice_len`/`const_ref_values` sidecars replayed blocks later,
+/// obj-id resolution via `known_alloc_ids`, `local_expr_env` cross-block
+/// expression replay, and float congruent-table keys that embed operand columns.
+/// When that happens the dropped column does not fail loudly: `declare-var` is
+/// emitted for every state var, so it becomes a universally quantified FREE
+/// variable and its constraints turn trivially satisfiable — a spurious
+/// counterexample. Measured unguarded: 50 tests moved parity -> false_positive.
+///
+/// So the narrowing is treated as a speculative optimization and validated on the
+/// emitted VC, which is the only place those channels are observable. On any
+/// violation the harness is encoded a second time with the full frame, exactly as
+/// the `MemPromoteAction::Promote` path above re-encodes. Cost is one extra
+/// translate for the harnesses that need it; the ones that validate keep the win.
+fn narrow_or_reencode<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body,
+    current_instance: Option<Instance>,
+    fn_name: &Arc<str>,
+    cfg: super::ChcConfig,
+    vc: ChcVc,
+) -> ChcVc {
+    if !cfg.frame_narrowing {
+        return vc;
+    }
+    let dropped = crate::codegen_ay::chc::take_dropped_frame_columns();
+    let offenders = crate::codegen_ay::chc::constraint_vars_outside_relation_frames(&vc, &dropped);
+    if offenders.is_empty() {
+        return vc;
+    }
+    warn!(
+        fn_name = %fn_name,
+        offenders = offenders.len(),
+        first = %offenders.first().map(String::as_str).unwrap_or(""),
+        "CHC: frame narrowing dropped a column the encoding still reads; \
+         re-encoding with the full frame"
+    );
+    let full_cfg = super::ChcConfig { frame_narrowing: false, ..cfg };
+    let ctx = if let Some(instance) = current_instance {
+        ChcCtx::new_with_instance(tcx, body, instance, Arc::clone(fn_name), full_cfg)
+    } else {
+        ChcCtx::new(tcx, body, Arc::clone(fn_name), full_cfg)
+    };
+    let (full_vc, _) = ctx.translate();
+    full_vc
+}
+
 fn mir_to_chc_internal<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body,
@@ -260,6 +313,7 @@ fn mir_to_chc_internal<'tcx>(
         other => other,
     };
 
+    crate::codegen_ay::chc::reset_dropped_frame_columns();
     let resolved_cfg = super::ChcConfig { step_mode: effective_step_mode, ..cfg };
     let ctx = if let Some(instance) = current_instance {
         ChcCtx::new_with_instance(tcx, body, instance, fn_name_str.clone(), resolved_cfg)
@@ -289,16 +343,24 @@ fn mir_to_chc_internal<'tcx>(
             step_mode: effective_step_mode,
             ..cfg
         };
+        let fn_name_str_retry: Arc<str> = Arc::clone(&fn_name_str);
         let ctx = if let Some(instance) = current_instance {
             ChcCtx::new_with_instance(tcx, body, instance, fn_name_str, promoted_cfg)
         } else {
             ChcCtx::new(tcx, body, fn_name_str, promoted_cfg)
         };
         let (vc, _) = ctx.translate();
-        return vc;
+        return narrow_or_reencode(
+            tcx,
+            body,
+            current_instance,
+            &fn_name_str_retry,
+            promoted_cfg,
+            vc,
+        );
     }
 
-    vc
+    narrow_or_reencode(tcx, body, current_instance, &fn_name_str, resolved_cfg, vc)
 }
 
 /// Like `mir_to_chc`, but stops before Template-Directed Inductive Checking (TIC).

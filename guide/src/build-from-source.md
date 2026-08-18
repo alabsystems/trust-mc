@@ -47,10 +47,14 @@ To use a local AY checkout for rapid co-development:
    ```
 2. Uncomment the `[patch]` section in `.cargo/config.toml` to override
    git deps with your local AY checkout, then use `cargo build-dev`.
-   to update pinned revisions, then run `./scripts/ay-bump-canary.sh` before
-   trusting the new pin. The canary's first gate checks
+   To update pinned revisions, follow the bump procedure documented above
+   the `[workspace.dependencies]` pin block in `Cargo.toml`
+   (`scripts/check-ay-pin.sh`, then `cargo update -p ay-chc`), and run
    `cargo check -p trust-mc-driver --all-targets --features "ay,ay-chc-native"`
-   so future `ay-chc` API visibility drift is caught early.
+   before trusting the new pin so `ay-chc` API visibility drift is caught
+   early. A single `scripts/ay-bump-canary.sh` wrapper for this ceremony is
+   planned but NOT yet implemented (roadmap item 6.1 in
+   `docs/roadmap-100-parity-2026-07-06.md`).
 
 > **NOTE**: When reporting verification metrics or benchmarks, always record the
 > AY commit hash used. Path dependencies are not reproducible across clones.

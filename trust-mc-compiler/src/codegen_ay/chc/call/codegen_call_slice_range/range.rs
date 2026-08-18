@@ -9,6 +9,7 @@ use ay_bindings::Expr;
 use rustc_public::mir::Operand;
 use tracing::{debug, warn};
 
+use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::types::POINTER_WIDTH;
 use trust_mc_core::chc::{Rule, RuleBody};
 
@@ -117,13 +118,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "slice range backing resolution failed for Range index"
             );
         }
-        let effective_start =
-            slice_backing.as_ref().map(|backing| backing.offset.clone().bvadd(start_bv.clone()));
+        let effective_start = slice_backing
+            .as_ref()
+            .map(|backing| backing.offset.as_expr().clone().bvadd(start_bv.clone()));
         if let Some(ref backing) = slice_backing {
             let oob = if inclusive {
-                end_bv.clone().bvuge(backing.len.clone())
+                end_bv.clone().bvuge(backing.len.as_expr().clone())
             } else {
-                end_bv.clone().bvugt(backing.len.clone())
+                end_bv.clone().bvugt(backing.len.as_expr().clone())
             };
             let body =
                 RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, [oob]);
@@ -132,7 +134,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Register subslice data in side tables.
         if let (Some(backing), Some(effective_start)) = (&slice_backing, &effective_start) {
-            self.ref_resolution.const_ref_values.insert(dest_local, backing.data.clone());
+            self.ref_resolution.const_ref_values.insert(dest_local, backing.data.as_expr().clone());
             self.ref_resolution.subslice_offset.insert(dest_local, effective_start.clone());
 
             let subslice_len = if inclusive {
@@ -191,11 +193,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             );
             return;
         };
-        let inner_arr_sort = backing.data.sort().clone();
+        let inner_arr_sort = backing.data.as_expr().sort().clone();
         let effective_start =
             effective_start.expect("invariant: source resolution requires slice backing");
 
-        if backing.data.sort() != &inner_arr_sort
+        if backing.data.as_expr().sort() != &inner_arr_sort
             || !Self::is_zero_pointer_width_bitvec(&effective_start)
         {
             self.record_aggregate_gap("slice_range_sort_or_offset_mismatch");
@@ -204,10 +206,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // For subslice-of-subslice, backing.offset is only the first range's offset.
         // effective_start = backing.offset + start_bv, giving the correct absolute
         // position in the underlying array.
+        // `effective_start` is `backing.offset + start_bv`: an accumulated
+        // ELEMENT INDEX into the backing array, so it is a value like the two
+        // fields it is cloned alongside.
         let rebase_backing = ResolvedSliceBacking {
             data: backing.data.clone(),
             len: backing.len.clone(),
-            offset: effective_start,
+            offset: Val::of_value(effective_start),
         };
         let Some(shifted) = self.rebase_slice_backing_to_zero_based_array(
             &rebase_backing,
@@ -235,7 +240,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // share the same data pointer when start offsets match).
         let mut addr_override = self.resolve_subslice_source_addr(
             slice_arg,
-            &rebase_backing.offset,
+            rebase_backing.offset.as_expr(),
             elem_ty,
             modified_locals,
         );
@@ -243,7 +248,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Strategy 3: cache lookup by (provenance_local, start_const).
         // Covers heap allocations (Box deref) where source address resolution
         // fails but identical subslice operations should share a data pointer.
-        let cache_key = self.subslice_cache_key(slice_arg, &rebase_backing.offset);
+        let cache_key = self.subslice_cache_key(slice_arg, rebase_backing.offset.as_expr());
         if addr_override.is_none() {
             if let Some(key) = &cache_key {
                 addr_override = self.ref_resolution.subslice_addr_cache.get(key).cloned();

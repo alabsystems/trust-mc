@@ -40,8 +40,27 @@ pub(in crate::codegen_ay) struct ChcConfig {
     pub prove_safety_only: bool,
     /// Emit memory-safety error rules.
     pub memory_safety_checks: bool,
+    /// Narrow each block relation's frame to backward-live columns.
+    ///
+    /// DEFAULT OFF — opt in with `TRUST_MC_FRAME_NARROWING=1`. It measures net
+    /// positive on the corpus (+6 parity, unknown -16, at a 15 s budget) but has a
+    /// tail that the free-variable validator cannot see: `prusti/Selection_sort.rs`
+    /// goes from 0.54 s to NO VERDICT at a 150 s budget, and
+    /// `bounded-arbitrary/hash.rs` from 0.57 s to 95 s, neither of them re-encoding.
+    /// Turning a fast proof into a hang is a worse failure for a verifier than
+    /// leaving a noise-level parity gain on the table, so it stays opt-in until that
+    /// mechanism is understood.
+    ///
+    /// Also set false by the free-variable retry in `mir_to_chc_internal`: the
+    /// restriction is a decl-time MIR approximation and the encoder reads state
+    /// through channels MIR cannot see, so a harness whose VC ends up naming a
+    /// dropped column is re-encoded with the full frame.
+    pub frame_narrowing: bool,
     /// Emit arithmetic overflow error rules.
     pub overflow_checks: bool,
+    /// Emit NaN-generation obligations for float binops (`--nan-check`).
+    /// OFF by default; NaN is defined behaviour in Rust, not UB.
+    pub nan_checks: bool,
     /// Emit error rules for reachable undefined foreign function calls.
     pub undefined_function_checks: bool,
     /// Harness unwind depth for bounded recursive inline (Part of #3929).
@@ -76,7 +95,9 @@ impl Default for ChcConfig {
             extra_pointer_checks: false,
             prove_safety_only: false,
             memory_safety_checks: true,
+            frame_narrowing: false,
             overflow_checks: true,
+            nan_checks: false,
             undefined_function_checks: true,
             recursive_unwind_depth: 0,
             unwinding_assertions: true,

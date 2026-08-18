@@ -691,7 +691,7 @@ fn classify_violation(label: &str) -> (&'static str, &'static str) {
         }
         "untranslatable_assert_sort" => ("assertion", "assert condition sort unsupported"),
         "untranslatable_overflow_assert" => ("overflow", "overflow check operands untranslatable"),
-        "unsupported_cfg_cycle" | "unsupported_check" => {
+        "unsupported_cfg_cycle" | "unsupported_check" | "unsupported_shadow_memory" => {
             ("unsupported_construct", "unsupported construct")
         }
         _ if label.ends_with("_non_finite_lhs") || label.ends_with("_non_finite_rhs") => {

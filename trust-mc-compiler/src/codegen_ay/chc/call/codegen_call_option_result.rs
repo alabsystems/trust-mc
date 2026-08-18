@@ -470,7 +470,7 @@ fn deref_promoted_payload(
     };
     let src_ty = ctx.body.locals()[src_local].ty;
     let pointee_ty = extract_option_ref_pointee(src_ty)?;
-    let loaded = ctx.load_from_memory(payload.clone(), pointee_ty)?;
+    let loaded = ctx.load_from_memory_untyped(payload.clone(), pointee_ty)?;
     debug!(
         "option_copied_deref: dest={} payload_sort={:?} loaded_sort={:?}",
         dest_local,

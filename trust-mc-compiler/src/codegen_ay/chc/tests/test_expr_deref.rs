@@ -16,6 +16,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use super::common::*;
+use crate::codegen_ay::provenance::Loc;
 
 // =============================================================================
 // Reference deref at Reg level — try_resolve_deref_via_ref_targets
@@ -267,7 +268,8 @@ fn test_raw_ptr_deref_reg_level_resolves_known_alloc_id() {
             .concat(ay_bindings::Expr::bitvec_const(0_u128, 32));
 
         chc_ctx.known_alloc_ids.insert(ptr_local, obj_id);
-        let store_result = chc_ctx.build_memory_store(addr, stored_value, scalar_ty);
+        let store_result =
+            chc_ctx.build_memory_store(Loc::of_address(addr), stored_value, scalar_ty);
         assert!(store_result.is_none(), "memory store should accumulate into heap state");
 
         let deref_place = rustc_public::mir::Place {

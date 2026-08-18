@@ -85,6 +85,7 @@ fn preflight_toolchain_components() -> Result<()> {
     let missing: Vec<&str> = ["rustc-dev", "rust-src"]
         .into_iter()
         .filter(|component| !installed.lines().any(|line| line.starts_with(component)))
+        .filter(|component| !component_in_sysroot(component))
         .collect();
     if !missing.is_empty() {
         let toolchain = rustup_toolchain();
@@ -101,6 +102,38 @@ fn preflight_toolchain_components() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Linked toolchains (`rustup toolchain link`, e.g. the Trust stage2) have no
+/// rustup component model: `component list` reports nothing for them even when
+/// the artifacts are on disk. Probe the active sysroot before declaring a
+/// component missing — the same skip-don't-block intent as the rustup-absent
+/// branch above.
+fn component_in_sysroot(component: &str) -> bool {
+    let Ok(out) = Command::new("rustc").args(["--print", "sysroot"]).output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let sysroot = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    match component {
+        "rust-src" => sysroot.join("lib/rustlib/src/rust/library").is_dir(),
+        "rustc-dev" => {
+            // librustc_driver* under any lib/rustlib/<triple>/lib
+            let Ok(triples) = std::fs::read_dir(sysroot.join("lib/rustlib")) else {
+                return false;
+            };
+            triples.flatten().any(|t| {
+                std::fs::read_dir(t.path().join("lib")).map_or(false, |files| {
+                    files
+                        .flatten()
+                        .any(|f| f.file_name().to_string_lossy().starts_with("librustc_driver"))
+                })
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Ensures everything is good to go before we begin to build the release bundle.

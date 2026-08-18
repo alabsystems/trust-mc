@@ -14,8 +14,11 @@
 //! This crate includes proxy binaries and support for the trust_mc verifier.
 
 mod cmd;
+mod frontend;
 mod os_hacks;
 mod setup;
+
+pub use frontend::front_door;
 
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
@@ -171,7 +174,10 @@ fn exec(bin: &str) -> Result<()> {
 }
 
 /// Prepend paths to an environment variable search string like PATH
-fn prepend_search_path(paths: &[PathBuf], original: Option<OsString>) -> Result<OsString> {
+pub(crate) fn prepend_search_path(
+    paths: &[PathBuf],
+    original: Option<OsString>,
+) -> Result<OsString> {
     match original {
         None => Ok(env::join_paths(paths)?),
         Some(original) => {
@@ -209,7 +215,7 @@ fn prepend_search_path(paths: &[PathBuf], original: Option<OsString>) -> Result<
 /// item-level `env_mutation` allow; `unknown_lints` keeps the stock-rustc build
 /// green (the lint is defined only by the Trust toolchain).
 #[allow(unknown_lints, env_mutation)]
-fn set_process_env_var(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
+pub(crate) fn set_process_env_var(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: serialized by ENV_LOCK; single-threaded CLI startup with no
@@ -219,7 +225,7 @@ fn set_process_env_var(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
     }
 }
 
-fn fixup_dynamic_linking_environment() {
+pub(crate) fn fixup_dynamic_linking_environment() {
     #[cfg(not(target_os = "macos"))]
     const LOADER_PATH: &str = "LD_LIBRARY_PATH";
     #[cfg(target_os = "macos")]

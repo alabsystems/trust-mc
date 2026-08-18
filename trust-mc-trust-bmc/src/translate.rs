@@ -46,6 +46,19 @@ pub struct TranslateOptions {
     pub logic: Option<String>,
     /// Timeout in milliseconds for each query.
     pub timeout_ms: Option<u64>,
+    /// Target block of the SINGLE obligation this translation serves, when the
+    /// caller knows it. `None` (the default everywhere today) keeps the exact
+    /// whole-function behavior: every unsupported-construct error rule is
+    /// included unconditionally.
+    ///
+    /// When set, an unsupported construct's unconditional error rule is included
+    /// ONLY if the construct's block can appear on an entry->target path
+    /// (entry ->* site ->* target). A construct on no such path cannot influence
+    /// the states reaching the target assertion, so excluding its rule cannot
+    /// mask a real violation of THIS obligation. Reachability is computed over
+    /// the CFG successors; ANY uncertainty (unknown terminator, missing block)
+    /// includes the rule — over-approximate, never under.
+    pub narrow_to_target_block: Option<trust_ir::BlockId>,
 }
 
 impl Default for TranslateOptions {
@@ -57,6 +70,7 @@ impl Default for TranslateOptions {
             check_memory_bounds: true,
             logic: Some("QF_BV".to_owned()),
             timeout_ms: None,
+            narrow_to_target_block: None,
         }
     }
 }
@@ -1824,6 +1838,17 @@ impl<'a> FuncTranslator<'a> {
                 | BinOp::FRem
                 | BinOp::FMin
                 | BinOp::FMax => self.fresh_symbolic("float_on_int", ty),
+                // Trust: the BOOLEAN connectives (trust-ir 4b06918) on an INTEGER
+                // type are ill-typed IR -- trust-ir's own validator admits
+                // BAnd/BOr/BXor on Bool (or bool-vector) only. Treated exactly as
+                // float-on-int above: a fresh symbolic, which is unconstrained and
+                // therefore never silently unsound, with the callers flagging it
+                // fail-closed. NOT mapped onto bvand/bvor/bvxor: that would give an
+                // ill-typed program a plausible bit-level reading instead of
+                // rejecting it.
+                BinOp::BAnd | BinOp::BOr | BinOp::BXor => {
+                    self.fresh_symbolic("bool_connective_on_int", ty)
+                }
             }
         } else if matches!(ty, Ty::Bool) {
             // `And`/`Or`/`Xor` on a `Bool`-typed value are LOGICAL connectives,
@@ -1841,6 +1866,24 @@ impl<'a> FuncTranslator<'a> {
                     .try_or(rhs.clone())
                     .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
                 BinOp::Xor => lhs
+                    .clone()
+                    .try_ne(rhs.clone())
+                    .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
+                // Trust: the DEDICATED boolean connectives (trust-ir 4b06918) -- the
+                // same logical semantics as the `And`/`Or`/`Xor` arms above, which
+                // MIR reaches only via opcode overloading. Given explicit arms rather
+                // than left to the catch-all below, which would havoc them to a fresh
+                // symbolic and lose the very precision these opcodes exist to express.
+                BinOp::BAnd => lhs
+                    .clone()
+                    .try_and(rhs.clone())
+                    .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
+                BinOp::BOr => lhs
+                    .clone()
+                    .try_or(rhs.clone())
+                    .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
+                // Xor over booleans IS inequality, exactly as the `Xor` arm above.
+                BinOp::BXor => lhs
                     .clone()
                     .try_ne(rhs.clone())
                     .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
@@ -2226,6 +2269,9 @@ pub(crate) fn op_name(op: BinOp) -> &'static str {
         BinOp::Shl => "shl",
         BinOp::LShr => "lshr",
         BinOp::AShr => "ashr",
+        BinOp::BAnd => "band",
+        BinOp::BOr => "bor",
+        BinOp::BXor => "bxor",
     }
 }
 

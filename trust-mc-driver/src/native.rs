@@ -118,6 +118,8 @@ where
 // Trust: pub(crate) so the in-crate differential soundness oracle
 // (`crate::soundness_oracle`) can reach the real `lower_obligation`.
 #[cfg(feature = "ay-chc-native")]
+pub(crate) mod bounded_unroll;
+#[cfg(feature = "ay-chc-native")]
 pub(crate) mod typed_chc_ay;
 
 /// Result alias for native driver facade operations.
@@ -1296,6 +1298,39 @@ pub struct NativeTrustIrChcPdrBundleEvidence {
     /// proved except one whose own request produced a privately sealed
     /// exact-module derivation that the existing validation accepts.
     pub not_proved: Vec<NativeTrustIrChcPdrNotProved>,
+    /// One witnessed refutation per typed native trust-mc CHC/PDR request the
+    /// solver `Refuted { witness: Some(_) }`.
+    ///
+    /// SOUNDNESS INVARIANT: a `refuted` row carries NO proof authority in
+    /// either direction — it never enters the sealed proof-transport path, and
+    /// the carried witness is producer data the consumer MUST independently
+    /// revalidate (recompute the encoded-formula digest from its own fresh
+    /// translation of its own retained bundle, recompute the
+    /// semantic-configuration digest from its own engine configuration,
+    /// require the all-zero exact-encoding concreteness attestation, and
+    /// accept only machine-check kinds it recognizes) before surfacing a
+    /// Failed verdict. A witnessless `Refuted` stays in `not_proved`.
+    pub refuted: Vec<NativeTrustIrChcPdrRefuted>,
+}
+
+/// Witnessed refutation for one typed native trust_ir trust-mc CHC/PDR request.
+///
+/// `verification.outcome.status` is `Refuted { witness: Some(_) }` and
+/// `verification.verdict` is `Failed` carrying the materialized counterexample
+/// artifact the witness payload is bound to. Refutation-only: nothing in this
+/// row can mint proof credit (there is no sealed transport record on it), and
+/// consumers fail closed on any witness field they cannot recompute or any
+/// machine-check kind they do not recognize.
+#[cfg(feature = "native-trust-ir-bundle")]
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct NativeTrustIrChcPdrRefuted {
+    /// Typed obligation translated from the native trust_ir bundle. Its
+    /// `obligation.obligation_id` is the canonical native obligation id the
+    /// consumer keys per-row outcomes by.
+    pub translated: trust_mc_trust_bmc::NativeTrustMcChcPdrObligation,
+    /// Full-verification result whose outcome carries the refutation witness.
+    pub verification: TypedChcPdrFullVerification,
 }
 
 /// Honest per-request not-proved outcome for one typed native trust_ir
@@ -1439,6 +1474,35 @@ impl NativeTrustIrChcPdrRunner {
         &self,
         bundle: &trust_ir::NativeVerificationBundle,
     ) -> NativeSolveResult<NativeTrustIrChcPdrBundleEvidence> {
+        self.solve_bundle_native_proof_grade_inner(bundle, None)
+    }
+
+    /// Translate and solve a bundle produced at the audited live source-lowering seam.
+    ///
+    /// This is the only proof-grade entry point that can admit source-generated
+    /// `Inst::Assume`, `Inst::PtrMetadata`, and `ProofAnnotation::Wrapping`
+    /// constructs. The authority is non-cloneable, non-serializable, and must
+    /// still authorize this exact valid bundle. Its issuer is a safe semantic-TCB
+    /// seam, so the surrounding constellation must also gate
+    /// `SourceGenerationAuthority::mint_from_live_lowering` to the audited live
+    /// producer call site; this API cannot by itself prove that the issuer's
+    /// source-origin contract was honored. Replay, subprocess, cache, and
+    /// ordinary library callers must use
+    /// [`Self::solve_bundle_native_proof_grade`], which remains fail-closed for
+    /// those constructs.
+    pub fn solve_bundle_native_proof_grade_with_source_authority(
+        &self,
+        bundle: &trust_ir::NativeVerificationBundle,
+        authority: &trust_ir::SourceGenerationAuthority,
+    ) -> NativeSolveResult<NativeTrustIrChcPdrBundleEvidence> {
+        self.solve_bundle_native_proof_grade_inner(bundle, Some(authority))
+    }
+
+    fn solve_bundle_native_proof_grade_inner(
+        &self,
+        bundle: &trust_ir::NativeVerificationBundle,
+        authority: Option<&trust_ir::SourceGenerationAuthority>,
+    ) -> NativeSolveResult<NativeTrustIrChcPdrBundleEvidence> {
         let disabled_checks = disabled_native_bundle_safety_checks(&self.translate_options);
         if !disabled_checks.is_empty() {
             return Err(NativeSolveError::InvalidInput {
@@ -1449,10 +1513,11 @@ impl NativeTrustIrChcPdrRunner {
                 ),
             });
         }
-        validate_native_bundle_proof_authority_input(bundle)?;
+        validate_native_bundle_proof_authority_input(bundle, authority)?;
         let translated = self.translate_obligations(bundle)?;
         let mut obligations = Vec::with_capacity(translated.len());
         let mut not_proved = Vec::new();
+        let mut refuted = Vec::new();
 
         for translated in translated {
             let verification = match self
@@ -1470,6 +1535,35 @@ impl NativeTrustIrChcPdrRunner {
                 }
                 Err(error) => return Err(error),
             };
+            // Trust (refutation transport): a witnessed refutation is NOT a
+            // proof — it never enters the sealed-transport path below (whose
+            // record exists only for proof authority). It is delivered as its
+            // own typed row so the consumer can independently revalidate the
+            // witness (recomputed digests, concreteness, recognized
+            // machine-check kind) and, only then, surface a Failed verdict.
+            //
+            // SCOPE: only the bounded-unroll lane's witnesses ride this
+            // channel today. Its mint is additionally guarded by the
+            // trust-ir-stage GROUNDING gate (`bounded_unroll`), which the
+            // other witness kinds minted on this path do not yet carry —
+            // their `ChcVc`-production stage may contain translation havoc
+            // the lowering accounting does not cover, so they keep today's
+            // honest not_proved delivery byte-for-byte. Widening this match
+            // requires extending the grounding gate to those mints first.
+            // A witnessless `Refuted` stays on the not_proved path exactly as
+            // before: with nothing certifying the encoding's concreteness it
+            // neither proves nor refutes.
+            if matches!(
+                &verification.outcome.status,
+                trust_mc_core::ChcPdrSolveStatus::Refuted { witness: Some(witness) }
+                    if matches!(
+                        witness.verification,
+                        trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { .. }
+                    )
+            ) {
+                refuted.push(NativeTrustIrChcPdrRefuted { translated, verification });
+                continue;
+            }
             // Minting was attempted only after fresh translation from this exact
             // validated bundle. A non-authoritative/undecided response is an
             // honest per-request not-proved result; only a successfully sealed
@@ -1490,7 +1584,7 @@ impl NativeTrustIrChcPdrRunner {
             obligations.push(NativeTrustIrChcPdrEvidence { translated, verification, transport });
         }
 
-        Ok(NativeTrustIrChcPdrBundleEvidence { obligations, not_proved })
+        Ok(NativeTrustIrChcPdrBundleEvidence { obligations, not_proved, refuted })
     }
 }
 
@@ -1499,14 +1593,20 @@ impl NativeTrustIrChcPdrRunner {
 /// claims.
 ///
 /// Diagnostic translation intentionally remains broader. This gate is only for
-/// minting the private exact-bundle/CHC authority: every construct rejected here
-/// has a known translation lane that can omit a safety edge or import a public
-/// claim. Keeping the checks together makes additions auditable and ensures a
-/// future relaxation has to ship with an exact semantic derivation.
+/// the proof-grade exact-bundle/CHC authority path: every construct rejected
+/// here has a known translation lane that can omit a safety edge or import a
+/// public claim. Keeping the checks together makes additions auditable and
+/// ensures a future relaxation has to ship with an exact semantic derivation.
 #[cfg(feature = "native-trust-ir-bundle")]
 fn validate_native_bundle_proof_authority_input(
     bundle: &trust_ir::NativeVerificationBundle,
+    authority: Option<&trust_ir::SourceGenerationAuthority>,
 ) -> NativeSolveResult<()> {
+    // The capability is necessary but deliberately not sufficient for proof
+    // authority: it relaxes only the three source-generated constructs whose
+    // CHC semantics are modeled below. Every other public semantic shortcut
+    // remains rejected even for the exact live bundle.
+    let source_generation_authorized = authority.is_some_and(|a| a.authorizes_bundle(bundle));
     let module_report = trust_ir_build::validate_module_report(&bundle.module);
     if !module_report.is_ok() {
         let detail = module_report
@@ -1569,10 +1669,32 @@ fn validate_native_bundle_proof_authority_input(
                     instruction_index
                 );
 
-                if node
+                // `FreshSymbolicHavoc` is deliberately a public, forgeable
+                // semantic marker rather than an authority token. It selects
+                // the already-sound CHC interpretation of `Undef` as one
+                // stable, unconstrained value. That interpretation can only
+                // enlarge the error set, so admitting the exact pair is sound
+                // even after serialization. The marker grants no permission
+                // to narrow the value with `Assume`, pointer metadata, or any
+                // other source-authority-gated construct.
+                let fresh_symbolic_havoc = node
                     .proofs
                     .iter()
-                    .any(|proof| matches!(proof, trust_ir::ProofAnnotation::Wrapping))
+                    .any(|proof| matches!(proof, trust_ir::ProofAnnotation::FreshSymbolicHavoc));
+                if fresh_symbolic_havoc && !matches!(&node.inst, trust_ir::Inst::Undef { .. }) {
+                    return Err(native_bundle_proof_authority_input_error(
+                        "module.functions.proof_annotations",
+                        format!(
+                            "{location} carries FreshSymbolicHavoc on a non-Undef instruction; the marker grants no proof authority"
+                        ),
+                    ));
+                }
+
+                if !source_generation_authorized
+                    && node
+                        .proofs
+                        .iter()
+                        .any(|proof| matches!(proof, trust_ir::ProofAnnotation::Wrapping))
                 {
                     return Err(native_bundle_proof_authority_input_error(
                         "module.functions.proof_annotations",
@@ -1582,10 +1704,24 @@ fn validate_native_bundle_proof_authority_input(
                     ));
                 }
 
+                // `ValidBorrow` on a Load/Store is admitted only under the exact
+                // live-lowering authority: the stamp is minted by the same audited
+                // producer whose `Assume`/`PtrMetadata`/`Wrapping` claims are
+                // admitted below, and derives from rustc's reference typing (a
+                // deref through a borrow-checked `&`/`&mut`). The CHC model takes
+                // no value from it — the loaded value stays fresh havoc — it only
+                // discharges the access's bounds-model refusal. Everything else
+                // carrying the stamp (or any replayed/serialized bundle) stays
+                // fail-closed on the private borrow-authority requirement.
                 if node
                     .proofs
                     .iter()
                     .any(|proof| matches!(proof, trust_ir::ProofAnnotation::ValidBorrow))
+                    && !(source_generation_authorized
+                        && matches!(
+                            &node.inst,
+                            trust_ir::Inst::Load { .. } | trust_ir::Inst::Store { .. }
+                        ))
                 {
                     return Err(native_bundle_proof_authority_input_error(
                         "module.functions.proof_annotations",
@@ -1596,6 +1732,12 @@ fn validate_native_bundle_proof_authority_input(
                 }
 
                 match &node.inst {
+                    // A stamped `Undef` is modeled by `translate_chc` as a
+                    // stable fresh symbol with no value constraint. The stamp
+                    // does not authenticate facts about that symbol: the
+                    // `Assume` and pointer-metadata arms below remain gated by
+                    // their independent exact source-generation authority.
+                    trust_ir::Inst::Undef { .. } if fresh_symbolic_havoc => {}
                     trust_ir::Inst::Undef { .. } => {
                         return Err(native_bundle_proof_authority_input_error(
                             "module.functions.instructions",
@@ -1604,6 +1746,7 @@ fn validate_native_bundle_proof_authority_input(
                             ),
                         ));
                     }
+                    trust_ir::Inst::Assume { .. } if source_generation_authorized => {}
                     trust_ir::Inst::Assume { .. } => {
                         return Err(native_bundle_proof_authority_input_error(
                             "module.functions.instructions",
@@ -1636,6 +1779,13 @@ fn validate_native_bundle_proof_authority_input(
                             ),
                         ));
                     }
+                    // `PtrData` rides the same audited live-lowering authority as
+                    // `PtrMetadata`: it reads the data lane of a pointer-like
+                    // value (asserting nothing about it), and `translate_chc`
+                    // models it exactly — `ptr_parts` data when tracked, else the
+                    // value itself — with no error rule.
+                    trust_ir::Inst::PtrMetadata { .. } | trust_ir::Inst::PtrData { .. }
+                        if source_generation_authorized => {}
                     trust_ir::Inst::PtrData { .. }
                     | trust_ir::Inst::PtrMetadata { .. }
                     | trust_ir::Inst::PtrFromParts { .. } => {
@@ -1646,6 +1796,20 @@ fn validate_native_bundle_proof_authority_input(
                             ),
                         ));
                     }
+                    // A fixed-size, metadata-less scalar or aggregate stack cell
+                    // has an exact proof-grade lane when the translator either
+                    // leaves it opaque (loads are fresh havoc) or proves its
+                    // precise cell pointer never escapes, every direct access
+                    // keeps the exact cell type, and every load is initialized by
+                    // an earlier same-block store. This is default-on because the
+                    // safety predicate is structural and fail closed; it imports
+                    // no public proof annotation or source claim.
+                    trust_ir::Inst::Alloca { ty, count: None, align: None }
+                        if node.results.first().copied().is_some_and(|result| {
+                            trust_mc_trust_bmc::single_cell_alloca_is_admissible(
+                                function, result, ty,
+                            )
+                        }) => {}
                     trust_ir::Inst::Alloca { .. } => {
                         return Err(native_bundle_proof_authority_input_error(
                             "module.functions.instructions",
@@ -1662,19 +1826,32 @@ fn validate_native_bundle_proof_authority_input(
                             ),
                         ));
                     }
+                    // Beyond integer Trunc/ZExt/SExt, the ONLY other admitted casts
+                    // are the exact pointer bit-identity shapes enumerated by
+                    // `trust_mc_trust_bmc::proof_grade_cast_is_admissible` (kept in
+                    // lockstep with the translator's value-preserving legs): thin
+                    // pointer identities, single-pointer-newtype wrap/unwrap, the
+                    // usize<->NonNull `fmt::Arguments` packing, same-type fat
+                    // reinterprets, fat->thin data-lane, and thin `PtrToInt`.
                     trust_ir::Inst::Cast { op, src_ty, dst_ty, .. }
-                        if !matches!(
+                        if (!matches!(
                             op,
                             trust_ir::inst::CastOp::Trunc
                                 | trust_ir::inst::CastOp::ZExt
                                 | trust_ir::inst::CastOp::SExt
                         ) || !src_ty.is_integer()
-                            || !dst_ty.is_integer() =>
+                            || !dst_ty.is_integer())
+                            && !trust_mc_trust_bmc::proof_grade_cast_is_admissible(
+                                &bundle.module,
+                                *op,
+                                src_ty,
+                                dst_ty,
+                            ) =>
                     {
                         return Err(native_bundle_proof_authority_input_error(
                             "module.functions.instructions",
                             format!(
-                                "{location} uses cast {op:?} from {src_ty} to {dst_ty}; proof authority currently admits only modeled integer Trunc/ZExt/SExt casts"
+                                "{location} uses cast {op:?} from {src_ty} to {dst_ty}; proof authority currently admits only modeled integer Trunc/ZExt/SExt casts and exact pointer bit-identity casts"
                             ),
                         ));
                     }
@@ -1734,6 +1911,19 @@ fn disabled_native_bundle_safety_checks(
         check_memory_bounds,
         logic: _,
         timeout_ms: _,
+        // AUDITED, deliberately NOT reported as a disabled check.
+        //
+        // This list names options that WEAKEN the proof by switching a safety
+        // check off. `narrow_to_target_block` switches nothing off: it scopes an
+        // unsupported construct's unconditional error rule to the obligations
+        // that construct can actually reach (entry ->* site ->* target), instead
+        // of letting one unmodeled construct sink every obligation in the
+        // function. The exclusion fires only when the site is PROVABLY off every
+        // entry->target path; site == target, an unknown terminator, an absent
+        // block, or unprovable reachability in either direction all keep the
+        // rule. It can therefore only drop a rule irrelevant to the obligation
+        // being asked about — never mask a violation, never mint a proof.
+        narrow_to_target_block: _,
     } = options;
     let mut disabled = Vec::new();
     if !*check_signed_overflow {
@@ -2036,6 +2226,191 @@ pub fn typed_chc_pdr_semantic_config_sha256(
     .value
 }
 
+#[cfg(feature = "ay-chc-native")]
+const MAX_REFUTATION_REPLAY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(feature = "ay-chc-native")]
+const MAX_REFUTATION_REPLAY_RELATIONS: usize = 65_536;
+#[cfg(feature = "ay-chc-native")]
+const MAX_REFUTATION_REPLAY_RULES: usize = 262_144;
+
+#[cfg(feature = "ay-chc-native")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectSmtRefutationReplayPayload {
+    schema: String,
+    source: String,
+    #[serde(default)]
+    unroll_k: Option<u32>,
+    derivation_clause_indices: Vec<u64>,
+    witness_model: serde_json::Value,
+}
+
+/// Independently replay a direct-SMT typed-CHC refutation against a freshly
+/// lowered copy of the consumer's retained obligation.
+///
+/// This is the refutation-side authority boundary for compiler consumers.  It
+/// does not accept the producer's verification class, digests, concreteness
+/// attestation, JSON shape, trace, or model by assertion.  It validates the
+/// retained typed obligation, re-runs the exact-or-reject lowering, recomputes
+/// the normalized-input and semantic-configuration digests, requires exact
+/// zero-loss accounting, rebuilds the exact acyclic problem (including the
+/// declared bounded unroll when present), and SMT-checks the supplied total,
+/// sort-exact model on the supplied clause trace.  Any unsupported class,
+/// malformed or extra payload field, budget breach, path mismatch, model
+/// mismatch, or undecided replay returns an error; callers must keep the row
+/// Unknown.
+///
+/// This API deliberately declines `AyChcReplayVerified`: its current payload
+/// contains only a debug rendering, not the typed trace needed for independent
+/// consumer replay.
+#[cfg(feature = "ay-chc-native")]
+pub fn independently_replay_typed_chc_pdr_refutation_witness(
+    obligation: &trust_mc_core::MirChcPdrObligation,
+    expected_engine: trust_mc_core::ChcPdrEngine,
+    witness: &trust_mc_core::ChcPdrRefutationWitness,
+) -> NativeSolveResult<String> {
+    let reject = |detail: String| NativeSolveError::InvalidInput {
+        field: "refutation_witness".to_string(),
+        detail,
+    };
+    obligation.validate().map_err(|error| NativeSolveError::InvalidInput {
+        field: "obligation".to_string(),
+        detail: error.to_string(),
+    })?;
+    if witness.obligation_id != obligation.obligation_id {
+        return Err(reject(format!(
+            "witness obligation `{}` differs from retained obligation `{}`",
+            witness.obligation_id, obligation.obligation_id
+        )));
+    }
+    if !witness.concreteness.is_exact_with_zero_counts() {
+        return Err(reject(
+            "witness does not carry an all-zero exact-encoding attestation".to_string(),
+        ));
+    }
+    if witness.counterexample_json.len() > MAX_REFUTATION_REPLAY_PAYLOAD_BYTES {
+        return Err(reject(format!(
+            "counterexample payload has {} bytes, above the replay budget",
+            witness.counterexample_json.len()
+        )));
+    }
+    if obligation.vc.relations.len() > MAX_REFUTATION_REPLAY_RELATIONS
+        || obligation.vc.rules.len() > MAX_REFUTATION_REPLAY_RULES
+    {
+        return Err(reject(format!(
+            "retained obligation has {} relations and {} rules, above the replay budget",
+            obligation.vc.relations.len(),
+            obligation.vc.rules.len()
+        )));
+    }
+
+    let prepared = prepare_validated_typed_chc_pdr_input(obligation)?;
+    if prepared.normalized.route != TypedChcPdrRoute::PdrProof {
+        return Err(reject(
+            "retained obligation does not select the typed CHC/PDR route".to_string(),
+        ));
+    }
+    if witness.encoded_formula_sha256 != prepared.normalized.normalized_input_hash.value {
+        return Err(reject(
+            "encoded-formula digest differs from the fresh exact lowering".to_string(),
+        ));
+    }
+    let semantic_config =
+        typed_chc_pdr_semantic_config_sha256(expected_engine, prepared.normalized.route);
+    if witness.semantic_config_sha256 != semantic_config {
+        return Err(reject(
+            "semantic-configuration digest differs from the consumer configuration".to_string(),
+        ));
+    }
+    if !prepared.lowering.is_some_and(typed_chc_ay::TypedChcLoweringAccounting::is_exact) {
+        return Err(reject(
+            "fresh typed lowering did not retain exact all-zero accounting".to_string(),
+        ));
+    }
+    let problem = prepared
+        .problem
+        .ok_or_else(|| reject("fresh typed lowering retained no CHC problem".to_string()))?;
+
+    let payload: DirectSmtRefutationReplayPayload =
+        serde_json::from_str(&witness.counterexample_json).map_err(|error| {
+            reject(format!("counterexample payload does not match the strict JSON schema: {error}"))
+        })?;
+    if payload.schema != "trust_mc.typed-chc-pdr-counterexample/v1" {
+        return Err(reject(format!("unsupported counterexample schema `{}`", payload.schema)));
+    }
+    let direct_witness = crate::direct_smt_cex::AcyclicUnsafeWitness {
+        model: payload.witness_model,
+        derivation_clause_indices: payload.derivation_clause_indices,
+    };
+
+    let (replay_problem, summary) = match witness.verification {
+        trust_mc_core::ChcPdrCexVerification::DirectSmtModel => {
+            if payload.source != "direct-smt-acyclic-error-derivation" || payload.unroll_k.is_some()
+            {
+                return Err(reject(
+                    "direct-SMT payload source or unroll budget does not match its proof class"
+                        .to_string(),
+                ));
+            }
+            if problem.has_cycles() {
+                return Err(reject(
+                    "direct-SMT proof class was attached to a cyclic fresh problem".to_string(),
+                ));
+            }
+            (problem, "fresh direct-SMT acyclic derivation and exact model replay".to_string())
+        }
+        trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k } => {
+            let k = u32::try_from(k)
+                .map_err(|_| reject(format!("bounded-unroll budget {k} is not representable")))?;
+            if !bounded_unroll::BOUNDED_UNROLL_K_LADDER.contains(&k) {
+                return Err(reject(format!(
+                    "bounded-unroll budget {k} is outside the exact production ladder"
+                )));
+            }
+            if payload.source != "direct-smt-bounded-unroll-error-derivation"
+                || payload.unroll_k != Some(k)
+            {
+                return Err(reject(
+                    "bounded-unroll payload source or budget does not match its proof class"
+                        .to_string(),
+                ));
+            }
+            if obligation.kind != trust_mc_core::MirObligationKind::Assertion
+                || !obligation
+                    .native_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.structural_reachability_complete)
+                || fail_closed_lowering_sites(obligation) != 0
+            {
+                return Err(reject(
+                    "retained obligation is outside the exact bounded-unroll refutation lane"
+                        .to_string(),
+                ));
+            }
+            let unrolled = bounded_unroll::bounded_unroll_chc_for_refutation(&problem, k)
+                .ok_or_else(|| {
+                    reject(
+                        "fresh problem cannot be rebuilt as the declared exact bounded unroll"
+                            .to_string(),
+                    )
+                })?;
+            (
+                unrolled.problem,
+                format!("fresh k={k} bounded-unroll derivation and exact model replay"),
+            )
+        }
+        ref other => {
+            return Err(reject(format!(
+                "counterexample verification kind {other:?} has no independent replay surface"
+            )));
+        }
+    };
+
+    crate::direct_smt_cex::replay_acyclic_direct_smt_witness(&replay_problem, &direct_witness)
+        .map_err(reject)?;
+    Ok(summary)
+}
+
 /// Mint a refutation witness for a typed CHC/PDR `Refuted` verdict, or `None`
 /// when the concreteness condition does not hold.
 ///
@@ -2073,6 +2448,200 @@ fn typed_chc_pdr_refutation_witness(
             undef_diagnostic_havocs: lowering.undef_diagnostic_havocs,
         },
     )))
+}
+
+/// Bounded-unroll REFUTATION-ONLY escalation for cyclic typed CHC problems.
+///
+/// Runs only when every proof-seeking lane has already ended Unknown on this
+/// obligation (the caller invokes it from the `VerifiedChcResult::Unknown`
+/// arm), and only for the L0 safety class (`MirObligationKind::Assertion` —
+/// panic-freedom / overflow / bounds), never for invariant/protocol
+/// obligations. It climbs `BOUNDED_UNROLL_K_LADDER`, building the acyclic
+/// k-bounded under-approximation of `problem` and asking the existing
+/// direct-SMT composer for a concrete derivation of the query target.
+///
+/// SOUNDNESS (load-bearing, in order):
+/// - Refutation-only BY TYPE: the only success value this function can build
+///   is `Refuted { witness }` + `FullVerificationVerdict::Failed`. A `Safe`
+///   decision on a truncated unroll means nothing (deeper traces are
+///   unrepresented) and is deliberately indistinguishable from `Inconclusive`
+///   here: both fall through to the next rung / `None`.
+/// - A found witness is REAL: every unrolled clause is one original clause
+///   with predicates renamed per level, so the satisfiable derivation
+///   projects (by erasing levels) onto a derivation of the ORIGINAL problem.
+///   That is why the minted witness binds `normalized_input_hash` of the
+///   ORIGINAL problem — the digest the consumer independently recomputes.
+/// - Same fail-closed gates as the existing refutation arms: a nonzero
+///   fail-closed-lowering-site count discards the model (the derivation may
+///   pass through an admission-failure error rule, not a program trap), and
+///   witness minting requires the exact all-zero lowering accounting
+///   (`typed_chc_pdr_refutation_witness` declines otherwise).
+/// - The provenance rides the witness payload itself
+///   (`ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k }` plus the
+///   `unroll_k` field of the counterexample artifact), never a detachable
+///   transport flag, so consumers that do not recognize the class fail closed.
+#[cfg(feature = "ay-chc-native")]
+#[allow(clippy::too_many_arguments)] // mirrors the sibling lane helpers' seams
+fn try_bounded_unroll_refutation_lane(
+    problem: &ay_chc::ChcProblem,
+    request: &trust_mc_core::ChcPdrSolveRequest,
+    stats: trust_mc_core::ChcPdrStats,
+    normalized_input_hash: &trust_mc_core::EvidenceHash,
+    route: TypedChcPdrRoute,
+    cache_key: &trust_mc_core::FullVerificationCacheKey,
+    artifact_directory: &str,
+    lowering: Option<typed_chc_ay::TypedChcLoweringAccounting>,
+    watchdog_ceiling: Duration,
+) -> Option<TypedChcPdrFullVerification> {
+    try_bounded_unroll_refutation_lane_with_ladder(
+        problem,
+        request,
+        stats,
+        normalized_input_hash,
+        route,
+        cache_key,
+        artifact_directory,
+        lowering,
+        watchdog_ceiling,
+        &bounded_unroll::BOUNDED_UNROLL_K_LADDER,
+    )
+}
+
+/// Ladder-parameterized body of [`try_bounded_unroll_refutation_lane`], split
+/// out so tests can pin the beyond-budget behavior (a violation deeper than
+/// every rung must stay Unknown) without paying for the production ladder's
+/// deepest unroll. Production always passes `BOUNDED_UNROLL_K_LADDER`.
+#[cfg(feature = "ay-chc-native")]
+#[allow(clippy::too_many_arguments)] // mirrors the sibling lane helpers' seams
+fn try_bounded_unroll_refutation_lane_with_ladder(
+    problem: &ay_chc::ChcProblem,
+    request: &trust_mc_core::ChcPdrSolveRequest,
+    stats: trust_mc_core::ChcPdrStats,
+    normalized_input_hash: &trust_mc_core::EvidenceHash,
+    route: TypedChcPdrRoute,
+    cache_key: &trust_mc_core::FullVerificationCacheKey,
+    artifact_directory: &str,
+    lowering: Option<typed_chc_ay::TypedChcLoweringAccounting>,
+    watchdog_ceiling: Duration,
+    ladder: &[u32],
+) -> Option<TypedChcPdrFullVerification> {
+    // L0 safety obligations only. Invariant/protocol/termination classes are
+    // not the panic-reachability question this lane answers.
+    if request.obligation.kind != trust_mc_core::MirObligationKind::Assertion {
+        return None;
+    }
+    // Only the native-bundle translator's complete-by-construction lowering
+    // (`trust_mc_chc_pdr_obligations_from_native_bundle`, which stamps this
+    // marker) is in this lane's modeled domain: its per-site error edges and
+    // grounded relational encoding are what the grounding gate and the
+    // level-erasure projection argument reason about. A control-only
+    // structural reachability CHC — e.g. the compiler's whole-CFG
+    // default-function admission formula (nullary block relations, no data
+    // constraints) — is a sound over-approximation for PROOFS whose
+    // derivations are mere control-feasibility, so a refutation minted from
+    // it would be spurious. The marker itself is diagnostic (forgeable), but
+    // it is only the eligibility gate here: the consumer independently
+    // recomputes the encoded-formula digest from its OWN fresh native-bundle
+    // translation (which stamps the marker itself), so a forged marker on a
+    // foreign encoding fails that digest binding downstream.
+    if !request
+        .obligation
+        .native_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.structural_reachability_complete)
+    {
+        return None;
+    }
+    // Witness minting below requires the exact accounting anyway; decline
+    // before paying for any solve.
+    if !lowering.is_some_and(typed_chc_ay::TypedChcLoweringAccounting::is_exact) {
+        return None;
+    }
+    // A derivation that may pass through a fail-closed lowering error rule is
+    // an admission failure, not a program trap (same gate as the direct and
+    // PDR refutation arms).
+    if fail_closed_lowering_sites(&request.obligation) > 0 {
+        return None;
+    }
+    if !problem.has_cycles() {
+        return None;
+    }
+
+    // One shared wall-clock budget across the whole ladder, so escalation
+    // rungs cannot multiply the caller's ceiling.
+    let lane_deadline = std::time::Instant::now().checked_add(watchdog_ceiling)?;
+    for &k in ladder {
+        let remaining = lane_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let unrolled = bounded_unroll::bounded_unroll_chc_for_refutation(problem, k)?;
+        // Bind the provenance to the budget the unroll actually represents,
+        // not the ladder rung requested.
+        let k = unrolled.k;
+        let decision_problem = unrolled.problem;
+        let decision = run_native_solve_within_deadline(remaining, move || {
+            crate::direct_smt_cex::acyclic_direct_smt_decision(&decision_problem)
+        })?;
+        let direct_witness = match decision {
+            crate::direct_smt_cex::AcyclicDecision::Unsafe(witness) => witness,
+            // `Safe` on a k-truncated under-approximation proves NOTHING about
+            // deeper traces; `Inconclusive` decided nothing. Both only mean
+            // "no witness at this budget" — climb the ladder.
+            crate::direct_smt_cex::AcyclicDecision::Safe
+            | crate::direct_smt_cex::AcyclicDecision::Inconclusive => continue,
+        };
+
+        let counterexample = serde_json::json!({
+            "schema": "trust_mc.typed-chc-pdr-counterexample/v1",
+            "source": "direct-smt-bounded-unroll-error-derivation",
+            "unroll_k": k,
+            "derivation_clause_indices": direct_witness.derivation_clause_indices,
+            "witness_model": direct_witness.model,
+        });
+        // Bind the witness to the ORIGINAL problem's normalized input: the
+        // unrolled derivation projects onto the original problem (see the
+        // module docs), and the original digest is what the consumer
+        // independently recomputes from its own retained request.
+        let witness = typed_chc_pdr_refutation_witness(
+            &request.obligation.obligation_id,
+            normalized_input_hash,
+            request.options.engine,
+            route,
+            &counterexample,
+            trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k: u64::from(k) },
+            lowering,
+        )?;
+        let outcome = trust_mc_core::ChcPdrSolveOutcome::refuted_with_witness(
+            request.obligation.obligation_id.clone(),
+            witness,
+            stats,
+        )
+        .with_diagnostic(format!(
+            "direct SMT confirmed a satisfiable typed query fact on a k={k} bounded unroll; \
+             refuted obligation via an error derivation that projects onto the original \
+             cyclic problem"
+        ));
+        let verdict = trust_mc_core::FullVerificationVerdict::Failed {
+            counterexample_artifacts: vec![trust_mc_core::FullVerificationArtifact::from_bytes(
+                trust_mc_core::FullVerificationArtifactKind::CounterexampleTrace,
+                format!(
+                    "trust_mc://typed-chc/{}/counterexample.json",
+                    request.obligation.obligation_id
+                ),
+                &json_bytes(&counterexample),
+            )],
+        };
+        return Some(TypedChcPdrFullVerification {
+            route,
+            cache_key: cache_key.clone(),
+            artifact_directory: artifact_directory.to_string(),
+            outcome,
+            verdict,
+            private_native_proof_seal: None,
+        });
+    }
+    None
 }
 
 fn prepare_validated_typed_chc_pdr_input(
@@ -2256,10 +2825,10 @@ fn native_trust_ir_trivial_safe_unsupported(
 /// `solve_typed_chc_pdr_full_verification` constructs a fresh generic response
 /// with no such seal, so public callers should expect this compatibility helper
 /// to fail closed. The authority-minting entry point is
-/// `NativeTrustIrChcPdrRunner::solve_bundle_native_proof_grade`, where full
-/// module validation, conservative semantic preflight, and fresh translation
-/// precede sealing. The public verdict remains an untrusted candidate in both
-/// paths and cannot be admitted by itself.
+/// `NativeTrustIrChcPdrRunner::solve_bundle_native_proof_grade` (or its explicit
+/// live-source-authority variant), where full module validation, conservative
+/// semantic preflight, and fresh translation precede sealing. The public verdict
+/// remains an untrusted candidate in both paths and cannot be admitted by itself.
 pub fn solve_typed_chc_pdr_native_proof_grade(
     request: trust_mc_core::ChcPdrSolveRequest,
 ) -> NativeSolveResult<TypedChcPdrFullVerification> {
@@ -2943,7 +3512,7 @@ fn solve_typed_chc_pdr_full_with_ay(
         }
     };
     match decision {
-        crate::direct_smt_cex::AcyclicDecision::Unsafe(witness_model) => {
+        crate::direct_smt_cex::AcyclicDecision::Unsafe(direct_witness) => {
             let sites = fail_closed_lowering_sites(&request.obligation);
             if sites > 0 {
                 let reason = fail_closed_lowering_demotion_reason(sites);
@@ -2968,7 +3537,8 @@ fn solve_typed_chc_pdr_full_with_ay(
             let counterexample = serde_json::json!({
                 "schema": "trust_mc.typed-chc-pdr-counterexample/v1",
                 "source": "direct-smt-acyclic-error-derivation",
-                "witness_model": witness_model,
+                "derivation_clause_indices": direct_witness.derivation_clause_indices,
+                "witness_model": direct_witness.model,
             });
             // Attach a refutation witness bound to the exact pre-solve
             // normalized input when the lowering was exact; a nonzero
@@ -3378,6 +3948,25 @@ fn solve_typed_chc_pdr_full_with_ay(
                     )
                 })
             {
+                return Ok(verification);
+            }
+            // Bounded-unroll REFUTATION lane (last escalation, cyclic L0
+            // obligations only). Runs only after every proof-seeking lane
+            // (direct-SMT, IC3 loop invariant, PDR) ended Unknown, and can
+            // only ever return `Refuted { witness }` + `Failed` — its return
+            // type has no Proved/Safe arm, so a truncated search can never
+            // mint proof credit. See `bounded_unroll` module docs.
+            if let Some(verification) = try_bounded_unroll_refutation_lane(
+                &problem,
+                &request,
+                stats,
+                &normalized_input_hash,
+                route,
+                &cache_key,
+                &artifact_directory,
+                lowering,
+                watchdog_ceiling,
+            ) {
                 return Ok(verification);
             }
             (
@@ -6764,6 +7353,10 @@ mod tests {
     enum ProofAuthorityAttackShape {
         Assume,
         Undef,
+        FreshHavocUndef,
+        FreshHavocWithAssume,
+        FreshHavocNonUndef,
+        FreshHavocValueAssertion,
         ValidBorrowLoad,
         ValidBorrowStore,
         Borrow,
@@ -6771,7 +7364,18 @@ mod tests {
         Wrapping,
         ExtractElement,
         Gep,
+        PointerData,
         PointerMetadata,
+        PointerFromParts,
+        ScalarAlloca,
+        UninitializedScalarAlloca,
+        CrossBlockScalarAlloca,
+        TypeMismatchedScalarAlloca,
+        ExplicitlyAlignedScalarAlloca,
+        ExplicitlyAlignedScalarAccess,
+        AggregateAlloca,
+        EscapingAggregateAlloca,
+        TypeMismatchedAggregateAlloca,
         Alloca,
         IntToPtr,
         DialectOperation,
@@ -6809,6 +7413,63 @@ mod tests {
                 function.switch_to_block(entry);
                 function.set_entry(entry);
                 let _undefined = function.undef(Ty::U32);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::FreshHavocUndef => {
+                let ty = builder.add_func_type(vec![], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let _havoc =
+                    function.undef_proven(Ty::U32, vec![ProofAnnotation::FreshSymbolicHavoc]);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::FreshHavocWithAssume => {
+                let ty = builder.add_func_type(vec![], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let havoc =
+                    function.undef_proven(Ty::U32, vec![ProofAnnotation::FreshSymbolicHavoc]);
+                let upper = function.iconst(Ty::U32, 10);
+                let narrowed = function.icmp(trust_ir::inst::ICmpOp::Ule, Ty::U32, havoc, upper);
+                function.assume(narrowed);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::FreshHavocNonUndef => {
+                let ty = builder.add_func_type(vec![], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let lhs = function.iconst(Ty::U32, 1);
+                let rhs = function.iconst(Ty::U32, 2);
+                let _sum = function.binop_proven(
+                    BinOp::Add,
+                    Ty::U32,
+                    lhs,
+                    rhs,
+                    vec![ProofAnnotation::FreshSymbolicHavoc],
+                );
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::FreshHavocValueAssertion => {
+                let ty = builder.add_func_type(vec![], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let havoc =
+                    function.undef_proven(Ty::U32, vec![ProofAnnotation::FreshSymbolicHavoc]);
+                let seven = function.iconst(Ty::U32, 7);
+                let value_claim = function.icmp(trust_ir::inst::ICmpOp::Eq, Ty::U32, havoc, seven);
+                function.assert(value_claim);
                 function.ret(vec![]);
                 function.build();
             }
@@ -6907,13 +7568,149 @@ mod tests {
                 function.ret(vec![]);
                 function.build();
             }
+            ProofAuthorityAttackShape::PointerData => {
+                let pointer_ty = Ty::FatPtr(trust_ir::FatPtrKind::Str);
+                let ty = builder.add_func_type(vec![pointer_ty.clone()], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let pointer = function.add_block_param(entry, pointer_ty.clone());
+                let _data = function.ptr_data(pointer_ty, pointer);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::PointerFromParts => {
+                let pointer_ty = Ty::FatPtr(trust_ir::FatPtrKind::Str);
+                let ty = builder.add_func_type(vec![Ty::Ptr, Ty::U64], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let data = function.add_block_param(entry, Ty::Ptr);
+                let metadata = function.add_block_param(entry, Ty::U64);
+                let _pointer = function.ptr_from_parts(pointer_ty, Ty::U64, data, metadata);
+                function.ret(vec![]);
+                function.build();
+            }
             ProofAuthorityAttackShape::Alloca => {
+                let ty = builder.add_func_type(vec![], vec![Ty::Ptr]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let ptr = function.alloca(Ty::I32);
+                function.ret(vec![ptr]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::ScalarAlloca => {
+                let ty = builder.add_func_type(vec![Ty::I32], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let value = function.add_block_param(entry, Ty::I32);
+                let ptr = function.alloca(Ty::I32);
+                function.store(Ty::I32, ptr, value);
+                let _loaded = function.load(Ty::I32, ptr);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::UninitializedScalarAlloca => {
                 let ty = builder.add_func_type(vec![], vec![]);
                 let mut function = builder.function("attack", ty);
                 let entry = function.create_block();
                 function.switch_to_block(entry);
                 function.set_entry(entry);
-                let _ptr = function.alloca(Ty::I32);
+                let ptr = function.alloca(Ty::I32);
+                let _loaded = function.load(Ty::I32, ptr);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::CrossBlockScalarAlloca => {
+                let ty = builder.add_func_type(vec![], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                let next = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let ptr = function.alloca(Ty::I32);
+                let value = function.iconst(Ty::I32, 1);
+                function.store(Ty::I32, ptr, value);
+                function.br(next, vec![]);
+                function.switch_to_block(next);
+                let _loaded = function.load(Ty::I32, ptr);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::TypeMismatchedScalarAlloca => {
+                let ty = builder.add_func_type(vec![Ty::U32], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let value = function.add_block_param(entry, Ty::U32);
+                let ptr = function.alloca(Ty::I32);
+                function.store(Ty::U32, ptr, value);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::ExplicitlyAlignedScalarAlloca => {
+                let ty = builder.add_func_type(vec![], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let _ptr = function.alloca_aligned(Ty::I32, 8);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::ExplicitlyAlignedScalarAccess => {
+                let ty = builder.add_func_type(vec![], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let ptr = function.alloca(Ty::I32);
+                let _loaded = function.load_aligned(Ty::I32, ptr, 8);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::AggregateAlloca => {
+                let aggregate_ty = Ty::Tuple(vec![Ty::U32, Ty::U32]);
+                let ty = builder.add_func_type(vec![aggregate_ty.clone()], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let value = function.add_block_param(entry, aggregate_ty.clone());
+                let ptr = function.alloca(aggregate_ty.clone());
+                function.store(aggregate_ty.clone(), ptr, value);
+                let _loaded = function.load(aggregate_ty, ptr);
+                function.ret(vec![]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::EscapingAggregateAlloca => {
+                let aggregate_ty = Ty::Tuple(vec![Ty::U32, Ty::U32]);
+                let ty = builder.add_func_type(vec![], vec![Ty::Ptr]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let ptr = function.alloca(aggregate_ty);
+                function.ret(vec![ptr]);
+                function.build();
+            }
+            ProofAuthorityAttackShape::TypeMismatchedAggregateAlloca => {
+                let aggregate_ty = Ty::Tuple(vec![Ty::U32, Ty::U32]);
+                let ty = builder.add_func_type(vec![Ty::U32], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let value = function.add_block_param(entry, Ty::U32);
+                let ptr = function.alloca(aggregate_ty);
+                function.store(Ty::U32, ptr, value);
                 function.ret(vec![]);
                 function.build();
             }
@@ -6980,7 +7777,6 @@ mod tests {
     #[test]
     #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
     fn proof_grade_bundle_preflight_rejects_public_semantic_shortcuts() {
-        let runner = NativeTrustIrChcPdrRunner::new();
         for (shape, expected) in [
             (ProofAuthorityAttackShape::Assume, "unauthenticated Assume"),
             (ProofAuthorityAttackShape::Undef, "executes Undef"),
@@ -6991,7 +7787,9 @@ mod tests {
             (ProofAuthorityAttackShape::Wrapping, "public Wrapping"),
             (ProofAuthorityAttackShape::ExtractElement, "uses ExtractElement"),
             (ProofAuthorityAttackShape::Gep, "uses GEP"),
+            (ProofAuthorityAttackShape::PointerData, "pointer-part semantics"),
             (ProofAuthorityAttackShape::PointerMetadata, "pointer-part semantics"),
+            (ProofAuthorityAttackShape::PointerFromParts, "pointer-part semantics"),
             (ProofAuthorityAttackShape::Alloca, "uses Alloca"),
             (ProofAuthorityAttackShape::IntToPtr, "uses cast IntToPtr"),
             (ProofAuthorityAttackShape::DialectOperation, "public dialect operation"),
@@ -7001,14 +7799,484 @@ mod tests {
             ),
         ] {
             let bundle = proof_authority_attack_bundle(shape);
-            let error = runner
-                .solve_bundle_native_proof_grade(&bundle)
+            let error = validate_native_bundle_proof_authority_input(&bundle, None)
                 .expect_err("public semantic shortcut must fail before authority minting");
             let NativeSolveError::InvalidInput { field, detail } = error else {
                 panic!("{shape:?} must be a structural preflight rejection");
             };
             assert!(field.starts_with("native_trust_ir_bundle."), "{shape:?}: {field}");
             assert!(detail.contains(expected), "{shape:?}: {detail}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn single_cell_alloca_is_default_on_but_escape_and_type_punning_fail_closed() {
+        for shape in
+            [ProofAuthorityAttackShape::ScalarAlloca, ProofAuthorityAttackShape::AggregateAlloca]
+        {
+            let admitted = proof_authority_attack_bundle(shape);
+            validate_native_bundle_proof_authority_input(&admitted, None)
+                .unwrap_or_else(|error| panic!("{shape:?} has an exact CHC model: {error}"));
+        }
+
+        for shape in [
+            ProofAuthorityAttackShape::Alloca,
+            ProofAuthorityAttackShape::UninitializedScalarAlloca,
+            ProofAuthorityAttackShape::CrossBlockScalarAlloca,
+            ProofAuthorityAttackShape::TypeMismatchedScalarAlloca,
+            ProofAuthorityAttackShape::ExplicitlyAlignedScalarAlloca,
+            ProofAuthorityAttackShape::ExplicitlyAlignedScalarAccess,
+            ProofAuthorityAttackShape::EscapingAggregateAlloca,
+            ProofAuthorityAttackShape::TypeMismatchedAggregateAlloca,
+        ] {
+            let bundle = proof_authority_attack_bundle(shape);
+            let error = validate_native_bundle_proof_authority_input(&bundle, None)
+                .expect_err("a cell that can go stale must fail closed");
+            let NativeSolveError::InvalidInput { field, detail } = error else {
+                panic!("{shape:?} must be rejected structurally");
+            };
+            assert!(field.starts_with("native_trust_ir_bundle."), "{shape:?}: {field}");
+            assert!(detail.contains("uses Alloca"), "{shape:?}: {detail}");
+        }
+    }
+
+    /// Swap a freshly built module into the valid compiler-shaped bundle
+    /// skeleton (obligations/requests reference the single `FuncId(0)`
+    /// function, which the builder must therefore define exactly one of).
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn swapped_module_bundle(
+        builder: trust_ir_build::ModuleBuilder,
+    ) -> trust_ir::NativeVerificationBundle {
+        let mut bundle = panic_free_compiler_bundle();
+        let mut module = builder.build();
+        module.proof_obligations = bundle.module.proof_obligations.clone();
+        module.proof_certificates = bundle.module.proof_certificates.clone();
+        module.obligation_diagnostics = bundle.module.obligation_diagnostics.clone();
+        bundle.module = module;
+        refresh_native_test_bundle_module_identity(&mut bundle);
+        bundle
+    }
+
+    /// A `NonNull`-shaped single-pointer-newtype struct registered as
+    /// `StructId(0)`, for the pointer bit-identity cast fixtures.
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn register_nonnull_shaped_struct(mb: &mut trust_ir_build::ModuleBuilder) -> trust_ir::ty::Ty {
+        use trust_ir::ty::{FieldDef, StructDef, Ty};
+        use trust_ir::value::StructId;
+        let id = StructId::new(0);
+        mb.add_struct(StructDef {
+            repr: Default::default(),
+            id,
+            name: "NonNullShaped".to_owned(),
+            fields: vec![FieldDef { name: "pointer".to_owned(), ty: Ty::Ptr, offset: Some(0) }],
+            // The module validator demands layout evidence for struct-involved
+            // bitcasts — mirror the bridge's registered `NonNull` layout.
+            size: Some(8),
+            align: Some(8),
+        });
+        Ty::Struct(id)
+    }
+
+    /// One-cast fixture: `attack(x: param_ty) { _ = cast(op, param_ty, dst); }`.
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn single_cast_bundle(
+        op: trust_ir::inst::CastOp,
+        src_of: fn(&trust_ir::ty::Ty) -> trust_ir::ty::Ty,
+        dst_of: fn(&trust_ir::ty::Ty) -> trust_ir::ty::Ty,
+    ) -> trust_ir::NativeVerificationBundle {
+        use trust_ir_build::ModuleBuilder;
+        let mut builder = ModuleBuilder::new(format!("bit_identity_cast_{op:?}"));
+        let newtype = register_nonnull_shaped_struct(&mut builder);
+        let src = src_of(&newtype);
+        let dst = dst_of(&newtype);
+        let ty = builder.add_func_type(vec![src.clone()], vec![]);
+        let mut function = builder.function("attack", ty);
+        let entry = function.create_block();
+        function.switch_to_block(entry);
+        function.set_entry(entry);
+        let x = function.add_block_param(entry, src.clone());
+        let _cast = function.cast(op, src, dst, x);
+        function.ret(vec![]);
+        function.build();
+        swapped_module_bundle(builder)
+    }
+
+    /// The exact pointer bit-identity cast shapes are admitted by the
+    /// proof-grade preflight WITHOUT any authority — they are public,
+    /// type-derived bit facts, translated value-preservingly (the semantics
+    /// live in `trust_mc_trust_bmc::proof_grade_cast_is_admissible`'s lockstep
+    /// legs; the value-level proof/refutation pair is the round-trip test
+    /// below).
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn proof_grade_preflight_admits_exact_pointer_bit_identity_casts() {
+        use trust_ir::inst::CastOp;
+        use trust_ir::ty::{FatPtrKind, Ty};
+        let fat = |_: &Ty| Ty::FatPtr(FatPtrKind::Str);
+        let cases: [(CastOp, fn(&Ty) -> Ty, fn(&Ty) -> Ty, &str); 6] = [
+            (CastOp::Bitcast, |_| Ty::U64, |nn: &Ty| nn.clone(), "usize->newtype pack"),
+            (CastOp::Bitcast, |nn: &Ty| nn.clone(), |_| Ty::U64, "newtype->usize unpack"),
+            (CastOp::Bitcast, |_| Ty::Ptr, |nn: &Ty| nn.clone(), "thin->newtype wrap"),
+            (CastOp::Bitcast, |nn: &Ty| nn.clone(), |_| Ty::Ptr, "newtype->thin unwrap"),
+            (CastOp::Bitcast, fat, fat, "same-type fat reinterpret"),
+            (CastOp::PtrToInt, |_| Ty::Ptr, |_| Ty::U64, "thin PtrToInt"),
+        ];
+        for (op, src_of, dst_of, what) in cases {
+            let bundle = single_cast_bundle(op, src_of, dst_of);
+            validate_native_bundle_proof_authority_input(&bundle, None)
+                .unwrap_or_else(|error| panic!("{what} must be admitted: {error}"));
+        }
+    }
+
+    /// Everything outside the enumerated bit-identity shapes keeps the
+    /// fail-closed cast refusal — including the shapes adjacent to the admitted
+    /// ones (narrow int pack, mismatched fat, a bare integer->`Ty::Ptr` forge
+    /// spelled as Bitcast, fat-source PtrToInt). `IntToPtr` keeps its own pin
+    /// in the attack-shape tables.
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn proof_grade_preflight_keeps_out_of_scope_casts_refused() {
+        use trust_ir::inst::CastOp;
+        use trust_ir::ty::{FatPtrKind, Ty};
+        // The fat->thin Bitcast spelling is refused one gate EARLIER (the
+        // module validator's cast layout rule) — its honest proof-grade
+        // spelling is `Inst::PtrData` under source authority.
+        let cases: [(CastOp, fn(&Ty) -> Ty, fn(&Ty) -> Ty, &str, &str); 5] = [
+            // Refused by the module validator's cast layout rule (32b -> 64b)
+            // before the floor's own cast arm is even consulted.
+            (CastOp::Bitcast, |_| Ty::U32, |nn: &Ty| nn.clone(), "narrow-int pack", "cast"),
+            (
+                CastOp::Bitcast,
+                |_| Ty::FatPtr(FatPtrKind::Str),
+                |_| Ty::FatPtr(FatPtrKind::TraitObject { trait_id: 0 }),
+                "mismatched fat reinterpret",
+                "uses cast",
+            ),
+            (
+                CastOp::Bitcast,
+                |_| Ty::U64,
+                |_| Ty::Ptr,
+                "bare int->ptr forge as Bitcast",
+                "uses cast",
+            ),
+            // Also refused by the module validator ("cast ptrtoint from
+            // fatptr<str> to u64 is invalid") before the floor's arm.
+            (
+                CastOp::PtrToInt,
+                |_| Ty::FatPtr(FatPtrKind::Str),
+                |_| Ty::U64,
+                "fat PtrToInt",
+                "cast",
+            ),
+            (
+                CastOp::Bitcast,
+                |_| Ty::FatPtr(FatPtrKind::Str),
+                |_| Ty::Ptr,
+                "fat->thin as Bitcast",
+                "cast",
+            ),
+        ];
+        for (op, src_of, dst_of, what, expected) in cases {
+            let bundle = single_cast_bundle(op, src_of, dst_of);
+            let Err(error) = validate_native_bundle_proof_authority_input(&bundle, None) else {
+                panic!("{what} must stay refused");
+            };
+            let NativeSolveError::InvalidInput { field, detail } = error else {
+                panic!("{what} must be a structural preflight rejection");
+            };
+            assert!(field.starts_with("native_trust_ir_bundle."), "{what}: {field}");
+            assert!(detail.contains(expected), "{what}: {detail}");
+        }
+    }
+
+    /// Value-level contract of the `fmt::Arguments` packing legs, through the
+    /// production floor + translator + PDR: the usize -> NonNull -> usize round
+    /// trip IS the identity (proves `bits == x`) and is ONLY the identity (the
+    /// negated claim refutes). A havoc model of either leg proves neither.
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn usize_newtype_pack_unpack_round_trip_is_exactly_the_identity() {
+        use trust_ir::inst::{CastOp, ICmpOp};
+        use trust_ir::ty::Ty;
+        use trust_ir_build::ModuleBuilder;
+
+        let build = |claim_identity: bool| {
+            let mut builder = ModuleBuilder::new("pack_unpack_round_trip");
+            let newtype = register_nonnull_shaped_struct(&mut builder);
+            let ty = builder.add_func_type(vec![Ty::U64], vec![]);
+            let mut function = builder.function("attack", ty);
+            let entry = function.create_block();
+            function.switch_to_block(entry);
+            function.set_entry(entry);
+            let x = function.add_block_param(entry, Ty::U64);
+            let packed = function.cast(CastOp::Bitcast, Ty::U64, newtype.clone(), x);
+            let bits = function.cast(CastOp::Bitcast, newtype.clone(), Ty::U64, packed);
+            let claim = function.icmp(
+                if claim_identity { ICmpOp::Eq } else { ICmpOp::Ne },
+                Ty::U64,
+                bits,
+                x,
+            );
+            function.assert(claim);
+            function.ret(vec![]);
+            function.build();
+            swapped_module_bundle(builder)
+        };
+
+        let runner = NativeTrustIrChcPdrRunner::with_solve_options(
+            trust_mc_core::ChcPdrSolveOptions::default()
+                .with_engine(trust_mc_core::ChcPdrEngine::Pdr)
+                .with_timeout(Duration::from_secs(10)),
+        );
+
+        let proved = runner
+            .solve_bundle_native_proof_grade(&build(true))
+            .expect("identity claim must solve");
+        assert_eq!(proved.obligations.len(), 1, "bits == x must PROVE");
+        proved.obligations[0]
+            .verification
+            .authorized_native_proof()
+            .expect("the identity proof must carry native proof authority");
+
+        let refuted = runner
+            .solve_bundle_native_proof_grade(&build(false))
+            .expect("negated claim must still solve without a structural error");
+        assert!(
+            refuted.obligations.is_empty(),
+            "bits != x is FALSE for every x and must never prove"
+        );
+        assert_eq!(
+            refuted.not_proved.len() + refuted.refuted.len(),
+            1,
+            "the negated claim must be reported outside the proof channel"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn fresh_symbolic_havoc_admission_is_exact_and_grants_no_narrowing_authority() {
+        let stamped = proof_authority_attack_bundle(ProofAuthorityAttackShape::FreshHavocUndef);
+        validate_native_bundle_proof_authority_input(&stamped, None)
+            .expect("the exact FreshSymbolicHavoc + Undef pair is unconstrained havoc");
+
+        for (shape, expected) in [
+            (ProofAuthorityAttackShape::FreshHavocWithAssume, "unauthenticated Assume"),
+            (
+                ProofAuthorityAttackShape::FreshHavocNonUndef,
+                "FreshSymbolicHavoc on a non-Undef instruction",
+            ),
+        ] {
+            let bundle = proof_authority_attack_bundle(shape);
+            let error = validate_native_bundle_proof_authority_input(&bundle, None)
+                .expect_err("the public marker must grant no semantic narrowing authority");
+            let NativeSolveError::InvalidInput { field, detail } = error else {
+                panic!("{shape:?} must be rejected structurally");
+            };
+            assert!(field.starts_with("native_trust_ir_bundle."), "{shape:?}: {field}");
+            assert!(detail.contains(expected), "{shape:?}: {detail}");
+        }
+
+        // The marker is intentionally serializable and forgeable. Roundtrip
+        // therefore cannot turn it into the live capability required by the
+        // independent Assume gate.
+        let narrowed =
+            proof_authority_attack_bundle(ProofAuthorityAttackShape::FreshHavocWithAssume);
+        let encoded = serde_json::to_vec(&narrowed).expect("serialize marked public bundle");
+        let decoded: trust_ir::NativeVerificationBundle =
+            serde_json::from_slice(&encoded).expect("deserialize marked public bundle");
+        let error = validate_native_bundle_proof_authority_input(&decoded, None)
+            .expect_err("serialized marker must not authenticate its forged narrowing");
+        let NativeSolveError::InvalidInput { detail, .. } = error else {
+            panic!("serialized narrowing must be rejected structurally");
+        };
+        assert!(detail.contains("unauthenticated Assume"), "{detail}");
+    }
+
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn fresh_symbolic_havoc_cannot_prove_a_value_specific_assertion() {
+        let bundle =
+            proof_authority_attack_bundle(ProofAuthorityAttackShape::FreshHavocValueAssertion);
+        validate_native_bundle_proof_authority_input(&bundle, None)
+            .expect("stamped Undef itself must pass the selective input gate");
+
+        let translated = trust_mc_trust_bmc::trust_mc_chc_pdr_obligations_from_native_bundle(
+            &bundle,
+            &trust_mc_trust_bmc::TranslateOptions::default(),
+        )
+        .expect("fresh symbolic havoc bundle translates");
+        assert_eq!(translated.len(), 1);
+        assert!(
+            translated[0].obligation.vc.rules.iter().any(|rule| rule.head.name == "error"),
+            "the unconstrained value-specific assertion must retain a reachable error rule"
+        );
+        assert!(
+            !translated[0].obligation.is_trivially_safe(),
+            "fresh havoc must not collapse a value-specific assertion to structural safety"
+        );
+
+        let runner = NativeTrustIrChcPdrRunner::with_solve_options(
+            trust_mc_core::ChcPdrSolveOptions::default()
+                .with_engine(trust_mc_core::ChcPdrEngine::Pdr)
+                .with_timeout(Duration::from_secs(10)),
+        );
+        let evidence = runner
+            .solve_bundle_native_proof_grade(&bundle)
+            .expect("the refutable bundle must return an honest non-proof outcome");
+        assert!(
+            evidence.obligations.is_empty(),
+            "an arbitrary havoc value cannot prove it equals seven"
+        );
+        assert_eq!(
+            evidence.not_proved.len() + evidence.refuted.len(),
+            1,
+            "the sole request must be reported outside the proof-authority channel"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn exact_source_generation_authority_admits_only_source_generated_semantics() {
+        for shape in [
+            ProofAuthorityAttackShape::Assume,
+            ProofAuthorityAttackShape::PointerMetadata,
+            ProofAuthorityAttackShape::Wrapping,
+            // `ValidBorrow` on a Load/Store rides the same audited live-lowering
+            // authority as the three above: the stamp derives from rustc's
+            // reference typing, contributes no value fact (the loaded value is
+            // still fresh havoc), and only discharges the bounds-model refusal.
+            ProofAuthorityAttackShape::ValidBorrowLoad,
+            ProofAuthorityAttackShape::ValidBorrowStore,
+            // `PtrData` is the fat->thin data-lane read (the `as_ptr` leg of the
+            // `fmt::Arguments` packing) — asserts nothing, modeled exactly.
+            ProofAuthorityAttackShape::PointerData,
+        ] {
+            let mut bundle = proof_authority_attack_bundle(shape);
+            let authority =
+                trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut bundle)
+                    .unwrap_or_else(|error| {
+                        panic!("{shape:?} fixture must mint authority: {error}")
+                    });
+            validate_native_bundle_proof_authority_input(&bundle, Some(&authority)).unwrap_or_else(
+                |error| panic!("{shape:?} must pass the exact authority gate: {error}"),
+            );
+        }
+
+        for (shape, expected) in [
+            (ProofAuthorityAttackShape::Undef, "executes Undef"),
+            (ProofAuthorityAttackShape::Borrow, "borrow-checker validity"),
+            (ProofAuthorityAttackShape::BorrowMut, "borrow-checker validity"),
+            (ProofAuthorityAttackShape::ExtractElement, "uses ExtractElement"),
+            (ProofAuthorityAttackShape::Gep, "uses GEP"),
+            (ProofAuthorityAttackShape::PointerFromParts, "pointer-part semantics"),
+            (ProofAuthorityAttackShape::Alloca, "uses Alloca"),
+            (ProofAuthorityAttackShape::IntToPtr, "uses cast IntToPtr"),
+            (ProofAuthorityAttackShape::DialectOperation, "public dialect operation"),
+            (
+                ProofAuthorityAttackShape::NameOnlyWrappingCall,
+                "name-only wrapping-intrinsic substitution",
+            ),
+        ] {
+            let mut bundle = proof_authority_attack_bundle(shape);
+            let authority =
+                trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut bundle)
+                    .unwrap_or_else(|error| {
+                        panic!("{shape:?} fixture must mint authority: {error}")
+                    });
+            let error = validate_native_bundle_proof_authority_input(&bundle, Some(&authority))
+                .expect_err("source authority must not admit an unrelated semantic shortcut");
+            let NativeSolveError::InvalidInput { field, detail } = error else {
+                panic!("{shape:?} must be a structural preflight rejection");
+            };
+            assert!(field.starts_with("native_trust_ir_bundle."), "{shape:?}: {field}");
+            assert!(detail.contains(expected), "{shape:?}: {detail}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn source_generation_authority_is_send_sync_for_shared_parallel_dispatch() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<trust_ir::SourceGenerationAuthority>();
+    }
+
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn source_generation_authority_rejects_clone_roundtrip_cross_bundle_and_mutation() {
+        fn expect_assume_rejection(
+            bundle: &trust_ir::NativeVerificationBundle,
+            authority: &trust_ir::SourceGenerationAuthority,
+            case: &str,
+        ) {
+            let error = match validate_native_bundle_proof_authority_input(bundle, Some(authority))
+            {
+                Err(error) => error,
+                Ok(()) => panic!("{case} must not retain source authority"),
+            };
+            let NativeSolveError::InvalidInput { field, detail } = error else {
+                panic!("{case} must fail at the structural preflight");
+            };
+            assert_eq!(field, "native_trust_ir_bundle.module.functions.instructions", "{case}");
+            assert!(detail.contains("unauthenticated Assume"), "{case}: {detail}");
+        }
+
+        let mut bundle = proof_authority_attack_bundle(ProofAuthorityAttackShape::Assume);
+        let authority = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut bundle)
+            .expect("fresh in-process fixture must mint authority");
+        validate_native_bundle_proof_authority_input(&bundle, Some(&authority))
+            .expect("the original exact bundle must be authorized");
+
+        let cloned = bundle.clone();
+        expect_assume_rejection(&cloned, &authority, "clone");
+
+        let encoded = serde_json::to_vec(&bundle).expect("serialize authority-bearing bundle");
+        let decoded: trust_ir::NativeVerificationBundle =
+            serde_json::from_slice(&encoded).expect("deserialize bundle");
+        expect_assume_rejection(&decoded, &authority, "serde roundtrip");
+
+        let mut independently_built =
+            proof_authority_attack_bundle(ProofAuthorityAttackShape::Assume);
+        let foreign_authority =
+            trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut independently_built)
+                .expect("independent fixture must mint its own authority");
+        expect_assume_rejection(&bundle, &foreign_authority, "cross-bundle authority");
+        expect_assume_rejection(&independently_built, &authority, "wrong authority");
+
+        bundle.diagnostics.emit_proof_traces = !bundle.diagnostics.emit_proof_traces;
+        expect_assume_rejection(&bundle, &authority, "post-mint mutation");
+    }
+
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn public_bundle_entrypoints_default_deny_and_thread_exact_source_authority() {
+        let mut bundle = proof_authority_attack_bundle(ProofAuthorityAttackShape::Assume);
+        let runner = NativeTrustIrChcPdrRunner::new();
+
+        let default_error = runner
+            .solve_bundle_native_proof_grade(&bundle)
+            .expect_err("the ordinary public API must keep Assume fail-closed");
+        let NativeSolveError::InvalidInput { field, detail } = default_error else {
+            panic!("ordinary public API must reject Assume at its structural preflight");
+        };
+        assert_eq!(field, "native_trust_ir_bundle.module.functions.instructions");
+        assert!(detail.contains("unauthenticated Assume"), "{detail}");
+
+        let authority = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut bundle)
+            .expect("fresh in-process fixture must mint authority");
+        if let Err(error) =
+            runner.solve_bundle_native_proof_grade_with_source_authority(&bundle, &authority)
+        {
+            if let NativeSolveError::InvalidInput { field, detail } = &error
+                && detail.contains("unauthenticated Assume")
+            {
+                panic!(
+                    "privileged public API failed to thread its exact authority at {field}: {detail}"
+                );
+            }
+            // A later solver/translation outcome is not source-authority
+            // admission. The regression guards only the public plumbing seam;
+            // private preflight tests above exhaustively guard the relaxation.
         }
     }
 
@@ -7267,6 +8535,123 @@ mod tests {
         assert!(witness.concreteness.is_exact_with_zero_counts());
         assert_eq!(witness.verification, trust_mc_core::ChcPdrCexVerification::DirectSmtModel);
         assert!(witness.counterexample_json.contains("trust_mc.typed-chc-pdr-counterexample/v1"));
+        let replay = independently_replay_typed_chc_pdr_refutation_witness(
+            &obligation,
+            trust_mc_core::ChcPdrEngine::Pdr,
+            witness,
+        )
+        .expect("consumer must independently replay the direct-SMT trace and exact model");
+        assert!(replay.contains("acyclic derivation"), "{replay}");
+    }
+
+    /// Consumer replay is fail-closed under every serialized authority input:
+    /// formula/config bindings, proof class, trace, total model, concreteness,
+    /// strict payload shape, and payload budget.
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn independent_direct_smt_refutation_replay_rejects_mutations() {
+        let obligation = typed_chc_obligation(true);
+        let request = trust_mc_core::ChcPdrSolveRequest::new(obligation.clone()).with_options(
+            trust_mc_core::ChcPdrSolveOptions::default()
+                .with_engine(trust_mc_core::ChcPdrEngine::Pdr)
+                .with_timeout(Duration::from_secs(10)),
+        );
+        let solved = solve_typed_chc_pdr_full_verification(request)
+            .expect("reachable error should fully verify");
+        let trust_mc_core::ChcPdrSolveStatus::Refuted { witness: Some(witness) } =
+            &solved.outcome.status
+        else {
+            panic!("reachable error must carry a refutation witness");
+        };
+        let original = witness.as_ref().clone();
+        independently_replay_typed_chc_pdr_refutation_witness(
+            &obligation,
+            trust_mc_core::ChcPdrEngine::Pdr,
+            &original,
+        )
+        .expect("unmodified witness replays");
+
+        let rejects = |label: &str, mutated: &trust_mc_core::ChcPdrRefutationWitness| {
+            assert!(
+                independently_replay_typed_chc_pdr_refutation_witness(
+                    &obligation,
+                    trust_mc_core::ChcPdrEngine::Pdr,
+                    mutated,
+                )
+                .is_err(),
+                "{label} mutation must fail closed"
+            );
+        };
+
+        let mut mutated = original.clone();
+        mutated.encoded_formula_sha256 = "00".repeat(32);
+        rejects("formula digest", &mutated);
+
+        let mut mutated = original.clone();
+        mutated.semantic_config_sha256 = "11".repeat(32);
+        rejects("semantic configuration", &mutated);
+
+        assert!(
+            independently_replay_typed_chc_pdr_refutation_witness(
+                &obligation,
+                trust_mc_core::ChcPdrEngine::AdaptivePortfolio,
+                &original,
+            )
+            .is_err(),
+            "a consumer engine mismatch must fail closed"
+        );
+
+        let mut mutated = original.clone();
+        mutated.verification =
+            trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k: 4 };
+        rejects("proof class", &mutated);
+
+        let mut mutated = original.clone();
+        mutated.concreteness = trust_mc_core::ChcPdrEncodingConcreteness::ExactEncoding {
+            translation_drops: 0,
+            havocs: 1,
+            undef_diagnostic_havocs: 0,
+        };
+        rejects("concreteness", &mutated);
+
+        let mutate_payload =
+            |witness: &mut trust_mc_core::ChcPdrRefutationWitness,
+             mutate: &dyn Fn(&mut serde_json::Value)| {
+                let mut payload: serde_json::Value =
+                    serde_json::from_str(&witness.counterexample_json).expect("fixture payload");
+                mutate(&mut payload);
+                witness.counterexample_json = payload.to_string();
+            };
+
+        let mut mutated = original.clone();
+        mutate_payload(&mut mutated, &|payload| {
+            payload
+                .as_object_mut()
+                .expect("payload object")
+                .insert("unrecognized_authority".to_string(), serde_json::json!(true));
+        });
+        rejects("unknown JSON field", &mutated);
+
+        let mut mutated = original.clone();
+        mutate_payload(&mut mutated, &|payload| {
+            let trace = payload["derivation_clause_indices"].as_array_mut().expect("trace array");
+            let repeated = trace.first().expect("nonempty trace").clone();
+            trace.push(repeated);
+        });
+        rejects("derivation trace", &mutated);
+
+        let mut mutated = original.clone();
+        mutate_payload(&mut mutated, &|payload| {
+            payload["witness_model"].as_object_mut().expect("model object").insert(
+                "forged_extra_binding".to_string(),
+                serde_json::json!({ "kind": "bool", "value": true }),
+            );
+        });
+        rejects("model domain", &mutated);
+
+        let mut mutated = original;
+        mutated.counterexample_json = "x".repeat(MAX_REFUTATION_REPLAY_PAYLOAD_BYTES + 1);
+        rejects("payload budget", &mutated);
     }
 
     /// (β) Nonzero lowering-exactness accounting — any counter, including
@@ -7754,5 +9139,766 @@ mod tests {
             verification.is_none(),
             "IC3 loop lane must REJECT the false +2 parity loop (re-validation fails)"
         );
+    }
+
+    // ===== Bounded-unroll refutation lane (shift-reduction BMC) =====
+
+    /// What the loop body adds to the accumulator each iteration.
+    #[cfg(feature = "ay-chc-native")]
+    #[derive(Clone, Copy)]
+    enum LoopAddend {
+        /// `t += x` for the entry parameter `x` (i128 reduction shape).
+        Param,
+        /// `t += x << 4` for the entry parameter `x` (the shift-reduction
+        /// fixture shape: `t += (x as u8) << 4`).
+        ShiftedParam,
+        /// `t += c` for a constant `c` (input-independent overflow depth).
+        Const(i128),
+    }
+
+    /// Build the trust-ir mirror of the gate's loop-reduction fixtures:
+    ///
+    /// ```text
+    /// fn loop_accumulator(x: T) -> T {
+    ///     let mut t: T = 0;
+    ///     let mut i: u64 = 0;
+    ///     while i < iterations { t += addend; i += 1; }
+    ///     t
+    /// }
+    /// ```
+    ///
+    /// as a typed CHC obligation (the exact translation the native bundle
+    /// path produces for the requested function). The `t += addend` unsigned/
+    /// signed overflow VC is the L0 obligation under test.
+    #[cfg(feature = "ay-chc-native")]
+    fn loop_accumulator_obligation(
+        acc_ty: trust_ir::ty::Ty,
+        iterations: i128,
+        addend: LoopAddend,
+    ) -> trust_mc_core::MirChcPdrObligation {
+        use trust_ir::inst::{BinOp, ICmpOp};
+        use trust_ir::ty::Ty;
+        use trust_ir_build::ModuleBuilder;
+
+        let mut mb = ModuleBuilder::new("bounded_unroll_fixture");
+        let param_tys = match addend {
+            LoopAddend::Const(_) => vec![],
+            _ => vec![acc_ty.clone()],
+        };
+        let ft = mb.add_func_type(param_tys, vec![acc_ty.clone()]);
+        {
+            let mut fb = mb.function("loop_accumulator", ft);
+            let entry = fb.create_block();
+            let header = fb.create_block();
+            let body = fb.create_block();
+            let exit = fb.create_block();
+
+            fb.switch_to_block(entry);
+            fb.set_entry(entry);
+            let addend_value = match addend {
+                LoopAddend::Param => fb.add_block_param(entry, acc_ty.clone()),
+                LoopAddend::ShiftedParam => {
+                    let x = fb.add_block_param(entry, acc_ty.clone());
+                    let four = fb.iconst(acc_ty.clone(), 4);
+                    // `x << 4`: truncating shift (bits out are dropped), the
+                    // constant amount keeps its own shift-amount VC unsat.
+                    fb.binop(BinOp::Shl, acc_ty.clone(), x, four)
+                }
+                LoopAddend::Const(c) => fb.iconst(acc_ty.clone(), c),
+            };
+            let zero_i = fb.iconst(Ty::U64, 0);
+            let zero_t = fb.iconst(acc_ty.clone(), 0);
+            fb.br(header, vec![zero_i, zero_t]);
+
+            // Loop-carried state travels as explicit BLOCK ARGUMENTS on every
+            // edge (the shape the CHC translator threads exactly); a
+            // dominance-scoped cross-block reference would instead be encoded
+            // as a fresh (havoc'd) variable and the grounding gate would
+            // decline the whole fixture.
+            let i = fb.add_block_param(header, Ty::U64);
+            let t = fb.add_block_param(header, acc_ty.clone());
+            fb.switch_to_block(header);
+            let bound = fb.iconst(Ty::U64, iterations);
+            let in_loop = fb.icmp(ICmpOp::Ult, Ty::U64, i, bound);
+            fb.condbr(in_loop, body, vec![i, t], exit, vec![t]);
+
+            let i_body = fb.add_block_param(body, Ty::U64);
+            let t_body = fb.add_block_param(body, acc_ty.clone());
+            fb.switch_to_block(body);
+            // The obligation under test: loop-carried accumulator add.
+            let t_next = fb.add(acc_ty.clone(), t_body, addend_value);
+            let one = fb.iconst(Ty::U64, 1);
+            let i_next = fb.add(Ty::U64, i_body, one);
+            fb.br(header, vec![i_next, t_next]);
+
+            let t_exit = fb.add_block_param(exit, acc_ty.clone());
+            fb.switch_to_block(exit);
+            fb.ret(vec![t_exit]);
+            fb.build();
+        }
+        let module = mb.build();
+        let function = module.functions[0].id;
+        let vc = trust_mc_trust_bmc::trust_ir_function_to_chc_vc(
+            &module,
+            function,
+            &trust_mc_trust_bmc::TranslateOptions::default(),
+        )
+        .expect("fixture function translates");
+        let mut obligation = trust_mc_core::MirChcPdrObligation::new(
+            "bounded-unroll-fixture",
+            "loop_accumulator",
+            trust_mc_core::MirObligationKind::Assertion,
+            vc,
+        );
+        // Mirror the native-bundle translator's metadata: the VC above IS its
+        // complete-by-construction lowering, and the bounded-unroll lane
+        // self-gates on this marker (see the lane's eligibility comment).
+        obligation.native_metadata = Some(
+            trust_mc_core::NativeTypedChcObligationMetadata::new(
+                "tRust",
+                "trust_ir-module",
+                None,
+                trust_mc_core::NativeArtifactDigest::new("sha256", "00".repeat(32)),
+                trust_mc_core::NativeArtifactDigest::new("sha256", "11".repeat(32)),
+                0,
+                "chc",
+                0,
+                vec![],
+                vec![],
+            )
+            .with_structural_reachability_complete(true),
+        );
+        obligation
+    }
+
+    /// Drive the bounded-unroll lane exactly as `solve_typed_chc_pdr_full_with_ay`'s
+    /// Unknown arm does, without paying for the primary PDR solve.
+    #[cfg(feature = "ay-chc-native")]
+    fn run_bounded_unroll_lane(
+        obligation: &trust_mc_core::MirChcPdrObligation,
+        ladder: &[u32],
+    ) -> Option<TypedChcPdrFullVerification> {
+        let request = trust_mc_core::ChcPdrSolveRequest::new(obligation.clone()).with_options(
+            trust_mc_core::ChcPdrSolveOptions::default()
+                .with_engine(trust_mc_core::ChcPdrEngine::Pdr),
+        );
+        let prepared = prepare_validated_typed_chc_pdr_input(obligation).expect("fixture prepares");
+        assert_eq!(prepared.normalized.route, TypedChcPdrRoute::PdrProof);
+        let problem = prepared.problem.expect("PdrProof route retains the lowered problem");
+        let stats = obligation.stats();
+        let cache_key =
+            typed_full_verification_cache_key(obligation, &request.options, &prepared.normalized);
+        let artifact_directory = typed_artifact_directory(&cache_key);
+        try_bounded_unroll_refutation_lane_with_ladder(
+            &problem,
+            &request,
+            stats,
+            &prepared.normalized.normalized_input_hash,
+            prepared.normalized.route,
+            &cache_key,
+            &artifact_directory,
+            prepared.lowering,
+            Duration::from_secs(120),
+            ladder,
+        )
+    }
+
+    /// Collect every bit-vector value of the given width from a direct-SMT
+    /// witness model (the typed JSON rendering of `smt_value_to_json`).
+    #[cfg(feature = "ay-chc-native")]
+    fn collect_bitvec_model_values(model: &serde_json::Value, width: u64, out: &mut Vec<u128>) {
+        match model {
+            serde_json::Value::Object(map) => {
+                if map.get("kind").and_then(serde_json::Value::as_str) == Some("bit_vec")
+                    && map.get("width").and_then(serde_json::Value::as_u64) == Some(width)
+                {
+                    if let Some(value) = map.get("value").and_then(serde_json::Value::as_str) {
+                        if let Ok(value) = value.parse::<u128>() {
+                            out.push(value);
+                        }
+                    }
+                }
+                for value in map.values() {
+                    collect_bitvec_model_values(value, width, out);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect_bitvec_model_values(value, width, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mirror of the u8 shift-reduction fixture semantics (`t += (x << 4)` over
+    /// 64 iterations, Rust shift/overflow semantics): the 1-based iteration at
+    /// which the accumulator add first overflows, `None` if it never does.
+    #[cfg(feature = "ay-chc-native")]
+    fn u8_shift_reduction_overflow_iteration(x: u8) -> Option<usize> {
+        let addend = x << 4; // truncating: bits shifted out are dropped, no panic
+        let mut t: u8 = 0;
+        for iteration in 1..=64usize {
+            match t.checked_add(addend) {
+                Some(next) => t = next,
+                None => return Some(iteration),
+            }
+        }
+        None
+    }
+
+    /// Mirror of the i128 accumulator fixture semantics (`t += x` over 4
+    /// iterations): the 1-based iteration of the first signed overflow.
+    #[cfg(feature = "ay-chc-native")]
+    fn i128_accumulator_overflow_iteration(x: i128) -> Option<usize> {
+        let mut t: i128 = 0;
+        for iteration in 1..=4usize {
+            match t.checked_add(x) {
+                Some(next) => t = next,
+                None => return Some(iteration),
+            }
+        }
+        None
+    }
+
+    /// Unpack a lane result into (witness, k, parsed witness model).
+    #[cfg(feature = "ay-chc-native")]
+    fn unpack_bounded_unroll_refutation(
+        verification: &TypedChcPdrFullVerification,
+    ) -> (&trust_mc_core::ChcPdrRefutationWitness, u64, serde_json::Value) {
+        let trust_mc_core::ChcPdrSolveStatus::Refuted { witness: Some(witness) } =
+            &verification.outcome.status
+        else {
+            panic!("lane result must be Refuted with witness, got {:?}", verification.outcome);
+        };
+        let trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k } =
+            witness.verification
+        else {
+            panic!("lane witness must carry the bounded-unroll kind: {:?}", witness.verification);
+        };
+        let counterexample: serde_json::Value =
+            serde_json::from_str(&witness.counterexample_json).expect("witness payload is JSON");
+        assert_eq!(
+            counterexample.get("source").and_then(serde_json::Value::as_str),
+            Some("direct-smt-bounded-unroll-error-derivation"),
+        );
+        assert_eq!(counterexample.get("unroll_k").and_then(serde_json::Value::as_u64), Some(k));
+        let model = counterexample.get("witness_model").expect("witness model present").clone();
+        (witness, k, model)
+    }
+
+    /// The u8 shift-reduction loop (`t += x << 4` over `[_; 64]`-shaped
+    /// iteration) genuinely overflows for some inputs; the lane must refute it
+    /// with a machine-checked witness whose input CONCRETELY overflows when the
+    /// fixture semantics are executed (the ground-truth oracle: execution, not
+    /// solver output).
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn bounded_unroll_lane_refutes_u8_shift_reduction_overflow() {
+        let obligation =
+            loop_accumulator_obligation(trust_ir::ty::Ty::U8, 64, LoopAddend::ShiftedParam);
+        let verification =
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .expect("u8 shift-reduction overflow must refute inside the ladder");
+        assert!(
+            matches!(verification.verdict, trust_mc_core::FullVerificationVerdict::Failed { .. }),
+            "refutation carries a Failed verdict: {:?}",
+            verification.verdict
+        );
+        let (witness, k, model) = unpack_bounded_unroll_refutation(&verification);
+
+        let replay = independently_replay_typed_chc_pdr_refutation_witness(
+            &obligation,
+            trust_mc_core::ChcPdrEngine::Pdr,
+            witness,
+        )
+        .expect("consumer must independently rebuild and replay the bounded unroll");
+        assert!(replay.contains(&format!("k={k}")), "{replay}");
+
+        // Digest binding: the witness binds the ORIGINAL problem's normalized
+        // input, which the consumer recomputes from its own retained request.
+        let expected = normalized_typed_chc_pdr_input(&obligation).expect("normalizes");
+        assert_eq!(witness.encoded_formula_sha256, expected.normalized_input_hash.value);
+        assert!(witness.concreteness.is_exact_with_zero_counts());
+
+        // Concrete replay (ground-truth oracle): the witness model constrains
+        // the input `x` so the violated add is reachable within k back edges;
+        // executing the mirrored Rust semantics at a model input must really
+        // overflow within k+1 body executions. `x` is among the model's u8
+        // values, so the existential scan below is guaranteed to include it —
+        // and any hit is itself a real overflowing input drawn from the model.
+        let mut candidates = Vec::new();
+        collect_bitvec_model_values(&model, 8, &mut candidates);
+        assert!(!candidates.is_empty(), "witness model carries u8 assignments: {model}");
+        let earliest = candidates
+            .iter()
+            .filter_map(|&value| {
+                u8::try_from(value).ok().and_then(u8_shift_reduction_overflow_iteration)
+            })
+            .min();
+        let earliest = earliest.expect(
+            "at least one u8 value in the witness model must concretely overflow the mirrored \
+             fixture semantics — a witness that does not replay is a lane bug",
+        );
+        assert!(
+            earliest <= usize::try_from(k).expect("production bounded-unroll k fits usize") + 1,
+            "the concrete overflow (iteration {earliest}) must be reachable within the \
+             unroll budget k={k}"
+        );
+    }
+
+    /// The bounded proof class, budget and exact rebuilt path are authority
+    /// inputs rather than labels. Consumer replay must reject any mutation.
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn independent_bounded_unroll_refutation_replay_rejects_mutations() {
+        let obligation =
+            loop_accumulator_obligation(trust_ir::ty::Ty::U8, 64, LoopAddend::ShiftedParam);
+        let verification =
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .expect("fixture refutes");
+        let (witness, k, _) = unpack_bounded_unroll_refutation(&verification);
+        let original = witness.clone();
+        independently_replay_typed_chc_pdr_refutation_witness(
+            &obligation,
+            trust_mc_core::ChcPdrEngine::Pdr,
+            &original,
+        )
+        .expect("unmodified bounded witness replays");
+
+        let rejects = |label: &str, mutated: &trust_mc_core::ChcPdrRefutationWitness| {
+            assert!(
+                independently_replay_typed_chc_pdr_refutation_witness(
+                    &obligation,
+                    trust_mc_core::ChcPdrEngine::Pdr,
+                    mutated,
+                )
+                .is_err(),
+                "{label} mutation must fail closed"
+            );
+        };
+
+        let mut mutated = original.clone();
+        mutated.verification = trust_mc_core::ChcPdrCexVerification::DirectSmtModel;
+        rejects("proof class", &mutated);
+
+        let mut mutated = original.clone();
+        mutated.verification =
+            trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k: 2 };
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&mutated.counterexample_json).expect("fixture payload");
+        payload["unroll_k"] = serde_json::json!(2);
+        mutated.counterexample_json = payload.to_string();
+        rejects("out-of-ladder budget", &mutated);
+
+        let mut mutated = original.clone();
+        mutated.verification =
+            trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k };
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&mutated.counterexample_json).expect("fixture payload");
+        payload["unroll_k"] = serde_json::json!(if k == 4 { 16 } else { 4 });
+        mutated.counterexample_json = payload.to_string();
+        rejects("payload/class budget", &mutated);
+
+        let mut mutated = original.clone();
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&mutated.counterexample_json).expect("fixture payload");
+        let trace = payload["derivation_clause_indices"].as_array_mut().expect("trace array");
+        let repeated = trace.first().expect("nonempty trace").clone();
+        trace.push(repeated);
+        mutated.counterexample_json = payload.to_string();
+        rejects("transition trace", &mutated);
+
+        let mut mutated = original;
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&mutated.counterexample_json).expect("fixture payload");
+        let model = payload["witness_model"].as_object_mut().expect("model object");
+        let removed = model.keys().next().cloned().expect("nonempty model");
+        model.remove(&removed);
+        mutated.counterexample_json = payload.to_string();
+        rejects("partial model", &mutated);
+    }
+
+    /// The i128 reduction (`t += x` over `[i128; 4]`) genuinely overflows for
+    /// large elements; the lane must refute it and the witness input must
+    /// concretely overflow under the mirrored semantics.
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn bounded_unroll_lane_refutes_i128_accumulator_overflow() {
+        let obligation = loop_accumulator_obligation(trust_ir::ty::Ty::I128, 4, LoopAddend::Param);
+        let verification =
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .expect("i128 accumulator overflow must refute inside the ladder");
+        let (witness, k, model) = unpack_bounded_unroll_refutation(&verification);
+
+        let expected = normalized_typed_chc_pdr_input(&obligation).expect("normalizes");
+        assert_eq!(witness.encoded_formula_sha256, expected.normalized_input_hash.value);
+        assert!(witness.concreteness.is_exact_with_zero_counts());
+
+        let mut candidates = Vec::new();
+        collect_bitvec_model_values(&model, 128, &mut candidates);
+        assert!(!candidates.is_empty(), "witness model carries i128 assignments: {model}");
+        let earliest = candidates
+            .iter()
+            .filter_map(|&value| {
+                // Reinterpret the unsigned model value as two's-complement i128.
+                i128_accumulator_overflow_iteration(value as i128)
+            })
+            .min()
+            .expect(
+                "at least one i128 value in the witness model must concretely overflow the \
+                 mirrored fixture semantics",
+            );
+        assert!(
+            earliest <= usize::try_from(k).expect("production bounded-unroll k fits usize") + 1
+        );
+    }
+
+    /// A safe bounded loop (`u64 t += 1` over 10 iterations, no reachable
+    /// overflow) must NOT be refuted — and this lane can never prove it either
+    /// (its return type has no Proved arm); the safe proof must keep coming
+    /// from the structural/PDR lanes.
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn bounded_unroll_lane_never_refutes_a_safe_loop() {
+        let obligation =
+            loop_accumulator_obligation(trust_ir::ty::Ty::U64, 10, LoopAddend::Const(1));
+        assert!(
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .is_none(),
+            "a safe loop must yield no refutation at any rung"
+        );
+    }
+
+    /// A violation reachable only BEYOND every ladder rung must stay Unknown
+    /// (honest incompleteness): the under-approximation never over-claims in
+    /// either direction. `u8 t += 64` first overflows on the 4th add (3 back
+    /// edges), which a k=2 ladder cannot reach.
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn bounded_unroll_lane_stays_unknown_beyond_its_budget() {
+        let obligation =
+            loop_accumulator_obligation(trust_ir::ty::Ty::U8, 64, LoopAddend::Const(64));
+        assert!(
+            run_bounded_unroll_lane(&obligation, &[2]).is_none(),
+            "a violation deeper than every rung must not be refuted"
+        );
+        // The same violation IS caught once the ladder covers its depth,
+        // pinning that the miss above is a budget property, not a lane bug.
+        let verification =
+            run_bounded_unroll_lane(&obligation, &[4]).expect("depth-4 violation refutes at k=4");
+        let (_, k, _) = unpack_bounded_unroll_refutation(&verification);
+        assert_eq!(k, 4);
+        // And the production ladder covers the gate fixtures' depths (u8
+        // shift-reduction needs 15 back edges, [u8; 64] full trips need 63).
+        assert_eq!(bounded_unroll::BOUNDED_UNROLL_K_LADDER.last(), Some(&64));
+    }
+
+    /// Non-L0 obligation kinds (invariants, protocols) are outside this lane.
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn bounded_unroll_lane_declines_non_assertion_kinds() {
+        let mut obligation =
+            loop_accumulator_obligation(trust_ir::ty::Ty::U8, 64, LoopAddend::ShiftedParam);
+        obligation.kind = trust_mc_core::MirObligationKind::Invariant;
+        assert!(
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .is_none(),
+            "the lane is L0-only"
+        );
+    }
+
+    /// A nonzero fail-closed-lowering-site count poisons any derivation (it may
+    /// route through an admission-failure error rule), so the lane declines
+    /// before solving — same gate as the direct and PDR refutation arms.
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn bounded_unroll_lane_declines_fail_closed_lowering_sites() {
+        let mut obligation =
+            loop_accumulator_obligation(trust_ir::ty::Ty::U8, 64, LoopAddend::ShiftedParam);
+        obligation.native_metadata = Some(
+            trust_mc_core::NativeTypedChcObligationMetadata::new(
+                "tRust",
+                "trust_ir-module",
+                None,
+                trust_mc_core::NativeArtifactDigest::new("sha256", "00".repeat(32)),
+                trust_mc_core::NativeArtifactDigest::new("sha256", "11".repeat(32)),
+                0,
+                "chc",
+                0,
+                vec![],
+                vec![],
+            )
+            // Keep the eligibility marker so the decline is attributable to
+            // the fail-closed count alone.
+            .with_structural_reachability_complete(true)
+            .with_fail_closed_lowering_site_count(1),
+        );
+        assert!(
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .is_none(),
+            "fail-closed lowering sites must suppress the refutation"
+        );
+    }
+
+    /// Obligations that do not carry the native-bundle translator's
+    /// complete-by-construction marker are outside the lane's modeled domain —
+    /// notably the compiler's control-only whole-CFG default-admission CHC
+    /// (nullary relations, no data constraints), whose "derivations" are mere
+    /// control-feasibility and must never be surfaced as refutations.
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn bounded_unroll_lane_declines_without_completeness_marker() {
+        let mut obligation =
+            loop_accumulator_obligation(trust_ir::ty::Ty::U8, 64, LoopAddend::ShiftedParam);
+        // (a) no native metadata at all.
+        obligation.native_metadata = None;
+        assert!(
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .is_none(),
+            "metadata-free obligations are outside the lane"
+        );
+        // (b) metadata present but the completeness claim absent.
+        obligation.native_metadata = Some(trust_mc_core::NativeTypedChcObligationMetadata::new(
+            "tRust",
+            "trust_ir-module",
+            None,
+            trust_mc_core::NativeArtifactDigest::new("sha256", "00".repeat(32)),
+            trust_mc_core::NativeArtifactDigest::new("sha256", "11".repeat(32)),
+            0,
+            "chc",
+            0,
+            vec![],
+            vec![],
+        ));
+        assert!(
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .is_none(),
+            "an unclaimed encoding must not enter the refutation lane"
+        );
+    }
+
+    /// End-to-end over the native bundle boundary: the loop-overflow request
+    /// lands in the new `refuted` channel as a witnessed refutation (never in
+    /// `obligations`, which is proof authority), and the witness digest matches
+    /// a consumer-style fresh recomputation.
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn native_bundle_delivers_witnessed_loop_refutation_on_refuted_channel() {
+        let bundle = loop_overflow_trust_ir_bundle();
+        let runner = NativeTrustIrChcPdrRunner::with_solve_options(
+            trust_mc_core::ChcPdrSolveOptions::default()
+                .with_engine(trust_mc_core::ChcPdrEngine::Pdr)
+                .with_timeout(Duration::from_secs(8)),
+        );
+        let evidence =
+            runner.solve_bundle_native_proof_grade(&bundle).expect("bundle solve completes");
+        assert!(
+            evidence.obligations.is_empty(),
+            "a genuinely refutable obligation must never surface as proof authority"
+        );
+        assert_eq!(
+            evidence.refuted.len(),
+            1,
+            "the witnessed refutation rides the refuted channel (not_proved: {:?})",
+            evidence
+                .not_proved
+                .iter()
+                .map(|row| (&row.translated.obligation.obligation_id, &row.reason))
+                .collect::<Vec<_>>()
+        );
+        let row = &evidence.refuted[0];
+        let trust_mc_core::ChcPdrSolveStatus::Refuted { witness: Some(witness) } =
+            &row.verification.outcome.status
+        else {
+            panic!("refuted row carries the witness: {:?}", row.verification.outcome);
+        };
+        // Consumer-style independent recomputation of the encoded-formula
+        // digest from the (freshly translated) typed obligation.
+        let expected = normalized_typed_chc_pdr_input(&row.translated.obligation)
+            .expect("translated obligation normalizes");
+        assert_eq!(witness.encoded_formula_sha256, expected.normalized_input_hash.value);
+        assert!(witness.concreteness.is_exact_with_zero_counts());
+        // Only the bounded-unroll lane's witnesses ride the refuted channel
+        // (see the diversion's SCOPE note): its mint is grounding-gated, so a
+        // row on this channel always carries the bounded-unroll kind.
+        assert!(
+            matches!(
+                witness.verification,
+                trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { .. }
+            ),
+            "unexpected witness kind on the refuted channel: {:?}",
+            witness.verification
+        );
+    }
+
+    /// Compiler-style native bundle around the u8 shift-reduction loop mirror.
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn loop_overflow_trust_ir_bundle() -> trust_ir::NativeVerificationBundle {
+        use trust_ir::inst::{BinOp, ICmpOp};
+        use trust_ir::ty::Ty;
+        use trust_ir::{
+            NativeAdapterInput, NativeAssertionId, NativeBundleProducer, NativeCompilerFactRef,
+            NativeCompilerFacts, NativeMonomorphizationFact, NativeMonomorphizationId,
+            NativeObligationCause, NativeObligationSource, NativeReplayAtom, NativeReplayAtomId,
+            NativeReplayContext, NativeRequestId, NativeRequestProvenance, NativeToolIdentity,
+            NativeVerificationBundle, NativeVerificationRequest, ObligationKind, ProofDigest,
+            ProofFormula, ProofId, ProofLineageId, ProofLineageManifest, ProofLineageNode,
+            ProofObligation, ProofReplayIdentity, ProofStatus, ProofTransform, ProofTransformStage,
+            TrustMcNativeRequest, TrustMcVerificationMode,
+        };
+        use trust_ir_build::ModuleBuilder;
+
+        let source_digest = ProofDigest::sha256([0x71; 32]);
+        let trust_ir_module_digest = ProofDigest::sha256([0x72; 32]);
+
+        let mut mb = ModuleBuilder::new("native_trust_ir_loop_overflow_bundle");
+        let ft = mb.add_func_type(vec![Ty::U8], vec![Ty::U8]);
+        {
+            let mut fb = mb.function("shift_reduction_loop", ft);
+            let entry = fb.create_block();
+            let header = fb.create_block();
+            let body = fb.create_block();
+            let exit = fb.create_block();
+
+            fb.switch_to_block(entry);
+            fb.set_entry(entry);
+            let x = fb.add_block_param(entry, Ty::U8);
+            let four = fb.iconst(Ty::U8, 4);
+            let addend = fb.binop(BinOp::Shl, Ty::U8, x, four);
+            let zero_i = fb.iconst(Ty::U64, 0);
+            let zero_t = fb.iconst(Ty::U8, 0);
+            fb.br(header, vec![zero_i, zero_t]);
+
+            // Explicit block-argument threading — see loop_accumulator_obligation.
+            let i = fb.add_block_param(header, Ty::U64);
+            let t = fb.add_block_param(header, Ty::U8);
+            fb.switch_to_block(header);
+            let bound = fb.iconst(Ty::U64, 64);
+            let in_loop = fb.icmp(ICmpOp::Ult, Ty::U64, i, bound);
+            fb.condbr(in_loop, body, vec![i, t], exit, vec![t]);
+
+            let i_body = fb.add_block_param(body, Ty::U64);
+            let t_body = fb.add_block_param(body, Ty::U8);
+            fb.switch_to_block(body);
+            let t_next = fb.add(Ty::U8, t_body, addend);
+            let one = fb.iconst(Ty::U64, 1);
+            let i_next = fb.add(Ty::U64, i_body, one);
+            fb.br(header, vec![i_next, t_next]);
+
+            let t_exit = fb.add_block_param(exit, Ty::U8);
+            fb.switch_to_block(exit);
+            fb.ret(vec![t_exit]);
+            fb.build();
+        }
+
+        let mut module = mb.build();
+        let trust_mc_function = module
+            .functions
+            .iter()
+            .find(|func| func.name == "shift_reduction_loop")
+            .expect("fixture includes requested trust-mc function")
+            .id;
+        module.proof_obligations.push(
+            ProofObligation::new(
+                ProofId::new(0),
+                ObligationKind::PanicFreedom,
+                ProofStatus::Pending,
+                "loop-carried accumulator add does not overflow",
+            )
+            .with_formula(ProofFormula::smtlib2("shift_reduction_loop_safe", "Bool"))
+            .with_function(trust_mc_function)
+            .with_source(native_test_obligation_source(
+                "rust:native_trust_ir_loop_overflow_bundle::shift_reduction_loop",
+                "vc:trust-mc-driver:loop-overflow:0",
+                b"shift_reduction_loop_safe",
+            )),
+        );
+
+        let mut lineage_node = ProofLineageNode::new(
+            ProofLineageId::new(0),
+            ProofTransform::new(
+                ProofTransformStage::Frontend,
+                "rustc-mir-to-trust_ir",
+                "tRust",
+                "native-request-schema-v1",
+            ),
+            source_digest,
+            trust_ir_module_digest,
+        );
+        lineage_node.obligations.push(ProofId::new(0));
+
+        let lineage = ProofLineageManifest {
+            schema_version: ProofLineageManifest::SCHEMA_VERSION,
+            nodes: vec![lineage_node],
+            roots: vec![ProofLineageId::new(0)],
+        };
+
+        let mut bundle = NativeVerificationBundle::new(
+            NativeBundleProducer::TRust,
+            NativeAdapterInput::RustMir { body_digest: source_digest },
+            trust_ir_module_digest,
+            module,
+            lineage,
+        );
+        let source_span = trust_ir::SourceSpan { file: 0, line: 21, col: 9 };
+        bundle.compiler_facts = NativeCompilerFacts {
+            monomorphizations: vec![NativeMonomorphizationFact {
+                id: NativeMonomorphizationId::new(0),
+                source_item: "native_trust_ir_loop_overflow_bundle::shift_reduction_loop"
+                    .to_owned(),
+                symbol: "_RNvNtC6native20shift_reduction_loop".to_owned(),
+                generic_args: Vec::new(),
+                function: Some(trust_mc_function),
+                stable_digest: ProofDigest::sha256([0x73; 32]),
+            }],
+            obligation_sources: vec![NativeObligationSource {
+                obligation: ProofId::new(0),
+                public_obligation_id: "vc:trust-mc-driver:loop-overflow:0".to_string(),
+                function: Some(trust_mc_function),
+                span: Some(source_span),
+                assertion_id: Some(NativeAssertionId::new(0)),
+                cause: NativeObligationCause::OverflowCheck,
+                monomorphization: Some(NativeMonomorphizationId::new(0)),
+                facts: vec![NativeCompilerFactRef::Monomorphization(
+                    NativeMonomorphizationId::new(0),
+                )],
+            }],
+            ..NativeCompilerFacts::default()
+        };
+        bundle.requests.push(NativeVerificationRequest::TrustMc(TrustMcNativeRequest {
+            id: NativeRequestId::new(9),
+            mode: TrustMcVerificationMode::Chc,
+            function: trust_mc_function,
+            obligations: vec![ProofId::new(0)],
+            lineage_roots: vec![ProofLineageId::new(0)],
+            options: {
+                let mut options = trust_ir::TrustMcRequestOptions::default();
+                options.chc.emit_horn_clauses = true;
+                options
+            },
+            diagnostics: Default::default(),
+            provenance: NativeRequestProvenance::trust_mc(
+                NativeToolIdentity::new("trust-mc").with_version("chc-v1"),
+            )
+            .with_solver(NativeToolIdentity::new("ay-chc").with_version("native-v1"))
+            .with_replay(
+                ProofReplayIdentity::new("trust-mc", "trust_mc native typed CHC/PDR test replay")
+                    .with_transcript_digest(ProofDigest::sha256([0x74; 32])),
+            )
+            .with_replay_context(
+                NativeReplayContext::default().with_atom(
+                    NativeReplayAtom::assertion(
+                        NativeReplayAtomId::new(0),
+                        ProofFormula::smtlib2("shift_reduction_loop_safe", "Bool"),
+                    )
+                    .with_obligation(ProofId::new(0))
+                    .with_assertion_id(NativeAssertionId::new(0))
+                    .with_span(source_span),
+                ),
+            ),
+        }));
+        refresh_native_test_bundle_module_identity(&mut bundle);
+        bundle
     }
 }

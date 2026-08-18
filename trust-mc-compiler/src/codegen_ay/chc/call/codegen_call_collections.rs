@@ -665,7 +665,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.mark_heap_metadata_read();
         }
 
-        if let Some(c) = self.build_memory_store(addr.clone(), value_expr.clone(), pointee_ty) {
+        if let Some(c) =
+            self.build_memory_store_untyped(addr.clone(), value_expr.clone(), pointee_ty)
+        {
             extra_constraints.push(c);
         }
         extra_constraints.append(&mut self.heap_state.pending_updates);
@@ -679,7 +681,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         field_values[1] = Some(addr.clone());
 
         if let Some(dest_addr) = self.get_or_create_local_address(dest_local) {
-            if let Some(c) = self.build_memory_store(dest_addr, addr, ref_ty) {
+            if let Some(c) = self.build_memory_store_untyped(dest_addr, addr, ref_ty) {
                 extra_constraints.push(c);
             }
             extra_constraints.append(&mut self.heap_state.pending_updates);

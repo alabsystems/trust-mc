@@ -220,8 +220,11 @@ pub(super) fn try_dyn_drop_dispatch(
     let self_expr = if let Some(expr) = self_expr_override {
         expr
     } else {
+        // `self_expr_override` is an inline-body parameter term of unreported
+        // provenance, so the merged slot stays a bare `Expr`; the address lane
+        // drops its wave-11 tag here instead of tagging the override lane.
         match ctx.translate_ref_to_address(place, tctx.modified_locals) {
-            Some(addr) => addr,
+            Some(addr) => addr.into_expr(),
             None => return false,
         }
     };

@@ -163,8 +163,10 @@ fn parse_ay_package_field<'a>(lock: &'a str, field: &str) -> Option<&'a str> {
 }
 
 fn parse_uniform_ay_manifest_pin(manifest: &str) -> Result<String> {
-    let document = manifest
-        .parse::<toml::Value>()
+    // toml 0.9's `FromStr for Value` parses a bare *value*, not a document, so
+    // `.parse::<toml::Value>()` rejects every manifest ("expected nothing").
+    // Use the document deserializer.
+    let document = toml::from_str::<toml::Value>(manifest)
         .context("parse root Cargo.toml for AY version authority")?;
     let dependencies = document
         .get("workspace")

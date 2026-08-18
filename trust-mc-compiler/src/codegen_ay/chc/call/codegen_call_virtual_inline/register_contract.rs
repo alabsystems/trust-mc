@@ -12,9 +12,11 @@ use tracing::debug;
 
 use super::super::ChcCtx;
 use super::super::codegen_call_closure::resolve_closure_body_for_operand;
+use super::super::codegen_types::CodegenTypes;
 use super::super::inline_body::InlineReturn;
 use super::super::inline_shared::{PlaceResolver, inline_operand_to_expr};
-use crate::codegen_ay::types::POINTER_WIDTH;
+use crate::codegen_ay::provenance::is_value_widened_into_address;
+use crate::codegen_ay::ptr_repr::PtrSlot;
 
 fn extract_nested_closure_captures<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
@@ -114,6 +116,55 @@ fn extract_captures_from_ay_expr(
     Vec::new()
 }
 
+/// Is the term resolved for a `&T`-typed capture local the ADDRESS of the
+/// referent (peel on to the referent) rather than the referent's own value?
+///
+/// # What the retired guard got wrong
+///
+/// The test used to be "the local is `Ref`-typed AND the term is pointer-width",
+/// read as "what I am holding is the address, so keep peeling". That reading is
+/// unavailable from a width: the inline walker models references transparently,
+/// so a `&T` local's term is very often the referent's VALUE already — and when
+/// `T` is itself pointer-width (`&usize`, `&u64`, `&fn()`) that value is a
+/// `bv(POINTER_WIDTH)` indistinguishable from an address. The peel then ran on
+/// past the correct answer, up to the loop's six hops, and returned some
+/// unrelated ancestor local's term.
+///
+/// # What decides it now
+///
+/// The MIR pointee type, which the walker's own transparent-reference model
+/// makes decisive: if the referent's sort is the sort we are holding, then what
+/// we are holding *is* (or is indistinguishable from) the referent's value, and
+/// there is nothing left to peel. Only a term that cannot be the referent's
+/// value is treated as its address.
+///
+/// Both remaining refusals are honest about their limits rather than papering
+/// over them: an unresolvable pointee sort answers `false` (stop, we cannot
+/// tell), and so does a `&&T` / `&Box<T>` capture whose pointee is itself
+/// pointer-width — genuinely ambiguous, and stopping keeps a real term instead
+/// of gambling on another hop. The width comparison that survives is a
+/// representation precondition (`PtrSlot::Thin`), and the widened-value refusal
+/// keeps a zero-extended narrow datum from re-entering through it.
+fn should_peel_capture_reference(
+    ctx: &ChcCtx<'_, '_>,
+    outer_body: &rustc_public::mir::Body,
+    local: usize,
+    expr: &Expr,
+) -> bool {
+    let TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) =
+        ctx.resolve_body_ty(outer_body.locals()[local].ty).kind()
+    else {
+        return false;
+    };
+    if PtrSlot::of_sort(expr.sort()) != Some(PtrSlot::Thin) || is_value_widened_into_address(expr) {
+        return false;
+    }
+    let Some(pointee_sort) = ChcCtx::translate_ty(ctx.resolve_body_ty(pointee)) else {
+        return false;
+    };
+    pointee_sort != *expr.sort()
+}
+
 fn resolve_nested_closure_capture_expr<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
     operand: &Operand,
@@ -135,12 +186,8 @@ fn resolve_nested_closure_capture_expr<'tcx, 'body>(
         if let Some(expr) =
             inline_operand_to_expr(ctx, &current, local_exprs, resolver, outer_body.locals())
         {
-            let keep_peeling = maybe_local.is_some_and(|local| {
-                matches!(
-                    ctx.resolve_body_ty(outer_body.locals()[local].ty).kind(),
-                    TyKind::RigidTy(RigidTy::Ref(..))
-                ) && expr.sort().bitvec_width() == Some(POINTER_WIDTH)
-            });
+            let keep_peeling = maybe_local
+                .is_some_and(|local| should_peel_capture_reference(ctx, outer_body, local, &expr));
             if !keep_peeling {
                 return Some(expr);
             }

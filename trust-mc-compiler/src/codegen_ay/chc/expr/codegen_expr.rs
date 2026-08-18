@@ -440,8 +440,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         field_ty: rustc_public::ty::Ty,
     ) -> Option<Expr> {
         use super::FieldProjection;
-        use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width_safe};
-        use rustc_public::ty::{RigidTy, TyKind};
 
         if crate::codegen_ay::types::is_coroutine_root_sort(current.sort()) {
             return crate::codegen_ay::types::coroutine_root_select(current, cons_idx, field_idx);

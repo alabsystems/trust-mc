@@ -66,7 +66,7 @@ pub(in crate::codegen_ay::chc) fn try_codegen_slice_as_array(
     // with the length tracked out-of-band in subslice_len, collections.len_state,
     // or MIR backward tracing. translate_ptr_metadata uses all these strategies.
     let slice_arg = &dcx.args[0];
-    let len = ctx.translate_ptr_metadata(slice_arg, dcx.modified_locals);
+    let len = ctx.translate_ptr_metadata(slice_arg, dcx.modified_locals).map(|len| len.into_expr());
     let len = match len {
         Some(expr) if expr.sort().is_bitvec() => expr,
         _ => {

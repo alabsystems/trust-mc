@@ -485,10 +485,8 @@ impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
             // tests) instead of EncodingGap. SOUND: error() is fail-closed either
             // way — it never hides a bug; this only fixes the CTREX attribution,
             // not the verdict.
-            let genuine_panic = dcx
-                .callee_path
-                .as_deref()
-                .is_some_and(is_known_diverging_panic_intrinsic);
+            let genuine_panic =
+                dcx.callee_path.as_deref().is_some_and(is_known_diverging_panic_intrinsic);
             if !genuine_panic {
                 self.diagnostics.diverging_call_drop.inc();
             }

@@ -182,6 +182,90 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         || path.contains("NonNull") && (path.ends_with("new_unchecked") || path.ends_with("::new"))
     }
 
+    /// Structural test for the ADDRESS-used-as-VALUE defect: would a deref
+    /// load through `ptr_local` inherit the alloc_id of its own referent slot?
+    ///
+    /// A load `_d = copy (*_p)` reads the CONTENTS of the object `_p` points
+    /// at. When `_p` provably holds `&_L` — the address of stack local `_L`'s
+    /// own slot, with no projections — and the alloc_id recorded for `_p` is
+    /// exactly that slot's obj_id, then `_d` holds the VALUE stored in `_L`,
+    /// not an address into `_L`'s allocation. Propagating `_p`'s alloc_id to
+    /// `_d` makes every later deref of `_d` resolve back to `_L`'s own slot,
+    /// so the encoding reads a memory cell no rule ever writes at that type —
+    /// a free variable, which makes the surrounding assertion refutable
+    /// (`&[1,2,3][..]`: `head == &slice[0]` reported as a Genuine CTREX).
+    ///
+    /// Returns `Some(_L)` for exactly that shape; `None` for every other deref
+    /// load — through a cast, through a projected reference (`&(*_p).field`),
+    /// through a pointer carrying a heap alloc_id, or through a
+    /// multiply-assigned local — which keeps the existing inheritance
+    /// behaviour that Box/Rc/NonNull deref chains depend on. Callers use `_L`'s
+    /// own recorded alloc_id — the allocation `_L`'s VALUE points into — in
+    /// place of `_L`'s slot id.
+    pub(in crate::codegen_ay::chc) fn deref_load_referent_local(
+        &self,
+        ptr_local: usize,
+    ) -> Option<usize> {
+        let &obj_id = self.known_alloc_ids.get(&ptr_local)?;
+        let slot_local = self.heap_state.local_idx_for_obj_id(obj_id)?;
+        if !self.ptr_provably_addresses_local(ptr_local, slot_local) {
+            return None;
+        }
+        debug!(
+            ptr_local,
+            obj_id,
+            slot_local,
+            "GUARD4262_FIRED: deref load through a pointer to its own referent slot"
+        );
+        Some(slot_local)
+    }
+
+    /// Bounded backward walk answering "does `ptr_local` provably hold
+    /// `&_target` with no projections?".
+    ///
+    /// Follows only unprojected `Use(Copy|Move)` wrappers, so it never crosses
+    /// a load, a cast, an offset, or a field projection, and it requires every
+    /// local on the chain to be written exactly once so the answer is
+    /// path-independent. Any other shape answers `false`.
+    fn ptr_provably_addresses_local(&self, ptr_local: usize, target: usize) -> bool {
+        use rustc_public::mir::{Operand, Rvalue, StatementKind};
+
+        let mut current = ptr_local;
+        for _ in 0..8 {
+            let mut def: Option<&Rvalue> = None;
+            let mut assign_count = 0usize;
+            for bb_data in &self.body.blocks {
+                for stmt in &bb_data.statements {
+                    if let StatementKind::Assign(lhs, rhs) = &stmt.kind
+                        && lhs.local == current
+                    {
+                        assign_count += 1;
+                        if lhs.projection.is_empty() {
+                            def = Some(rhs);
+                        }
+                    }
+                }
+            }
+            // More than one writer (branch merge, reassignment, or a projected
+            // write into the same local) makes the provenance path-dependent.
+            if assign_count != 1 {
+                return false;
+            }
+            match def {
+                Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p)))
+                    if p.projection.is_empty() =>
+                {
+                    current = p.local;
+                }
+                Some(Rvalue::Ref(_, _, p) | Rvalue::AddressOf(_, p)) => {
+                    return p.projection.is_empty() && p.local == target;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Scan all MIR blocks for the assignment that defines `target_local`,
     /// returning the source local that may carry an alloc_id.
     fn scan_mir_for_alloc_source(&self, target_local: usize) -> Option<usize> {
@@ -193,6 +277,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     && lhs.local == target_local
                 {
                     let result = match rhs {
+                        // Same ADDRESS-used-as-VALUE shape that
+                        // `propagate_alloc_ids_for_assign` refuses to inherit:
+                        // when the pointer names the referent's own slot, the
+                        // backward hop must land on the referent `_L`, whose
+                        // recorded alloc_id describes the loaded VALUE. Hopping
+                        // to the pointer local instead picks the slot's own
+                        // obj_id straight back up.
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                            if matches!(src.projection.first(), Some(ProjectionElem::Deref)) =>
+                        {
+                            Some(self.deref_load_referent_local(src.local).unwrap_or(src.local))
+                        }
                         Rvalue::ShallowInitBox(Operand::Copy(src) | Operand::Move(src), _)
                         | Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
                         | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _) => {
@@ -327,10 +423,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // turns `*Box::as_mut(b) = v` into a spurious memory-safety CTREX
             // (the contract-modifies FP cluster). Keep it on the Mem-level store
             // path below, which writes the heap object via the pointer value.
-            let drills_heap_pointer = ref_target
-                .projections
-                .iter()
-                .any(|p| matches!(p, ProjectionElem::Field(_, ty) if projection_ty_is_heap_pointer(*ty)));
+            let drills_heap_pointer = ref_target.projections.iter().any(
+                |p| matches!(p, ProjectionElem::Field(_, ty) if projection_ty_is_heap_pointer(*ty)),
+            );
             if has_state && proj_1 && !has_offset && !drills_heap_pointer {
                 return false; // defer to handle_deref_store_via_ref_targets
             }
@@ -537,7 +632,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if !decomposed {
                 // Not a decomposable struct — use standard memory store path
                 if let Some(store_constraint) =
-                    self.build_memory_store(addr_expr.clone(), rhs_expr.clone(), store_ty)
+                    self.build_memory_store_untyped(addr_expr.clone(), rhs_expr.clone(), store_ty)
                 {
                     acc.constraints.push(store_constraint);
                     if lhs.projection.len() > 1 {

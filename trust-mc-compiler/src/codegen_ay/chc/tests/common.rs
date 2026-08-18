@@ -1152,3 +1152,37 @@ pub(super) fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
         .expect("spawn large-stack thread");
     join_with_timeout(handle, "run_with_large_stack");
 }
+
+/// Test adapters for the Wave-5 typed projection entries.
+///
+/// `ChcCtx::datatype_field_select` / `datatype_field_update` take and return
+/// [`crate::codegen_ay::provenance::Val`]: a field of a value is itself a value,
+/// and nothing in either function touches memory. The tests below build literal
+/// datatype terms, so the tag is justified by the fixture itself; these wrappers
+/// only keep the assertions expression-shaped.
+pub(super) fn select_field_val(
+    container: &Expr,
+    field_idx: usize,
+    cons_idx: Option<usize>,
+) -> Option<Expr> {
+    use crate::codegen_ay::provenance::Val;
+    ChcCtx::datatype_field_select(&Val::of_value(container.clone()), field_idx, cons_idx)
+        .map(Val::into_expr)
+}
+
+/// Write-side counterpart of [`select_field_val`].
+pub(super) fn update_field_val(
+    container: &Expr,
+    field_idx: usize,
+    cons_idx: Option<usize>,
+    new_val: Expr,
+) -> Option<Expr> {
+    use crate::codegen_ay::provenance::Val;
+    ChcCtx::datatype_field_update(
+        &Val::of_value(container.clone()),
+        field_idx,
+        cons_idx,
+        Val::of_value(new_val),
+    )
+    .map(Val::into_expr)
+}

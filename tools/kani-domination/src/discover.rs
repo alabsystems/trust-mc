@@ -190,11 +190,24 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
             } else {
                 exp.file_stem().and_then(|s| s.to_str()).map(str::to_string)
             };
-            let oracle = std::fs::read_to_string(&exp)
-                .ok()
-                .as_deref()
-                .and_then(expected_file_verdict)
-                .unwrap_or(Verdict::Success);
+            let oracle = match oracle_from_expected_file(&exp) {
+                Ok(v) => v,
+                Err(err) => {
+                    // FAIL CLOSED. This file EXISTS (enumeration just yielded it),
+                    // so an unreadable one is a corpus-integrity failure, not a
+                    // "test passes" signal. Defaulting it to Success would be
+                    // fail-OPEN in the dangerous direction: `missed_bug` is
+                    // (oracle == Fail && observed == Success), so a wrongly
+                    // Success oracle can HIDE a missed bug from the hard gate.
+                    // Dropping the row keeps it out of the denominator entirely,
+                    // which understates coverage but cannot launder a defect.
+                    eprintln!(
+                        "[kani-domination] CORPUS INTEGRITY: cannot read expected file {} \
+                         ({err}) — dropping the row rather than guessing oracle=Success"
+                    , exp.display());
+                    continue;
+                }
+            };
             out.push(Discovered {
                 suite: suite.name.to_string(),
                 rel: rel_of(&exp, &root),
@@ -345,6 +358,20 @@ fn resolve_expected_path(path: &Path, sole_entry_in_dir: bool) -> Option<PathBuf
 /// Free-text mentions such as `assertion failed: …` quoted inside a SUCCESS
 /// Description must still NOT flip the oracle, so bare-token matching is exact
 /// (a line whose trimmed content *is* the token), not a substring scan.
+/// Oracle for one `.expected` file, distinguishing "read it and it names no
+/// failure" from "could not read it at all".
+///
+/// The first is a legitimate corpus convention — an expected file with no failure
+/// markers describes a passing run — so it yields `Success`. The second is an I/O
+/// failure and is returned as an error so the caller can refuse to score the row;
+/// collapsing both into `unwrap_or(Verdict::Success)` is fail-OPEN, and since
+/// `missed_bug` is (oracle == Fail && observed == Success) a wrongly-Success
+/// oracle can hide a missed bug from the hard gate.
+fn oracle_from_expected_file(path: &Path) -> std::io::Result<Verdict> {
+    let content = std::fs::read_to_string(path)?;
+    Ok(expected_file_verdict(&content).unwrap_or(Verdict::Success))
+}
+
 fn expected_file_verdict(content: &str) -> Option<Verdict> {
     // Whole-run verdict lines win over any per-check marker (should_panic).
     if content.contains("VERIFICATION:- FAILED") {
@@ -507,7 +534,42 @@ mod tests {
 
     /// Per-test `.expected` files are matched to their own test; a directory
     /// with many `.expected` files must NEVER concatenate them into one
-    /// fabricated oracle.
+    /// fabricated oracle.    /// An expected file that READS but names no failure is a passing run — the
+    /// corpus convention — so Success is correct there.
+    #[test]
+    fn readable_expected_with_no_failure_marker_is_success() {
+        let dir = std::env::temp_dir().join("kd_oracle_ok_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("expected");
+        std::fs::write(&f, "some check: SUCCESS\n").unwrap();
+        assert_eq!(super::oracle_from_expected_file(&f).unwrap(), Verdict::Success);
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// A file we CANNOT read must NOT collapse to Success. That default is
+    /// fail-OPEN: `missed_bug` is (oracle == Fail && observed == Success), so a
+    /// wrongly-Success oracle hides a missed bug from the hard gate.
+    #[test]
+    fn unreadable_expected_file_is_an_error_not_success() {
+        let missing = std::env::temp_dir().join("kd_oracle_definitely_missing_9f3a/expected");
+        assert!(
+            super::oracle_from_expected_file(&missing).is_err(),
+            "an unreadable expected file must not yield a verdict"
+        );
+    }
+
+    /// A real failure marker still wins.
+    #[test]
+    fn readable_expected_with_failure_marker_is_fail() {
+        let dir = std::env::temp_dir().join("kd_oracle_fail_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("expected");
+        std::fs::write(&f, "VERIFICATION:- FAILED\n").unwrap();
+        assert_eq!(super::oracle_from_expected_file(&f).unwrap(), Verdict::Fail);
+        let _ = std::fs::remove_file(&f);
+    }
+
+
     #[test]
     fn per_test_expected_preferred_over_directory_concat() {
         let root = tmpdir("pertest");

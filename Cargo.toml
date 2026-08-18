@@ -35,6 +35,16 @@ path = "src/bin/trust-mc.rs"
 name = "cargo-trust-mc"
 path = "src/bin/cargo_trust-mc.rs"
 
+# Trust-native subcommand surface: `targo trust-mc ...` dispatches to this
+# binary, bringing the mc subcommand into the targo-<x> family (targo-trust,
+# targo-fmt, targo-tippy). The old `cargo-trust-mc` [[bin]] above is retained
+# so `cargo trust-mc` discovery and the guide keep working (back-compat).
+# Both bins share the same proxy code; the tool-internal proxy/argv identity
+# stays `cargo-trust-mc` (PRIVATE compat protocol) in either entry point.
+[[bin]]
+name = "targo-trust-mc"
+path = "src/bin/targo_trust-mc.rs"
+
 # R2 deletion D-C (two-language spec surface, author ruling 2026-07-13): the
 # legacy `kani` / `cargo-kani` [[bin]] proxies are retired from the installed
 # user surface. The canonical installed names are `trust-mc` / `cargo-trust-mc`
@@ -339,22 +349,22 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # 40-character ay revision for reproducible measurements; a floating
 # `branch = "main"` does not satisfy it. Cargo.lock intentionally records the
 # path-patched packages; this manifest rev records the exact upstream commit.
-ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
-ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
-ay-frontend = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
-ay-chc = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
-ay_bindings = { package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+ay-dpll = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
+ay-core = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
+ay-frontend = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
+ay-chc = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
+ay_bindings = { version = "0.10.0", package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
 # Trust: default-features = false drops ay's GMP-backed LRA path (`rug` +
 # `gmp-mpfr-sys`). trust-mc-driver links ay in-process; the pure-Rust
 # num_rational fallback is functionally identical and adds no native `-lgmp`
 # link, so the Trust rustc_driver link has no undefined `___gmpq_*` symbols.
-ay = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb", default-features = false }
-ay-sys = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+ay = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60", default-features = false }
+ay-sys = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
 # Shared AY encoding/invocation surface — consumed from its canonical home in
 # the ay repo (NOT vendored). Because all ay-family deps above use the same
 # pinned rev, ay-encode's own ay-chc/ay-bindings/ay-core resolve to the same
 # rev — one shared copy of ChcProblem/VerifiedChcResult/etc.
-ay-encode = { git = "https://github.com/alabsystems/ay.git", rev = "1b1ee59594548a444be3183a31b39fdc96d6eefb" }
+ay-encode = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
 num-bigint = "0.4"
 
 # Common dependencies centralized for version consistency across workspace members.
@@ -408,3 +418,34 @@ ay-sat = { path = "../ay/crates/ay-sat" }
 ay-bindings = { path = "../ay/crates/ay-bindings" }
 ay-sys = { path = "../ay/crates/ay-sys" }
 ay-encode = { path = "../ay/crates/ay-encode" }
+
+[workspace.metadata.atpkg]
+# READ THIS BEFORE ADDING A COMMAND HERE.
+#
+# trust-mc's VERIFIER surface is NOT a PATH binary and must never ship through
+# the bin-only atpkg-pack.sh lane. `trust-mc-compiler` is a rustc driver
+# (#![feature(rustc_private)], links librustc_driver); `trust-mc-driver` fails
+# CLOSED unless it finds that compiler beside itself AND a prebuilt library
+# sysroot (lib/, no_core/lib, playback/lib) — see
+# trust-mc-driver/src/session/{mod.rs,install.rs}. `cargo-trust-mc` is a
+# ~10-line proxy that resolves ${KANI_HOME:-~/.kani}/kani-<VERSION> on EVERY
+# invocation, including --version. `trust-mc` is now a real front door
+# (src/frontend.rs): --version/--help/example/doctor answer with nothing
+# installed, and a missing engine prints the build command instead of a loader
+# error — but VERIFYING still execs trust-mc-driver out of a sysroot, so on a
+# machine without one the PATH command still cannot verify anything. Shimming
+# either of them onto PATH therefore still ships a command whose main job fails
+# on first use — the opposite of batteries included.
+#
+# trust-mc therefore ships as a SYSROOT BUNDLE (bin/ + lib/, relocated and
+# smoke-exec'd at pack time) via aterm's tools/atpkg-pack-bundle.sh. Build the
+# payload with `cargo run --release -p build-trust-mc -- build-dev --release`
+# and pack with SYSROOT=target/trust-mc EXPOSES="trust-mc-driver".
+#
+# The ONE bin here that is genuinely self-contained — no sysroot, no rustc, no
+# `ay` on PATH — is the coverage post-processor, so that is all this lane
+# exposes. build-args keeps the pack off the rustc-driver build path: a bare
+# `cargo build --release` builds default-members, i.e. trust-mc-compiler, which
+# needs the rustc-dev component and is not relocatable.
+expose = ["trust-mc-cov"]
+build-args = ["-p", "trust-mc-cov"]

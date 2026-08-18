@@ -13,6 +13,8 @@ use super::inline_alloc_helpers::{emit_inline_alloc_metadata, inline_alloc_size_
 use super::inline_call_classify::is_nested_pointer_wrapper_deref_call;
 use super::loop_replay::InlineWalkCtx;
 use super::{InlineReturn, receiver_base_local};
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::POINTER_WIDTH;
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
@@ -35,7 +37,7 @@ fn inline_box_new_payload_vtable(
                 .cloned()
                 .or_else(|| ctx.known_vtable_expr_for_local(local_idx))
         })
-        .or_else(|| ctx.extract_embedded_vtable_expr(value_expr))
+        .or_else(|| ctx.extract_embedded_vtable_expr(value_expr).map(Val::into_expr))
 }
 
 fn record_inline_heap_vtable_forward(ctx: &mut ChcCtx<'_, '_>, addr: &Expr, vtable: Option<Expr>) {
@@ -58,7 +60,7 @@ fn record_inline_loaded_value_vtable_forward(
     let Some(vtable_expr) = vtable else {
         return;
     };
-    let Some(loaded) = ctx.load_from_memory(addr.clone(), store_ty) else {
+    let Some(loaded) = ctx.load_from_memory_untyped(addr.clone(), store_ty) else {
         return;
     };
     record_inline_heap_vtable_forward(ctx, &loaded, Some(vtable_expr.clone()));
@@ -68,12 +70,12 @@ fn record_inline_loaded_value_vtable_forward(
         && variant.fields().len() == 1
     {
         let field_ty = ctx.resolve_body_ty(variant.fields()[0].ty_with_args(&args));
-        if let Some(field_loaded) = ctx.load_from_memory(addr.clone(), field_ty) {
+        if let Some(field_loaded) = ctx.load_from_memory_untyped(addr.clone(), field_ty) {
             record_inline_heap_vtable_forward(ctx, &field_loaded, Some(vtable_expr.clone()));
         }
     }
     if let Some(ptr_expr) = ctx.extract_pointer_storage_expr(&loaded) {
-        record_inline_heap_vtable_forward(ctx, &ptr_expr, Some(vtable_expr));
+        record_inline_heap_vtable_forward(ctx, ptr_expr.as_expr(), Some(vtable_expr));
     }
 }
 
@@ -86,7 +88,7 @@ fn record_inline_loaded_wrapper_payload_vtable_forward(
     let Some(vtable_expr) = vtable else {
         return;
     };
-    let Some(loaded) = ctx.load_from_memory(addr.clone(), store_ty) else {
+    let Some(loaded) = ctx.load_from_memory_untyped(addr.clone(), store_ty) else {
         return;
     };
     record_inline_heap_vtable_forward(ctx, &loaded, Some(vtable_expr.clone()));
@@ -96,7 +98,7 @@ fn record_inline_loaded_wrapper_payload_vtable_forward(
         && variant.fields().len() == 1
     {
         let field_ty = ctx.resolve_body_ty(variant.fields()[0].ty_with_args(&args));
-        if let Some(field_loaded) = ctx.load_from_memory(addr.clone(), field_ty) {
+        if let Some(field_loaded) = ctx.load_from_memory_untyped(addr.clone(), field_ty) {
             record_inline_heap_vtable_forward(ctx, &field_loaded, Some(vtable_expr));
         }
     }
@@ -107,8 +109,8 @@ pub(super) fn inline_pointer_wrapper_deref_result_ptr<'tcx, 'body>(
     callee_path: &str,
     destination: &rustc_public::mir::Place,
     outer_body: &rustc_public::mir::Body,
-    ptr_expr: Expr,
-) -> Option<Expr> {
+    ptr_expr: Loc,
+) -> Option<Loc> {
     if path_mentions_pointer_wrapper(callee_path, "boxed::Box") {
         return Some(ptr_expr);
     }
@@ -133,7 +135,10 @@ pub(super) fn inline_pointer_wrapper_deref_result_ptr<'tcx, 'body>(
         return Some(if value_offset == 0 {
             ptr_expr
         } else {
-            ptr_expr.bvadd(Expr::bitvec_const(value_offset as u128, POINTER_WIDTH))
+            // Address + byte offset is still an address.
+            Loc::of_address(
+                ptr_expr.into_expr().bvadd(Expr::bitvec_const(value_offset as u128, POINTER_WIDTH)),
+            )
         });
     }
 
@@ -275,9 +280,17 @@ pub(super) fn try_inline_pointer_wrapper_deref<'tcx, 'body>(
         .and_then(receiver_base_local)
         .and_then(|local_idx| inline_vtable_ids.get(&local_idx).cloned())
         .or_else(|| {
-            let width = wrapper_expr.sort().bitvec_width()?;
-            (width == 2 * POINTER_WIDTH)
-                .then(|| wrapper_expr.clone().extract(2 * POINTER_WIDTH - 1, POINTER_WIDTH))
+            // The high half of a double-width wrapper term is a vtable id only
+            // if the term is a GENUINE wide pointer. `coerce_bitvec_width_safe`
+            // widens thin pointers into exactly this slot, and the width test
+            // that used to stand here could not tell the two apart: for a
+            // widened thin pointer it handed back zero-extension padding as a
+            // vtable id, pinning dynamic dispatch to whichever candidate holds
+            // that id. `PtrRepr` reports metadata for `Fat` only, so the
+            // widened shape now declines and falls through to the
+            // `resolve_unique_wrapped_dyn_vtable_id` lane below (and, failing
+            // that, to no vtable at all — the honest answer).
+            PtrRepr::classify(&wrapper_expr)?.into_metadata().map(Val::into_expr)
         })
         .or_else(|| {
             ctx.resolve_unique_wrapped_dyn_vtable_id(dest_ty)
@@ -285,7 +298,7 @@ pub(super) fn try_inline_pointer_wrapper_deref<'tcx, 'body>(
         });
 
     Some(InlineReturn {
-        value: ptr_expr,
+        value: ptr_expr.into_expr(),
         vtable,
         alloc_id: None,
         alias_updates: BTreeMap::new(),
@@ -317,15 +330,25 @@ pub(super) fn try_inline_rc_arc_new<'tcx, 'body>(
         });
     emit_inline_alloc_metadata(ctx, obj_id, size_expr, false);
 
-    let alloc_ptr = Expr::bitvec_const((obj_id as u128) << 32, POINTER_WIDTH);
+    // An allocation base minted from a fresh obj_id: an address by
+    // construction, with nothing inferred from its width.
+    let alloc_ptr = Loc::of_address(Expr::bitvec_const((obj_id as u128) << 32, POINTER_WIDTH));
     let header_size = 2u64 * (POINTER_WIDTH as u64 / 8);
-    let value_ptr = alloc_ptr.bvadd(Expr::bitvec_const(header_size as u128, POINTER_WIDTH));
+    // Past the header, still inside the same allocation: still an address.
+    let value_ptr = Loc::of_address(
+        alloc_ptr.as_expr().clone().bvadd(Expr::bitvec_const(header_size as u128, POINTER_WIDTH)),
+    );
     let value_expr = translated_args[0].clone();
     let mut extra = Vec::new();
 
     let prev_suppress = ctx.suppress_heap_store_checks;
     ctx.suppress_heap_store_checks = true;
-    ctx.mirror_array_elements_to_flat_memory(&value_expr, store_ty, &value_ptr, &mut extra);
+    ctx.mirror_array_elements_to_flat_memory(
+        &value_expr,
+        store_ty,
+        value_ptr.as_expr(),
+        &mut extra,
+    );
     // Part of #4014: Always emit the whole-struct store so that
     // `load_from_memory(addr, StructTy)` finds the value in `mem_StructTy`.
     // Additionally decompose into per-field stores so virtual dispatch that
@@ -333,7 +356,7 @@ pub(super) fn try_inline_rc_arc_new<'tcx, 'body>(
     // Previously, decomposition success skipped the whole-struct store,
     // causing a store/load type-key mismatch: stores went to `mem_bool` but
     // loads read from `mem_Table` → unconstrained → false CTREX.
-    ctx.try_decompose_struct_store(&value_ptr, &value_expr, store_ty, &mut extra);
+    ctx.try_decompose_struct_store(value_ptr.as_expr(), &value_expr, store_ty, &mut extra);
     if let Some(store_constraint) = ctx.build_memory_store(value_ptr.clone(), value_expr, store_ty)
     {
         extra.push(store_constraint);
@@ -355,7 +378,7 @@ pub(super) fn try_inline_rc_arc_new<'tcx, 'body>(
     // stores go to `alloc+0x10` but loads read from `alloc+0x00` → 16-byte
     // address mismatch → false CTREX.
     Some(InlineReturn {
-        value: value_ptr,
+        value: value_ptr.into_expr(),
         vtable,
         alloc_id: Some(obj_id),
         alias_updates: BTreeMap::new(),
@@ -392,28 +415,35 @@ pub(super) fn try_inline_box_new<'tcx, 'body>(
         });
     emit_inline_alloc_metadata(ctx, obj_id, size_expr, false);
 
-    let alloc_ptr = Expr::bitvec_const((obj_id as u128) << 32, POINTER_WIDTH);
+    // An allocation base minted from a fresh obj_id: an address by
+    // construction, with nothing inferred from its width.
+    let alloc_ptr = Loc::of_address(Expr::bitvec_const((obj_id as u128) << 32, POINTER_WIDTH));
     let value_expr = translated_args[0].clone();
     let payload_vtable = args
         .first()
         .and_then(|arg| inline_box_new_payload_vtable(ctx, arg, &value_expr, inline_vtable_ids));
-    let embedded_payload_vtable = ctx.extract_embedded_vtable_expr(&value_expr);
+    let embedded_payload_vtable = ctx.extract_embedded_vtable_expr(&value_expr).map(Val::into_expr);
     let mut extra = Vec::new();
 
     let prev_suppress = ctx.suppress_heap_store_checks;
     ctx.suppress_heap_store_checks = true;
-    ctx.mirror_array_elements_to_flat_memory(&value_expr, store_ty, &alloc_ptr, &mut extra);
-    ctx.try_decompose_struct_store(&alloc_ptr, &value_expr, store_ty, &mut extra);
+    ctx.mirror_array_elements_to_flat_memory(
+        &value_expr,
+        store_ty,
+        alloc_ptr.as_expr(),
+        &mut extra,
+    );
+    ctx.try_decompose_struct_store(alloc_ptr.as_expr(), &value_expr, store_ty, &mut extra);
     if let Some(store_constraint) = ctx.build_memory_store(alloc_ptr.clone(), value_expr, store_ty)
     {
         extra.push(store_constraint);
     }
     ctx.suppress_heap_store_checks = prev_suppress;
-    record_inline_heap_vtable_forward(ctx, &alloc_ptr, payload_vtable.clone());
-    record_inline_loaded_value_vtable_forward(ctx, &alloc_ptr, store_ty, payload_vtable);
+    record_inline_heap_vtable_forward(ctx, alloc_ptr.as_expr(), payload_vtable.clone());
+    record_inline_loaded_value_vtable_forward(ctx, alloc_ptr.as_expr(), store_ty, payload_vtable);
     record_inline_loaded_wrapper_payload_vtable_forward(
         ctx,
-        &alloc_ptr,
+        alloc_ptr.as_expr(),
         store_ty,
         embedded_payload_vtable,
     );
@@ -425,7 +455,7 @@ pub(super) fn try_inline_box_new<'tcx, 'body>(
         .map(|id| Expr::bitvec_const(id as u128, POINTER_WIDTH));
 
     Some(InlineReturn {
-        value: alloc_ptr,
+        value: alloc_ptr.into_expr(),
         vtable,
         alloc_id: Some(obj_id),
         alias_updates: BTreeMap::new(),

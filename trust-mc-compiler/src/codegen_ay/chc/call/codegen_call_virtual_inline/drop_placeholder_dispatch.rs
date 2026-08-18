@@ -12,6 +12,7 @@ use super::super::inline_shared::PlaceResolver;
 use super::InlineReturn;
 use super::pointer_wrapper::resolve_nested_ref_arg_referent;
 use super::walker::translate_virtual_body_inline;
+use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::types::POINTER_WIDTH;
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
@@ -31,7 +32,7 @@ pub(super) fn resolve_nested_drop_arg_value<'tcx, 'body>(
         return Some(referent);
     }
     if referent.sort().bitvec_width().is_some()
-        && let Some(loaded) = ctx.load_from_memory(referent.clone(), pointee_ty)
+        && let Some(loaded) = ctx.load_from_memory_untyped(referent.clone(), pointee_ty)
     {
         return Some(loaded);
     }
@@ -173,7 +174,10 @@ pub(super) fn seed_box_new_payload_vtable_inline(
         .cloned()
         .or_else(|| ctx.known_vtable_expr_for_local(payload_local))
         .or_else(|| {
-            local_exprs.get(&payload_local).and_then(|expr| ctx.extract_embedded_vtable_expr(expr))
+            local_exprs
+                .get(&payload_local)
+                .and_then(|expr| ctx.extract_embedded_vtable_expr(expr))
+                .map(Val::into_expr)
         })
     else {
         return;
@@ -193,6 +197,7 @@ fn extract_wrapper_payload_vtable_from_expr(
     }
 
     ctx.extract_embedded_vtable_expr(expr)
+        .map(Val::into_expr)
         .or_else(|| forwarded_heap_vtable_for_expr(ctx, expr))
         .or_else(|| {
             let dt = expr.sort().datatype_sort()?;
@@ -212,7 +217,7 @@ fn extract_wrapper_payload_vtable_from_addr(
     if depth_remaining == 0 {
         return None;
     }
-    let loaded = ctx.load_from_memory(addr.clone(), ty)?;
+    let loaded = ctx.load_from_memory_untyped(addr.clone(), ty)?;
     extract_wrapper_payload_vtable_from_expr(ctx, &loaded, depth_remaining).or_else(|| {
         let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, args)) =
             ty.kind()

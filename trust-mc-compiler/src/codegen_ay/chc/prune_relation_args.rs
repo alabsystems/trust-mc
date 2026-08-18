@@ -140,7 +140,15 @@ fn is_pure_array_state_copy(lhs: &Expr, rhs: &Expr) -> bool {
     else {
         return false;
     };
-    lhs.sort().is_array()
+    // The forwarding must concern the SAME state slot (`arr__out = arr`), as the
+    // caller's doc comment describes. A CROSS-slot array equality (`a__out = b`)
+    // is not state forwarding at all: it is a data transfer that *defines* `a`
+    // from `b`. Skipping it would leave `b` unobserved, letting the pruner drop
+    // `b`'s relation column while keeping `a`'s -- which rewrites the definition
+    // into a havoc over a universally quantified free array (#4329/#4330).
+    let same_slot = lhs_name.trim_end_matches("__out") == rhs_name.trim_end_matches("__out");
+    same_slot
+        && lhs.sort().is_array()
         && rhs.sort().is_array()
         && (lhs_name.ends_with("__out") || rhs_name.ends_with("__out"))
 }
@@ -222,9 +230,8 @@ fn classify_prunable_relation_arg(
         return Ok(());
     }
 
-    let pad_name = generated_pad_name(rel_name, idx);
     if let ExprValue::Var { name } = arg.value() {
-        if name == &pad_name && !constraint_vars.contains(name) {
+        if is_generated_pad_name(name, rel_name, idx) && !constraint_vars.contains(name as &str) {
             return Ok(());
         }
         if array_sort && !constraint_vars.contains(name) {
@@ -300,30 +307,49 @@ fn strip_args_by_mask(args: impl IntoIterator<Item = Expr>, mask: &[bool]) -> Ve
 }
 
 fn remove_stripped_pad_vars(vc: &mut ChcVc, masks: &HashMap<String, Vec<bool>>) {
-    let stripped_pad_names: HashSet<String> = masks
+    let stripped_pad_slots: Vec<(String, usize)> = masks
         .iter()
         .flat_map(|(rel_name, mask)| {
             mask.iter()
                 .enumerate()
                 .filter(|(_, dead)| **dead)
-                .map(|(idx, _)| generated_pad_name(rel_name, idx))
+                .map(|(idx, _)| (rel_name.clone(), idx))
         })
         .collect();
-    if stripped_pad_names.is_empty() {
+    if stripped_pad_slots.is_empty() {
         return;
     }
 
     let keep = vc
         .vars()
         .iter()
-        .filter(|var| !stripped_pad_names.contains(var.name.as_ref()))
+        .filter(|var| {
+            !stripped_pad_slots
+                .iter()
+                .any(|(rel_name, idx)| is_generated_pad_name(var.name.as_ref(), rel_name, *idx))
+        })
         .map(|var| var.name.to_string())
         .collect();
     vc.retain_vars(&keep);
 }
 
-fn generated_pad_name(rel_name: &str, idx: usize) -> String {
-    format!("__pad_{rel_name}_{idx}")
+/// Does `name` denote the generated pad for `rel_name`'s argument `idx`?
+///
+/// Pad names are `__pad_{rel}_{idx}` optionally followed by `_{sort_tag}` (see
+/// `pad_sort_tag` in translate.rs — the tag keeps a name from being bound to a
+/// STALE sort after columns are pruned or realigned). Matching must accept both
+/// spellings, and must NOT accept a longer index (8 is not 80).
+fn is_generated_pad_name(name: &str, rel_name: &str, idx: usize) -> bool {
+    let Some(rest) = name.strip_prefix("__pad_") else { return false };
+    let Some(rest) = rest.strip_prefix(rel_name).and_then(|r| r.strip_prefix('_')) else {
+        return false;
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() || digits.parse::<usize>() != Ok(idx) {
+        return false;
+    }
+    let tail = &rest[digits.len()..];
+    tail.is_empty() || tail.starts_with('_')
 }
 
 struct StripDeadArrayRelationExprs<'a> {

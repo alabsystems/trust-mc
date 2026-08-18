@@ -9,8 +9,10 @@
 
 use ay_bindings::{Expr, ExprValue};
 use rustc_public::mir::{Operand, Place, ProjectionElem, Rvalue, StatementKind};
-use rustc_public::ty::{ConstantKind, TyConstKind};
+use rustc_public::ty::{ConstantKind, RigidTy, Ty, TyConstKind, TyKind};
 use tracing::debug;
+
+use crate::codegen_ay::ptr_repr::PtrRepr;
 
 use super::ChcCtx;
 
@@ -70,12 +72,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let Some(value) = self.projected_immutable_static_value(place) else {
             return false;
         };
-        if value.sort().bitvec_width() == Some(2 * crate::codegen_ay::types::POINTER_WIDTH) {
-            let len = value.clone().extract(
-                2 * crate::codegen_ay::types::POINTER_WIDTH - 1,
-                crate::codegen_ay::types::POINTER_WIDTH,
-            );
-            self.ref_resolution.subslice_len.insert(dest_local, len);
+        // Address-vs-value: the metadata half is recorded only when the place's
+        // Rust TYPE says a metadata half exists, and only when the term is a
+        // GENUINE fat pointer.
+        //
+        // The retired test was `width == 2 * POINTER_WIDTH` alone, which is the
+        // fabricated-fat-pointer-metadata shape verbatim: a `u128` static and a
+        // thin pointer zero-extended into a wide slot are both `bv128`, and both
+        // yielded a `subslice_len` — usually `0` for the widening, which makes
+        // every downstream bounds obligation trivially satisfiable, i.e. it can
+        // manufacture a PROOF rather than a spurious counterexample.
+        //
+        // Two independent facts now have to agree, neither of them a width test:
+        // the projected place is a WIDE-pointer type (only those have metadata at
+        // all), and `PtrRepr` decodes the term structurally as `Fat` — it returns
+        // `None` for `WidenedThin`, so the padding is unrepresentable here rather
+        // than merely discouraged.
+        let place_ty = place.ty(self.body.locals()).ok();
+        if place_ty.is_some_and(Self::is_wide_pointer_ty)
+            && let Some(len) = PtrRepr::classify(&value).and_then(PtrRepr::into_metadata)
+        {
+            self.ref_resolution.subslice_len.insert(dest_local, len.into_expr());
         }
         self.ref_resolution.const_ref_values.insert(dest_local, value);
         debug!(
@@ -84,6 +101,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             "CHC: propagated projected immutable static value"
         );
         true
+    }
+
+    /// Does `ty` denote a **wide** pointer — a reference or raw pointer whose
+    /// pointee is unsized, so the encoder gives it a `[metadata | data]` slot?
+    ///
+    /// This is the fact `propagate_projected_static_value` needs and the width
+    /// test could not supply: only these types HAVE a metadata half, so only
+    /// these can have one read back out. A `u128` static, a `[u8; 16]` flattened
+    /// into a `bv128`, and a thin pointer widened into a wide slot are all
+    /// `bv128` and all answer `false` here.
+    fn is_wide_pointer_ty(ty: Ty) -> bool {
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => matches!(
+                pointee.kind(),
+                TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..))
+            ),
+            _ => false, // external enum: TyKind
+        }
     }
 
     fn projected_immutable_static_value(&self, place: &Place) -> Option<Expr> {

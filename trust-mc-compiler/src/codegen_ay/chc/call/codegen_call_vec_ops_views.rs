@@ -492,7 +492,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             "VecAsSlice: BV64 state var → memory load fallback"
         );
 
-        let loaded = self.load_from_memory(addr, pointee_ty)?;
+        let loaded = self.load_from_memory_untyped(addr, pointee_ty)?;
         Self::extract_vec_dt_fields(&loaded)
     }
 }

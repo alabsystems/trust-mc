@@ -13,6 +13,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use super::common::*;
+use crate::codegen_ay::provenance::{Loc, Val};
 
 // =============================================================================
 // translate_ptr_add_call — pointer arithmetic translation
@@ -393,7 +394,8 @@ fn test_translate_ptr_write_uses_known_alloc_id_constant_addr() {
             .expect("PtrWrite operand should dereference to u32");
         let const_addr = Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32));
         let loaded = chc_ctx
-            .load_from_memory(const_addr, pointee_ty)
+            .load_from_memory(Loc::of_address(const_addr), pointee_ty)
+            .map(Val::into_expr)
             .expect("PtrWrite store should be recoverable through constant alloc-id address");
         let rendered = loaded.to_string();
         assert!(
@@ -518,7 +520,11 @@ fn test_translate_ptr_read_uses_known_alloc_id_constant_addr() {
             .and_then(ChcCtx::deref_pointee_ty)
             .expect("PtrRead operand should dereference to u32");
         let const_addr = Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32));
-        chc_ctx.build_memory_store(const_addr, Expr::bitvec_const(42, 32), pointee_ty);
+        chc_ctx.build_memory_store(
+            Loc::of_address(const_addr),
+            Expr::bitvec_const(42, 32),
+            pointee_ty,
+        );
 
         let expr = chc_ctx
             .translate_ptr_read_call(&args, &modified)

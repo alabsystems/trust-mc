@@ -630,6 +630,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             // sort-consistent VC, we emit this snapshot (un-optimized but
             // well-formed) rather than an ill-sorted program AY would reject.
             let pre_opt_snapshot = chc_vc.clone();
+            super::chc::report_slot_layout(&chc_vc, "00_pre_opt");
             if !const_prop_disabled {
                 let propagated = chc_vc.propagate_constants();
                 if propagated > 0 {
@@ -672,6 +673,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             // now qualify. Also re-runs const-folding and dead-scalar
             // pruning internally.
             super::chc::scalarize_vc(&mut chc_vc);
+            super::chc::report_slot_layout(&chc_vc, "02_scalarize");
 
             // Strip dead constraints that reference only universally
             // quantified free variables (not in any relation's args).
@@ -689,6 +691,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             // relation declarations were rewritten. Repair the final VC just
             // before emission so the emitted HORN program matches its decls.
             super::chc::fixup_relation_app_arities(&mut chc_vc);
+            super::chc::report_slot_layout(&chc_vc, "04_fixup_arities");
             super::chc::prune_dead_array_relation_args(&mut chc_vc);
             // Part of #argorder: the passes above can leave a relation
             // application mis-permuted relative to its declaration (a column
@@ -696,6 +699,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             // Re-permute divergent applications by slot name, then re-run the
             // arity fixup as the downstream safety net.
             super::chc::canonicalize_block_relation_apps(&mut chc_vc);
+            super::chc::report_slot_layout(&chc_vc, "05_canonicalize");
             super::chc::fixup_relation_app_arities(&mut chc_vc);
 
             // SOUNDNESS fail-close: slot MISALIGNMENT must be caught HERE, before

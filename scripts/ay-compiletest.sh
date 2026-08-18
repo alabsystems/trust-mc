@@ -80,7 +80,17 @@ print_help() {
 # --------------------------------------------------------------------------
 SUITE=""
 MODE=""
-TIMEOUT="60"
+# `AY_TEST_TIMEOUT` supplies the DEFAULT per-harness timeout; an explicit
+# `--timeout` still wins. Without this the variable was inert: callers that only
+# export it (scripts/ay-soundness-gate.sh does exactly that, and echoes it as if
+# it were in effect) silently got 60s, so the driver's own wall-clock watchdog
+# — 5x the per-harness timeout — killed every harness needing more than 300s
+# BEFORE it printed a verdict. The gate then scored those files VACUOUS
+# ("verifier never ran"), which is indistinguishable from a real regression even
+# though the file was fail-closing correctly. Two ledger entries
+# (memory_safety_uaf_fail at ~352s, realloc_stale_pointer_fail at ~93s+compile)
+# were unscoreable for this reason alone.
+TIMEOUT="${AY_TEST_TIMEOUT:-60}"
 USE_CHC=0
 DRY_RUN=0
 SKIP_BUILD=0

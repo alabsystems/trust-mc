@@ -14,6 +14,8 @@ use rustc_public::mir::Operand;
 use rustc_public::ty::{ConstantKind, IntTy, RigidTy, Ty, TyConstKind, TyKind, UintTy};
 use tracing::debug;
 
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::{PtrRepr, PtrSlot};
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 
 use super::super::ChcCtx;
@@ -22,7 +24,15 @@ use super::super::codegen_call_coerce::CallCoerce;
 use super::super::codegen_rules::CodegenRules;
 
 pub(super) struct SubsliceMaterialization {
-    pub fresh_addr: Expr,
+    /// Where the materialized subslice lives.
+    ///
+    /// Both producers mint an address and know it: a fresh `concat(obj_id, 0)`
+    /// allocation, or the source-derived address
+    /// [`ChcCtx::resolve_subslice_source_addr`] decoded out of the source
+    /// pointer. Carrying that as a [`Loc`] is what lets
+    /// [`ChcCtx::emit_subslice_destination`] stop re-testing the width of its
+    /// own allocation before packing it into a fat pointer.
+    pub fresh_addr: Loc,
     pub elem_key: String,
 }
 
@@ -89,14 +99,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         shifted: Expr,
         _inner_arr_sort: Sort,
         elem_ty: Ty,
-        addr_override: Option<Expr>,
+        addr_override: Option<Loc>,
     ) -> Option<SubsliceMaterialization> {
         let _ = shifted;
         let fresh_addr = if let Some(addr) = addr_override {
             addr
         } else {
+            // Allocation: an object id paired with a zero offset is an address
+            // by construction, which is one of the two canonical `Loc` producers.
             let obj_id = self.heap_state.next_alloc_id()?;
-            Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32))
+            Loc::of_address(
+                Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32)),
+            )
         };
 
         let elem_key = self.type_key_for_body_ty(elem_ty).to_string();
@@ -109,7 +123,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         cx: &ChcCallContext<'_>,
         dest_local: usize,
-        fresh_addr: Expr,
+        fresh_addr: Loc,
         coerce_label: &'static str,
         fat_ptr_label: &'static str,
     ) {
@@ -120,19 +134,30 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let new_output_args = self.build_output_args(cx.modified_locals, &[dest_local]);
 
         if let Some((_, dest_var)) = self.resolve_destination(dest_local) {
-            // Part of #4030: BV128 fat pointer dest with BV64 addr — build len||ptr.
-            let coerce_value = if dest_var.sort().bitvec_width() == Some(2 * POINTER_WIDTH)
-                && fresh_addr.sort().bitvec_width() == Some(POINTER_WIDTH)
-            {
+            // Part of #4030: a fat-pointer destination takes `[len | ptr]`.
+            //
+            // This used to be a two-part width test: `dest is bv128 AND
+            // fresh_addr is bv64`. The second half tested this function's own
+            // input — every producer of `fresh_addr` mints a `POINTER_WIDTH`
+            // address (a `concat(obj_id, 0)` allocation, or `PtrRepr`'s data
+            // half, which is `POINTER_WIDTH` for all three shapes) — so it was
+            // asking whether an address is an address. Typing the parameter
+            // `Loc` answers that once, and the remaining question is purely
+            // about the DECLARED destination sort, which is what `PtrSlot` is
+            // for. The packing order is stated by `PtrRepr::into_packed`
+            // instead of being restated here as a bare `concat`.
+            let coerce_value = if PtrSlot::of_sort(dest_var.sort()) == Some(PtrSlot::Fat) {
                 let len_expr = self
                     .ref_resolution
                     .subslice_len
                     .get(&dest_local)
                     .cloned()
                     .unwrap_or_else(|| Expr::bitvec_const(0, POINTER_WIDTH));
-                len_expr.concat(fresh_addr)
+                PtrRepr::from_declared_roles(fresh_addr, Val::of_value(len_expr))
+                    .into_packed()
+                    .expect("invariant: declared roles always pack")
             } else {
-                fresh_addr
+                fresh_addr.into_expr()
             };
             if let Some(eq) = self.make_coerced_eq_constraint(
                 &dest_var,
@@ -183,7 +208,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// RangeFrom-only: the slice-level store is not read by load_from_memory.
     pub(super) fn seed_subslice_element_memory(
         &mut self,
-        fresh_addr: &Expr,
+        fresh_addr: &Loc,
         source_inner: &Expr,
         effective_start: &Expr,
         elem_ty: Ty,
@@ -218,7 +243,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let idx_bv = Expr::bitvec_const(i as i128, POINTER_WIDTH);
             let byte_off =
                 idx_bv.clone().bvmul(Expr::bitvec_const(elem_size as i128, POINTER_WIDTH));
-            let elem_addr = fresh_addr.clone().bvadd(byte_off);
+            let elem_addr = fresh_addr.as_expr().clone().bvadd(byte_off);
             let src_idx = effective_start.clone().bvadd(idx_bv);
             let elem_val = source_inner.clone().select(src_idx);
             // Part of #4212: coerce source element to match target memory array sort.
@@ -437,48 +462,52 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         effective_start: &Expr,
         elem_ty: Ty,
         modified_locals: &HashSet<usize>,
-    ) -> Option<Expr> {
+    ) -> Option<Loc> {
         let local = Self::operand_local(slice_arg)?;
         let elem_size = self.get_type_size(elem_ty)? as u64;
 
-        // Strategy 1: stack local with known address
+        // Strategy 1: stack local with known address. An object id paired with a
+        // zero offset is an address by construction.
         let source_local = self.resolve_provenance_local(local);
         if let Some((obj_id, _)) = self.heap_state.local_addresses.get(&source_local) {
-            let base_addr =
-                Expr::bitvec_const(*obj_id as i128, 32).concat(Expr::bitvec_const(0, 32));
+            let base_addr = Loc::of_address(
+                Expr::bitvec_const(*obj_id as i128, 32).concat(Expr::bitvec_const(0, 32)),
+            );
             return Some(self.apply_subslice_byte_offset(base_addr, effective_start, elem_size));
         }
 
-        // Strategy 2: resolve the input local's expression and extract the
-        // data pointer. Covers heap-allocated slices (e.g., Box deref) where
-        // the local's expression is a BV64 address or BV128 fat pointer.
+        // Strategy 2: resolve the input local's expression and take its data
+        // address. `slice_arg` is a slice operand, so the term is a pointer —
+        // the caller establishes that from the MIR, not from this function.
+        //
+        // This used to be TWO returns partitioned by width: one for a `bv64`
+        // thin pointer ("the expression IS the data address"), one for a `bv128`
+        // fat pointer ("lower 64 bits are the data pointer"). The only thing the
+        // width decided was *where the data address sits inside the term*, which
+        // is exactly what `PtrRepr` answers — and `data()` is total, so both
+        // shapes now take one path and a widened thin pointer (which the width
+        // test read as a fat one) is no longer a third, unhandled case.
         let input_expr = self.try_resolve_local_expr(local, modified_locals)?;
-        let bv_width = input_expr.sort().bitvec_width()?;
-        if bv_width == POINTER_WIDTH {
-            // Thin pointer (BV64) — the expression IS the data address
-            return Some(self.apply_subslice_byte_offset(input_expr, effective_start, elem_size));
-        }
-        if bv_width == 2 * POINTER_WIDTH {
-            // Fat pointer (BV128) — lower 64 bits are the data pointer
-            let data_ptr = input_expr.extract(POINTER_WIDTH - 1, 0);
-            return Some(self.apply_subslice_byte_offset(data_ptr, effective_start, elem_size));
-        }
-
-        None
+        let data_addr = PtrRepr::classify(&input_expr)?.into_data();
+        Some(self.apply_subslice_byte_offset(data_addr, effective_start, elem_size))
     }
 
+    /// Advance an address by `effective_start` elements.
+    ///
+    /// Address plus value: the two operands are no longer interchangeable
+    /// `Expr`s, and the result is the address, not the offset.
     fn apply_subslice_byte_offset(
         &self,
-        base_addr: Expr,
+        base_addr: Loc,
         effective_start: &Expr,
         elem_size: u64,
-    ) -> Expr {
+    ) -> Loc {
         if elem_size == 0 {
             return base_addr;
         }
         let byte_offset =
             effective_start.clone().bvmul(Expr::bitvec_const(elem_size as i128, POINTER_WIDTH));
-        base_addr.bvadd(byte_offset)
+        Loc::of_address(base_addr.into_expr().bvadd(byte_offset))
     }
 
     /// Build cache key `(provenance_root, start_const)` for subslice address dedup.

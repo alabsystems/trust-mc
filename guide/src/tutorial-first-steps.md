@@ -38,7 +38,7 @@ This is a lot like a test harness, but now we can use `kani::any()` to represent
 ```
 
 ```
-# cargo trust-mc
+# targo trust-mc
 [...]
 Runtime decision procedure: 0.00116886s
 

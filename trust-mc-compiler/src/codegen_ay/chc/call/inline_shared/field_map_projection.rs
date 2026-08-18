@@ -14,6 +14,7 @@ use super::super::{ChcCtx, constant_index_offset};
 use crate::codegen_ay::chc::call::inline_field_map::DIRECT_DEREF_FIELD;
 use crate::codegen_ay::chc::codegen_types::CodegenTypes;
 use crate::codegen_ay::chc::dyn_coercion;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::shared::is_pointer_wrapper_adt;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
@@ -57,9 +58,10 @@ pub(in crate::codegen_ay::chc) fn resolve_projected_place(
                 // Captured-ref walk gap: when the local was seeded BY VALUE
                 // with the pointee's Datatype (closure env passed by reference
                 // into contract ensures/requires closures), Deref is identity.
-                // extract_pointer_expr would otherwise fabricate a "pointer"
-                // from the DT's first BV64 field (cap_0), destroying the env
-                // and failing every subsequent capture Field read.
+                // extract_pointer_expr would otherwise peel the env DT's cap_0
+                // — a capture the closure sort may legitimately declare to be
+                // an address (wave 18) — and use it as the base, destroying the
+                // env and failing every subsequent capture Field read.
                 let identity_value_deref = !last_deref_was_raw_ptr
                     && match current_ty.kind() {
                         TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => {
@@ -72,7 +74,10 @@ pub(in crate::codegen_ay::chc) fn resolve_projected_place(
                     };
                 if !identity_value_deref {
                     if let Some(ptr_expr) = dyn_coercion::extract_pointer_expr(&current) {
-                        current = ptr_expr;
+                        // `current` is the walker's running term and is a VALUE
+                        // on the identity lane above, so the slot cannot be
+                        // typed; the tag ends at this crossing.
+                        current = ptr_expr.into_expr();
                     }
                 }
                 current_ty = match current_ty.kind() {
@@ -129,7 +134,16 @@ pub(in crate::codegen_ay::chc) fn resolve_projected_place(
                 }
                 current = ctx.try_unflatten_bv_to_datatype(current, current_ty);
                 let cons_idx = downcast_variant.take();
-                if let Some(selected) = ChcCtx::datatype_field_select(&current, *idx, cons_idx) {
+                // `current` is the running term for the place's value as the
+                // projection chain is walked; every producer feeding it above is
+                // a local expression or a loaded pointee, so it is a value.
+                if let Some(selected) = ChcCtx::datatype_field_select(
+                    &crate::codegen_ay::provenance::Val::of_value(current.clone()),
+                    *idx,
+                    cons_idx,
+                )
+                .map(crate::codegen_ay::provenance::Val::into_expr)
+                {
                     // Part of #4050: Detect flattened DT field chain mismatch.
                     // When the DT is flattened (e.g., Vec_bv64 has {fld_ptr, fld_len,
                     // fld_cap, fld_data}) but MIR projects into an intermediate struct
@@ -258,21 +272,24 @@ pub(in crate::codegen_ay::chc) fn resolve_projected_place(
             && let Some(loaded) = self_field_map.get(&(place.local, DIRECT_DEREF_FIELD))
         {
             current = loaded.clone();
-        } else if current.sort().bitvec_width() == Some(POINTER_WIDTH) {
-            // Part of #3848: When dereferencing a raw pointer to a static (e.g.,
-            // `_old = (*_ptr)` where `_ptr = &raw mut CELL`), the field_map has
-            // no entry because the pointer isn't the `self` parameter. Without
-            // this load, we return the raw BV64 address instead of the value at
-            // that address, causing `CELL += 1` to compute `address + 1`.
-            //
-            // Guard: only load for raw pointer types, not references. References
-            // are transparent in CHC encoding (deref is identity). Raw pointers
-            // to statics need actual memory loads.
-            if last_deref_was_raw_ptr {
-                if let Some(loaded) = ctx.load_from_memory(current.clone(), current_ty) {
-                    current = loaded;
-                }
-            }
+        }
+        // Part of #3848: When dereferencing a raw pointer to a static (e.g.,
+        // `_old = (*_ptr)` where `_ptr = &raw mut CELL`), the field_map has
+        // no entry because the pointer isn't the `self` parameter. Without
+        // this load, we return the raw address instead of the value at that
+        // address, causing `CELL += 1` to compute `address + 1`.
+        //
+        // `last_deref_was_raw_ptr` is read off the MIR type and is what makes
+        // the term an address: references ARE transparent in the CHC encoding
+        // (deref is identity), raw pointers never are. That type test now
+        // leads — it used to sit inside a width test that had already decided
+        // the term was an address — and `PtrRepr::thin_address` supplies only
+        // the pointer's shape.
+        else if last_deref_was_raw_ptr
+            && let Some(addr) = PtrRepr::thin_address(&current)
+            && let Some(loaded) = ctx.load_from_memory(addr, current_ty)
+        {
+            current = loaded.into_expr();
         }
     }
 

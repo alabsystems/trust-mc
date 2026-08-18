@@ -18,6 +18,7 @@ use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
 use tracing::debug;
 
 use super::super::ChcCtx;
+use crate::codegen_ay::provenance::Loc;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort};
 
 /// Peel reference/pointer wrappers to the effective slice/array payload.
@@ -181,8 +182,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let tgt_elem_sort = self.elem_sort_for_memory_array(target_inner);
                 let alias_src_expr = self.translate_operand_with_modified(operand, modified_locals);
                 if let Some(alias_src) = alias_src_expr {
-                    let alias_ptr =
-                        dyn_coercion::extract_pointer_expr(&alias_src).unwrap_or_else(|| {
+                    let alias_ptr = dyn_coercion::extract_pointer_expr(&alias_src)
+                        .map(Loc::into_expr)
+                        .unwrap_or_else(|| {
                             coerce_bitvec_width_safe(
                                 alias_src,
                                 POINTER_WIDTH,
@@ -290,9 +292,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Translate the source operand (the data pointer).
         let src_expr = self.translate_operand_with_modified(operand, modified_locals)?;
-        let ptr_expr = dyn_coercion::extract_pointer_expr(&src_expr).unwrap_or_else(|| {
-            coerce_bitvec_width_safe(src_expr.clone(), POINTER_WIDTH, SignExtension::ZeroExtend)
-        });
+        // The unsize coercion PACKS this half into the `Dyn_Trait` datatype
+        // built below, i.e. it becomes a field datum; the tag ends here.
+        let ptr_expr = dyn_coercion::extract_pointer_expr(&src_expr)
+            .map(Loc::into_expr)
+            .unwrap_or_else(|| {
+                coerce_bitvec_width_safe(src_expr.clone(), POINTER_WIDTH, SignExtension::ZeroExtend)
+            });
         let ptr_expr = coerce_bitvec_width_safe(ptr_expr, POINTER_WIDTH, SignExtension::ZeroExtend);
 
         // Construct Dyn_Trait{fld_ptr: ptr_expr, fld_vtable: vtable_id}.

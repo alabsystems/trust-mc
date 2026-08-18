@@ -67,3 +67,7 @@ result_output_dir/
 
 # Publish tool work area (export tree, reports, staging clone)
 publish/.out/
+
+# ay-chc proof certificates + their lock files, regenerated per verification run
+*.chccert
+*.chccert.ay-chc.lock

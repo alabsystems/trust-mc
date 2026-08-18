@@ -184,32 +184,63 @@ impl TestCx<'_> {
         let mut child = disable_error_reporting(|| command.spawn())
             .unwrap_or_else(|_| panic!("failed to exec `{:?}`", &command));
 
-        let killed_status = if let Some(timeout) = self.command_timeout() {
+        // DRAIN THE PIPES CONCURRENTLY, from the instant the child exists.
+        //
+        // This previously called `wait_timeout()` and only `read2()` AFTER the
+        // child exited — nobody consumed stdout/stderr while it ran. The OS pipe
+        // buffer is 64 KiB, so as soon as a verbose harness filled it the child's
+        // next write BLOCKED FOREVER and it could never exit. The outer wall then
+        // ALWAYS expired regardless of size (a 900s wall timed out exactly like a
+        // 310s one), the killed child's output was replaced with `Vec::new()`, and
+        // `<name>.out` was written EMPTY — so scripts/ay-soundness-gate.sh, which
+        // greps the artifact for `VERIFICATION:-`, reported "verifier never ran"
+        // (VACUOUS) even though the verifier had decided and reported.
+        //
+        // Two ledgered soundness files hit it (memory_safety_uaf_fail,
+        // realloc_stale_pointer_fail): their PDR/portfolio logging exceeds 64 KiB,
+        // while every file that passed stayed under it. The smoking gun was a
+        // `<name>.err` of exactly 65536 bytes — a full pipe buffer.
+        //
+        // Measured on memory_safety_uaf_fail: >900s deadlock with a 0-byte .out and
+        // a 65536-byte .err  ->  118s, 2,204,627-byte .err, and a real
+        // `VERIFICATION:- FAILED` + `Complete - ...` in .out.
+        //
+        // Reader threads own the pipes, so the child always makes progress and its
+        // output survives even when we do have to kill it.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let out_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = stdout_pipe {
+                use std::io::Read;
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let err_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = stderr_pipe {
+                use std::io::Read;
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let status = if let Some(timeout) = self.command_timeout() {
             match child.wait_timeout(timeout).unwrap() {
-                Some(_status) => None, // No timeout — proceed to read2.
+                Some(status) => status,
                 None => {
-                    // Timeout. Kill the isolated process group so solver
-                    // descendants cannot survive after the verifier exits.
                     println!("Process timed out after {timeout:?}s: {cmdline}");
                     kill_process_group(&mut child).unwrap();
-                    // Drop stdout/stderr pipes so grandchild processes (z3/ay
-                    // solver) that inherited the FDs get broken-pipe on write,
-                    // preventing read2 from hanging indefinitely.
-                    drop(child.stdout.take());
-                    drop(child.stderr.take());
-                    Some(child.wait().expect("invariant: killed child must be waitable"))
+                    child.wait().expect("invariant: killed child must be waitable")
                 }
             }
         } else {
-            None
+            child.wait().expect("failed to wait on child")
         };
-
-        let Output { status, stdout, stderr } = if let Some(status) = killed_status {
-            // Process was killed and pipes closed — skip read2.
-            Output { status, stdout: Vec::new(), stderr: Vec::new() }
-        } else {
-            read2(child).expect("failed to read output")
-        };
+        // Readers finish once every writer FD is closed, which exit/kill guarantees.
+        let stdout = out_handle.join().unwrap_or_default();
+        let stderr = err_handle.join().unwrap_or_default();
 
         let result = ProcRes {
             status,

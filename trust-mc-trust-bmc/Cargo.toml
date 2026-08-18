@@ -14,12 +14,17 @@ description = "trust_ir Module consumption for trust-mc BMC verification"
 trust-mc-core = { path = "../trust-mc-core" }
 ay_bindings.workspace = true
 thiserror.workspace = true
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7cccbfcd7d3d5187e040e86fb4adc58a4beb977d" }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab" }
 
 [dev-dependencies]
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7cccbfcd7d3d5187e040e86fb4adc58a4beb977d" }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab" }
 # In-process AY solving for guarded-path CFG encoding tests (SAT/UNSAT checks).
 ay_bindings = { workspace = true, features = ["direct"] }
+# Load a REAL `-Ztrust-dump=native-bundle` module (produced by trustc from Rust
+# source through the trust-ir-bridge) so the interior-pointer store tests run on
+# the production lowering path, not only on hand-built IR.
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab", features = ["serde"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

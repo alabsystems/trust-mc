@@ -13,6 +13,7 @@
 use super::{
     Expr, IndexedVal, IntoOption, Place, ProjectionElem, RigidTy, StatementCodegen, TyKind,
 };
+use crate::codegen_ay::provenance::is_transparent_pointer_wrapper_repr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH};
 use ay_bindings::ExprValue;
 use tracing::{debug, warn};
@@ -304,8 +305,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // Part of #1100: Also allow active_variant == Some(0) for ControlFlow::Continue
                     // from Try::branch stubs. When we Downcast to variant 0 on a bv64, the Field(0)
                     // should return the bv64 itself (it IS the Continue output).
-                    if expr.sort().is_bitvec()
-                        && expr.sort().bitvec_width() == Some(POINTER_WIDTH)
+                    // The shared REPRESENTATION predicate, identical to the one
+                    // the post-deref walker and the CHC select/update pair use:
+                    // it answers "was a wrapper flattened to this bv?", never
+                    // "is this bv an address?". One definition keeps the four
+                    // walkers from disagreeing about which slot field 0 is.
+                    if is_transparent_pointer_wrapper_repr(expr.sort())
                         && *field == 0
                         && (active_variant.is_none() || active_variant == Some(0))
                     {
@@ -399,8 +404,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         // ControlFlow datatype, we allow the Downcast to proceed if:
                         // 1. It's a bv64 (pointer-width)
                         // 2. It's variant 0 (Continue - the success path we assume)
-                        if expr.sort().is_bitvec()
-                            && expr.sort().bitvec_width() == Some(POINTER_WIDTH)
+                        // Same shared representation predicate as the `Field`
+                        // arm below and as `apply_post_deref_projections`.
+                        if is_transparent_pointer_wrapper_repr(expr.sort())
                             && variant_idx.to_index() == 0
                         {
                             // Treat as transparent - the bv64 IS the Continue payload

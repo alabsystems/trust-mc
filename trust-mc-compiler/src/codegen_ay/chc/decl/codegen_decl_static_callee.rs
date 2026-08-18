@@ -112,9 +112,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let Some(obj_id) = self.heap_state.next_alloc_id() else {
                     continue;
                 };
-                let addr_expr = ay_bindings::Expr::bitvec_const(obj_id as i128, 32)
-                    .concat(ay_bindings::Expr::bitvec_const(0i128, 32));
-                self.ref_resolution.static_address_exprs.insert(alloc_id, addr_expr.clone());
+                // Freshly minted object base: an address by construction, so
+                // this is where the tag belongs.
+                let addr = crate::codegen_ay::provenance::Loc::of_address(
+                    ay_bindings::Expr::bitvec_const(obj_id as i128, 32)
+                        .concat(ay_bindings::Expr::bitvec_const(0i128, 32)),
+                );
+                self.ref_resolution.static_address_exprs.insert(alloc_id, addr.as_expr().clone());
 
                 // Record static layout metadata for entry-rule size/alignment
                 // constraints on callee-discovered statics.
@@ -157,8 +161,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         obj_id,
                         "CHC: contract harness — callee static mut left havocked (P2-S1)"
                     );
-                } else if let Some(init_expr) = init_expr_opt {
-                    self.register_static_memory_init_entries(static_ty, init_expr, addr_expr);
+                } else if let Some(init_value) = init_expr_opt {
+                    self.register_static_memory_init_entries(static_ty, init_value, addr);
                     debug!(
                         static_name = %static_name,
                         obj_id,

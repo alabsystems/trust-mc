@@ -94,8 +94,11 @@ pub use native::{
     typed_chc_pdr_semantic_config_sha256,
 };
 
+#[cfg(feature = "ay-chc-native")]
+pub use native::independently_replay_typed_chc_pdr_refutation_witness;
+
 #[cfg(feature = "native-trust-ir-bundle")]
 pub use native::{
     NativeTrustIrChcPdrBundleEvidence, NativeTrustIrChcPdrEvidence, NativeTrustIrChcPdrNotProved,
-    NativeTrustIrChcPdrRunner,
+    NativeTrustIrChcPdrRefuted, NativeTrustIrChcPdrRunner,
 };

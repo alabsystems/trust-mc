@@ -34,6 +34,7 @@ use crate::codegen_ay::chc::rules::codegen_rules::transition_drop::{
     shared_pointer_drop_local_from_drop_arg, shared_pointer_inner_ty,
     shared_pointer_value_ptr_for_drop, try_translate_shared_pointer_inner_drop,
 };
+use crate::codegen_ay::provenance::Loc;
 use crate::codegen_ay::types::POINTER_WIDTH;
 use tracing::{debug, warn};
 
@@ -829,7 +830,12 @@ impl<'tcx, 'body> CallDispatchMiscGenericPreroutes for ChcCtx<'tcx, 'body> {
                 "misc::slice_as_ptr",
                 |ctx, d| {
                     d.args.first().and_then(|arg| {
+                        // `slice::as_ptr` STORES its address into the
+                        // destination local as a pointer datum, and the
+                        // fallback lane is an untyped operand translation, so
+                        // the address tag ends at this crossing.
                         ctx.slice_as_ptr_data_expr(arg, d.modified_locals)
+                            .map(Loc::into_expr)
                             .or_else(|| ctx.translate_operand_with_modified(arg, d.modified_locals))
                     })
                 },
@@ -837,9 +843,12 @@ impl<'tcx, 'body> CallDispatchMiscGenericPreroutes for ChcCtx<'tcx, 'body> {
                     if let Some(arg) = d.args.first() {
                         ctx.propagate_slice_as_ptr_metadata(d.destination.local, arg);
                         if let Some(addr) = ctx.slice_as_ptr_data_expr(arg, d.modified_locals) {
+                            // `known_stack_addr_exprs` is still an untyped
+                            // `HashMap<usize, Expr>` (a wave-10 address
+                            // oracle), so the tag is dropped at its boundary.
                             ctx.record_known_stack_addr_expr(
                                 d.destination.local,
-                                addr,
+                                addr.into_expr(),
                                 "slice-as-ptr",
                             );
                         }
@@ -892,7 +901,8 @@ impl<'tcx, 'body> CallDispatchMiscGenericPreroutes for ChcCtx<'tcx, 'body> {
             if let Some(target) = target {
                 let dest_local = destination.local;
                 let eq_constraint = args.first().and_then(|arg| {
-                    let metadata_expr = self.translate_ptr_metadata(arg, modified_locals)?;
+                    let metadata_expr =
+                        self.translate_ptr_metadata(arg, modified_locals)?.into_expr();
                     let vec_idx = self.try_state_idx_for_local(dest_local)?;
                     let (out_name, out_sort) = self.state_var_mgr.output_state_vars.get(vec_idx)?;
                     let out_sort = out_sort.clone();
@@ -1211,7 +1221,10 @@ impl<'tcx, 'body> CallDispatchMiscGenericPreroutes for ChcCtx<'tcx, 'body> {
                     .args
                     .first()
                     .and_then(|arg| ctx.translate_operand_with_modified(arg, d.modified_locals))?;
-                Some(extract_pointer_expr(&ptr_expr).unwrap_or(ptr_expr))
+                // The identity-cast result becomes the destination local's
+                // pointer DATUM; the fallback lane is the untranslated operand,
+                // so the wave-11 tag ends at this crossing.
+                Some(extract_pointer_expr(&ptr_expr).map(Loc::into_expr).unwrap_or(ptr_expr))
             });
         }
 

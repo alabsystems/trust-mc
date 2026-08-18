@@ -15,7 +15,7 @@ These harnesses are internal to trust-mc—i.e., trust-mc does not make any chan
 ## Usage
 Run either:
 ```
-# cargo trust-mc autoharness -Z autoharness
+# targo trust-mc autoharness -Z autoharness
 ```
 or
 ```
@@ -88,7 +88,7 @@ Using the `estimate_size` example from [First Steps](../../tutorial-first-steps.
 We get:
 
 ```
-# cargo trust-mc autoharness -Z autoharness
+# targo trust-mc autoharness -Z autoharness
 Autoharness: Checking function estimate_size against all possible inputs...
 RESULTS:
 Check 3: estimate_size.assertion.1

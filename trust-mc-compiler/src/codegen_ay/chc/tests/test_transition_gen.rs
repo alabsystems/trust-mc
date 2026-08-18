@@ -689,7 +689,7 @@ fn test_drop_box_dyn_d2_restores_heap_state_between_candidates() {
             chc_ctx
                 .heap_state
                 .store_forward_map
-                .insert(0, (0, ay_bindings::Expr::bitvec_const(9, 32)));
+                .insert(0, (0, ay_bindings::Expr::bitvec_const(9, 32), "u32".into()));
 
             chc_ctx.encode.modified_state_indices = baseline_modified.clone();
             chc_ctx.heap_state.restore_transient_rule_state(&baseline_heap);

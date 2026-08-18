@@ -134,6 +134,16 @@ pub(in crate::codegen_ay::chc) fn fat_ref_const_len(alloc: &Allocation) -> Optio
 
 /// Returns true when a constant enum payload of type `concrete_ty` must be
 /// decoded as a BV128 fat pointer (`&str` / `&[T]` / slice-tail DST ref).
+///
+/// Address-vs-value: this predicate takes no [`Expr`], so there is no
+/// provenance to thread through it — the decision is already made from the
+/// TYPE (`RigidTy::Ref`/`RawPtr` whose pointee is a fat-BV128 DST), and the
+/// width term is only a representation precondition on the declared payload
+/// slot. The width term alone would also match a plain `u128` VALUE, which is
+/// why it must stay a conjunct and not become the discriminator. Separating a
+/// real fat pointer from a zero-extended thin one where the type is *not*
+/// available is the `PtrRepr` work in wave 3 of
+/// `docs/addr-vs-value-conversion-queue.md`, not a wave-1 retyping.
 pub(in crate::codegen_ay::chc) fn const_payload_is_fat_ref(
     concrete_ty: rustc_public::ty::Ty,
     payload_sort: &Sort,

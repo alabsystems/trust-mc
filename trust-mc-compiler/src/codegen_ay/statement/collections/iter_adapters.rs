@@ -28,6 +28,7 @@ use super::iter::get_bmc_iterator_unsound_skip_count;
 use crate::codegen_ay::context::{
     get_unconstrained_assignment_count, get_unsupported_construct_fallback_count,
 };
+use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH, bool_sort, ptr_sort};
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
@@ -160,7 +161,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         if args.len() >= 2
-            && let Some(iter_expr) = self.codegen_operand(&args[0])
+            // `fold`/`try_fold` take `self` BY VALUE: the receiver operand
+            // translates to the iterator value, not to its address.
+            && let Some(iter_expr) = self.codegen_operand(&args[0]).map(Val::of_value)
             && let Some(init_expr) = self.codegen_operand(&args[1])
             && let Some(has_remaining) = self.iter_has_remaining_items(&iter_expr)
         {
@@ -177,7 +180,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 self.infer_sort_from_place(destination).unwrap_or_else(|| init_expr.sort().clone());
             let sym_name = self.ctx.fresh_name("iter_fold_value");
             let symbolic_result = self.ctx.declare_var(&sym_name, sym_sort);
-            let result = Expr::ite(has_remaining, symbolic_result, init_expr);
+            let result = Expr::ite(has_remaining.into_expr(), symbolic_result, init_expr);
             self.assign_value_to_place(destination, result);
             // FAIL-CLOSED: the per-element fold closure is captured into the opaque
             // Filter/Map adapter value and is not recoverable at the fold call site,
@@ -216,14 +219,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         if !args.is_empty()
-            && let Some(iter_expr) = self.codegen_operand(&args[0])
+            // `sum` takes `self` BY VALUE: the receiver operand translates to
+            // the iterator value, not to its address.
+            && let Some(iter_expr) = self.codegen_operand(&args[0]).map(Val::of_value)
             && let Some(result_sort) = self.infer_sort_from_place(destination)
             && let Some(zero) = Self::zero_expr_for_sort(&result_sort)
             && let Some(has_remaining) = self.iter_has_remaining_items(&iter_expr)
         {
             let sym_name = self.ctx.fresh_name("iter_sum_value");
             let symbolic_result = self.ctx.declare_var(&sym_name, result_sort);
-            let result = Expr::ite(has_remaining, symbolic_result, zero);
+            let result = Expr::ite(has_remaining.into_expr(), symbolic_result, zero);
             self.assign_value_to_place(destination, result);
             // FAIL-CLOSED: see `codegen_iter_fold_stub`. The summed values are not
             // recovered here (the map/filter closures are not threaded to the sum
@@ -359,10 +364,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         None
     }
 
+    /// `has_remaining` predicate for an iterator RECEIVER VALUE.
+    ///
+    /// Address-vs-value (wave 1): `iter_expr` is the iterator datatype itself —
+    /// a [`Val`], never a location — so `fld_pos` is a VALUE too. The old guard
+    /// here read `pos.sort().bitvec_width() == Some(POINTER_WIDTH)`, i.e. "is
+    /// the cursor a pointer?", which is nonsense for a value and only ever
+    /// happened to work because it agreed with the width of the thing `pos` is
+    /// compared against. The real precondition is that `bvult`'s two operands
+    /// agree in width, so the test is now against `len`'s own sort. `len` is
+    /// selected at `ptr_sort()` and `vec_field_select` returns that sort on both
+    /// its branches, so the two tests accept exactly the same expressions.
     #[must_use]
-    fn iter_has_remaining_items(&mut self, iter_expr: &Expr) -> Option<Expr> {
-        use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
+    fn iter_has_remaining_items(&mut self, iter_expr: &Val) -> Option<Val> {
+        use crate::codegen_ay::types::ptr_sort;
 
+        let iter_expr = iter_expr.as_expr();
         let dt = iter_expr.sort().datatype_sort()?;
         let ctor = dt.constructors.first()?;
 
@@ -371,14 +388,19 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let pos = iter_expr.clone().field_select(&dt.name, "fld_pos", pos_field.sort.clone());
             let len = self.vec_field_select_declared(&vec, "fld_len", ptr_sort());
 
-            if pos.sort().bitvec_width() == Some(POINTER_WIDTH) {
-                return Some(pos.bvult(len));
+            if pos.sort().bitvec_width() == len.sort().bitvec_width() {
+                // Comparison of two values: a value again.
+                return Some(Val::of_value(pos.bvult(len)));
             }
         }
 
         if let Some(inner_field) = ctor.field("fld_iter") {
-            let inner =
-                iter_expr.clone().field_select(&dt.name, "fld_iter", inner_field.sort.clone());
+            // A field of a value is a value.
+            let inner = Val::of_value(iter_expr.clone().field_select(
+                &dt.name,
+                "fld_iter",
+                inner_field.sort.clone(),
+            ));
             return self.iter_has_remaining_items(&inner);
         }
 

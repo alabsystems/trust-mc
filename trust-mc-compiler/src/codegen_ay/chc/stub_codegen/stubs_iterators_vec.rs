@@ -148,9 +148,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
         let backing = self.resolve_slice_backing(arg, modified_locals)?;
-        let target_sort = backing.data.sort().clone();
-        let data = if Self::is_zero_pointer_width_bitvec(&backing.offset) {
-            backing.data.clone()
+        let target_sort = backing.data.as_expr().sort().clone();
+        let data = if Self::is_zero_pointer_width_bitvec(backing.offset.as_expr()) {
+            backing.data.as_expr().clone()
         } else {
             self.record_aggregate_gap("vec_iter_slice_backing_rebase");
             self.rebase_slice_backing_to_zero_based_array(
@@ -175,7 +175,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Some(Expr::datatype_constructor(
             &slice_sort_name,
             ctor_name,
-            vec![Expr::bitvec_const(0u64, POINTER_WIDTH), backing.len, data],
+            vec![Expr::bitvec_const(0u64, POINTER_WIDTH), backing.len.into_expr(), data],
             slice_sort,
         ))
     }

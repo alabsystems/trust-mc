@@ -22,6 +22,16 @@ triage surfaces for the current workspace. The authoritative replacement proof
 flow remains the inventory generator plus the hard proof gates documented here,
 driven by the clean tooling under `tools/replacement-inventory/`.
 
+> **Tooling status (2026-08-11):** several commands this standard names are
+> planned but NOT yet implemented — `scripts/ay_manifest_pin.py`,
+> `scripts/compiletest_report_contract.py`, `scripts/ay-bump-canary.sh`,
+> `scripts/zero_fallback_canary.sh`, `scripts/ay-compiletest.sh --self-test`,
+> and the `reports/compiletest-per-harness-latest-trust-mc.json` report-naming
+> family (roadmap items 6.1/6.2 in `docs/roadmap-100-parity-2026-07-06.md`;
+> some strict `replacement_progress.py` flags shown below are also 6.2 work).
+> Until they land, the ceremony below cannot be executed end to end; it remains
+> the bar an evidence packet must meet, not a description of runnable tooling.
+
 ## Definition
 
 trust-mc is a 100% Kani replacement only when all of the following hold on one named

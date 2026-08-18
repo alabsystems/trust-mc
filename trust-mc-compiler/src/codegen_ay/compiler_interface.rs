@@ -49,6 +49,7 @@ use super::codegen_function::codegen_function;
 use super::codegen_results::AYCodegenResults;
 use super::target_config::{check_target, select_target_features};
 use super::unsoundness_per_harness as uph;
+use super::{take_kani_mem_overapprox_by_fn, take_offset_provenance_unresolved_by_fn};
 use crate::kani_middle::{attributes, check_reachable_items};
 
 /// AY verification backend for the trust_mc compiler.
@@ -229,6 +230,9 @@ impl CodegenBackend for AYCodegenBackend {
                                     && !queries.args().no_memory_safety_checks,
                                 overflow_checks: !queries.args().no_default_checks
                                     && !queries.args().no_overflow_checks,
+                                // Opt-in only: NaN is defined behaviour, so
+                                // `no_default_checks` is irrelevant here.
+                                nan_checks: queries.args().nan_checks,
                                 undefined_function_checks: !queries.args().no_default_checks
                                     && !queries.args().no_undefined_function_checks,
                                 // Auto-enable bounded unrolling when CHC mode has
@@ -272,6 +276,20 @@ impl CodegenBackend for AYCodegenBackend {
                                 &harness_md.pretty_name,
                                 &counters_before,
                                 &counters_after,
+                            );
+                            // Re-key the per-FUNCTION attribution maps onto THIS harness while
+                            // we are still inside its codegen boundary. Their recorders document
+                            // the intent ("attributes the demotion to the harness whose codegen
+                            // accumulated it so it cannot leak onto siblings") but key by function
+                            // name, and the driver's fail-closed `attributable_to_harness` charges
+                            // any non-harness key against EVERY harness — so a fn-keyed entry
+                            // demoted every sibling's genuine proof. Draining here is precise:
+                            // codegen_items ran for this harness alone, so everything these maps
+                            // accumulated is this harness's.
+                            uph::absorb_fn_keyed_for_harness(
+                                &harness_md.pretty_name,
+                                &take_offset_provenance_unresolved_by_fn(),
+                                &take_kani_mem_overapprox_by_fn(),
                             );
                             results.extend(min_ctx, items, None);
                             let smt_path = model_path.with_extension("smt2");

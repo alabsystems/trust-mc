@@ -18,11 +18,11 @@ use super::codegen_ctx::{
     ChcCtx, ChcDiagnostics, PENDING_FRESH_VAR_DECLS, chc_debug_enabled,
     record_aggregate_encoding_gap_for_fn, record_fp_bitvector_encoding_for_fn,
     record_kani_mem_overapprox_for_fn, record_offset_provenance_unresolved_for_fn,
-    record_ptr_metadata_unconstrained_for_fn,
-    record_signedness_fallback_for_fn, record_static_init_incomplete_for_fn,
-    record_sound_havoc_drop_for_fn, record_store_dropped_for_fn, record_stub_approximation_for_fn,
-    record_translation_drop_for_fn, record_type_sort_fallback_for_fn, record_unhandled_call_for_fn,
-    set_chc_fallback_count_for_fn, take_undef_counter,
+    record_ptr_metadata_unconstrained_for_fn, record_signedness_fallback_for_fn,
+    record_sound_havoc_drop_for_fn, record_static_init_incomplete_for_fn,
+    record_store_dropped_for_fn, record_stub_approximation_for_fn, record_translation_drop_for_fn,
+    record_type_sort_fallback_for_fn, record_unhandled_call_for_fn, set_chc_fallback_count_for_fn,
+    take_undef_counter,
 };
 // Trait impls providing methods called on ChcCtx in translate_inner
 use super::codegen_rules::CodegenRules;
@@ -470,28 +470,38 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.diagnostics.offset_provenance_unresolved.discharge_local_into_global();
         }
 
-        // Task #78 (OFFSET_PROV_GENUINE_CERT): account the
-        // `offset_provenance_unresolved` demotion so the harness's
-        // approximation identity is COMPLETE. That demotion SKIPS an
-        // allocation-bound / in-bounds check (`ptr_offset_alloc_bound_check`
-        // returned None) but frees NO readable SMT state var — the result
-        // pointer stays fully constrained by the pointer arithmetic. So each
-        // event is accounted with a `None` identity (dead / provably
-        // unreadable): it counts toward completeness WITHOUT adding a readable
-        // var, letting the driver certify an INDEPENDENT violated check (e.g.
-        // the isize-overflow property, which reads only `count` + the pointee
-        // size — both concrete) Genuine. The skipped in-bounds obligation
-        // ITSELF stays demoted (this only completes the accounting; it never
-        // claims to verify the check). Read the LOCAL counter AFTER the
-        // intrinsic-span discharge above so a discharged (already-Genuine)
-        // offset contributes zero here and cannot double-count. Because the
-        // recorded count and the added total below are the SAME value, offset
-        // is self-consistent and can never be the source of incompleteness —
-        // sound precisely because it frees nothing readable.
+        // Task #78 (OFFSET_PROV_GENUINE_CERT): the `offset_provenance_unresolved`
+        // accounting is owned by `record_offset_provenance_unresolved`
+        // (codegen_stmt_rvalue_offset.rs), which records EXACTLY one accounted
+        // approximation per skip — with the base pointer's freed-var IDENTITY,
+        // so the provenance / wrap / same-object checks come out
+        // `approximation_dependent` while an independent check (the
+        // isize-overflow property, reading only `count` + the pointee size) does
+        // not.
+        //
+        // A per-skip `record_approximation_identity(None)` loop used to live
+        // HERE, from before the recorder self-accounted. Once both ran, every
+        // skip was accounted TWICE: `accounted_approximations == 2 * count`
+        // while the driver's expected total is `count` (parsed from the CTREX
+        // categories). `ctrex_certifiable_genuine` gates on
+        // `ev.accounted == effective_total`, so the double-count made that gate
+        // unsatisfiable and killed the whole certification lane for every
+        // harness with count >= 1 (expected/offset-overflows-isize: the violated
+        // `pointer_overflow` property already carried
+        // `approximation_dependent = false`, and the harness was already
+        // `complete`, yet accounted=2 vs total=1 kept it OverApproximation).
+        // Deleting the duplicate restores `accounted == count`. It removes no
+        // accounting and no taint: those records carried a `None` identity, so
+        // they contributed nothing to the tainted set.
+        //
+        // The count is still read HERE — and still AFTER the intrinsic-span
+        // discharge above, so a discharged (already-Genuine) offset contributes
+        // zero — because each skip remains an EXPECTED freeing event in
+        // `sound_approx_freeing_total` below. That total is the completeness
+        // denominator (`complete = accounted >= total`); dropping it from the
+        // sum would make completeness vacuous for these harnesses instead of
+        // checked.
         let offset_provenance_freed = self.diagnostics.offset_provenance_unresolved.get();
-        for _ in 0..offset_provenance_freed {
-            self.vc.record_approximation_identity(None);
-        }
 
         // Task #78: finalize approximation-identity plumbing. The freed-var
         // identities were pushed to `self.vc.approximated_vars` during codegen
@@ -616,6 +626,140 @@ pub(in crate::codegen_ay) fn block_relation_apps_consistent(
         .all(|rule| app_ok(&rule.head) && rule.body.relation.as_ref().map_or(true, app_ok))
 }
 
+/// Diagnostic lever: report block-relation slot-layout consistency at a named
+/// pipeline stage.
+///
+/// The emit-time pipeline has ~8 passes that each edit relation columns, and any
+/// one of them desynchronizing a declaration from its applications produces a
+/// FABRICATED PROOF — the frame misaligns, a block's own body constraints turn
+/// contradictory, its successor becomes unreachable, and a FALSE assertion is
+/// reported PROVEN (see [`block_relation_slot_names_consistent`] and the
+/// `dual_slot_misalign_option_predicate*` duals). The fail-close catches the END
+/// state, but not WHICH pass broke it, and locating that cost a bespoke
+/// instrumentation pass once already.
+///
+/// Set `TRUST_MC_CHECK_SLOT_LAYOUT=1` to log a per-stage verdict. The expected
+/// shape of a regression looks like:
+///
+/// ```text
+/// SLOT_LAYOUT stage=02_scalarize      consistent=true
+/// SLOT_LAYOUT stage=04_fixup_arities  consistent=false   <-- introduced here
+/// ```
+///
+/// Off by default and gated on one cached env read, so the normal path is
+/// unaffected. This is triage infrastructure for the slot-layout-authority work,
+/// which is the prerequisite for narrowing CHC frames (the trust-mc-side lever on
+/// the solver-latency bucket).
+///
+/// NOTE a limitation worth knowing when reading its output: the underlying check
+/// only inspects SORT-CONFORMING applications, so an application whose arity
+/// already diverges is invisible to it. A stage can therefore read
+/// `consistent=true` while carrying a latent divergence that only becomes visible
+/// once a later pass pads it into conformance at the wrong positions.
+pub(in crate::codegen_ay) fn report_slot_layout(vc: &trust_mc_core::chc::ChcVc, stage: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("TRUST_MC_CHECK_SLOT_LAYOUT").map(|v| v == "1").unwrap_or(false)
+    });
+    if !enabled {
+        return;
+    }
+    tracing::warn!(
+        stage,
+        consistent = block_relation_slot_names_consistent(vc),
+        sort_consistent = block_relation_apps_consistent(vc),
+        relations = vc.relations.len(),
+        rules = vc.rules.len(),
+        "SLOT_LAYOUT"
+    );
+}
+
+/// Does any rule-body constraint name a variable that no relation atom in that
+/// rule carries?
+///
+/// This is the correctness condition for frame narrowing. `live_state_indices`
+/// only SIZES a relation's signature (`decl/codegen_decl.rs:277`), while
+/// `declare-var` is emitted for EVERY state var (`:303`), so dropping a column
+/// the encoder still reads does not fail loudly — the variable silently becomes
+/// universally quantified. The codebase already names the consequence:
+/// "the local becomes a universally-quantified free variable, making constraints
+/// trivially satisfiable and producing spurious counterexamples"
+/// (`chc/codegen_ctx_dead_locals.rs:158`).
+///
+/// It has to be checked on the EMITTED VC rather than predicted from MIR.
+/// `compute_live_state_indices` runs at decl time, before rule generation, so the
+/// maps that decide what the encoder actually reads are not populated yet —
+/// `ref_targets` deref chains, `subslice_len`/`const_ref_values` sidecars,
+/// `known_alloc_ids` obj-id resolution, `local_expr_env` cross-block expression
+/// replay, and float table keys that embed operand columns. Every one of those is
+/// invisible to MIR source-operand liveness and visible here.
+///
+/// Returns the offending variable names (empty when the VC is well-formed).
+pub(in crate::codegen_ay) fn constraint_vars_outside_relation_frames(
+    vc: &trust_mc_core::chc::ChcVc,
+    dropped: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    if dropped.is_empty() {
+        return Vec::new();
+    }
+    use ay_bindings::ExprValue;
+    use std::collections::HashSet;
+
+    let rel_names: HashSet<&str> = vc.relations.iter().map(|r| r.name.as_str()).collect();
+    let mut offenders: Vec<String> = Vec::new();
+
+    for rule in &vc.rules {
+        // Every variable this rule's relation atoms carry, in either polarity.
+        let mut carried: HashSet<String> = HashSet::new();
+        let mut note_atom = |app: &trust_mc_core::chc::RelationApp| {
+            for arg in app.args.iter() {
+                let mut stack = vec![arg.clone()];
+                while let Some(node) = stack.pop() {
+                    if let ExprValue::Var { name } = node.value() {
+                        carried.insert(name.clone());
+                        if let Some(base) = name.strip_suffix("__out") {
+                            carried.insert(base.to_string());
+                        } else {
+                            carried.insert(format!("{name}__out"));
+                        }
+                    }
+                    stack.extend(node.children().cloned());
+                }
+            }
+        };
+        note_atom(&rule.head);
+        if let Some(ref br) = rule.body.relation {
+            note_atom(br);
+        }
+
+        for constraint in rule.body.constraints.iter() {
+            let mut stack = vec![constraint.clone()];
+            while let Some(node) = stack.pop() {
+                match node.value() {
+                    // Do not descend into nested relation applications.
+                    ExprValue::FuncApp { name, .. } if rel_names.contains(name.as_str()) => {}
+                    ExprValue::Var { name } => {
+                        // Only MIR-local-backed STATE columns matter: those are the
+                        // only variables frame narrowing can remove. Everything else
+                        // in a constraint is legitimately unframed — generated
+                        // dispatch/nondet/pad symbols (`__partial_vdisp_0`,
+                        // `__pad_*`), quantifier binders, and ambient arrays — and
+                        // flagging them would re-encode every harness, making the
+                        // narrowing inert.
+                        if dropped.contains(name.as_str()) && !carried.contains(name.as_str()) {
+                            offenders.push(name.clone());
+                        }
+                    }
+                    _ => stack.extend(node.children().cloned()),
+                }
+            }
+        }
+    }
+    offenders.sort();
+    offenders.dedup();
+    offenders
+}
+
 /// Do all applications of each block relation agree on WHICH slot lives at each
 /// position?
 ///
@@ -664,8 +808,7 @@ pub(in crate::codegen_ay) fn block_relation_slot_names_consistent(
         if !ok || !conforms(app) {
             return;
         }
-        let entry =
-            seen.entry(app.name.to_string()).or_insert_with(|| vec![None; app.args.len()]);
+        let entry = seen.entry(app.name.to_string()).or_insert_with(|| vec![None; app.args.len()]);
         for (k, arg) in app.args.iter().enumerate() {
             let ExprValue::Var { name } = arg.value() else { continue };
             let Some(base) = canonical_slot_name(name) else { continue };
@@ -703,6 +846,36 @@ pub(in crate::codegen_ay) fn block_relation_slot_names_consistent(
 /// output/intermediate variants by appending `__out` or `__mid_bb<k>`. Padding
 /// fillers are named `__pad_<rel>_<i>` and are NOT slot identities — they map to
 /// `None`.
+
+/// Deterministic, filename-safe tag for a sort, used to make pad-variable names
+/// SORT-QUALIFIED.
+///
+/// `__pad_{rel}_{idx}` alone is not a safe identity: `add_var` dedups by NAME and
+/// keeps the FIRST declaration, while a slot's sort at a given index can change
+/// between passes (columns get pruned/realigned). When that happens the name
+/// stays bound to the STALE sort, and the emitted application passes e.g. a
+/// BitVec where the relation declares Bool — which ay-chc rejects at PARSE time,
+/// costing the harness its ENTIRE verification (the error aborts the whole
+/// problem, so nothing is ever solved):
+///     Predicate 'main__bb15' expected argument sort Bool, got (_ BitVec 64)
+/// Folding the sort into the name makes equal names imply equal sorts, so
+/// first-wins dedup becomes harmless. (`__cpad_*` was an earlier, narrower
+/// workaround for the same hazard.)
+fn pad_sort_tag(sort: &ay_bindings::Sort) -> String {
+    let mut tag = String::new();
+    for ch in format!("{sort}").chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => tag.push(ch),
+            _ => {
+                if !tag.ends_with('_') {
+                    tag.push('_');
+                }
+            }
+        }
+    }
+    tag.trim_matches('_').to_string()
+}
+
 fn canonical_slot_name(name: &str) -> Option<String> {
     if name.starts_with("__pad_") {
         return None;
@@ -912,7 +1085,7 @@ pub(in crate::codegen_ay) fn canonicalize_block_relation_apps(vc: &mut trust_mc_
     // reusing `__pad_*` here would bind our pad to a stale sort. `__cpad_*`
     // names are fresh, so each is declared with the correct sort below.
     fn pad(rel: &str, idx: usize, sort: &Sort) -> Expr {
-        Expr::var(&format!("__cpad_{rel}_{idx}"), sort.clone())
+        Expr::var(&format!("__cpad_{rel}_{idx}_{}", pad_sort_tag(sort)), sort.clone())
     }
 
     let mut rewrote = false;
@@ -944,15 +1117,39 @@ pub(in crate::codegen_ay) fn canonicalize_block_relation_apps(vc: &mut trust_mc_
     // registration, but with the canonicalization-local prefix).
     if padded {
         use trust_mc_core::chc::VarDecl;
-        let pad_vars: Vec<VarDecl> = vc
-            .relations
-            .iter()
-            .flat_map(|rel| {
-                rel.arg_sorts.iter().enumerate().map(move |(i, sort)| {
-                    VarDecl::new(Arc::from(format!("__cpad_{}_{i}", rel.name)), sort.clone())
-                })
-            })
-            .collect();
+        // Declare from ACTUAL USE, for the same reason `fixup_relation_app_arities`
+        // does: re-synthesizing `__cpad_{rel}_{i}` from the current signature names
+        // a DIFFERENT variable than the one `pad()` put in the rule (the name now
+        // carries a sort tag), leaving the referenced cpad UNDECLARED — and an
+        // undeclared symbol parses as Int, aborting the whole problem
+        // ("expected argument sort Bool, got Int", kani/FatPointers/boxslice2.rs).
+        let mut pad_vars: Vec<VarDecl> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut note_cpad = |expr: &Expr| {
+            let mut stack: Vec<Expr> = vec![expr.clone()];
+            while let Some(node) = stack.pop() {
+                if let ExprValue::Var { name } = node.value()
+                    && name.starts_with("__cpad_")
+                    && seen.insert(name.to_string())
+                {
+                    pad_vars.push(VarDecl::new(Arc::from(name.as_str()), node.sort().clone()));
+                }
+                stack.extend(node.children().into_iter().cloned());
+            }
+        };
+        for rule in &vc.rules {
+            for arg in rule.head.args.as_ref() {
+                note_cpad(arg);
+            }
+            if let Some(body_rel) = &rule.body.relation {
+                for arg in body_rel.args.as_ref() {
+                    note_cpad(arg);
+                }
+            }
+            for constraint in rule.body.constraints.iter() {
+                note_cpad(constraint);
+            }
+        }
         for var in pad_vars {
             vc.add_var(var);
         }
@@ -1031,15 +1228,51 @@ pub(in crate::codegen_ay) fn fixup_relation_app_arities(vc: &mut trust_mc_core::
     }
 
     if any_padded {
-        let pad_vars: Vec<VarDecl> = vc
-            .relations
-            .iter()
-            .flat_map(|rel| {
-                rel.arg_sorts.iter().enumerate().map(move |(i, sort)| {
-                    VarDecl::new(Arc::from(format!("__pad_{}_{i}", rel.name)), sort.clone())
-                })
-            })
-            .collect();
+        // Declare pads from their ACTUAL USE in the rules, carrying each Var's own
+        // sort — not by re-synthesizing names from `rel.arg_sorts`.
+        //
+        // Synthesizing from the current signature declares the pad the CURRENT
+        // layout wants, which is not necessarily the pad an application already
+        // references: a pad arg is built when its rule is emitted, and a later
+        // pass can prune/realign the relation. The synthesized declaration then
+        // names a different variable than the one in the rule, leaving the
+        // referenced pad UNDECLARED — and an undeclared symbol parses as Int,
+        // which is why these harnesses died with "expected argument sort Bool,
+        // got Int" (a parse error aborts the whole problem, so nothing is ever
+        // solved). Collecting from the rules guarantees every referenced pad has
+        // a declaration whose sort is exactly the sort the application uses.
+        let mut pad_vars: Vec<VarDecl> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut note_pad = |expr: &Expr| {
+            let mut stack: Vec<Expr> = vec![expr.clone()];
+            while let Some(node) = stack.pop() {
+                if let ExprValue::Var { name } = node.value()
+                    && (name.starts_with("__pad_") || name.starts_with("__cpad_"))
+                    && seen.insert(name.to_string())
+                {
+                    pad_vars.push(VarDecl::new(Arc::from(name.as_str()), node.sort().clone()));
+                }
+                stack.extend(node.children().into_iter().cloned());
+            }
+        };
+        for rule in &vc.rules {
+            for arg in rule.head.args.as_ref() {
+                note_pad(arg);
+            }
+            if let Some(body_rel) = &rule.body.relation {
+                for arg in body_rel.args.as_ref() {
+                    note_pad(arg);
+                }
+            }
+            // Constraints too: a pad can be carried into one (the prune pass has a
+            // `compound_mentions_pad` case for exactly that). Missing it here would
+            // leave the pad undeclared, which is the same parse-abort this block
+            // exists to prevent. Declaring a var that turns out to be unused is
+            // harmless, so this scan is strictly on the safe side.
+            for constraint in rule.body.constraints.iter() {
+                note_pad(constraint);
+            }
+        }
         for var in pad_vars {
             vc.add_var(var);
         }
@@ -1105,7 +1338,7 @@ pub(in crate::codegen_ay) fn fixup_relation_app_arities(vc: &mut trust_mc_core::
             let missing = expected_len - current_len;
             let mut padded = Vec::with_capacity(expected_len);
             for (idx, sort) in decl_sorts[..missing].iter().enumerate() {
-                let var_name = format!("__pad_{rel_name}_{idx}");
+                let var_name = format!("__pad_{rel_name}_{idx}_{}", pad_sort_tag(sort));
                 padded.push(Expr::var(&var_name, sort.clone()));
             }
             padded.append(&mut args);
@@ -1113,7 +1346,7 @@ pub(in crate::codegen_ay) fn fixup_relation_app_arities(vc: &mut trust_mc_core::
         }
         for (i, sort) in decl_sorts[current_len..].iter().enumerate() {
             let idx = current_len + i;
-            let var_name = format!("__pad_{rel_name}_{idx}");
+            let var_name = format!("__pad_{rel_name}_{idx}_{}", pad_sort_tag(sort));
             args.push(Expr::var(&var_name, sort.clone()));
         }
         Some((args, true))
@@ -1276,11 +1509,17 @@ pub(in crate::codegen_ay) fn fixup_relation_app_arities(vc: &mut trust_mc_core::
         let Some(rest) = name.strip_prefix("__pad_") else {
             return false;
         };
-        let Some(index) = rest.strip_prefix(rel_name).and_then(|suffix| suffix.strip_prefix('_'))
+        let Some(rest) = rest.strip_prefix(rel_name).and_then(|suffix| suffix.strip_prefix('_'))
         else {
             return false;
         };
-        !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+        // `__pad_{rel}_{idx}` with an OPTIONAL `_{sort_tag}` suffix (see `pad_sort_tag`).
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            return false;
+        }
+        let tail = &rest[digits.len()..];
+        tail.is_empty() || tail.starts_with('_')
     }
 
     fn collect_full_relation_templates(

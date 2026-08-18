@@ -11,6 +11,8 @@ use crate::codegen_ay::chc::rules::codegen_rules_helpers::{
     rust_dealloc_obj_id_expr, rust_dealloc_validity_guard,
     traced_alloc_id_for_unprojected_drop_place,
 };
+use crate::codegen_ay::provenance::Loc;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 
 use super::super::{CodegenRules, TransitionContext};
 use super::dyn_dispatch::try_dyn_drop_dispatch;
@@ -92,11 +94,23 @@ pub(in crate::codegen_ay::chc) fn collect_box_dyn_dealloc_effects(
         obj_size_in, obj_size_out, obj_valid_in, obj_valid_out,
     };
 
-    let mut bv_ptr =
-        super::super::super::dyn_coercion::extract_pointer_expr(&ptr_expr).unwrap_or(ptr_expr);
-    if bv_ptr.sort().bitvec_width() == Some(crate::codegen_ay::types::POINTER_WIDTH * 2) {
-        bv_ptr = bv_ptr.extract(crate::codegen_ay::types::POINTER_WIDTH - 1, 0);
-    }
+    let storage = super::super::super::dyn_coercion::extract_pointer_expr(&ptr_expr)
+        .map(Loc::into_expr)
+        .unwrap_or(ptr_expr);
+    // Wave 4: this deallocates. The `width == 2 * POINTER_WIDTH` test it
+    // replaces decided which half of a wide pointer names the object being
+    // FREED, and it could not tell a real `Box<dyn T>` fat pointer from a thin
+    // one widened into the same slot. `PtrRepr::into_data` is total across all
+    // three shapes and picks the address half structurally, so the obj_id fed
+    // to the double-free / validity obligations below comes from a decode
+    // rather than a width coincidence.
+    //
+    // The no-decode arm used to read `Loc::of_address(storage)` — a tag on the
+    // term `PtrRepr` had just declined to recognize as pointer-shaped, naming
+    // the object this path FREES. `split_pointer` below would have rejected it
+    // anyway on every shape that matters, so refusing here loses no coverage and
+    // stops the tag asserting what the decoder denied.
+    let bv_ptr = PtrRepr::classify(&storage)?.into_data().into_expr();
     let Some((raw_obj_id_expr, offset_expr)) = ctx.split_pointer(&bv_ptr) else {
         return None;
     };

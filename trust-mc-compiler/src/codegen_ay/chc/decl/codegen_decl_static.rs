@@ -15,8 +15,11 @@ use rustc_public::mir::{Operand, Rvalue, StatementKind};
 use tracing::debug;
 
 use crate::codegen_ay::chc::codegen_ctx::diagnostics::CellCounter;
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::{PtrRepr, PtrSlot};
 
 use super::ChcCtx;
+use super::codegen_decl_static_alloc::AllocScalar;
 use super::codegen_types::CodegenTypes;
 
 /// Part of #4066: Returns true when a static name belongs to the
@@ -246,54 +249,76 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // P2-S1: skipped under contract havoc — resolving the
                     // pointer target (and seeding the target's memory) would
                     // re-pin state the contract must treat as arbitrary.
-                    if !contract_havoc && let Some(bv_width) = sort.bitvec_width() {
-                        let is_thin_ptr = bv_width == crate::codegen_ay::types::POINTER_WIDTH;
-                        let is_fat_ptr = bv_width == 2 * crate::codegen_ay::types::POINTER_WIDTH;
-                        if (is_thin_ptr || is_fat_ptr)
-                            && let Some(ref alloc) = init_alloc_opt
-                            && !alloc.provenance.ptrs.is_empty()
+                    if !contract_havoc
+                        // Which pointer shape did `translate_ty` declare for
+                        // this static? A *representation* question about the
+                        // slot, asked once. Whether the slot holds a pointer at
+                        // all is decided on the next line, by the allocation's
+                        // own relocation table — not by this width.
+                        && let Some(ptr_slot) = PtrSlot::of_sort(&sort)
+                        && let Some(ref alloc) = init_alloc_opt
+                        && !alloc.provenance.ptrs.is_empty()
+                    {
+                        let target_alloc_id = alloc.provenance.ptrs[0].1.0;
+                        // Derive the pointee type from the static's type
+                        // (e.g., &mut i32 → i32, *mut i32 → i32).
+                        let pointee_ty = Self::deref_ref_ty(static_ty).0;
+                        if !is_mutable_static
+                            && let Some(metadata) = self
+                                .resolve_pointer_static_seed_metadata(target_alloc_id, pointee_ty)
                         {
-                            let target_alloc_id = alloc.provenance.ptrs[0].1.0;
-                            // Derive the pointee type from the static's type
-                            // (e.g., &mut i32 → i32, *mut i32 → i32).
-                            let pointee_ty = Self::deref_ref_ty(static_ty).0;
-                            if !is_mutable_static
-                                && let Some(metadata) = self.resolve_pointer_static_seed_metadata(
-                                    target_alloc_id,
-                                    pointee_ty,
-                                )
-                            {
-                                seed_metadata = Some(metadata);
-                            }
-                            if let Some(resolved_data_ptr) = self.resolve_pointer_static_init(
-                                target_alloc_id,
-                                pointee_ty,
-                                &static_name,
-                                vec_idx,
-                            ) {
-                                if is_fat_ptr {
-                                    // Fat pointer: data ptr in low 64 bits, metadata (length) in
-                                    // high 64 bits. Read the length from the allocation's raw
-                                    // bytes at offset ptr_bytes (8 on 64-bit).
+                            seed_metadata = Some(metadata);
+                        }
+                        if let Some(resolved_data_ptr) = self.resolve_pointer_static_init(
+                            target_alloc_id,
+                            pointee_ty,
+                            &static_name,
+                            vec_idx,
+                        ) {
+                            let repr = match ptr_slot {
+                                PtrSlot::Thin => Some(PtrRepr::Thin(resolved_data_ptr)),
+                                PtrSlot::Fat => {
+                                    // The length half lives in the allocation's
+                                    // raw bytes just past the relocation; where
+                                    // it lands in the packed word is stated by
+                                    // `PtrRepr::into_packed`, not restated here.
+                                    //
+                                    // A read that FAILS means the initializer
+                                    // image is shorter than the fat-pointer slot
+                                    // — this allocation never carried the
+                                    // metadata. Substituting `0` was a DECLARED
+                                    // role reporting a length the program never
+                                    // computed, and a zero length makes every
+                                    // bounds obligation over the referent
+                                    // trivially satisfiable: the fabrication
+                                    // manufactures a PROOF, not a spurious
+                                    // counterexample. Declining leaves the
+                                    // static unconstrained, which is booked
+                                    // below as `static_init_incomplete` — a
+                                    // sound widening.
                                     let ptr_bytes =
                                         (crate::codegen_ay::types::POINTER_WIDTH / 8) as usize;
-                                    let metadata_expr = Self::read_composite_from_bytes(
+                                    Self::read_composite_from_bytes(
                                         &alloc.bytes,
                                         ptr_bytes,
                                         &ay_bindings::Sort::bitvec(
                                             crate::codegen_ay::types::POINTER_WIDTH,
                                         ),
                                     )
-                                    .unwrap_or_else(|| {
-                                        ay_bindings::Expr::bitvec_const(
-                                            0u64,
-                                            crate::codegen_ay::types::POINTER_WIDTH,
+                                    .map(|metadata_expr| {
+                                        PtrRepr::from_declared_roles(
+                                            resolved_data_ptr,
+                                            Val::of_value(metadata_expr),
                                         )
-                                    });
-                                    init_expr_opt = Some(metadata_expr.concat(resolved_data_ptr));
-                                } else {
-                                    init_expr_opt = Some(resolved_data_ptr);
+                                    })
                                 }
+                            };
+                            // The static's initial VALUE is the pointer it
+                            // holds — not the address of the static itself,
+                            // which is minted separately below.
+                            if let Some(repr) = repr {
+                                init_expr_opt =
+                                    Some(Val::of_value(AllocScalar::Ptr(repr).into_expr()));
                             }
                         }
                     }
@@ -319,7 +344,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             self.collect_contract_partial_static_pins(
                                 static_ty,
                                 var_expr,
-                                init_expr.clone(),
+                                init_expr.as_expr().clone(),
                                 &mut pins,
                             );
                             debug!(
@@ -338,7 +363,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         );
                         self.ref_resolution
                             .static_initial_values
-                            .insert(vec_idx, init_expr.clone());
+                            .insert(vec_idx, init_expr.as_expr().clone());
                     } else if init_alloc_opt.is_some() {
                         // Part of #3447: allocation exists but encoding returned None
                         // (composite type encoding gap). Static left unconstrained.
@@ -365,11 +390,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // Uses the same obj_id address scheme as heap allocations:
                     // addr = obj_id(BV32) ++ offset(BV32), with offset=0.
                     if let Some(obj_id) = self.heap_state.next_alloc_id() {
-                        let addr_expr = ay_bindings::Expr::bitvec_const(obj_id as i128, 32)
-                            .concat(ay_bindings::Expr::bitvec_const(0i128, 32));
+                        // Freshly minted object base: an address by
+                        // construction, which is what makes this the right
+                        // place — and the only place — to say so.
+                        let addr = Loc::of_address(
+                            ay_bindings::Expr::bitvec_const(obj_id as i128, 32)
+                                .concat(ay_bindings::Expr::bitvec_const(0i128, 32)),
+                        );
                         self.ref_resolution
                             .static_address_exprs
-                            .insert(alloc_id, addr_expr.clone());
+                            .insert(alloc_id, addr.as_expr().clone());
 
                         // Part of #3793: Record static layout metadata so the entry rule
                         // emits obj_size[obj_id] = size. Family 3 also threads the
@@ -395,11 +425,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         // `register_static_memory_init_entries` (their Freeze
                         // fields stay pinned only on the state-var side).
                         if !(contract_havoc && is_mutable_static)
-                            && let Some(init_expr) = init_expr_opt.clone()
+                            && let Some(init_value) = init_expr_opt.clone()
                         {
-                            self.register_static_memory_init_entries(
-                                static_ty, init_expr, addr_expr,
-                            );
+                            self.register_static_memory_init_entries(static_ty, init_value, addr);
                             debug!(
                                 vec_idx,
                                 static_name = %static_name,

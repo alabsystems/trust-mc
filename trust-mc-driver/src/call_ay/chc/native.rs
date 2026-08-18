@@ -100,7 +100,21 @@ pub(super) fn dedup_lemma_hints(hints: Vec<LemmaHint>) -> (Vec<LemmaHint>, usize
 /// Part of #4304 / #4301.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum UnknownCategory {
-    /// ≥2 Array-sorted state parameters on any predicate — known solver limit.
+    /// ≥2 Array-sorted state parameters on any predicate.
+    ///
+    /// DESCRIPTIVE, NOT CAUSAL. This records a structural property of the VC.
+    /// It does NOT mean ay hit an array-parameter ceiling — measured
+    /// 2026-08-02, that claim is false: ay proves a real 2-array VC
+    /// (`check_pin`, 70 predicates → `sat`) and proves synthetic array-content
+    /// problems with 2, 3 and 4 array params in both `(Array Int Int)` and
+    /// `(Array (_ BitVec 64) (_ BitVec 32))`, with `AY_CHC_ARRAY_INV` on and
+    /// off. The rows carrying this label ARE feature-bound (44/46 re-run at 8×
+    /// budget converted nothing), but the responsible factor is unisolated:
+    /// the unsolved VCs differ in array count AND predicate count (93–142 vs
+    /// 45–70) simultaneously. See docs/ay-asks/2026-08-02-array-scale.
+    ///
+    /// Do not "fix" this by reordering it behind the budget check — that would
+    /// relabel these rows `PdrTimeout`, which is equally untrue of them.
     /// Remediation pointer: #4259 (heap-to-scalar promotion).
     ArrayParamLimit { predicate: String, array_sort_count: usize },
     /// Portfolio engines ran out of budget (PDR invariant synthesis timeout).
@@ -561,7 +575,10 @@ pub(super) fn validate_external_pdr_invariant_model(
 ///
 /// Priority order (most specific first):
 /// 1. No error rule → degenerate VC
-/// 2. ≥2 Array-sorted state params on any predicate → known solver limit
+/// 2. ≥2 Array-sorted state params on any predicate → structural label only
+///    (see `UnknownCategory::ArrayParamLimit`; this is NOT a proven solver
+///    ceiling, and it deliberately preempts the budget check because these
+///    rows are not budget-bound either)
 /// 3. All engines either timed out or yielded inconclusive results:
 ///    - at least one timeout → PDR timeout
 ///    - otherwise (NotApplicable / Disabled / Unknown only) → solver error
@@ -724,8 +741,25 @@ impl KaniSession {
         // per-harness deadline (an aborted search returns `None`, which only
         // skips a CTREX shortcut; it never asserts safety).
         bail_unknown_if_deadline_exhausted(deadline, "acyclic_witness_search")?;
+        // Bound the search to a SLICE of the remaining budget, not all of it.
+        // This is a counterexample shortcut that "never asserts safety" (see
+        // above), but it sits in front of the COMPLETE acyclic-BMC decision
+        // lane. Given the whole deadline it can spend every second enumerating
+        // up to 1024 fact combinations per clause across (preds+clauses)
+        // rounds, and then the lane that could actually have decided the
+        // harness never runs -- the row comes back PreSolveDeadline having
+        // proved nothing. An optimisation must not be able to starve the
+        // decision procedure behind it.
+        //
+        // Aborting early only forfeits a CTREX shortcut, so this cannot turn a
+        // proof into a miss; the worst case is a counterexample found later by
+        // the normal path.
+        let witness_budget =
+            std::cmp::min(deadline.remaining() / 5, std::time::Duration::from_secs(3));
+        let witness_deadline = crate::deadline::Deadline::after(witness_budget);
         if acyclicity::is_acyclic_problem(&problem)
-            && let Some(witness) = satisfiable_acyclic_error_derivation_witness(&problem, deadline)
+            && let Some(witness) =
+                satisfiable_acyclic_error_derivation_witness(&problem, witness_deadline)
         {
             if self.args.common_args.verbose {
                 solver_stdout!(

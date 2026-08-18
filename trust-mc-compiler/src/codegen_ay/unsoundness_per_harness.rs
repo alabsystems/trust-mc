@@ -93,6 +93,59 @@ pub(super) struct PerHarnessAccumulator {
     pub(super) stub_approximation: BTreeMap<String, usize>,
     /// Part of #3779: rounding assertion bypass per-harness accumulator.
     pub(super) rounding_assertion_bypass: BTreeMap<String, usize>,
+    /// HARNESS-keyed offset-provenance-unresolved, absorbed from the
+    /// per-FUNCTION map at each harness's codegen boundary. See
+    /// [`absorb_fn_keyed_for_harness`] for why this exists.
+    pub(super) offset_provenance_unresolved: BTreeMap<String, usize>,
+    /// HARNESS-keyed kani::mem over-approximation, absorbed the same way.
+    pub(super) kani_mem_overapprox: BTreeMap<String, usize>,
+}
+
+/// Fold a drained per-FUNCTION map into a HARNESS-keyed entry.
+///
+/// Why this is needed, and why it is sound:
+///
+/// `record_offset_provenance_unresolved_for_fn` / `record_kani_mem_overapprox_for_fn`
+/// document their intent as "attributes the demotion to the harness whose
+/// codegen accumulated it so it cannot leak onto siblings" — but their callers
+/// key by FUNCTION name, not harness name. The driver treats `per_harness` as a
+/// mixed key space and is deliberately fail-closed: `attributable_to_harness`
+/// (trust-mc-driver/src/demotion.rs) charges any key that names no known proof
+/// harness against EVERY harness of the crate. So a function-keyed entry leaks
+/// to all siblings — exactly the outcome the comment says it wanted to avoid,
+/// and it demotes their genuine proofs.
+///
+/// Attribution here is unambiguous because `codegen_items` is invoked ONCE PER
+/// HARNESS (`compiler_interface.rs`, `&[MonoItem::Fn(*harness)]`), each harness
+/// gets its own `.smt2`, and those problems are disjoint. Whatever these
+/// counters accumulated between one harness's codegen entry and exit was
+/// produced by that harness's own reachable code, so folding the drained map
+/// under that harness's name is precise — strictly MORE precise than the
+/// fail-closed charge-everyone fallback, never less conservative for the
+/// harness that actually caused it.
+///
+/// Note this does NOT relax the driver's fail-closed rule: it removes the
+/// unattributable keys that make the rule fire spuriously.
+pub(in crate::codegen_ay) fn absorb_fn_keyed_for_harness(
+    harness_name: &str,
+    offset_provenance_by_fn: &BTreeMap<String, usize>,
+    kani_mem_by_fn: &BTreeMap<String, usize>,
+) {
+    fn fold(
+        acc: &mut BTreeMap<String, usize>,
+        harness_name: &str,
+        by_fn: &BTreeMap<String, usize>,
+    ) {
+        let total: usize = by_fn.values().copied().sum();
+        if total > 0 {
+            *acc.entry(harness_name.to_owned()).or_default() += total;
+        }
+    }
+    PER_HARNESS_ACC.with(|acc| {
+        let mut acc = acc.borrow_mut();
+        fold(&mut acc.offset_provenance_unresolved, harness_name, offset_provenance_by_fn);
+        fold(&mut acc.kani_mem_overapprox, harness_name, kani_mem_by_fn);
+    });
 }
 
 thread_local! {
@@ -118,6 +171,8 @@ thread_local! {
             aggregate_encoding_gap: BTreeMap::new(),
             stub_approximation: BTreeMap::new(),
             rounding_assertion_bypass: BTreeMap::new(),
+            offset_provenance_unresolved: BTreeMap::new(),
+            kani_mem_overapprox: BTreeMap::new(),
         }) };
 }
 

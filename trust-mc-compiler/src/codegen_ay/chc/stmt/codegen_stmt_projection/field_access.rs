@@ -12,8 +12,8 @@ use tracing::{debug, trace};
 
 use crate::codegen_ay::chc::stubs_util::extract_payload_from_option_reconstruction_ite;
 use crate::codegen_ay::chc::{ChcCtx, chc_fresh_name, declare_pending_var};
+use crate::codegen_ay::provenance::{Val, is_transparent_pointer_wrapper_repr};
 use crate::codegen_ay::shared::IntoOption;
-use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::field_select_coercion::coerce_selected_field_value;
 use super::projection_path::FieldProjection;
@@ -21,16 +21,46 @@ use super::projection_path::FieldProjection;
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     // ===== Projection Handling (#600) =====
 
-    /// Selects a field from a datatype expression.
+    /// Selects a field from a datatype **value**.
     ///
     /// For a struct expression `s` of type `Point { x: i32, y: i32 }`, selecting field 0
     /// returns the expression `(get-Point-x s)`.
     ///
+    /// # Provenance
+    ///
+    /// Field projection is a pure operation on the CHC term algebra: it never
+    /// consults the memory model and never takes the address of anything, so a
+    /// field of a [`Val`] is itself a [`Val`]. That is the whole crossing rule
+    /// here, and it is what makes the transparent-wrapper passthrough below
+    /// safe to state: what comes back out of a flattened `NonNull`/`Unique`/`Box`
+    /// is the pointer **datum** the wrapper holds, *not* an address of storage.
+    /// A consumer that wants to load or store through it must obtain a
+    /// [`crate::codegen_ay::provenance::Loc`] from an address producer
+    /// (`translate_ref_to_address`, `extract_pointer_expr`); it may not
+    /// reinterpret this `Val` as one.
+    ///
     /// # Arguments
-    /// * `container` - The datatype expression to select from
+    /// * `container` - The datatype value to select from
     /// * `field_idx` - The field index (0-based)
     /// * `cons_idx` - Optional constructor index for multi-constructor datatypes (enums)
     pub(in crate::codegen_ay::chc) fn datatype_field_select(
+        container: &Val,
+        field_idx: usize,
+        cons_idx: Option<usize>,
+    ) -> Option<Val> {
+        Self::datatype_field_select_term(container.as_expr(), field_idx, cons_idx)
+            .map(Val::of_value)
+    }
+
+    /// Term-level core of [`Self::datatype_field_select`].
+    ///
+    /// Carries no provenance because it does not need any: every path here maps
+    /// a sub-term of the container to another sub-term of the same container, so
+    /// the tag the public entry applies is preserved by construction. Keeping the
+    /// recursion (and the `apply_*` helpers below, which are still `Expr`-shaped
+    /// and have ~100 callers) on this core avoids minting a tag per recursive
+    /// step for a fact the caller already established.
+    fn datatype_field_select_term(
         container: &Expr,
         field_idx: usize,
         cons_idx: Option<usize>,
@@ -56,9 +86,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Handle bitvec types that represent special wrappers.
         if container.sort().is_bitvec() {
             let width = container.sort().bitvec_width();
-            // Transparent wrapper encoded as a single bv64 value (e.g., NonNull/Unique).
-            // Field(0) should return the underlying bv64 unchanged.
-            if width == Some(POINTER_WIDTH) && field_idx == 0 && cons_idx.is_none() {
+            // Transparent wrapper flattened to a single bv64 (e.g., NonNull/Unique/Box).
+            // Field(0) returns the underlying bv64 unchanged. The predicate is shared
+            // with `datatype_field_update` (and the BMC post-deref projection) so the
+            // read side and the write side cannot disagree about which slot field 0 is.
+            if is_transparent_pointer_wrapper_repr(container.sort())
+                && field_idx == 0
+                && cons_idx.is_none()
+            {
                 return Some(container.clone());
             }
             // Part of #2161: Flattened alloc-infra enums (e.g. Result<Layout, LayoutError>)
@@ -157,10 +192,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             || declare_pending_var(chc_fresh_name("field_select"), field.sort.clone());
 
         if let ExprValue::Ite { cond, then_expr, else_expr } = container.value() {
-            let then_selected = Self::datatype_field_select(then_expr, field_idx, cons_idx)
+            let then_selected = Self::datatype_field_select_term(then_expr, field_idx, cons_idx)
                 .and_then(|selected| coerce_selected_field_value(selected, &field.sort))
                 .unwrap_or_else(&fresh_field_value);
-            let else_selected = Self::datatype_field_select(else_expr, field_idx, cons_idx)
+            let else_selected = Self::datatype_field_select_term(else_expr, field_idx, cons_idx)
                 .and_then(|selected| coerce_selected_field_value(selected, &field.sort))
                 .unwrap_or_else(&fresh_field_value);
             return Some(Expr::ite(cond.clone(), then_selected, else_selected));
@@ -187,18 +222,48 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Some(container.clone().field_select(&*dt.name, &*field.name, field.sort.clone()))
     }
 
-    /// Updates a field in a datatype expression using functional update.
+    /// Updates a field in a datatype **value** using functional update.
     ///
     /// Reconstructs the datatype with the specified field replaced by `new_val`.
     /// For example, updating field 0 of `Point { x: 1, y: 2 }` with `10` produces
     /// `(mk 10 (get-Point-y original))`.
     ///
+    /// # Provenance
+    ///
+    /// The write-side mirror of [`Self::datatype_field_select`]: a functional
+    /// update rebuilds one value out of another, so container, replacement and
+    /// result are all [`Val`]. Nothing is stored to memory here — the caller
+    /// still owns that step — so no address ever enters or leaves this function.
+    ///
+    /// The two halves **must** agree about which slot `field_idx` names; a
+    /// disagreement writes a different slot than the read side reads, which is
+    /// the slot-misalignment shape that has fabricated proofs before. Every
+    /// slot decision below is therefore taken from the same shared predicate
+    /// the select side uses.
+    ///
     /// # Arguments
-    /// * `container` - The datatype expression to update
+    /// * `container` - The datatype value to update
     /// * `field_idx` - The field index to update
     /// * `cons_idx` - Optional constructor index for multi-constructor datatypes
     /// * `new_val` - The new value for the field
     pub(in crate::codegen_ay::chc) fn datatype_field_update(
+        container: &Val,
+        field_idx: usize,
+        cons_idx: Option<usize>,
+        new_val: Val,
+    ) -> Option<Val> {
+        Self::datatype_field_update_term(
+            container.as_expr(),
+            field_idx,
+            cons_idx,
+            new_val.into_expr(),
+        )
+        .map(Val::of_value)
+    }
+
+    /// Term-level core of [`Self::datatype_field_update`]; see
+    /// [`Self::datatype_field_select_term`] for why the core is untagged.
+    fn datatype_field_update_term(
         container: &Expr,
         field_idx: usize,
         cons_idx: Option<usize>,
@@ -212,8 +277,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         if container.sort().is_bitvec() {
             let width = container.sort().bitvec_width();
-            // Transparent wrapper (bv64): field 0 update replaces the value.
-            if width == Some(POINTER_WIDTH) && field_idx == 0 && cons_idx.is_none() {
+            // Transparent wrapper (bv64): field 0 update replaces the value. Same
+            // shared predicate as the select side — see the note on drift above.
+            if is_transparent_pointer_wrapper_repr(container.sort())
+                && field_idx == 0
+                && cons_idx.is_none()
+            {
                 if new_val.sort() != container.sort() {
                     debug!(
                         "datatype_field_update: sort mismatch - expected {:?}, got {:?}",
@@ -436,8 +505,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 trace!("apply_field_selections: bv32 marker field - no-op");
                 return Some(current);
             }
-            current =
-                Self::datatype_field_select(&current, projection.field_idx, projection.cons_idx)?;
+            current = Self::datatype_field_select_term(
+                &current,
+                projection.field_idx,
+                projection.cons_idx,
+            )?;
         }
         Some(current)
     }
@@ -475,7 +547,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             path.push((current.clone(), projection.field_idx, projection.cons_idx));
             if i + 1 < projections.len() {
                 // Navigate to next level
-                current = Self::datatype_field_select(
+                current = Self::datatype_field_select_term(
                     &current,
                     projection.field_idx,
                     projection.cons_idx,
@@ -483,12 +555,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
 
-        // Apply updates bottom-up: start with the new value and work back to root
-        let mut updated = new_val;
+        // Apply updates bottom-up: start with the new value and work back to root.
+        // This is the write side of the whole projection machinery, so it goes
+        // through the TYPED entry: `new_val` is the datum being written and every
+        // `container` on the path was reached by selecting fields of `root`, so
+        // both are values, and the type now stops an address from being handed to
+        // either one.
+        let mut updated = Val::of_value(new_val);
         for (container, field_idx, cons_idx) in path.into_iter().rev() {
-            updated = Self::datatype_field_update(&container, field_idx, cons_idx, updated)?;
+            updated = Self::datatype_field_update(
+                &Val::of_value(container),
+                field_idx,
+                cons_idx,
+                updated,
+            )?;
         }
 
-        Some(updated)
+        Some(updated.into_expr())
     }
 }

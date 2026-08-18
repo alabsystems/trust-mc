@@ -21,6 +21,7 @@ use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::provenance::{Loc, MaybeLoc};
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::super::heap::is_value_widened_into_address;
@@ -108,7 +109,7 @@ impl<'tcx, 'body> CallUnsafeCell for ChcCtx<'tcx, 'body> {
                 .or_else(|| self.resolve_ref_operand(arg, ecx.modified_locals))
                 .filter(identity_shaped)
                 .or_else(|| {
-                    let addr =
+                    let addr: Loc =
                         self.recover_unsafe_cell_referent_address(arg, ecx.modified_locals)?;
                     // Record concrete stack provenance for the dest pointer so
                     // downstream deref load/store paths resolve the same
@@ -117,10 +118,13 @@ impl<'tcx, 'body> CallUnsafeCell for ChcCtx<'tcx, 'body> {
                     // address is a constant naming a tracked stack object.
                     self.record_known_stack_addr_expr(
                         dest_local,
-                        addr.clone(),
+                        addr.as_expr().clone(),
                         "unsafe_cell_get_referent_recovery",
                     );
-                    Some(addr)
+                    // The identity constraint below is still an untyped `Expr`
+                    // lane (`make_coerced_eq_constraint` is wave 12/13 work),
+                    // so the tag is dropped here rather than laundered.
+                    Some(addr.into_expr())
                 })
         });
         if let Some(ptr_expr) = ptr_expr
@@ -176,11 +180,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// caller then falls through to the sound-fallback lane (dest havoced,
     /// checks fail-closed), matching the OffsetProvenanceUnresolved
     /// discipline of never failing open on unresolved provenance.
+    ///
+    /// Address-vs-value refactor (wave 2): this is a `Loc` PRODUCER. Both
+    /// routes establish address provenance from a fact, not from a width test —
+    /// route 1 by taking the ADDRESS-OF a known referent place, route 2 by
+    /// LOADING a slot whose Rust type is `&T`/`*T`.
     pub(in crate::codegen_ay::chc) fn recover_unsafe_cell_referent_address(
         &mut self,
         arg: &Operand,
         modified_locals: &HashSet<usize>,
-    ) -> Option<ay_bindings::Expr> {
+    ) -> Option<Loc> {
         // Addresses only exist in the Mem-level split-pointer model.
         if self.track_level < ChcTrackLevel::Mem {
             return None;
@@ -188,7 +197,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let (Operand::Copy(place) | Operand::Move(place)) = arg else {
             return None;
         };
-        let recovered = if place.projection.is_empty() {
+        if place.projection.is_empty() {
             let ref_target = self.ref_resolution.ref_targets.get(&place.local).cloned()?;
             let referent = Place { local: ref_target.local, projection: ref_target.projections };
             let addr = self.translate_ref_to_address(&referent, modified_locals)?;
@@ -197,7 +206,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 referent = referent.local,
                 "UnsafeCell::get: recovered referent mirror address via ref_targets"
             );
-            addr
+            // ADDRESS-OF lane: `translate_ref_to_address` mints thin
+            // `(obj_id, offset)` storage addresses and nothing else, so the
+            // blanket thin-pointer width re-test that used to sit at the end of
+            // this function is redundant HERE and has been deleted. The gate
+            // survives only on the load lane below, where it is load-bearing.
+            // Wave 11 made the producer return `Loc`, so the debug-only
+            // re-assertion of that ENSURES went with it.
+            Some(addr)
         } else {
             // The arg place names a slot HOLDING the pointer (field of a
             // wrapper/tuple, possibly behind a Deref). Only pointer-typed
@@ -216,15 +232,49 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 return None;
             }
             let slot_addr = self.translate_ref_to_address(place, modified_locals)?;
-            let loaded = self.load_ptr_from_memory(slot_addr, slot_ty)?;
+            let loaded = self.load_ptr_from_memory(slot_addr.into_expr(), slot_ty)?;
             debug!(
                 arg_local = place.local,
                 "UnsafeCell::get: recovered pointer identity via typed-memory slot load"
             );
-            loaded
-        };
-        // Identity must be a thin pointer-width address; anything else would
-        // reintroduce the value-as-address fabrication this path removes.
-        (recovered.sort().bitvec_width() == Some(POINTER_WIDTH)).then_some(recovered)
+            match loaded {
+                // TYPED-ARRAY LANE — guard retired. The slot's Rust type was
+                // proven `&T`/`*T` above and `load_ptr_from_memory` reports that
+                // it selected from the pointer-sorted type array keyed by that
+                // type, so the term is the pointer datum the slot holds. Both
+                // halves of the retired test are consequences of that fact
+                // rather than evidence for it: the element sort IS
+                // `POINTER_WIDTH`, and an array select is never an extend node,
+                // so `is_value_widened_into_address` could not fire.
+                MaybeLoc::Known(loc) => Some(loc),
+                // FORWARDING LANE — the width guess is DELETED, and the case it
+                // was covering moved to `Known` above.
+                //
+                // It used to read: `store_forward_map` is keyed by
+                // `(obj_id, offset)` across all type arrays, so a `u64` stored
+                // at this address is handed back here, and a width test was all
+                // that separated it from a real pointer — a guess, on the path
+                // that decides pointer IDENTITY. Failing closed was rejected
+                // then because it would have dropped same-block `*mut T`
+                // store-then-`UnsafeCell::get` recovery outright.
+                //
+                // That trade-off is gone: `store_forward_map` now records the
+                // type key each store wrote through, so a same-block `*mut T`
+                // store forwarded to a `*mut T` slot load arrives as
+                // `MaybeLoc::Known` and keeps its recovery. `Unknown` here now
+                // means specifically "the datum at this address was written
+                // through a DIFFERENT type" — the `u64`-read-as-an-address case
+                // itself — and there is nothing left to establish it with, so it
+                // fails closed. The caller's decline routes to the fail-closed
+                // Cell quarantine (see this module's header).
+                MaybeLoc::Unknown(expr) => {
+                    debug!(
+                        expr_sort = ?expr.sort(),
+                        "UnsafeCell::get: forwarded datum was stored through another type key — declined"
+                    );
+                    None
+                }
+            }
+        }
     }
 }

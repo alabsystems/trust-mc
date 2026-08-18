@@ -1,0 +1,8 @@
+(set-logic HORN)
+(declare-var w (_ BitVec 256))
+(declare-var wo (_ BitVec 256))
+(declare-rel error ())
+(declare-rel ep ())
+(rule (=> (= wo (concat #x00000000000000000000000000000001 #x00000000000000000000000000000001)) ep))
+(rule (=> ep error))
+(query error)

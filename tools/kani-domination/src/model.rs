@@ -183,9 +183,37 @@ pub struct TestResult {
     /// `EncodingGap`, `OverApproximation`, or `Unknown`.
     #[serde(default)]
     pub ctrex_category: Option<String>,
-    /// `[AY:UNKNOWN_REASON:…]` (e.g. `SolverError`, `Timeout`).
+    /// `[AY:UNKNOWN_REASON:…]` (e.g. `SolverError`, `Timeout`,
+    /// `PreSolveDeadline`, `UndecidedModel`).
     #[serde(default)]
     pub unknown_reason: Option<String>,
+    /// NORMALIZED `[AY:UNKNOWN-CATEGORY]` key — `ArrayParamLimit`, `PdrTimeout`,
+    /// `SolverError`, `NoErrorRule`, `Uncategorized`, or `Other`.
+    ///
+    /// The driver already computes a precise reason for an inconclusive CHC run
+    /// and prints it, but the scoreboard used to discard it, leaving the largest
+    /// bucket in the gate unactionable. Normalized because the raw line embeds
+    /// predicate names and counts (`predicate=main__bb0, array_sorts=6`), which
+    /// would fragment every rollup into singletons. Measurement ONLY — it feeds
+    /// no classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_category: Option<String>,
+    /// The raw `[AY:UNKNOWN-CATEGORY]` text, kept so the specific limit is
+    /// recoverable without a re-run (e.g. WHICH predicate hit the array ceiling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_category_detail: Option<String>,
+    /// `[AY:DEMOTION_REASONS:a,b]` — the driver demoted an original PROOF to
+    /// FAILURE because an unsoundness counter fired. Recorded for measurement
+    /// ONLY; it feeds no classification.
+    ///
+    /// Why it matters: the driver classifies CTREX only for *non-demoted*
+    /// failures, so a demoted proof carries no `[AY:CTREX_CAT:…]` marker at
+    /// all. Without this field a demoted proof is indistinguishable from a
+    /// genuine counterexample — which is how a `FAILED` with no counterexample
+    /// can be credited against a `fail` oracle. This field makes that
+    /// population countable instead of invisible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub demotion_reasons: Vec<String>,
     /// trust-mc printed a self-reported-unsoundness confession in the run
     /// (e.g. "created fresh unconstrained symbolic", `pointee_synthesis_fallback`,
     /// `unconstrained_assignment`, "UNSOUND verification"). A SUCCESS carrying one

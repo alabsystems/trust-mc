@@ -16,6 +16,8 @@
 //! Part of #2306: include!() to proper module migration.
 
 use ay_bindings::{Expr, ExprValue};
+
+use crate::codegen_ay::provenance::Loc;
 use num_bigint::BigInt;
 use rustc_public::CrateDef;
 use rustc_public::mir::{BasicBlockIdx, Operand};
@@ -127,7 +129,9 @@ impl<'tcx, 'body> CodegenRulesHelpers<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // Part of #3655: Box<str> and Box<[T]> are represented as Datatype
         // expressions (e.g. Slice_bv8(fld_ptr, fld_len, fld_data)) rather than
         // flat BV64 pointers. Extract the fld_ptr field before split_pointer().
-        let bv_ptr = super::dyn_coercion::extract_pointer_expr(&ptr_expr).unwrap_or(ptr_expr);
+        let bv_ptr = super::dyn_coercion::extract_pointer_expr(&ptr_expr)
+            .map(Loc::into_expr)
+            .unwrap_or(ptr_expr);
         let Some((raw_obj_id_expr, offset_expr)) = self.split_pointer(&bv_ptr) else {
             return false;
         };

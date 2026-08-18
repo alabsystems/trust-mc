@@ -17,6 +17,44 @@ use crate::codegen_ay::types::{
 };
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Concatenate every field of a single-constructor, all-BitVec datatype
+    /// value into one BitVec, little-endian (field 0 occupies the low bits).
+    ///
+    /// Returns `None` when a selected field's ACTUAL sort disagrees with the
+    /// width its constructor declares. That is reachable, not paranoia: ay
+    /// folds `selector(constructor(a))` straight to `a`, so if any upstream
+    /// site built the constructor with an argument whose sort contradicts the
+    /// declared field — trust-mc used to do exactly that for `MaybeUninit<T>`
+    /// aggregates — the select hands that argument back and the caller's
+    /// `concat`/`extract` aborts the whole codegen (#3312 `Str/raw_ptr`).
+    /// Declining leaves the caller to fall through to its unconstrained
+    /// symbolic store: an over-approximation, never a panic and never a
+    /// fabricated value.
+    fn flatten_all_bv_constructor(
+        src_expr: &Expr,
+        constructor: &ay_bindings::sort::DatatypeConstructor,
+    ) -> Option<Expr> {
+        let mut flat: Option<Expr> = None;
+        // MSB first: the LAST field ends up in the high bits.
+        for idx in (0..constructor.fields.len()).rev() {
+            let field = datatype_field_select(src_expr.clone(), 0, idx)?;
+            if field.sort().bitvec_width() != constructor.fields[idx].sort.bitvec_width() {
+                tracing::debug!(
+                    field = %constructor.fields[idx].name,
+                    declared = %constructor.fields[idx].sort,
+                    actual = %field.sort(),
+                    "reinterpret: datatype field value contradicts its declared sort; declining"
+                );
+                return None;
+            }
+            flat = Some(match flat {
+                Some(acc) => acc.concat(field),
+                None => field,
+            });
+        }
+        flat
+    }
+
     /// Part of #3457/#3596: layout-preserving reinterpretation for fixed layouts.
     ///
     /// Handles these cases for `CastKind::Transmute` and repr-SIMD array views:
@@ -211,15 +249,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         .sum();
                     if total_field_bits <= target_width {
                         // Extract fields and concat: last field is MSB, first field is LSB.
-                        let n = constructor.fields.len();
-                        let last_field = datatype_field_select(src_expr.clone(), 0, n - 1)
-                            .expect("field exists");
-                        let mut result = last_field;
-                        for i in (0..n - 1).rev() {
-                            let field = datatype_field_select(src_expr.clone(), 0, i)
-                                .expect("field exists");
-                            result = result.concat(field);
-                        }
+                        let mut result = Self::flatten_all_bv_constructor(src_expr, constructor)?;
                         // Zero-pad if total field bits < target width (alignment padding).
                         if total_field_bits < target_width {
                             let pad_width = target_width - total_field_bits;
@@ -251,15 +281,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             .sum();
                         if total_field_bits % elem_width == 0 {
                             // First flatten to BV (Case 6 logic).
-                            let n = constructor.fields.len();
-                            let last_field = datatype_field_select(src_expr.clone(), 0, n - 1)
-                                .expect("field exists");
-                            let mut flat_bv = last_field;
-                            for i in (0..n - 1).rev() {
-                                let field = datatype_field_select(src_expr.clone(), 0, i)
-                                    .expect("field exists");
-                                flat_bv = flat_bv.concat(field);
-                            }
+                            let flat_bv = Self::flatten_all_bv_constructor(src_expr, constructor)?;
                             // Then split BV into array elements (Case 2 logic).
                             let count = total_field_bits / elem_width;
                             let zero_elem = Expr::bitvec_const(0u64, elem_width);

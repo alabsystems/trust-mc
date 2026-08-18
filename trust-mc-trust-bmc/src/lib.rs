@@ -22,7 +22,10 @@
 //! - **Assertions**: `Assert` instructions become direct VCs
 //! - **Control flow**: acyclic multi-block CFGs (br/condbr/scalar switch with
 //!   block-parameter joins) use a guarded-path BMC encoding; loops
-//!   (back-edges) fail closed pending bounded unrolling
+//!   (back-edges) fail closed pending bounded unrolling. (The CHC lane
+//!   encodes loops relationally; trust-mc-driver's `bounded_unroll` module
+//!   additionally derives a k-bounded acyclic under-approximation from that
+//!   encoding for REFUTATION-only counterexample search.)
 //! - **Postconditions**: Return instructions generate VCs from function proof annotations
 //! - **Interprocedural**: Bounded acyclic direct calls get typed CHC summaries;
 //!   unknown and recursive calls fail closed
@@ -41,10 +44,12 @@
 //! The BMC lane treats bare safety claims as metadata. The CHC diagnostic lane
 //! additionally interprets `Wrapping` as modular arithmetic and `ValidBorrow`
 //! as a borrow-checker claim, so those annotations can suppress diagnostic
-//! overflow/memory error edges. They are not proof authority: the
-//! `trust-mc-driver` proof-grade native-bundle entry point rejects public
-//! `Wrapping`/`ValidBorrow` occurrences before minting its private exact-bundle
-//! capability. Callers using this crate directly receive diagnostic VCs only.
+//! overflow/memory error edges. They are not proof authority: the ordinary
+//! `trust-mc-driver` proof-grade native-bundle entry point rejects both. Its
+//! separate live-source entry point admits `Wrapping` only when a non-serializable
+//! source-generation authority still belongs to that exact valid bundle;
+//! `ValidBorrow` remains rejected. Callers using this crate directly receive
+//! diagnostic VCs only.
 //!
 //! Function-level annotations:
 //! - `BoundedOutput` → generates postcondition VCs on Return
@@ -67,6 +72,7 @@ pub use native_bundle::{
 pub use translate::{TranslateOptions, trust_ir_function_to_bmc_vc, trust_ir_to_bmc_vc};
 pub use translate_chc::{
     ChcTranslationOutput, TrustIrChcDiagnostic, TrustIrChcUnsupportedReason,
+    proof_grade_cast_is_admissible, single_cell_alloca_is_admissible,
     trust_ir_function_to_chc_translation_output, trust_ir_function_to_chc_vc,
     trust_ir_to_chc_translation_outputs, trust_ir_to_chc_vc,
 };

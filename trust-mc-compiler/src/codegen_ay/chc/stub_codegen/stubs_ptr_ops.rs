@@ -316,7 +316,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Translate ptr.write(value): store value to memory at ptr address.
     ///
-    /// Calls `build_memory_store(addr, value, pointee_ty)` which handles
+    /// Calls `build_memory_store(loc, value, pointee_ty)` which handles
     /// type-indexed arrays, region arrays, and store chain accumulation.
     /// Part of #1836: CHC memory write for heap data flow.
     pub(in crate::codegen_ay::chc) fn translate_ptr_write_call(
@@ -340,9 +340,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .or_else(|| self.translate_operand_with_modified(&args[0], modified_locals)),
             _ => self.translate_operand_with_modified(&args[0], modified_locals),
         };
-        let ptr = match ptr {
-            Some(p) => coerce_bitvec_width_safe(p, POINTER_WIDTH, SignExtension::ZeroExtend),
-            None => return false,
+        let ptr_ty = args[0].ty(self.body.locals()).into_option();
+        // ESTABLISH the address instead of coercing into one.
+        //
+        // This used to be `coerce_bitvec_width_safe(.., ZeroExtend)` followed by
+        // `Loc::of_address`, i.e. a tag on a WIDENED term. The MIR type says
+        // args[0] is a raw pointer, but the coercion is total: it zero-extends a
+        // narrow datum and passes a non-bitvec sort straight through, so the tag
+        // asserted address-ness of terms that are demonstrably values.
+        // `normalize_deref_address_expr` is the encoder's `Loc` producer for
+        // exactly this question — it peels a wrapper datatype, refuses
+        // sub-pointer-width terms and refuses `is_value_widened_into_address`
+        // shapes — and a `None` here fails closed into `record_fallback()`
+        // (DEMOTED) at the call site.
+        let ptr = match (ptr, ptr_ty) {
+            (Some(p), Some(ty)) => match self.normalize_deref_address_expr(p, ty) {
+                Some(loc) => loc,
+                None => return false,
+            },
+            _ => return false,
         };
 
         // Get value to write
@@ -352,8 +368,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
 
         // Get pointee type from the pointer argument
-        let pointee_ty =
-            args[0].ty(self.body.locals()).into_option().and_then(Self::deref_pointee_ty);
+        let pointee_ty = ptr_ty.and_then(Self::deref_pointee_ty);
 
         if let Some(pointee_ty) = pointee_ty {
             // Part of #3108: Mirror array elements to flat memory for ptr.write([T; N]).
@@ -361,10 +376,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.mirror_array_elements_to_flat_memory(
                 &value,
                 pointee_ty,
-                &ptr,
+                ptr.as_expr(),
                 &mut mirror_constraints,
             );
             self.heap_state.pending_updates.extend(mirror_constraints);
+            // The `Loc` was minted by `normalize_deref_address_expr` above, so
+            // this is a thread-through, not a re-tag.
             self.build_memory_store(ptr, value, pointee_ty);
             debug!("CHC: translate_ptr_write_call - stored value via build_memory_store");
             true
@@ -400,13 +417,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .or_else(|| self.translate_operand_with_modified(&args[0], modified_locals)),
             _ => self.translate_operand_with_modified(&args[0], modified_locals),
         }?;
-        let ptr = coerce_bitvec_width_safe(ptr, POINTER_WIDTH, SignExtension::ZeroExtend);
+        let ptr_ty = args[0].ty(self.body.locals()).into_option()?;
 
         // Get pointee type from the pointer argument
-        let pointee_ty =
-            args[0].ty(self.body.locals()).into_option().and_then(Self::deref_pointee_ty)?;
+        let pointee_ty = Self::deref_pointee_ty(ptr_ty)?;
 
-        let result = self.load_from_memory(ptr, pointee_ty)?;
+        // ESTABLISH the address rather than coerce into one. `deref_pointee_ty`
+        // just succeeded, so the MIR type of args[0] is a raw pointer — but the
+        // old `coerce_bitvec_width_safe(.., ZeroExtend)` here would zero-extend a
+        // narrow datum or pass a datatype straight through, and the tag then
+        // asserted address-ness of the laundered result (the comment on the old
+        // line said as much). `normalize_deref_address_expr` peels a wrapper
+        // datatype and refuses both fabrications; `None` fails closed to the
+        // caller's fallback lane.
+        let ptr = self.normalize_deref_address_expr(ptr, ptr_ty)?;
+        let result = self.load_from_memory(ptr, pointee_ty)?.into_expr();
 
         debug!("CHC: translate_ptr_read_call - loaded value via load_from_memory");
 

@@ -421,8 +421,7 @@ fn test_decompose_hetero_result_ite_of_constructors_is_exact() {
     with_test_ay_ctx_for_source(RESULT_HETERO_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_result_hetero");
         let body = instance.body().expect("function body");
-        let mut chc_ctx =
-            ChcCtx::new(ctx.tcx, &body, "probe_result_hetero", ChcConfig::default());
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_result_hetero", ChcConfig::default());
         chc_ctx.declare_block_relations();
 
         // The flattened `Result<u32,u64>` local (no enum_bv layout is registered
@@ -488,21 +487,15 @@ fn test_decompose_hetero_result_ite_of_constructors_is_exact() {
 
         // Disjoint placement: Ok's bv32 payload lands in slot 1, Err's bv64 in
         // slot 2 — proving the two differently-sorted payloads did not collide.
-        let ok_slot = chc_ctx
-            .encode
-            .flattened_field_env
-            .get(&(dest_local, 1))
-            .expect("ok_val slot cached");
+        let ok_slot =
+            chc_ctx.encode.flattened_field_env.get(&(dest_local, 1)).expect("ok_val slot cached");
         assert_eq!(
             ok_slot.sort().bitvec_width(),
             Some(32),
             "ok_val slot must carry the bv32 Ok payload"
         );
-        let err_slot = chc_ctx
-            .encode
-            .flattened_field_env
-            .get(&(dest_local, 2))
-            .expect("err_val slot cached");
+        let err_slot =
+            chc_ctx.encode.flattened_field_env.get(&(dest_local, 2)).expect("err_val slot cached");
         assert_eq!(
             err_slot.sort().bitvec_width(),
             Some(64),
@@ -510,11 +503,8 @@ fn test_decompose_hetero_result_ite_of_constructors_is_exact() {
         );
 
         // Tag slot cached and Bool-sorted (is_ok discriminant).
-        let tag = chc_ctx
-            .encode
-            .flattened_field_env
-            .get(&(dest_local, 0))
-            .expect("tag slot cached");
+        let tag =
+            chc_ctx.encode.flattened_field_env.get(&(dest_local, 0)).expect("tag slot cached");
         assert!(tag.sort().is_bool(), "tag slot must be the Bool is_ok discriminant");
     });
 }

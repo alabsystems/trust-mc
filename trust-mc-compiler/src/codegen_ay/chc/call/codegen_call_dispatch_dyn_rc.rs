@@ -237,7 +237,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // CTREX. Mirrors the inline walker fix from #4014.
                 self.try_decompose_struct_store(&value_ptr, &value_expr, store_ty, &mut extra);
                 if let Some(store_constraint) =
-                    self.build_memory_store(value_ptr.clone(), value_expr, store_ty)
+                    self.build_memory_store_untyped(value_ptr.clone(), value_expr, store_ty)
                 {
                     extra.push(store_constraint);
                 }

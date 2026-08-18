@@ -12,6 +12,9 @@
 
 use std::collections::HashSet;
 
+use crate::codegen_ay::field_roles::{self, FieldRole};
+use crate::codegen_ay::provenance::{Loc, is_value_widened_into_address};
+use crate::codegen_ay::ptr_repr::PtrSlot;
 use crate::codegen_ay::shared::is_pointer_wrapper_adt;
 use crate::kani_middle::abi::LayoutOf;
 use ay_bindings::Expr;
@@ -22,8 +25,6 @@ use rustc_public::mir::{CastKind, Rvalue};
 use rustc_public::rustc_internal;
 use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
 use tracing::debug;
-
-use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::codegen_ctx::ChcCtx;
 
@@ -109,40 +110,132 @@ pub(super) fn find_dyn_trait_tail_ty(
     matches!(tail.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))).then_some(tail)
 }
 
-/// Extract the `fld_ptr` thin pointer from a wrapper or dyn fat-pointer datatype.
+/// Extract the thin pointer a wrapper or fat-pointer datatype DECLARED it holds.
 ///
-/// For datatypes with a named `fld_ptr` field, always extract it (known pointer
-/// wrappers like Box, Rc, Arc, slice fat-ptrs, NonNull).
+/// Two lanes, and both read a role off the declaration: a field the encoder
+/// itself named `fld_ptr` (the pointer-wrapper sorts — `Vec`, `String`,
+/// `Slice_*`, `Dyn_*`, `RawVec` — spell the role in the name), or a field the
+/// declaration recorded as [`FieldRole::Addr`] in
+/// [`crate::codegen_ay::field_roles`], from the MIR type it was built out of
+/// (generic ADT / tuple / closure datatypes, whose fields are named after the
+/// MIR field: `fld_inner`, `fld_0`, `cap_2`, `Some_field_0`).
 ///
-/// For the BV64-field fallback (generic ADT fat pointers with positional names
-/// like `field_0`), only extract if the datatype has ≤ 4 fields. User-defined
-/// structs with many BV64 fields (e.g., a struct with `usize` fields) must NOT
-/// have a field treated as a pointer — doing so corrupts the inline walker's
-/// Deref+Field resolution by using a field VALUE as a heap address. Part of #4099.
-pub(super) fn extract_pointer_expr(expr: &Expr) -> Option<Expr> {
+/// # This is the encoder's second address PRODUCER (Wave 11)
+///
+/// What comes out is the pointer the wrapper holds, so the return type is
+/// [`Loc`]: the consumers that dereference it, free it, offset it or split it
+/// into `(obj_id, offset)` inherit that fact instead of re-deriving it from
+/// `bitvec_width() == Some(POINTER_WIDTH)`.
+///
+/// Some callers instead re-pack the result — into a `(data, metadata)` tuple, a
+/// `Dyn_Trait` datatype, or a destination local's own pointer datum. That is a
+/// real `Loc -> value` crossing, and those sites drop the tag explicitly with
+/// `.map(Loc::into_expr)`; grep that spelling to find every one of them.
+///
+/// # Both lanes read a DECLARED role — the guess is GONE (wave 18)
+///
+/// What stood here until wave 18 was "the first pointer-width field of a
+/// datatype with ≤ 4 fields IS the pointer". That was never a criterion: the
+/// `≤ 4` bound was a blast-radius limiter added after `DtSolver`'s
+/// `fld_scope_len` was used as a base address (#4099), and inside the bound it
+/// fabricated just as freely — `IndexRange`'s `fld_start`, `VecIntoIter`'s
+/// `fld_pos`, `Layout`'s `fld_size` and any `struct S(usize, *mut u8)`'s first
+/// field all answered "yes, here is your address".
+///
+/// It was not fixable *here*, and that is the point: the fact was thrown away
+/// one module over, at the declaration. `translate_adt_sort` /
+/// `translate_ty`'s tuple and closure arms hold the MIR type of every field they
+/// declare, and a `&T` / `*mut T` / `Box` / `NonNull` / `Rc` field is an address
+/// by construction ([`crate::codegen_ay::provenance::mir_ty_denotes_address`]). They now say so, into the
+/// field-role table of `docs/addr-vs-value-conversion-queue.md` §4 item 7, and
+/// this function reads it back.
+///
+/// A datatype whose declaration recorded nothing — a stub sort, a coroutine
+/// state machine, a sort reconstructed by name — answers [`None`], and so does a
+/// datatype with more than one declared address field (which of them is "the"
+/// pointer is exactly the question the shape guess used to answer by position).
+/// `None` routes the caller to the demotion lane it already has. That is the
+/// trade this function now makes explicit: a demotion is sound, a fabricated
+/// address is not.
+///
+/// # The already-thin lane: the CALLER supplies the provenance
+///
+/// A bare bitvector has no wrapper to peel, so this function hands it straight
+/// back — and the [`Loc`] on that lane is **propagated, not discovered**. The
+/// contract is the same one [`crate::codegen_ay::ptr_repr::PtrRepr::classify`]
+/// states: the caller must already know `expr` denotes a pointer (it came from
+/// a `Ref`/`RawPtr`-typed place, a pointer-wrapper local `translate_adt_ty`
+/// flattened to `ptr_sort()`, a callee whose signature returns a pointer, or a
+/// `Deref` step MIR only admits through one). Callers that cannot establish it
+/// must drop the tag with `.map(Loc::into_expr)` — which most already do — or
+/// gate first, as `inline_shared::place` does on `current_ty_opt` and
+/// `rvalue_cast` does on the MIR `RawPtr`/`Ref` cast target.
+///
+/// What the lane now decides for itself is the **representation** half, and
+/// that half used to be missing entirely: it tagged EVERY bitvector, of any
+/// width, as an address. That is what made `extract_pointer_expr(..).is_some()`
+/// useless as the pointer TEST roughly ten `?`/`if let Some` callers use it as
+/// — a `bv1` discriminant, a `bv8` byte, a `bv32` index all answered "yes, and
+/// here is your address". [`PtrSlot::of_sort`] admits exactly the two shapes an
+/// address can have, and [`is_value_widened_into_address`] refuses the one
+/// pointer-WIDE shape that is provably not one (a zero/sign-extended narrow
+/// datum, whose obj_id lane is forced to the null object). Callers that drop
+/// the tag are unaffected — their `.unwrap_or(expr)` returns the same term
+/// either way — and callers that keep it now fail closed instead of receiving a
+/// fabricated address.
+pub(super) fn extract_pointer_expr(expr: &Expr) -> Option<Loc> {
+    // Already-thin lane: there is no wrapper to peel, so the pointer term the
+    // caller handed in IS the address. This lane is the identity, which is why
+    // most callers spell their fallback `.unwrap_or(the same expr)`.
     if expr.sort().is_bitvec() {
-        return Some(expr.clone());
+        // Thin (one word) or packed wide ([metadata | data], left for `PtrRepr`
+        // to split downstream) are the only shapes an address takes; every other
+        // width was never one. See the contract note above for who supplies the
+        // provenance this shape test does NOT supply.
+        if PtrSlot::of_sort(expr.sort()).is_none() || is_value_widened_into_address(expr) {
+            return None;
+        }
+        return Some(Loc::of_address(expr.clone()));
     }
 
     let dt = expr.sort().datatype_sort()?;
+    // PRE-EXISTING, untouched by wave 18: for a multi-constructor datatype this
+    // reads the FIRST variant's fields, which is a positional assumption of its
+    // own. It is harmless for the shapes this function is called on (the
+    // pointer-representation sorts are single-constructor, and an Option-like
+    // sort's first constructor is the empty `None_*`, so it declines), and
+    // fixing it would be a variant-selection change rather than a provenance
+    // one — a separate question from which FIELD holds the address.
     let cons = dt.constructors.first()?;
-    // Prefer named `fld_ptr` — always valid for known pointer wrappers.
+    // Lane 1: the role spelled in the name. The pointer-wrapper sorts the
+    // encoder writes literally declare their address field as `fld_ptr`.
     let ptr_field = cons.fields.iter().find(|field| field.name == "fld_ptr").or_else(|| {
-        // Fallback: first pointer-width BV field, but ONLY for small datatypes
-        // (≤ 4 fields) that look like pointer wrappers or fat pointers.
-        // User-defined structs with many fields must not have a field mistaken
-        // for a pointer — e.g., DtSolver(11 fields) had its scope_len (first
-        // BV64 field) used as a base address, reading stale heap memory.
-        if cons.fields.len() <= 4 {
-            cons.fields.iter().find(|field| {
-                field.sort.is_bitvec() && field.sort.bitvec_width() == Some(POINTER_WIDTH)
-            })
-        } else {
-            None
-        }
+        // Lane 2: the role RECORDED at declaration, for the datatypes whose
+        // field names are not free to carry it because they come from MIR.
+        //
+        // `PtrSlot::Thin` is a REPRESENTATION test, not the provenance decision
+        // — that arrived from the declaration. It is here because this producer
+        // returns a thin address by contract (Wave 11): a declared-`Addr` field
+        // of any other shape (a `Dyn_Trait` datatype, an `&str`'s packed
+        // `bv128`, an `&[T; N]` flattened to an Array) is a pointer this
+        // function is not the right decoder for, and the caller keeps its lane.
+        //
+        // EXACTLY ONE such field, or none: a datatype with two declared
+        // addresses does not say which one is the pointer it holds, and
+        // answering by position is the guess this lane replaced.
+        let mut declared = cons.fields.iter().filter(|field| {
+            matches!(PtrSlot::of_sort(&field.sort), Some(PtrSlot::Thin))
+                && field_roles::declared_field_role(&dt.name, &field.name) == Some(FieldRole::Addr)
+        });
+        let sole = declared.next();
+        if declared.next().is_none() { sole } else { None }
     })?;
 
-    Some(expr.clone().field_select(&dt.name, &ptr_field.name, ptr_field.sort.clone()))
+    Some(Loc::of_address(expr.clone().field_select(
+        &dt.name,
+        &ptr_field.name,
+        ptr_field.sort.clone(),
+    )))
 }
 
 /// A dyn-trait candidate: a concrete type that implements a trait, with an

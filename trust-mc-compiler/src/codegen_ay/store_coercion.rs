@@ -19,7 +19,7 @@ use ay_bindings::{Expr, Sort};
 
 use crate::codegen_ay::names;
 use crate::codegen_ay::types::{
-    POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, flatten_datatype_to_bitvec,
+    SignExtension, coerce_bitvec_width_safe, flatten_datatype_to_bitvec,
 };
 
 /// Counter for BMC store coercion fresh-symbolic fallbacks (Part of #2970).
@@ -63,21 +63,29 @@ pub(super) fn coerce_vec_string_store_value(arr_sort: &Sort, value: &Expr) -> Op
         return None;
     }
 
-    // Case 1: Array expects Vec/String datatype, value is pointer-width BitVec.
-    // Wrap the BitVec as the ptr field with zero len/cap (and symbolic data for Vec).
+    // Case 1: Array expects Vec/String datatype, value is the base pointer.
+    // Wrap it as the ptr field with zero len/cap (and symbolic data for Vec).
+    //
+    // The `val_sort.is_bitvec() && bitvec_width() == POINTER_WIDTH` test that
+    // used to guard this case is DELETED: `coerce_bitvec_to_vec_string` already
+    // rejects anything whose sort is not exactly the declared `fld_ptr` sort,
+    // and that check is strictly stronger — it compares against the DECLARED
+    // field instead of guessing from a width. Case 1 and case 2 are mutually
+    // exclusive (a sort cannot be both a datatype and a bitvector), so the
+    // early return cannot swallow case 2.
     if let Some(dt_name) = elem_sort.datatype_name()
         && is_vec_or_string_name(dt_name)
-        && val_sort.is_bitvec()
-        && val_sort.bitvec_width() == Some(POINTER_WIDTH)
     {
         return coerce_bitvec_to_vec_string(dt_name, elem_sort, value);
     }
 
-    // Case 2: Array expects pointer-width BitVec, value is Vec/String datatype.
-    // Extract fld_ptr from the datatype.
-    if elem_sort.is_bitvec()
-        && elem_sort.bitvec_width() == Some(POINTER_WIDTH)
-        && let Some(dt_name) = val_sort.datatype_name()
+    // Case 2: Array element slot holds the bare base pointer, value is a
+    // Vec/String datatype. Extract fld_ptr from the datatype.
+    //
+    // Same deletion, same reason: `coerce_vec_string_to_bitvec` requires the
+    // element sort to equal the declared `fld_ptr` sort exactly, which subsumes
+    // "is a POINTER_WIDTH bitvector".
+    if let Some(dt_name) = val_sort.datatype_name()
         && is_vec_or_string_name(dt_name)
     {
         return coerce_vec_string_to_bitvec(dt_name, elem_sort, value);

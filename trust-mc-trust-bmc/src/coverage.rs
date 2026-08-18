@@ -110,7 +110,7 @@ pub const SEMANTICS_COVERAGE: &[SemanticsCoverage] = &[
     SemanticsCoverage {
         family: SemanticsFamily::ProofAnnotations,
         status: SemanticsStatus::Conservative,
-        notes: "BMC safety claims are metadata-only; CHC diagnostic lowering consumes Wrapping and ValidBorrow, but the driver proof-grade bundle gate rejects those public claims before authority minting",
+        notes: "BMC safety claims are metadata-only; CHC diagnostic lowering consumes Wrapping and ValidBorrow; the ordinary proof-grade gate rejects both, the exact live-source authority admits only Wrapping, and ValidBorrow remains rejected",
     },
 ];
 

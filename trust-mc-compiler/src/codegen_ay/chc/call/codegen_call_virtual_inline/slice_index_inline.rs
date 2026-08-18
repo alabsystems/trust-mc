@@ -23,6 +23,7 @@ use super::slice_index_trace::{
 use super::terminator_exec::{TerminatorStep, apply_inline_writeback, resolve_inline_callee_path};
 use crate::codegen_ay::chc::codegen_ctx::ChcCtx;
 use crate::codegen_ay::chc::decl::codegen_types::CodegenTypes;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 
 fn inline_slice_index_receiver_arg<'a>(
     ctx: &ChcCtx<'_, '_>,
@@ -77,15 +78,23 @@ fn materialize_inline_collection_receiver(
     loop {
         ty = ctx.resolve_body_ty(ty);
         match ty.kind() {
+            // The MIR TYPE leads: a `&T` / `*const T` term standing at a deref
+            // step is the referent's address, and that is what makes the load
+            // below legitimate. `PtrRepr::thin_address` supplies only the
+            // pointer's SHAPE — it is the same predicate the inline
+            // pointer-width guard applied, but it is no longer the thing
+            // deciding provenance, and it hands back a `Loc` instead of one
+            // more anonymous `Expr`.
             TyKind::RigidTy(RigidTy::Ref(_, inner, _))
             | TyKind::RigidTy(RigidTy::RawPtr(inner, _))
-                if expr.sort().bitvec_width() == Some(crate::codegen_ay::types::POINTER_WIDTH) =>
+                if PtrRepr::thin_address(&expr).is_some() =>
             {
-                let addr = expr.clone();
+                let addr = PtrRepr::thin_address(&expr)
+                    .expect("invariant: the match guard just decoded this address");
                 let inner = ctx.resolve_body_ty(inner);
-                expr = ctx.load_from_memory(addr.clone(), inner)?;
+                expr = ctx.load_from_memory(addr.clone(), inner)?.into_expr();
                 ty = inner;
-                collection_addr = Some(addr);
+                collection_addr = Some(addr.into_expr());
             }
             _ => return Some((expr, ty, collection_addr)),
         }
@@ -113,7 +122,7 @@ fn inline_collection_select_via_memory_model(
 ) -> Option<Expr> {
     let (elem_addr, elem_ty) =
         inline_collection_element_addr(ctx, data_ptr, collection_ty, index_expr)?;
-    ctx.load_from_memory(elem_addr, elem_ty)
+    ctx.load_from_memory_untyped(elem_addr, elem_ty)
 }
 
 fn indexed_collection_elem_ty(ctx: &ChcCtx<'_, '_>, ty: Ty) -> Option<Ty> {
@@ -189,7 +198,10 @@ fn inline_slice_receiver_expr<'tcx, 'body>(
                 &walk_ctx.resolver,
                 walk_ctx.locals,
             ) {
-                Some(expr)
+                // The inline walker's expression map is still untyped, so the
+                // Address / Transparent distinction is dropped here rather than
+                // resolved — see `InlineRefExpr`.
+                Some(expr.into_expr())
             } else if matches!(
                 source_place.projection.as_slice(),
                 [rustc_public::mir::ProjectionElem::Deref]

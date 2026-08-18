@@ -10,6 +10,7 @@
 use super::{
     CrateDef, Expr, IntoOption, LayoutOf, Place, ProjectionElem, RigidTy, StatementCodegen, TyKind,
 };
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH};
 use ay_bindings::SortInner;
 use tracing::debug;
@@ -61,6 +62,24 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return None;
         }
 
+        // Address-vs-value: whether the stored `bv64` is the inner Box's POINTER
+        // or the Box's own stored VALUE is decided by the Box's POINTEE TYPE, not
+        // by the term's width. `Box<u64>` stores a datum that is `bv64` for
+        // exactly the same reason a nested `Box<Box<T>>` stores a pointer that is
+        // — and `ptr_source_map` is populated by several lanes (#1039 raw-pointer
+        // copies and the #3159 allocation-root chain, not only #3748's nested
+        // Box), so a hit on this key does not imply the term is a pointer either.
+        // Chasing on a `Box<u64>` replaced the program's value with an unrelated
+        // pointee's content.
+        //
+        // The chase is now gated on the fact that decides it: the pointee type is
+        // itself pointer-like, so the stored term IS another container's pointer.
+        // `PtrRepr::thin_address` then supplies the SHAPE (the same thin-pointer
+        // restriction the width test enforced) while the MIR type supplies the
+        // provenance — the division of labour `PtrRepr` documents.
+        let nested_pointee_is_pointer_like =
+            Self::box_pointee_ty(base_ty).is_some_and(Self::is_pointer_like_ty);
+
         // Look up the stored value in heap_pointees using root local
         let heap_key = self.root_ssa_base_name(place);
         let heap_value = if let Some(v) = self.heap_pointees.get(heap_key.as_str()).cloned() {
@@ -68,7 +87,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // pattern like Box<Box<T>>), follow ptr_source_map to find the inner
             // Box's actual non-bitvec content. Without this, nested Box deref
             // returns the inner pointer instead of the inner Box's content.
-            if v.sort().is_bitvec() && v.sort().bitvec_width() == Some(POINTER_WIDTH) {
+            if nested_pointee_is_pointer_like && PtrRepr::thin_address(&v).is_some() {
                 let mut resolved = v;
                 let mut chain_key = heap_key.as_str();
                 for _ in 0..4 {
@@ -155,6 +174,25 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         Some(expr)
     }
 
+    /// Is `ty` a type whose *value* is a pointer to storage?
+    ///
+    /// Used by [`Self::try_codegen_box_field_access`] to decide whether a
+    /// `Box`'s stored `bv64` is another container's pointer (chase it) or the
+    /// program's own datum (leave it alone). References, raw pointers and the
+    /// std smart pointers qualify; `u64` / `usize` / `f64` do not, and they are
+    /// exactly the types the retired width test could not tell apart from these.
+    pub(super) fn is_pointer_like_ty(ty: rustc_public::ty::Ty) -> bool {
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)) => true,
+            TyKind::RigidTy(RigidTy::Adt(def, _)) => {
+                let name = def.name();
+                let trimmed = name.rsplit("::").next().unwrap_or(name.as_str());
+                matches!(trimmed, "Box" | "Rc" | "Arc" | "NonNull" | "Unique")
+            }
+            _ => false, // external enum: TyKind
+        }
+    }
+
     /// Check if a type is Box<T>.
     pub(super) fn is_box_type(ty: rustc_public::ty::Ty) -> bool {
         match ty.kind() {
@@ -211,17 +249,44 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     .unsupported("Raw pointer deref", "non-bitvector pointer sort for deref check");
                 continue;
             };
-            let zero = Expr::bitvec_const(0, ptr_width);
+
+            // The address this `Deref` reads through.
+            //
+            // `ptr_place`'s MIR type is `RawPtr` (matched just above) — that is
+            // where the provenance is known, and it is the only reason an
+            // address may be named here at all. What is left to decide is the
+            // *shape*, and `PtrRepr` decides that structurally, handing back a
+            // `Loc` that is `POINTER_WIDTH` wide for every shape it recognizes.
+            // A thin pointer decodes to itself, so the emitted VC is unchanged
+            // in the overwhelmingly common case.
+            let deref_addr = PtrRepr::classify(&ptr_expr).map(PtrRepr::into_data);
+            // Not pointer-shaped at all (neither thin nor wide). Keep the
+            // shape-agnostic obligations at the term's own width, as before.
+            let (checked, checked_width) = match &deref_addr {
+                Some(loc) => (loc.as_expr().clone(), POINTER_WIDTH),
+                None => (ptr_expr.clone(), ptr_width),
+            };
+            let zero = Expr::bitvec_const(0, checked_width);
 
             // Record null pointer dereference violation if pointer is zero.
-            debug!("  emitting null_pointer_check for ptr width={}", ptr_width);
-            self.record_violation_guarded(ptr_expr.clone().eq(zero.clone()), "null_pointer_check");
+            debug!("  emitting null_pointer_check for ptr width={}", checked_width);
+            self.record_violation_guarded(checked.clone().eq(zero.clone()), "null_pointer_check");
 
-            if ptr_width == POINTER_WIDTH {
+            // The use-after-free obligation used to sit behind
+            // `if ptr_width == POINTER_WIDTH`, so a deref through a wide pointer
+            // was checked for null and alignment but NOT for liveness — the
+            // obligation was dropped silently, which is the fail-open shape a
+            // fabricated proof is made of. `heap_is_allocated`'s REQUIRES (a
+            // pointer-width operand) is now discharged by the type instead of by
+            // a test: a decoded `Loc` is `POINTER_WIDTH` by construction, so the
+            // obligation is emitted for every shape that has an address, and the
+            // only remaining `None` means there is no address to ask the heap
+            // model about — a representable reason, unlike a width coincidence.
+            if let Some(addr) = deref_addr {
                 let access_size = LayoutOf::new(pointee_ty)
                     .size_of()
                     .map(|size| Expr::bitvec_const(size as u128, POINTER_WIDTH));
-                let is_allocated = self.ctx.heap_is_allocated(ptr_expr.clone(), access_size);
+                let is_allocated = self.ctx.heap_is_allocated(addr.into_expr(), access_size);
                 self.record_violation_guarded(is_allocated.not(), "use_after_free_check");
             }
 
@@ -231,8 +296,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             };
             if align > 1 {
                 debug!("  emitting alignment_check for align={}", align);
-                let align_expr = Expr::bitvec_const(align as u128, ptr_width);
-                let rem = ptr_expr.bvurem(align_expr);
+                let align_expr = Expr::bitvec_const(align as u128, checked_width);
+                let rem = checked.bvurem(align_expr);
                 self.record_violation_guarded(rem.eq(zero).not(), "alignment_check");
             }
 
@@ -308,6 +373,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 ///
 /// If the expression has a Datatype sort with a `fld_ptr` field, extracts it
 /// as a BV64 pointer. Otherwise returns the expression unchanged.
+///
+/// This is a **shape** decoder reading a DECLARED field role — the field is
+/// literally named `fld_ptr` by `slice_sort` / `dyn_sort`. It says nothing about
+/// provenance, and deliberately so: the caller establishes that from the place's
+/// MIR type before asking. See `provenance.rs`.
 ///
 /// Part of #3159: enables pointer deref checks on dyn Trait fat pointers.
 fn extract_ptr_from_dyn_sort(expr: Expr) -> Expr {

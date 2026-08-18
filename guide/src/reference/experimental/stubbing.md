@@ -85,7 +85,7 @@ Now, let's run it through trust-mc:
 
 ```bash
 cargo add rand
-cargo trust-mc -Z stubbing --harness encrypt_then_decrypt_is_identity
+targo trust-mc -Z stubbing --harness encrypt_then_decrypt_is_identity
 ```
 
 The verification result is composed of a single check: the assertion corresponding to `assert_eq!(data, decrypted_data)`.

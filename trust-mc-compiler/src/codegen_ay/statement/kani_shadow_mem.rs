@@ -231,6 +231,26 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
+    /// UNRESOLVED address-vs-value guard — deliberately left standing.
+    ///
+    /// The `2 * POINTER_WIDTH` arm below reads bits 127..64 as `fat_len`, i.e.
+    /// as the slice length that then scales every byte range this model checks
+    /// (`shadow_mem_total_bytes`). That is the `PtrRepr::WidenedThin`
+    /// fabrication by name: a thin pointer that `coerce_bitvec_width_safe`
+    /// widened into a wide slot carries extension padding there, so the length
+    /// would be a fabricated `0` and the byte range would collapse to nothing.
+    ///
+    /// It is NOT converted to `PtrRepr` here because refusing is not the safe
+    /// direction at this call site. This module fails CLOSED (see the module
+    /// doc): a `None` from here makes `shadow_mem_{get,set}_expr` record a
+    /// demoting fallback *and* an always-violated property, so every harness
+    /// that reaches this arm with a widened operand would flip to FAILED. That
+    /// is a coverage change and has to be measured against the burndown, not
+    /// smuggled into a retyping pass — the same reason `MaybeLoc::Unknown` is
+    /// still permissive (`docs/addr-vs-value-conversion-queue.md` §4 item 10).
+    /// The CHC twin `codegen_call_kani_model_mem_init.rs::mem_init_ptr` has the
+    /// identical guard and the mirror-image problem (it fails OPEN, so refusing
+    /// there blesses the byte instead).
     fn shadow_mem_ptr(&mut self, op: &Operand) -> Option<BmcMemInitPtr> {
         let expr = self.codegen_operand(op)?;
         let (data, fat_len) = match expr.sort().bitvec_width()? {

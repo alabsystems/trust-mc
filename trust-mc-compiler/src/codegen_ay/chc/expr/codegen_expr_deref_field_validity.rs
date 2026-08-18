@@ -11,6 +11,7 @@ use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
 use super::ChcCtx;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Emit Ptr-level object validity check for raw pointer dereferences (#2310).
@@ -78,9 +79,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     .get(vec_idx)
                     .map(|(name, sort)| Expr::var(&**name, sort.clone()))
             };
+            // The local's MIR type is `RawPtr` (checked at the top of this
+            // function), so its state variable holds an ADDRESS — that fact is
+            // what licenses reading an object id out of it, and it is known
+            // here, from the type. What the code used to test instead was
+            // `bitvec_width() == Some(64)`: a hard-coded width (not even
+            // `POINTER_WIDTH`) that silently dropped the obj_valid obligation
+            // for every wide-pointer state var, i.e. a fail-open on exactly the
+            // use-after-free class this check exists to catch. `PtrRepr` decides
+            // the shape structurally and yields a pointer-width data address for
+            // every shape it recognizes; a thin pointer decodes to itself, so
+            // the emitted check is unchanged there.
             ptr_expr
-                .filter(|expr| expr.sort().bitvec_width() == Some(64))
-                .map(|expr| expr.extract(63, 32))
+                .as_ref()
+                .and_then(PtrRepr::classify)
+                .map(PtrRepr::into_data)
+                // `[obj_id : 63..32 | offset : 31..0]` — the encoder-wide split
+                // that `try_extract_constant_addr` and `pointer_step` also use.
+                .map(|addr| addr.into_expr().extract(63, 32))
         };
         if let Some(obj_id) = traced_obj_id.or_else(state_obj_id) {
             let obj_valid = self.current_obj_valid_array();

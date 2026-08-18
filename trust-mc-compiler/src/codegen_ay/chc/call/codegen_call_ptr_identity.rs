@@ -20,6 +20,7 @@ pub(super) use super::codegen_call_ptr_identity_ref_target::propagate_ref_target
 pub(in crate::codegen_ay::chc) use super::codegen_call_ptr_identity_ref_target::trace_pointer_identity_ref_target;
 use super::codegen_call_ptr_nonnull::{nonnull_new_option_wrap, try_emit_nonnull_new_flattened};
 use super::codegen_rules::CodegenRules;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::stubs::StubKind;
 
 /// Extension trait for pointer identity/passthrough call handling on `ChcCtx`.
@@ -49,10 +50,14 @@ fn codegen_into_raw_shared(ctx: &mut ChcCtx<'_, '_>, cx: &ChcCallContext<'_>, la
     if let Some(ptr_expr) = ptr_expr
         && let Some((_, dest_var)) = ctx.resolve_destination(dest_local)
     {
-        let ptr_obj_id = try_extract_data_obj_id(&ptr_expr);
-        if let Some(eq) =
-            ctx.make_coerced_eq_constraint(&dest_var, ptr_expr, dest_var.sort(), dest_local, label)
-        {
+        let ptr_obj_id = try_extract_data_obj_id(ptr_expr.as_expr());
+        if let Some(eq) = ctx.make_coerced_eq_constraint(
+            &dest_var,
+            ptr_expr.into_expr(),
+            dest_var.sort(),
+            dest_local,
+            label,
+        ) {
             propagate_alloc_id_with_obj(ctx, dest_local, src_local, ptr_obj_id);
             propagate_ref_target(ctx, dest_local, src_local, ptr_obj_id);
             ctx.clear_known_vtable_discriminant(dest_local);
@@ -175,21 +180,29 @@ pub(super) fn propagate_alloc_id_with_obj(
     }
 }
 
-pub(super) fn try_extract_data_obj_id(ptr_expr: &Expr) -> Option<u32> {
+// Wave 4 note: this one keeps a bare `&Expr` deliberately. Half its callers
+// hold a `Loc` from `extract_pointer_storage_expr`; the other half hold the
+// translated MIR operand of a pointer-typed parameter (`Box::from_raw`,
+// `ptr.cast`, `NonNull::new`), where the evidence is the callee's Rust
+// signature, not anything the encoder produced. Tagging those `Loc` would
+// launder a Rust-level fact into the encoder's provenance system without
+// carrying it, so they pass `as_expr()` instead. The fat-pointer guard that
+// used to live in the body is gone either way — that is the defect.
+pub(super) fn try_extract_data_obj_id(ptr: &Expr) -> Option<u32> {
     // obj_id 0 is the null/invalid sentinel: allocations use obj_id >= 2 and
     // the promoted-const region uses obj_id == 1. Refuse to propagate obj_id 0
     // as a "known allocation" — otherwise `propagate_alloc_id_with_obj` records
     // null-pointer-derived locals in `alloc_result_locals`, which makes the
     // `NullPointerDereference` MIR assert suppression (#3094) silently elide
     // the check, producing a false PROOF for `unsafe { *ptr::null::<T>() }`.
-    ChcCtx::try_extract_obj_id(ptr_expr)
+    ChcCtx::try_extract_obj_id(ptr)
         .or_else(|| {
-            let width = ptr_expr.sort().bitvec_width()?;
-            let ptr_width = crate::codegen_ay::types::POINTER_WIDTH;
-            (width == 2 * ptr_width).then(|| {
-                let data_ptr = ptr_expr.clone().extract(ptr_width - 1, 0);
-                ChcCtx::try_extract_obj_id(&data_ptr)
-            })?
+            // Wave 4: the `width == 2 * POINTER_WIDTH` gate is deleted —
+            // `PtrRepr` names the data half structurally and `into_data` is
+            // total, so a thin pointer decodes to itself (this retry is then a
+            // no-op) and a packed one decodes to its address half.
+            let data = PtrRepr::classify(ptr)?.into_data();
+            ChcCtx::try_extract_obj_id(data.as_expr())
         })
         .filter(|&obj_id| obj_id != 0)
 }
@@ -379,13 +392,19 @@ fn from_raw_vtable_constraint(
         .and_then(|sl| ctx.dyn_vtable_ids.get(&sl).cloned())
         .and_then(|vtable_expr| ctx.capture_known_vtable_constraint(dest_local, vtable_expr))
         .or_else(|| {
-            let width = raw_arg_expr.sort().bitvec_width()?;
-            if width != 2 * crate::codegen_ay::types::POINTER_WIDTH {
-                return None;
-            }
-            let ptr_width = crate::codegen_ay::types::POINTER_WIDTH;
-            let vtable_expr = raw_arg_expr.clone().extract(2 * ptr_width - 1, ptr_width);
-            ctx.capture_known_vtable_constraint(dest_local, vtable_expr)
+            // Strategy 2: the vtable is the metadata half of the raw fat pointer.
+            //
+            // The width test this replaces (`width == 2 * POINTER_WIDTH`) also
+            // matched a thin pointer WIDENED into the 128-bit slot, whose high
+            // half is extension padding — so `Box::from_raw(widened_thin)` used
+            // to CONSTRAIN the destination's vtable to a fabricated id (0 for a
+            // zero-extension), pinning dispatch and drop to whichever impl
+            // happens to carry that id. `PtrRepr::metadata()` yields nothing for
+            // that shape, so the chain falls through to strategy 3 (resolve the
+            // unique wrapped dyn vtable from the destination type) and, failing
+            // that, leaves the vtable unconstrained — the sound over-approximation.
+            let vtable = PtrRepr::classify(raw_arg_expr)?.into_metadata()?;
+            ctx.capture_known_vtable_constraint(dest_local, vtable.into_expr())
         })
         .or_else(|| {
             let dest_ty = ctx.body.locals()[dest_local].ty;

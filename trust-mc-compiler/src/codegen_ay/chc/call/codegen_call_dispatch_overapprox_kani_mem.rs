@@ -11,6 +11,8 @@ use ay_bindings::{Expr, ExprValue};
 
 use super::{ChcCtx, dyn_coercion};
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::provenance::{Loc, is_value_widened_into_address};
+use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
@@ -154,16 +156,78 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let pointee_ty = self.extract_kani_mem_pointee_ty(func).unwrap_or(operand_pointee_ty);
 
         let ptr_expr = self.translate_operand_with_modified(ptr_arg, modified_locals)?;
-        let ptr_expr = Self::normalize_kani_mem_pointer_expr(ptr_expr)?;
-        Some((ptr_expr, pointee_ty))
+        let ptr_expr = self.normalize_kani_mem_pointer_expr(ptr_arg, ptr_expr)?;
+        Some((ptr_expr.into_expr(), pointee_ty))
     }
 
-    fn normalize_kani_mem_pointer_expr(expr: Expr) -> Option<Expr> {
-        let ptr_expr = dyn_coercion::extract_pointer_expr(&expr).unwrap_or(expr);
+    /// Is `op`'s MIR type a pointer — the premise every `kani::mem` address tag
+    /// rests on?
+    ///
+    /// `kani::mem`'s intrinsics are declared over `*const T` / `*mut T`, so the
+    /// premise holds at every legitimate call; checking it *here* is what turns
+    /// it from a claim in a doc comment into something the code establishes
+    /// before it mints a [`Loc`]. A constant operand or a non-pointer local
+    /// (the shapes a stub rewrite or an inline substitution can leave behind)
+    /// fails closed: the caller demotes to its over-approximating lane rather
+    /// than asking `obj_valid` about a datum.
+    fn kani_mem_operand_is_pointer_typed(&self, op: &Operand) -> bool {
+        op.ty(self.body.locals()).is_ok_and(|ty| {
+            matches!(
+                ty.kind(),
+                TyKind::RigidTy(RigidTy::RawPtr(..)) | TyKind::RigidTy(RigidTy::Ref(..))
+            )
+        })
+    }
+
+    /// Reduce a `kani::mem` pointer ARGUMENT to the thin storage-address lane.
+    ///
+    /// Address-vs-value refactor: this is a [`Loc`] PRODUCER, and the tag is
+    /// justified by the Rust TYPE of the operand — which this function now
+    /// *takes and checks* ([`Self::kani_mem_operand_is_pointer_typed`]) instead
+    /// of trusting each caller to have done it. Wave 2 wrote that premise down
+    /// in prose and then minted the tag off `== Some(POINTER_WIDTH)`, so a bv64
+    /// datum arriving from any lane was admitted on width alone; the premise is
+    /// the only thing that can decide it, so it is now a parameter.
+    ///
+    /// What is left of the width test is a SHAPE question, and it is asked of
+    /// [`PtrRepr::thin_address`], which accepts exactly what the old comparison
+    /// accepted (a `POINTER_WIDTH` bitvector) and declines the wide and
+    /// non-bitvector shapes `coerce_bitvec_width_safe` passes through unchanged
+    /// (an unextracted datatype pointer, an array). No `Loc::of_address` is
+    /// written here any more: the tag comes back from the decoder, whose
+    /// contract is "the caller supplies the provenance, this supplies the shape".
+    ///
+    /// # The widening refusal
+    ///
+    /// `coerce_bitvec_width_safe` ZERO-EXTENDS a sub-pointer-width term into
+    /// `POINTER_WIDTH`, after which any width- or shape-based test passes. That
+    /// is the value-as-address fabrication `normalize_deref_address_expr` refuses
+    /// by name — the split-pointer model reads the (all-zero) upper half as
+    /// obj_id, i.e. the null object, so every `kani::mem` obligation asked about
+    /// it is decided against a fabricated allocation. The narrow shape is
+    /// therefore refused BEFORE the coercion can hide it, and pre-widened
+    /// arrivals are refused by [`is_value_widened_into_address`]. `None` routes
+    /// every caller to its existing fail-closed lane.
+    fn normalize_kani_mem_pointer_expr(&self, op: &Operand, expr: Expr) -> Option<Loc> {
+        // The premise. Without a pointer-typed operand there is no address here
+        // to normalize, whatever the term's width says.
+        if !self.kani_mem_operand_is_pointer_typed(op) {
+            debug!("kani_mem pointer normalize: operand is not pointer-typed — fail-closed");
+            return None;
+        }
+        let ptr_expr =
+            dyn_coercion::extract_pointer_expr(&expr).map(Loc::into_expr).unwrap_or(expr);
         let ptr_expr =
             if ptr_expr.sort().is_int() { ptr_expr.int2bv(POINTER_WIDTH) } else { ptr_expr };
+        // Refuse the value-as-address shapes before the widening coercion can
+        // make them indistinguishable from a real address.
+        if ptr_expr.sort().bitvec_width().is_some_and(|w| w < POINTER_WIDTH)
+            || is_value_widened_into_address(&ptr_expr)
+        {
+            return None;
+        }
         let ptr_expr = coerce_bitvec_width_safe(ptr_expr, POINTER_WIDTH, SignExtension::ZeroExtend);
-        (ptr_expr.sort().bitvec_width() == Some(POINTER_WIDTH)).then_some(ptr_expr)
+        PtrRepr::thin_address(&ptr_expr)
     }
 
     fn extract_kani_mem_pointee_ty(
@@ -447,7 +511,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         predicate_builder: fn(Expr) -> Option<Expr>,
     ) -> (Expr, bool) {
         let pending_checks_len = self.heap_state.pending_checks.len();
-        let loaded = self.load_from_memory(addr, ty);
+        let loaded = self.load_from_memory_untyped(addr, ty);
         self.heap_state.pending_checks.truncate(pending_checks_len);
 
         let Some(loaded) = loaded else {
@@ -791,8 +855,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut conds: Vec<Expr> = Vec::with_capacity(2);
         for op in args.iter().take(2) {
             let ptr_expr = self.translate_operand_with_modified(op, modified_locals)?;
-            let ptr_expr = Self::normalize_kani_mem_pointer_expr(ptr_expr)?;
-            let (_, offset) = self.split_pointer(&ptr_expr)?;
+            let ptr_expr = self.normalize_kani_mem_pointer_expr(op, ptr_expr)?;
+            let (_, offset) = self.split_pointer(ptr_expr.as_expr())?;
             conds.push(offset.bvule(Expr::bitvec_const(size, 32)));
         }
         conds.into_iter().reduce(Expr::and)
@@ -810,8 +874,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         let ptr_expr = self.translate_operand_with_modified(op, modified_locals)?;
-        let ptr_expr = Self::normalize_kani_mem_pointer_expr(ptr_expr)?;
-        let (obj_id, _) = self.split_pointer(&ptr_expr)?;
+        let ptr_expr = self.normalize_kani_mem_pointer_expr(op, ptr_expr)?;
+        let (obj_id, _) = self.split_pointer(ptr_expr.as_expr())?;
         Some(Self::simplify_same_allocation_obj_id_expr(obj_id))
     }
 

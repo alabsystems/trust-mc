@@ -22,6 +22,7 @@ use rustc_public::ty::{ClosureKind, RigidTy, Ty, TyKind};
 use std::collections::HashMap;
 use tracing::debug;
 
+use crate::codegen_ay::provenance::is_value_widened_into_address;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 /// Detect Fn/FnMut/FnOnce::call/call_mut/call_once calls by path suffix.
@@ -203,8 +204,39 @@ pub(in crate::codegen_ay::chc::call) fn resolve_mut_ref_value_args(
         // without replacement. This is SAFE (no false PROOF — the body reads the
         // address as a value, producing an overconstrained or UNKNOWN result) but
         // means dyn dispatch through &mut <bv64-sized-type> may fail to prove.
+        //
+        // ADDRESS-VS-VALUE: this guard is deliberately KEPT (see
+        // `codegen_ay/provenance.rs`). It cannot be retired by threading a tag
+        // from the producer, because there is no producer to thread it from:
+        // `fn_args` arrives from `unpack_fn_trait_call_args`, which unpacks the
+        // `Fn::call` argument tuple built by `translate_operand_with_modified` —
+        // the one function in the encoder that serves every operand and reports
+        // nothing about what it returned. That is the same wall the two
+        // `#[deprecated]` `*_untyped` memory shims are parked against, and
+        // typing this slot means typing that function's return, not this test.
+        // Retagging the term here from the MIR `&mut T` alone would be a
+        // FABRICATION of exactly the kind the campaign exists to remove: the
+        // walker's own transparent-Deref model is why a `&mut T` local's term is
+        // frequently the pointee's VALUE, which is the ambiguity above.
+        //
+        // What IS provable is narrowed off: a zero/sign-extended narrow datum is
+        // never an address (its obj_id lane is forced to 0), so it can no longer
+        // be replaced by an unrelated target local's state variable. The refusal
+        // runs on the UNCOERCED arg — nothing widens `fn_arg` between the tuple
+        // unpack and here — so it cannot be defeated by a coercion upstream of
+        // the test.
+        //
+        // The `pointee_sort != POINTER_WIDTH` conjunct below is also what the
+        // CONSUMER of this substitution now uses to discharge the same
+        // ambiguity: `projected_assign::inline_deref_target_addr` takes the
+        // pointee type from its callers and treats a non-pointer-width pointee
+        // as proof that its root term cannot be a value substituted here. The
+        // two halves of #3980 agree on one discriminator, deliberately — if this
+        // condition is ever widened, that consumer's ESTABLISHED lane widens
+        // with it and must be revisited in the same change.
         let is_address = fn_arg.sort().bitvec_width() == Some(POINTER_WIDTH)
-            && pointee_sort.bitvec_width() != Some(POINTER_WIDTH);
+            && pointee_sort.bitvec_width() != Some(POINTER_WIDTH)
+            && !is_value_widened_into_address(fn_arg);
         let is_already_value = *fn_arg.sort() == pointee_sort;
 
         if !is_address && !is_already_value {
@@ -307,7 +339,7 @@ pub(in crate::codegen_ay::chc::call) fn bridge_mut_ref_alias_updates(
         if let Some(addr) = ctx.get_or_create_local_address(target_local) {
             let target_ty = ctx.body.locals().get(target_local).map(|d| d.ty);
             if let Some(ty) = target_ty {
-                ctx.build_memory_store(addr, updated_value.clone(), ty);
+                ctx.build_memory_store_untyped(addr, updated_value.clone(), ty);
                 debug!(
                     body_arg_local,
                     target_local, "fn_trait_dispatch: also stored to heap memory (#4000)"

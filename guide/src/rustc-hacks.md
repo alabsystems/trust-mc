@@ -221,7 +221,7 @@ For logs that are related to `trust-mc-compiler` code, use the `TRUST_MC_LOG` va
 ## Debugging type layout
 
 In order to print the type layout computed by the Rust compiler, you can pass the following flag to `rustc`: `-Zprint-type-sizes`.
-This flag can be passed to `trust-mc` or `cargo trust-mc` by setting the `RUSTFLAG` environment variable.
+This flag can be passed to `trust-mc` or `targo trust-mc` by setting the `RUSTFLAG` environment variable.
 
 ```
 RUSTFLAGS=-Zprint-type-sizes trust-mc test.rs

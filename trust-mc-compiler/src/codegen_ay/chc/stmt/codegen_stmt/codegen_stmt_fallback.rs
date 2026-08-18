@@ -244,16 +244,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     Ok(TyKind::RigidTy(RigidTy::Float(_)))
                 );
                 if is_float {
-                    // Kani --nan-check parity: NaN-generation obligation for
-                    // float value binops through the congruent table lane
-                    // (fail-closed; see codegen_stmt_safety_checks.rs). The
+                    // NaN-generation obligation for float value binops,
+                    // gated on `--nan-check` (see codegen_stmt_safety_checks.rs).
+                    //
+                    // OFF by default, matching Kani. Producing a NaN is DEFINED
+                    // behaviour in Rust, not UB, so this is a lint and not a
+                    // safety property. It used to be pushed unconditionally,
+                    // which made EVERY harness containing symbolic float
+                    // arithmetic report a false FAILURE: the obligation ranges
+                    // over an unconstrained select from the uninterpreted
+                    // `float_binop_tbl_*`, and the only discharges are literal
+                    // constant operands or a dominating is_finite assume. The
                     // integer div/rem and overflow checks below must NOT run
                     // for floats — float division by zero is DEFINED in Rust
                     // (±inf/NaN results), and the divisor-bits != 0 check
                     // would spuriously fail legal float divisions now that
                     // symbolic float binops translate successfully.
-                    if let Some(c) = self
-                        .float_nan_check_condition(*op, lhs_op, rhs_op, &le, &re, rhs_expr, bb_idx)
+                    if self.nan_checks
+                        && let Some(c) = self.float_nan_check_condition(
+                            *op, lhs_op, rhs_op, &le, &re, rhs_expr, bb_idx,
+                        )
                     {
                         debug!(?op, "CHC: float NaN-generation check (Kani --nan-check parity)");
                         safety_checks.push(c);
@@ -395,6 +405,42 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.known_alloc_ids.insert(local_idx, obj_id);
             self.ref_resolution.alloc_result_locals.insert(local_idx);
         } else {
+            // Completes the #3871 rule stated above: a deref load through a
+            // pointer that provably holds `&_L` yields _L's VALUE, so _L's own
+            // slot alloc_id must NOT reach the destination. Without this the
+            // generic `Rvalue::Use` arm below re-derives it from the source
+            // pointer local and a later deref of the destination reads _L's
+            // slot as though it were the pointee — an ADDRESS used as a VALUE,
+            // landing on a memory cell no rule writes at that type. This also
+            // gives the `known_alloc_ids.remove` branch at the bottom of this
+            // function, written for exactly this shape, a path to run: the
+            // generic arm used to capture the shape first, leaving it dead.
+            // `deref_load_referent_local` matches only that exact shape, so
+            // Box/Rc/NonNull deref chains keep their inheritance.
+            if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rhs
+                && matches!(p.projection.first(), Some(ProjectionElem::Deref))
+                && let Some(referent) = self.deref_load_referent_local(p.local)
+            {
+                let forwarded = self.known_alloc_ids.get(&referent).copied();
+                debug!(
+                    local_idx,
+                    ptr_local = p.local,
+                    referent,
+                    ?forwarded,
+                    "CHC: deref load through a pointer to a local's own slot — \
+                     forwarding the referent's alloc_id, not the slot's"
+                );
+                match forwarded {
+                    Some(obj_id) => {
+                        self.known_alloc_ids.insert(local_idx, obj_id);
+                        self.ref_resolution.alloc_result_locals.insert(local_idx);
+                    }
+                    None => {
+                        self.known_alloc_ids.remove(&local_idx);
+                    }
+                }
+                return;
+            }
             let src_local_for_alloc = match rhs {
                 Rvalue::ShallowInitBox(Operand::Copy(p) | Operand::Move(p), _)
                 | Rvalue::Use(Operand::Copy(p) | Operand::Move(p))

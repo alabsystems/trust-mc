@@ -140,7 +140,9 @@ pub(super) fn inline_cast_to_expr<'tcx, 'body>(
         && matches!(target_ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..) | RigidTy::Ref(..)))
     {
         if let Some(p) = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(&inner) {
-            return Some(p);
+            // A pointer CAST writes this term into the destination local as its
+            // datum, so the tag ends at the crossing.
+            return Some(p.into_expr());
         }
     }
     Some(inner)
