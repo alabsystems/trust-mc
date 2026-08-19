@@ -104,6 +104,72 @@ impl Default for InlineConfig {
 /// resulting BMC formula can exceed the solver's capacity regardless.)
 const CONTRACT_INLINE_DEPTH: usize = 32;
 
+/// Absolute ceiling on the contract headroom granted by
+/// [`body_has_contract_glue_call`]. The headroom is re-granted every time
+/// another layer of glue is UNCOVERED, which is what a chain of contract-carrying
+/// callees needs, so this is the only thing standing between a pathological
+/// program and unbounded inlining. Deliberately far above what real chains need
+/// (a three-deep `proof_for_contract` chain measures ~120) and far below
+/// anything that could plausibly be inlined by accident.
+const MAX_CONTRACT_INLINE_DEPTH: usize = 512;
+
+/// Does the (working) body still contain a call to Kani contract GLUE —
+/// `kani_contract_mode`, `kani_force_fn_once[_with_args]` or
+/// `kani_register_contract`?
+///
+/// # Why this earns its own budget
+///
+/// These four are not user code and carry no user state: `kani_contract_mode`
+/// is a constant, `kani_force_fn_once[_with_args]` is literally `fn(f: F) -> F
+/// { f }`, and `kani_register_contract` is rewritten to `run_contract_fn`,
+/// a single tail call of the closure it was handed
+/// (`library/kani_macros/src/sysroot/contracts/mod.rs`). Inlining them is a
+/// constant-fold / identity / tail-call rewrite that hands the backend the
+/// contract frame as ORDINARY MIR — which is the only shape in which the
+/// backend models it faithfully.
+///
+/// Leaving one behind is not a neutral loss of precision. A surviving
+/// `kani_register_contract` sends the whole contract frame down the CHC
+/// walker's closure-capture path, where the four parts of a contract stop
+/// agreeing with each other: the precondition read, the `old(..)` history
+/// snapshot, the body's write-back and the ensures read each end up resolved
+/// against a different copy of the modified place, so a SAFE program reports a
+/// counterexample (`function-contract/as-assertions/precedence.rs`,
+/// `function-contract/history/stub.rs`).
+///
+/// A two-level `proof_for_contract` chain needs ~50 inline steps and a
+/// three-level one ~120, so the flat [`CONTRACT_INLINE_DEPTH`] ceiling ran out
+/// mid-chain. Each glue layer only becomes visible once the layer above it is
+/// inlined, so the budget is re-granted whenever glue is still pending, bounded
+/// by [`MAX_CONTRACT_INLINE_DEPTH`].
+///
+/// Deliberately NARROWER than [`body_has_contract_chain`]: the Fn-trait call
+/// shims that predicate also accepts are emitted by ordinary closure code, so
+/// granting repeated headroom on them would let any closure-heavy body inline
+/// without limit. Only the four compiler-generated contract markers do.
+fn body_has_contract_glue_call(body: &MutableBody) -> bool {
+    body.blocks().iter().any(|bb| {
+        let TerminatorKind::Call { func, .. } = &bb.terminator.kind else {
+            return false;
+        };
+        let Ok(func_ty) = func.ty(body.locals()) else {
+            return false;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(fn_def, _)) = func_ty.kind() else {
+            return false;
+        };
+        matches!(
+            attributes::fn_marker(fn_def).as_deref(),
+            Some(
+                "kani_contract_mode"
+                    | "kani_force_fn_once"
+                    | "kani_force_fn_once_with_args"
+                    | "kani_register_contract"
+            )
+        )
+    })
+}
+
 /// Does the (working) body still contain a Kani contract-instrumentation chain
 /// (`run_contract_fn`/closure-shim/contract-marker calls)?
 ///
@@ -1068,7 +1134,11 @@ impl FunctionInlinePass {
 
         let mut mutable_body = MutableBody::from(body);
         let mut ever_changed = false;
-        let mut total_inline_count = 0;
+        let mut total_inline_count: usize = 0;
+        // Per-body budget. The contract raises below are a property of THIS
+        // body's contract machinery, so they must not leak into the next body
+        // the (reused, `&mut self`) pass is handed.
+        let mut max_depth = self.config.max_depth;
 
         // Iterate until fixpoint or max_depth reached.
         // Each iteration resolves Drop terminators, then inlines Call sites.
@@ -1081,17 +1151,33 @@ impl FunctionInlinePass {
             // unsupported `Call terminator`. Once inlining has EXPOSED the chain
             // in the working body, raise the cap here. SOUND: deeper inlining
             // only eliminates Call terminators; it never changes semantics.
-            if self.config.max_depth < CONTRACT_INLINE_DEPTH
-                && body_has_contract_chain(&mutable_body)
-            {
+            if max_depth < CONTRACT_INLINE_DEPTH && body_has_contract_chain(&mutable_body) {
                 debug!(
                     "FunctionInlinePass: contract chain exposed in {} — raising max_depth {} -> {}",
-                    name, self.config.max_depth, CONTRACT_INLINE_DEPTH
+                    name, max_depth, CONTRACT_INLINE_DEPTH
                 );
-                self.config.max_depth = CONTRACT_INLINE_DEPTH;
+                max_depth = CONTRACT_INLINE_DEPTH;
             }
 
-            if total_inline_count >= self.config.max_depth {
+            // Contract GLUE still pending: re-grant the contract budget from
+            // where we are now. Each layer of glue only becomes visible once
+            // the layer above it has been inlined, so a chain of
+            // contract-carrying callees needs more than one flat grant — and
+            // stopping mid-chain leaves a `kani_register_contract` behind,
+            // which costs the contract frame's internal agreement rather than
+            // merely some precision (see `body_has_contract_glue_call`).
+            let contract_headroom = total_inline_count
+                .saturating_add(CONTRACT_INLINE_DEPTH)
+                .min(MAX_CONTRACT_INLINE_DEPTH);
+            if max_depth < contract_headroom && body_has_contract_glue_call(&mutable_body) {
+                debug!(
+                    "FunctionInlinePass: contract glue pending in {} — extending max_depth {} -> {}",
+                    name, max_depth, contract_headroom
+                );
+                max_depth = contract_headroom;
+            }
+
+            if total_inline_count >= max_depth {
                 debug!("FunctionInlinePass: max inline depth reached ({})", total_inline_count);
                 break;
             }
@@ -1107,7 +1193,7 @@ impl FunctionInlinePass {
                 &mut mutable_body,
                 &instance,
                 &mut body_provider,
-                self.config.max_depth.saturating_sub(total_inline_count),
+                max_depth.saturating_sub(total_inline_count),
                 &mut total_inline_count,
             ) {
                 iteration_changed = true;
@@ -1132,7 +1218,7 @@ impl FunctionInlinePass {
             for &call_bb_idx in call_sites.iter().rev() {
                 // Defer depth check: virtual calls bypass the limit because leaving
                 // them unresolved produces unsound unconstrained results in SSA codegen.
-                let depth_exceeded = total_inline_count >= self.config.max_depth;
+                let depth_exceeded = total_inline_count >= max_depth;
                 // Wall-2: a callee operand typed as the CLOSURE ITSELF is the
                 // loop-contract proof-rule / decreases invariant-evaluation
                 // shape (`rule.rs::fn_op` — `Instance::ty()` of a closure Fn

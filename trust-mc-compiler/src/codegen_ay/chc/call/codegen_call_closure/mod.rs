@@ -253,6 +253,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Follow ref_targets: args[0] is &closure, so ref_targets maps it to the closure local.
         let closure_local =
             self.ref_resolution.ref_targets.get(&ref_local).map_or(ref_local, |rt| rt.local);
+        // Step back over the contract macro's identity `kani_force_fn_once`
+        // relay so the aggregate scan below looks at the local the closure was
+        // actually CONSTRUCTED into.
+        let closure_local = self.resolve_closure_construction_local(closure_local);
 
         // Search all blocks for the Aggregate(Closure, ...) that built this local.
         for block in &self.body.blocks {
@@ -271,6 +275,103 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         debug!(?closure_local, "could not find closure aggregate for captures");
         Vec::new()
+    }
+
+    /// Step a closure-valued local back over the contract macro's identity
+    /// `kani_force_fn_once` relay to the local the closure was CONSTRUCTED into.
+    ///
+    /// A contract-instrumented function expands to
+    ///
+    /// ```text
+    /// _b = Aggregate(Closure)(captures…);
+    /// _a = add_one::kani_force_fn_once(move _b);   // const fn f(x: F) -> F { x }
+    /// _r = add_one::kani_register_contract(copy _a);
+    /// ```
+    ///
+    /// so the register-contract argument (`_a`) is a CALL DESTINATION, never an
+    /// `Aggregate(Closure)` site. Without this step the capture scan finds
+    /// nothing for `_a` and hands the walked contract closure ZERO captures:
+    /// its `self` param stays unpopulated, every `(_1.0)` read of a captured
+    /// argument is skipped, and the contract's precondition reads and `old(..)`
+    /// history operands become unconstrained — which is what made a safe
+    /// `old(*p + 1)` report an overflow.
+    ///
+    /// This is EXACT, not a guess: `kani_force_fn_once` and
+    /// `kani_force_fn_once_with_args` are literally `fn(f: F) -> F { f }`
+    /// (`library/kani_macros/src/sysroot/contracts/mod.rs`), so destination and
+    /// argument denote the SAME closure value. Anything else — a projected
+    /// destination or argument, a callee without one of those two markers, no
+    /// defining call at all — stops the walk and leaves the local unchanged,
+    /// so every non-contract closure path keeps its previous behaviour.
+    fn resolve_closure_construction_local(&self, closure_local: usize) -> usize {
+        let mut current = closure_local;
+        let mut visited = HashSet::new();
+        // One relay hop per `kani_force_fn_once` wrapper; the bound just keeps
+        // a malformed body from looping.
+        for _ in 0..4 {
+            if !visited.insert(current) {
+                return closure_local;
+            }
+            if self.local_has_closure_aggregate_def(current) {
+                return current;
+            }
+            let Some(next) = self.force_fn_once_relay_source_local(current) else {
+                return current;
+            };
+            current = next;
+        }
+        current
+    }
+
+    /// Does some block assign an `Aggregate(Closure, …)` to this whole local?
+    fn local_has_closure_aggregate_def(&self, local: usize) -> bool {
+        self.body.blocks.iter().flat_map(|block| block.statements.iter()).any(|stmt| {
+            matches!(
+                &stmt.kind,
+                StatementKind::Assign(place, Rvalue::Aggregate(AggregateKind::Closure(_, _), _))
+                    if place.local == local && place.projection.is_empty()
+            )
+        })
+    }
+
+    /// If `local` is the destination of a `kani_force_fn_once[_with_args]` call,
+    /// return the local holding that call's (identical) argument.
+    fn force_fn_once_relay_source_local(&self, local: usize) -> Option<usize> {
+        use rustc_public::mir::TerminatorKind;
+        for block in &self.body.blocks {
+            let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
+            else {
+                continue;
+            };
+            if destination.local != local || !destination.projection.is_empty() {
+                continue;
+            }
+            let Ok(func_ty) = func.ty(self.body.locals()) else {
+                return None;
+            };
+            let TyKind::RigidTy(RigidTy::FnDef(fn_def, _)) = func_ty.kind() else {
+                return None;
+            };
+            if !matches!(
+                crate::kani_middle::attributes::fn_marker(fn_def).as_deref(),
+                Some("kani_force_fn_once" | "kani_force_fn_once_with_args")
+            ) {
+                return None;
+            }
+            let (Operand::Copy(place) | Operand::Move(place)) = args.first()? else {
+                return None;
+            };
+            if !place.projection.is_empty() {
+                return None;
+            }
+            debug!(
+                dest = local,
+                source = place.local,
+                "closure captures: stepped back over kani_force_fn_once relay"
+            );
+            return Some(place.local);
+        }
+        None
     }
 
     fn resolve_closure_capture_expr(

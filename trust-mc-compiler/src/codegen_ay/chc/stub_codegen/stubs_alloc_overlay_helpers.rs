@@ -28,6 +28,42 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         elem_sort.is_bool().then_some(Expr::bool_const(false))
     }
 
+    /// The value an `elem_sort`-wide cell holds after every one of its bytes is
+    /// set to `byte` (a `memset` / `write_bytes` fill).
+    ///
+    /// Byte-uniform, so it is endianness-independent: the replicated pattern is
+    /// the same read either way. `None` for a sort whose byte image is not
+    /// exactly representable here (non-byte-multiple or >64-bit bitvecs, a bool
+    /// whose byte is not a valid `bool` bit pattern, datatypes) — callers must
+    /// then write an unconstrained value rather than leave the cell stale.
+    ///
+    /// Part of #3175.
+    pub(in crate::codegen_ay::chc) fn fill_value_for_sort(
+        elem_sort: &Sort,
+        byte: u8,
+    ) -> Option<Expr> {
+        if let Some(width) = elem_sort.bitvec_width() {
+            if width == 0 || width % 8 != 0 || width > 64 {
+                return None;
+            }
+            let mut value: u128 = 0;
+            for _ in 0..(width / 8) {
+                value = (value << 8) | u128::from(byte);
+            }
+            return Some(Expr::bitvec_const(value, width));
+        }
+        if elem_sort.is_bool() {
+            // A `bool` byte is only a valid value for 0 / 1; any other pattern
+            // is an invalid bool and has no representable value here.
+            return match byte {
+                0 => Some(Expr::bool_const(false)),
+                1 => Some(Expr::bool_const(true)),
+                _ => None,
+            };
+        }
+        None
+    }
+
     pub(in crate::codegen_ay::chc) fn should_overlay_type_array(
         type_key: &str,
         elem_sort: &Sort,

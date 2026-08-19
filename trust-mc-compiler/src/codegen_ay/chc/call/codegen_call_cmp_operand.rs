@@ -85,40 +85,97 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         rhs: &mut Expr,
         args: &[Operand],
         modified_locals: &HashSet<usize>,
+        lhs_is_own_pointer: bool,
+        rhs_is_own_pointer: bool,
     ) {
-        if self.track_level < ChcTrackLevel::Mem
-            || *lhs.sort() != ptr_sort()
-            || *rhs.sort() != ptr_sort()
-        {
+        if self.track_level < ChcTrackLevel::Mem {
             return;
         }
-        // Part of #3994: Try double-ref `&&T` first (#3270), then single-ref `&T`.
-        // MIR-inlined derived PartialEq for BV-flattened enums generates
-        // field-level `<T as PartialEq>::eq(&field1, &field2)` where args are
-        // `&T` (single ref). Without this fallback, the deref never fires and
-        // raw BV64 pointer addresses are compared instead of pointee values.
-        let Some(pointee_ty) = extract_ref_pointee_from_cmp_arg(&args[0], self.body.locals())
-            .or_else(|| extract_single_ref_pointee(&args[0], self.body.locals()))
+        if *lhs.sort() == ptr_sort() && *rhs.sort() == ptr_sort() {
+            // Part of #3994: Try double-ref `&&T` first (#3270), then single-ref `&T`.
+            // MIR-inlined derived PartialEq for BV-flattened enums generates
+            // field-level `<T as PartialEq>::eq(&field1, &field2)` where args are
+            // `&T` (single ref). Without this fallback, the deref never fires and
+            // raw BV64 pointer addresses are compared instead of pointee values.
+            let Some(pointee_ty) = extract_ref_pointee_from_cmp_arg(&args[0], self.body.locals())
+                .or_else(|| extract_single_ref_pointee(&args[0], self.body.locals()))
+            else {
+                return;
+            };
+            // Part of #4030: Raw pointer comparisons (`<*const T as Ord>::cmp`)
+            // pass `&*const T` args. Do NOT dereference through the raw pointer —
+            // Rust's Ord for raw pointers compares addresses (+ metadata for fat
+            // pointers), not the pointed-to content.
+            // Note: double-ref `&&*const T` (blanket impls) handled by
+            // resolve_double_ref_raw_ptr_cmp in codegen_call_primitive_cmp_stub.
+            if matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))) {
+                return;
+            }
+            // Resolve each operand, selectively retaining heap safety checks.
+            if let Some(lhs_val) = self.resolve_cmp_deref_operand(lhs, pointee_ty, modified_locals)
+            {
+                debug!("[#3270] cmp deref lhs: ptr -> {:?}", lhs_val.sort());
+                *lhs = lhs_val;
+            }
+            if let Some(rhs_val) = self.resolve_cmp_deref_operand(rhs, pointee_ty, modified_locals)
+            {
+                debug!("[#3270] cmp deref rhs: ptr -> {:?}", rhs_val.sort());
+                *rhs = rhs_val;
+            }
+            return;
+        }
+
+        // Asymmetric case: the referent cascade resolved ONE side through the
+        // reference (`Referent::Value` — e.g. a promoted unit-enum ref answered
+        // by `const_ref_discriminants`, which hands back a bv32 tag) while the
+        // other side came back `Referent::Unreported`, i.e. the operand's OWN
+        // term, which for a `&T`-typed operand is the ADDRESS.
+        //
+        // The old gate demanded BOTH sides sit in a pointer slot, so this
+        // mixed pair skipped the deref entirely and `compute_partial_eq`
+        // widened the tag to 64 bits and compared it against an address —
+        // `(= (concat obj_id #x00000000) ((_ zero_extend 32) tag))`, false by
+        // construction, so `|result: &Enum| *result == Enum::V` could never
+        // hold. Dereference the side that is still the pointer so both terms
+        // denote the referent, which is what `PartialEq::eq(&T, &T)` compares.
+        //
+        // `lhs_is_own_pointer` / `rhs_is_own_pointer` come from the producer's
+        // own `Referent` tag, not from a width test: at POINTER_WIDTH an
+        // address and a bv64 datum are indistinguishable, and only the
+        // resolving tier knows which it returned.
+        if lhs_is_own_pointer && *lhs.sort() == ptr_sort() {
+            self.deref_single_cmp_operand(lhs, &args[0], modified_locals);
+        }
+        if rhs_is_own_pointer && *rhs.sort() == ptr_sort() {
+            self.deref_single_cmp_operand(rhs, &args[1], modified_locals);
+        }
+    }
+
+    /// Dereference ONE comparison operand that is still the reference's own
+    /// address, using that operand's own MIR pointee type.
+    ///
+    /// Leaves `expr` untouched when the pointee type cannot be recovered, when
+    /// the pointee is a raw pointer (Rust compares raw pointers by address, not
+    /// content — same veto as the symmetric path), or when the load fails. It
+    /// never drops a memory-safety obligation: `resolve_cmp_deref_operand`
+    /// keeps the heap checks for non-stack addresses.
+    fn deref_single_cmp_operand(
+        &mut self,
+        expr: &mut Expr,
+        arg: &Operand,
+        modified_locals: &HashSet<usize>,
+    ) {
+        let Some(pointee_ty) = extract_ref_pointee_from_cmp_arg(arg, self.body.locals())
+            .or_else(|| extract_single_ref_pointee(arg, self.body.locals()))
         else {
             return;
         };
-        // Part of #4030: Raw pointer comparisons (`<*const T as Ord>::cmp`)
-        // pass `&*const T` args. Do NOT dereference through the raw pointer —
-        // Rust's Ord for raw pointers compares addresses (+ metadata for fat
-        // pointers), not the pointed-to content.
-        // Note: double-ref `&&*const T` (blanket impls) handled by
-        // resolve_double_ref_raw_ptr_cmp in codegen_call_primitive_cmp_stub.
         if matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))) {
             return;
         }
-        // Resolve each operand, selectively retaining heap safety checks.
-        if let Some(lhs_val) = self.resolve_cmp_deref_operand(lhs, pointee_ty, modified_locals) {
-            debug!("[#3270] cmp deref lhs: ptr -> {:?}", lhs_val.sort());
-            *lhs = lhs_val;
-        }
-        if let Some(rhs_val) = self.resolve_cmp_deref_operand(rhs, pointee_ty, modified_locals) {
-            debug!("[#3270] cmp deref rhs: ptr -> {:?}", rhs_val.sort());
-            *rhs = rhs_val;
+        if let Some(val) = self.resolve_cmp_deref_operand(expr, pointee_ty, modified_locals) {
+            debug!(?pointee_ty, "cmp deref (asymmetric): ptr -> {:?}", val.sort());
+            *expr = val;
         }
     }
 

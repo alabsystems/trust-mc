@@ -7812,9 +7812,28 @@ mod tests {
     #[test]
     #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
     fn single_cell_alloca_is_default_on_but_escape_and_type_punning_fail_closed() {
-        for shape in
-            [ProofAuthorityAttackShape::ScalarAlloca, ProofAuthorityAttackShape::AggregateAlloca]
-        {
+        for shape in [
+            ProofAuthorityAttackShape::ScalarAlloca,
+            ProofAuthorityAttackShape::AggregateAlloca,
+            // CrossBlockScalarAlloca was pinned as a rejection when this gate was
+            // written (2026-08-13) on the rationale that a cell whose accesses
+            // leave its defining block "can go stale" — true of the per-block
+            // `stack_cells` lane, and NOT true of this shape. `translate_chc`'s
+            // mem2reg promotion (landed 2026-07-02, six weeks EARLIER, and simply
+            // not accounted for by that gate) threads an un-aliased scalar cell
+            // through every block relation and updates it on each store, so the
+            // join-block Load reads the exact stored value. The gate's job is to
+            // mirror the translator's exact lanes; there are two, and this is the
+            // second. The stale-cell hazards it guards against are each still
+            // pinned as rejections below: an uninitialized read
+            // (`UninitializedScalarAlloca`), an unmodeled alignment claim, a
+            // type-punned access, and an escaping pointer. `volatile` — which the
+            // promotion analysis itself ignores, and which would leave a promoted
+            // cell holding its pre-store value in a non-def block — is excluded by
+            // `single_cell_alloca_is_admissible` and pinned in
+            // trust-mc-trust-bmc's `rejects_volatile_access_on_a_promoted_cell`.
+            ProofAuthorityAttackShape::CrossBlockScalarAlloca,
+        ] {
             let admitted = proof_authority_attack_bundle(shape);
             validate_native_bundle_proof_authority_input(&admitted, None)
                 .unwrap_or_else(|error| panic!("{shape:?} has an exact CHC model: {error}"));
@@ -7822,8 +7841,12 @@ mod tests {
 
         for shape in [
             ProofAuthorityAttackShape::Alloca,
+            // An uninitialized read stays fail-closed under BOTH lanes. The
+            // translator seeds an un-stored cell with one stable fresh symbol,
+            // which is arbitrary but self-consistent — strictly weaker than the
+            // `undef` a real uninitialized read has, so two loads of one uninit
+            // cell would be proved equal against a program that is UB.
             ProofAuthorityAttackShape::UninitializedScalarAlloca,
-            ProofAuthorityAttackShape::CrossBlockScalarAlloca,
             ProofAuthorityAttackShape::TypeMismatchedScalarAlloca,
             ProofAuthorityAttackShape::ExplicitlyAlignedScalarAlloca,
             ProofAuthorityAttackShape::ExplicitlyAlignedScalarAccess,

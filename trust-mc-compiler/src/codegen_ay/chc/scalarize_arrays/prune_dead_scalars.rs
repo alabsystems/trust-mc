@@ -4,10 +4,16 @@
 
 //! Dead scalar state variable elimination.
 //!
-//! Removes scalar (non-Array) state variables that are pure identity
-//! passthroughs: never constrained beyond `out = in` in any transition
-//! rule, and never read in any non-identity constraint. These variables
-//! inflate relation arity without carrying information.
+//! Removes scalar (non-Array) state SLOTS that are pure identity
+//! passthroughs: never constrained beyond a frame copy between two names of
+//! that same slot (`out = in`, `mid = in`, …) in any transition rule, and never
+//! read in any other constraint. These slots inflate relation arity without
+//! carrying information.
+//!
+//! Removal is positional and per relation: a column goes only when EVERY
+//! application of that relation carries a dead slot there, so the declaration
+//! and every application stay in lockstep. See `prune_dead_scalars` for what
+//! by-name removal cost.
 //!
 //! Common source: allocator MIR locals inlined into harness functions
 //! that are on return-reachable paths but carry no verification-relevant
@@ -17,147 +23,281 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ay_bindings::{Expr, ExprValue, Sort};
+use ay_bindings::{Expr, ExprValue};
 use tracing::debug;
 use trust_mc_core::chc::{ChcVc, RelationApp, Rule};
 use trust_mc_core::constraints::Constraints;
 
-/// Prune dead scalar state variables from the VC.
+/// Canonical slot identity of a state-variable name.
 ///
-/// A scalar state variable is "dead" if:
+/// The encoder gives ONE relation column several names: the input var `X`, its
+/// output `X__out`, and — inside a composed large-step fragment — the mid-frame
+/// aliases `X__mid_bbN` / `X__mid_bbN__out` (`fragment_compose::set_names_to_mid`).
+/// All of them denote the same slot, so any decision about that COLUMN has to be
+/// taken on the canonical base, never on the surface name.
+///
+/// Mirrors `translate::canonical_slot_name`, minus the pad special case: a
+/// `__pad_*` filler is its own (unpaired) identity here.
+fn slot_base(name: &str) -> &str {
+    let mut base = name;
+    if let Some(pos) = base.find("__mid_bb") {
+        base = &base[..pos];
+    }
+    if let Some(stripped) = base.strip_suffix("__out") {
+        base = stripped;
+    }
+    base
+}
+
+/// `(= u v)` where `u` and `v` are two names of the SAME slot — the frame-copy
+/// shape (`X__out = X`, `X__mid_bb7 = X`, …). Returns that slot's canonical base.
+fn alias_identity_base(constraint: &Expr) -> Option<&str> {
+    let ExprValue::Eq(lhs, rhs) = constraint.value() else {
+        return None;
+    };
+    let (ExprValue::Var { name: n1 }, ExprValue::Var { name: n2 }) = (lhs.value(), rhs.value())
+    else {
+        return None;
+    };
+    let b1 = slot_base(n1);
+    if b1 == slot_base(n2) { Some(b1) } else { None }
+}
+
+/// Prune dead scalar state slots from the VC.
+///
+/// A scalar state slot is "dead" if:
 /// 1. It is not Array-sorted (arrays are handled by const_fold/scalarize)
-/// 2. In every transition rule, it only appears in identity constraints
-///    (`out = in`) or not at all
-/// 3. It is never read in any non-identity constraint in any rule
+/// 2. Every constraint that mentions ANY name of the slot is a frame copy
+///    between two names of that same slot (`out = in`, `mid = in`, …)
 ///
-/// Dead variables are removed from relation applications and declarations,
-/// and their identity constraints are dropped.
+/// Removal is POSITIONAL, per relation, and only for a relation all of whose
+/// applications currently conform to the declared arity. A column is dropped
+/// only when *every* application of that relation carries a dead slot there.
+///
+/// Why not by name (the shape this replaced): a relation column is a property of
+/// the RELATION, but the name at that column varies per rule — a fragment-composed
+/// application carries `X__mid_bbN` where the per-block applications carry `X`, and
+/// a padded application carries `__pad_*` where its peers carry a real slot. Filtering
+/// arguments by name therefore removed the column from SOME applications of a relation
+/// and not others. The declaration was then rebuilt from the first rule head only, and
+/// the sort-only `fixup_relation_app_arities` padded the short applications back to
+/// arity at the TAIL — shifting every column past the removal point. Two applications
+/// of one loop-head relation ended up disagreeing about which state variable owns a
+/// column, which is not cosmetic: it re-binds the loop counter's `Range { start, end }`
+/// to the wrong slots, `Range::next` computes `start < end` on swapped operands, the
+/// loop body becomes PROVABLY unreachable and every value it computes is frozen at its
+/// pre-loop value. Live on `kani/Intrinsics/Count/{ctlz,cttz}.rs`, where it refuted a
+/// true assertion; the mirror image of the same corruption fabricates PROOFS
+/// (`block_relation_slot_names_consistent`, `dual_slot_misalign_option_predicate`).
+///
+/// Part of #4050: PDR array-param bottleneck optimization.
 pub(super) fn prune_dead_scalars(vc: &mut ChcVc) {
     prune_dead_single_use_local_assignments(vc);
 
-    // Collect scalar (non-Array) state var pairs.
-    let mut scalar_pairs: Vec<(String, String)> = Vec::new();
-    let mut seen_inputs: HashSet<String> = HashSet::new();
+    // Candidate slots: canonical bases of every declared non-Array var.
+    let mut dead: HashSet<String> = HashSet::new();
     for v in vc.vars() {
-        if !v.sort.is_array() && !v.name.ends_with("__out") {
-            let output = format!("{}__out", v.name);
-            if !seen_inputs.contains(v.name.as_ref()) {
-                seen_inputs.insert(v.name.to_string());
-                scalar_pairs.push((v.name.to_string(), output));
-            }
+        if v.sort.is_array() {
+            continue;
         }
+        dead.insert(slot_base(v.name.as_ref()).to_string());
     }
-
-    if scalar_pairs.is_empty() {
+    let total_slots = dead.len();
+    if dead.is_empty() {
         prune_dead_single_use_local_assignments(vc);
         return;
     }
 
-    let constraint_infos: Vec<Vec<ConstraintInfo<'_>>> = vc
-        .rules
-        .iter()
-        .map(|rule| {
-            rule.body
-                .constraints
-                .iter()
-                .map(|constraint| ConstraintInfo {
-                    expr: constraint,
-                    mentions: expr_var_mentions(constraint),
-                })
-                .collect()
-        })
-        .collect();
-
-    // Identify dead scalars: for each pair, check all rules.
-    let mut dead_inputs: HashSet<String> = HashSet::new();
-    let mut dead_outputs: HashSet<String> = HashSet::new();
-
-    for (input_name, output_name) in &scalar_pairs {
-        if is_dead_scalar(&constraint_infos, input_name, output_name) {
-            dead_inputs.insert(input_name.clone());
-            dead_outputs.insert(output_name.clone());
+    // Disqualify every slot a non-frame-copy constraint reads or writes, under
+    // ANY of its names.
+    for rule in &vc.rules {
+        for constraint in rule.body.constraints.iter() {
+            if alias_identity_base(constraint).is_some() {
+                continue;
+            }
+            for name in expr_var_mentions(constraint) {
+                dead.remove(slot_base(&name));
+            }
         }
     }
 
-    if dead_inputs.is_empty() {
+    if dead.is_empty() {
+        prune_dead_single_use_local_assignments(vc);
+        return;
+    }
+
+    // Per-relation dead-column mask. `None` = do not touch this relation's
+    // columns: some application does not conform to the declared arity, or two
+    // applications disagree about which slot owns a column, so positions are not
+    // comparable across its applications.
+    //
+    // A column is droppable only when EVERY application either names the same
+    // dead slot there or passes a variable-free constant (whose value nothing
+    // can read, the slot being dead), and at least one application names it — a
+    // column no application names cannot be shown dead.
+    let decl_arity: HashMap<String, usize> =
+        vc.relations.iter().map(|r| (r.name.clone(), r.arg_sorts.len())).collect();
+    // relation -> per position: (droppable-so-far, slot named here, saw a name)
+    let mut acc: HashMap<String, Option<Vec<(bool, Option<String>, bool)>>> = HashMap::new();
+    for rule in &vc.rules {
+        let mut observe = |app: &RelationApp| {
+            let Some(&arity) = decl_arity.get(app.name.as_str()) else {
+                acc.insert(app.name.to_string(), None);
+                return;
+            };
+            let entry = acc
+                .entry(app.name.to_string())
+                .or_insert_with(|| Some(vec![(true, None, false); arity]));
+            let Some(columns) = entry.as_mut() else { return };
+            if app.args.len() != arity {
+                *entry = None;
+                return;
+            }
+            for (k, arg) in app.args.iter().enumerate() {
+                match arg.value() {
+                    ExprValue::Var { name } => {
+                        let base = slot_base(name).to_string();
+                        match &columns[k].1 {
+                            // Two applications name different slots at one
+                            // column: the frame is already corrupt, so refuse
+                            // to edit this relation at all.
+                            Some(seen) if *seen != base => {
+                                *entry = None;
+                                return;
+                            }
+                            Some(_) => {}
+                            None => columns[k].1 = Some(base.clone()),
+                        }
+                        columns[k].2 = true;
+                        if !dead.contains(base.as_str()) {
+                            columns[k].0 = false;
+                        }
+                    }
+                    _ if !expr_mentions_any_var(arg) => {}
+                    _ => columns[k].0 = false,
+                }
+            }
+        };
+        observe(&rule.head);
+        if let Some(ref body_rel) = rule.body.relation {
+            observe(body_rel);
+        }
+    }
+    let masks: HashMap<String, Option<Vec<bool>>> = acc
+        .into_iter()
+        .map(|(name, columns)| {
+            let mask = columns.map(|cols| {
+                cols.into_iter().map(|(droppable, _, named)| droppable && named).collect()
+            });
+            (name, mask)
+        })
+        .collect();
+
+    let pruned_columns: usize = masks
+        .values()
+        .flatten()
+        .map(|mask| mask.iter().filter(|dead_col| **dead_col).count())
+        .sum();
+    if pruned_columns == 0 {
         prune_dead_single_use_local_assignments(vc);
         return;
     }
 
     debug!(
-        total_scalar_pairs = scalar_pairs.len(),
-        dead_scalars = dead_inputs.len(),
-        live_scalars = scalar_pairs.len() - dead_inputs.len(),
+        total_slots,
+        dead_slots = dead.len(),
+        pruned_columns,
         "CHC: pruning dead identity-passthrough scalars"
     );
 
-    // Rewrite all rules: drop identity constraints, remove dead vars from relations.
+    // Rewrite all rules: drop the dead columns, then the now-inert frame copies.
     for rule in &mut vc.rules {
-        let old_constraints: Vec<Expr> = rule.body.constraints.iter().cloned().collect();
-        let new_constraints: Vec<Expr> = old_constraints
-            .into_iter()
-            .filter(|c| !is_dead_identity_constraint(c, &dead_inputs, &dead_outputs))
+        rule.head = remove_dead_columns(&rule.head, &masks);
+        if let Some(ref body_rel) = rule.body.relation {
+            rule.body.relation = Some(remove_dead_columns(body_rel, &masks));
+        }
+
+        // A frame copy is only inert once BOTH its names have left this rule's
+        // relation atoms. A slot can be dead yet still occupy a column of a
+        // relation this pass declined to touch; dropping its copy there would
+        // turn the surviving column into an unconstrained free variable.
+        let still_framed = relation_arg_vars(rule);
+        let new_constraints: Vec<Expr> = rule
+            .body
+            .constraints
+            .iter()
+            .filter(|c| !is_inert_dead_frame_copy(c, &dead, &still_framed))
+            .cloned()
             .collect();
         rule.body.constraints = Constraints::Owned(new_constraints);
-
-        rule.head = remove_dead_args(&rule.head, &dead_inputs, &dead_outputs);
-        if let Some(ref body_rel) = rule.body.relation {
-            rule.body.relation = Some(remove_dead_args(body_rel, &dead_inputs, &dead_outputs));
-        }
     }
 
-    // Rewrite relation declarations.
-    let mut relation_sorts: HashMap<String, Vec<Sort>> = HashMap::new();
-    for rule in &vc.rules {
-        let name = rule.head.name.to_string();
-        relation_sorts.entry(name).or_insert_with(|| {
-            let sorts: Vec<Sort> = rule.head.args.iter().map(|a| a.sort().clone()).collect();
-            sorts
+    // Rewrite relation declarations with the same mask that rewrote the apps.
+    for rel in &mut vc.relations {
+        let Some(Some(mask)) = masks.get(&rel.name) else { continue };
+        if mask.len() != rel.arg_sorts.len() {
+            continue;
+        }
+        let mut position = 0usize;
+        rel.arg_sorts.retain(|_| {
+            let keep = !mask[position];
+            position += 1;
+            keep
         });
     }
-    for rel in &mut vc.relations {
-        if let Some(new_sorts) = relation_sorts.get(&rel.name) {
-            rel.arg_sorts = new_sorts.clone();
-        }
-    }
 
-    debug!(pruned = dead_inputs.len(), "CHC: dead scalar pruning complete");
+    debug!(pruned = pruned_columns, "CHC: dead scalar pruning complete");
 
     prune_dead_single_use_local_assignments(vc);
 }
 
-struct ConstraintInfo<'a> {
-    expr: &'a Expr,
-    mentions: HashSet<String>,
-}
-
-/// Check if a scalar state variable is dead (pure identity passthrough).
-fn is_dead_scalar(rules: &[Vec<ConstraintInfo<'_>>], input_name: &str, output_name: &str) -> bool {
-    for rule in rules {
-        for constraint in rule {
-            if is_identity_constraint(constraint.expr, input_name, output_name) {
-                continue;
-            }
-            if constraint.mentions.contains(output_name) || constraint.mentions.contains(input_name)
-            {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Check if a constraint is `(= var1 var2)` where one is input and other is output.
-fn is_identity_constraint(constraint: &Expr, input_name: &str, output_name: &str) -> bool {
-    let ExprValue::Eq(lhs, rhs) = constraint.value() else {
+/// Is this constraint a frame copy of a dead slot whose names have all left the
+/// rule's relation atoms?
+fn is_inert_dead_frame_copy(
+    constraint: &Expr,
+    dead: &HashSet<String>,
+    still_framed: &HashSet<String>,
+) -> bool {
+    let Some(base) = alias_identity_base(constraint) else {
         return false;
     };
-    match (lhs.value(), rhs.value()) {
-        (ExprValue::Var { name: n1 }, ExprValue::Var { name: n2 }) => {
-            (n1 == input_name && n2 == output_name) || (n1 == output_name && n2 == input_name)
-        }
-        _ => false,
+    if !dead.contains(base) {
+        return false;
     }
+    expr_var_mentions(constraint).iter().all(|name| !still_framed.contains(name))
+}
+
+/// Drop the dead columns of a relation application, by POSITION.
+fn remove_dead_columns(
+    app: &RelationApp,
+    masks: &HashMap<String, Option<Vec<bool>>>,
+) -> RelationApp {
+    let Some(Some(mask)) = masks.get(app.name.as_str()) else {
+        return app.clone();
+    };
+    if mask.len() != app.args.len() {
+        return app.clone();
+    }
+    let new_args: Vec<Expr> = app
+        .args
+        .iter()
+        .zip(mask.iter())
+        .filter(|(_, dead_col)| !**dead_col)
+        .map(|(arg, _)| arg.clone())
+        .collect();
+    RelationApp::new(app.name.as_str(), new_args)
+}
+
+/// Does this expression mention any variable at all?
+fn expr_mentions_any_var(expr: &Expr) -> bool {
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        if matches!(node.value(), ExprValue::Var { .. }) {
+            return true;
+        }
+        stack.extend(node.children());
+    }
+    false
 }
 
 /// Collect all variable names mentioned by an expression tree once.
@@ -171,47 +311,6 @@ fn expr_var_mentions(expr: &Expr) -> HashSet<String> {
         stack.extend(node.children());
     }
     mentions
-}
-
-/// Check if a constraint is a dead identity passthrough.
-fn is_dead_identity_constraint(
-    constraint: &Expr,
-    dead_inputs: &HashSet<String>,
-    dead_outputs: &HashSet<String>,
-) -> bool {
-    let ExprValue::Eq(lhs, rhs) = constraint.value() else {
-        return false;
-    };
-    if let (ExprValue::Var { name: n1 }, ExprValue::Var { name: n2 }) = (lhs.value(), rhs.value()) {
-        // Drop (= dead_out dead_in) or (= dead_in dead_out)
-        if (dead_outputs.contains(n1.as_str()) && dead_inputs.contains(n2.as_str()))
-            || (dead_outputs.contains(n2.as_str()) && dead_inputs.contains(n1.as_str()))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Remove dead vars from a relation application.
-fn remove_dead_args(
-    app: &RelationApp,
-    dead_inputs: &HashSet<String>,
-    dead_outputs: &HashSet<String>,
-) -> RelationApp {
-    let new_args: Vec<Expr> = app
-        .args
-        .iter()
-        .filter(|arg| {
-            if let ExprValue::Var { name } = arg.value() {
-                !dead_inputs.contains(name.as_str()) && !dead_outputs.contains(name.as_str())
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect();
-    RelationApp::new(app.name.as_str(), new_args)
 }
 
 /// Drop constraints like `(= tmp expr)` when `tmp` is a rule-local

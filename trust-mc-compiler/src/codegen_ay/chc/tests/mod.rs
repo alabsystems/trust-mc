@@ -99,6 +99,7 @@ mod test_call_inline_alloc_metadata;
 mod test_call_inline_field_map_scope;
 mod test_call_iterator_adapter;
 mod test_call_layout_semantic;
+mod test_call_libc_mem;
 mod test_call_mem_swap;
 mod test_call_misc_intrinsics_fallback;
 mod test_call_numeric;

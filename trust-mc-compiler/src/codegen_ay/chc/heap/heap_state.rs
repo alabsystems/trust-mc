@@ -136,6 +136,17 @@ pub(in crate::codegen_ay::chc) struct ChcHeapState {
     /// actually materializes a region/type array state for that object.
     pub(in crate::codegen_ay::chc) zeroed_heap_objects: HashSet<u32>,
 
+    /// Heap object IDs produced by the direct `libc::malloc` model.
+    ///
+    /// Part of #3175: a raw C allocation is untyped storage whose ONLY readers
+    /// are the memory arrays (region / type overlay). That is what makes a
+    /// whole-object `libc::memset` fill expressible: every reader of the object
+    /// sees the stores. It is NOT true of a stack local's address object (read
+    /// through its state variable) nor of a collection's backing buffer (read
+    /// through the collection's logical data array), so the memset model admits
+    /// only the objects recorded here rather than any object with a known size.
+    pub(in crate::codegen_ay::chc) c_malloc_objects: HashSet<u32>,
+
     /// Concrete heap allocation sizes known at codegen time.
     ///
     /// This is a side-channel for solver-simplifying access bounds checks on
@@ -269,6 +280,7 @@ impl ChcHeapState {
             promoted_const_obj_id: 1,
             mirror_base_addrs: HashMap::new(),
             zeroed_heap_objects: HashSet::new(),
+            c_malloc_objects: HashSet::new(),
             known_heap_alloc_sizes: HashMap::new(),
             provably_valid_backing_ids: HashSet::new(),
             type_overlay_heap_objects: HashMap::new(),
@@ -366,6 +378,17 @@ impl ChcHeapState {
     /// Returns the mirror base address for a type key, if recorded in this block.
     pub(in crate::codegen_ay::chc) fn get_mirror_base_addr(&self, type_key: &str) -> Option<&Expr> {
         self.mirror_base_addrs.get(type_key)
+    }
+
+    /// Record `obj_id` as the result of the direct `libc::malloc` model.
+    /// See [`Self::c_malloc_objects`].
+    pub(in crate::codegen_ay::chc) fn mark_c_malloc_obj(&mut self, obj_id: u32) {
+        self.c_malloc_objects.insert(obj_id);
+    }
+
+    /// Whether `obj_id` is a raw C allocation from the `libc::malloc` model.
+    pub(in crate::codegen_ay::chc) fn is_c_malloc_obj(&self, obj_id: u32) -> bool {
+        self.c_malloc_objects.contains(&obj_id)
     }
 
     pub(in crate::codegen_ay::chc) fn mark_heap_obj_zeroed(&mut self, obj_id: u32) {

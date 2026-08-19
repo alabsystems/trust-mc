@@ -840,93 +840,7 @@ impl<'a> ChcFuncTranslator<'a> {
     fn compute_promotable_cells(
         &self,
     ) -> (Vec<(ValueId, Ty)>, std::collections::BTreeMap<u32, BlockId>) {
-        use std::collections::{BTreeMap, BTreeSet};
-
-        // 1. Candidates: every `Alloca { count: None }` of a precise scalar type
-        //    with a first result. Keyed by result index for cheap membership tests.
-        let mut candidate_ty: BTreeMap<u32, Ty> = BTreeMap::new();
-        let mut candidate_val: BTreeMap<u32, ValueId> = BTreeMap::new();
-        let mut def_block: BTreeMap<u32, BlockId> = BTreeMap::new();
-        for block in &self.func.blocks {
-            for node in &block.body {
-                if let Inst::Alloca { ty, count: None, .. } = &node.inst
-                    && is_precise_stack_scalar_ty(ty)
-                    && let Some(result) = node.results.first()
-                {
-                    candidate_ty.insert(result.index(), ty.clone());
-                    candidate_val.insert(result.index(), *result);
-                    def_block.insert(result.index(), block.id);
-                }
-            }
-        }
-        if candidate_ty.is_empty() {
-            return (Vec::new(), BTreeMap::new());
-        }
-
-        // 2. Disqualify any candidate whose pointer is aliased (escapes past a
-        //    direct, matching-type Load/Store `ptr` use).
-        let mut disqualified: BTreeSet<u32> = BTreeSet::new();
-        for block in &self.func.blocks {
-            for node in &block.body {
-                match &node.inst {
-                    // A Load reads only through `ptr`; that use is allowed. The
-                    // loaded type must match the alloca type (else the threaded
-                    // leaf would not correspond to the cell).
-                    Inst::Load { ty, ptr, .. } => {
-                        if let Some(cell_ty) = candidate_ty.get(&ptr.index())
-                            && cell_ty != ty
-                        {
-                            disqualified.insert(ptr.index());
-                        }
-                    }
-                    // A Store's `ptr` use is allowed (matching type); its `value`
-                    // use is NOT — a candidate appearing as the stored value means
-                    // the pointer itself escaped into memory (aliasing).
-                    Inst::Store { ty, ptr, value, .. } => {
-                        if let Some(cell_ty) = candidate_ty.get(&ptr.index())
-                            && cell_ty != ty
-                        {
-                            disqualified.insert(ptr.index());
-                        }
-                        if candidate_ty.contains_key(&value.index()) {
-                            disqualified.insert(value.index());
-                        }
-                    }
-                    // Every other instruction: ANY value use of a candidate is an
-                    // alias. `collect_inst_value_uses` returns `true` for opaque /
-                    // unrecognized instructions (pushing nothing); treat that
-                    // conservatively by disqualifying all remaining candidates —
-                    // such an instruction could read a candidate pointer invisibly.
-                    other => {
-                        let mut uses = Vec::new();
-                        let conservative = collect_inst_value_uses(other, &mut uses);
-                        if conservative {
-                            for id in candidate_ty.keys() {
-                                disqualified.insert(*id);
-                            }
-                        } else {
-                            for used in uses {
-                                if candidate_ty.contains_key(&used.index()) {
-                                    disqualified.insert(used.index());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Surviving candidates, deterministic order by result index.
-        let mut promoted = Vec::new();
-        let mut promoted_def: BTreeMap<u32, BlockId> = BTreeMap::new();
-        for (index, ty) in &candidate_ty {
-            if disqualified.contains(index) {
-                continue;
-            }
-            promoted.push((candidate_val[index], ty.clone()));
-            promoted_def.insert(*index, def_block[index]);
-        }
-        (promoted, promoted_def)
+        compute_promotable_cells_of(self.func)
     }
 
     fn add_entry_rule(&mut self) {
@@ -4354,11 +4268,360 @@ fn aggregate_field_tys_of(module: &Module, ty: &Ty) -> Option<Vec<Ty>> {
     immediate_aggregate_field_tys(module, ty)
 }
 
+/// mem2reg candidate analysis, free of `&self` so the proof-grade ADMISSION
+/// predicate and the translator run the SAME analysis rather than two prose-
+/// synchronized copies. See `ChcTranslator::compute_promotable_cells` for the
+/// soundness argument; this is that function's whole body, moved verbatim.
+fn compute_promotable_cells_of(
+    func: &Function,
+) -> (Vec<(ValueId, Ty)>, std::collections::BTreeMap<u32, BlockId>) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // 1. Candidates: every `Alloca { count: None }` of a precise scalar type
+    //    with a first result. Keyed by result index for cheap membership tests.
+    let mut candidate_ty: BTreeMap<u32, Ty> = BTreeMap::new();
+    let mut candidate_val: BTreeMap<u32, ValueId> = BTreeMap::new();
+    let mut def_block: BTreeMap<u32, BlockId> = BTreeMap::new();
+    for block in &func.blocks {
+        for node in &block.body {
+            if let Inst::Alloca { ty, count: None, .. } = &node.inst
+                && is_precise_stack_scalar_ty(ty)
+                && let Some(result) = node.results.first()
+            {
+                candidate_ty.insert(result.index(), ty.clone());
+                candidate_val.insert(result.index(), *result);
+                def_block.insert(result.index(), block.id);
+            }
+        }
+    }
+    if candidate_ty.is_empty() {
+        return (Vec::new(), BTreeMap::new());
+    }
+
+    // 2. Disqualify any candidate whose pointer is aliased (escapes past a
+    //    direct, matching-type Load/Store `ptr` use).
+    let mut disqualified: BTreeSet<u32> = BTreeSet::new();
+    for block in &func.blocks {
+        for node in &block.body {
+            match &node.inst {
+                // A Load reads only through `ptr`; that use is allowed. The
+                // loaded type must match the alloca type (else the threaded
+                // leaf would not correspond to the cell).
+                Inst::Load { ty, ptr, .. } => {
+                    if let Some(cell_ty) = candidate_ty.get(&ptr.index())
+                        && cell_ty != ty
+                    {
+                        disqualified.insert(ptr.index());
+                    }
+                }
+                // A Store's `ptr` use is allowed (matching type); its `value`
+                // use is NOT — a candidate appearing as the stored value means
+                // the pointer itself escaped into memory (aliasing).
+                Inst::Store { ty, ptr, value, .. } => {
+                    if let Some(cell_ty) = candidate_ty.get(&ptr.index())
+                        && cell_ty != ty
+                    {
+                        disqualified.insert(ptr.index());
+                    }
+                    if candidate_ty.contains_key(&value.index()) {
+                        disqualified.insert(value.index());
+                    }
+                }
+                // Every other instruction: ANY value use of a candidate is an
+                // alias. `collect_inst_value_uses` returns `true` for opaque /
+                // unrecognized instructions (pushing nothing); treat that
+                // conservatively by disqualifying all remaining candidates —
+                // such an instruction could read a candidate pointer invisibly.
+                other => {
+                    let mut uses = Vec::new();
+                    let conservative = collect_inst_value_uses(other, &mut uses);
+                    if conservative {
+                        for id in candidate_ty.keys() {
+                            disqualified.insert(*id);
+                        }
+                    } else {
+                        for used in uses {
+                            if candidate_ty.contains_key(&used.index()) {
+                                disqualified.insert(used.index());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Surviving candidates, deterministic order by result index.
+    let mut promoted = Vec::new();
+    let mut promoted_def: BTreeMap<u32, BlockId> = BTreeMap::new();
+    for (index, ty) in &candidate_ty {
+        if disqualified.contains(index) {
+            continue;
+        }
+        promoted.push((candidate_val[index], ty.clone()));
+        promoted_def.insert(*index, def_block[index]);
+    }
+    (promoted, promoted_def)
+}
+
+/// The SECOND exact stack-cell lane: a cell the translator's mem2reg pass
+/// PROMOTES, i.e. threads through every block relation as an SSA-like value that
+/// stores update.
+///
+/// `single_cell_alloca_is_admissible`'s original clause mirrors only the
+/// translator's per-block `stack_cells` lane, so it rejects the ordinary
+/// `let k = if c { a } else { b };` shape rustc lowers as *alloca in the entry
+/// block, store in each arm, load in the join* — even though `translate_chc`
+/// models exactly that shape precisely. This clause admits it, and admits it by
+/// calling the translator's own promotion analysis
+/// (`compute_promotable_cells_of`) rather than restating it, so the admission
+/// predicate cannot drift from the model it is asserting about.
+///
+/// Promotion alone is NOT sufficient for proof grade; four further conditions
+/// are required here, each closing a lane where the translator's model is not
+/// the exact cell semantics:
+///
+///  * `align: None` on the Alloca AND on every access. The translator ignores
+///    `align` entirely, so a caller-asserted alignment is an unmodeled claim.
+///  * `volatile: false` on every access. A volatile Load is fresh havoc (sound,
+///    merely imprecise), but a volatile *Store* takes the `model_indirect_store`
+///    path, and in a NON-def block the cell has no `ptr_provenance` entry and
+///    nothing has escaped, so the store is classified `NoTrackedTarget` and the
+///    promoted cell KEEPS ITS PRE-STORE VALUE while `stack_ptrs` suppresses the
+///    fail-closed error. Reading that stale value back is a false-prove
+///    generator; excluding volatile accesses keeps it out of the proof lane.
+///  * the Alloca that defines the cell must itself carry `count: None` and the
+///    exact `ty` being admitted (the promotion analysis keys on the result id,
+///    this pins the instruction the driver is admitting).
+///  * DEFINITE INITIALIZATION: every `Load` of the cell must be preceded, on
+///    EVERY path from the function entry, by a `Store` to it. `translate_alloca`
+///    seeds an uninitialized cell with ONE stable fresh symbol, so the CHC reads
+///    an arbitrary but *self-consistent* value — which is strictly weaker than
+///    the `undef` an uninitialized Rust read actually has (two reads of one
+///    uninit cell need not agree, so `a = load c; b = load c; assert(a == b)`
+///    would PROVE against a program that is UB). That is a false-prove shape,
+///    not an over-approximation, so the block-local clause's "every load follows
+///    a store" requirement is kept here in its across-blocks form rather than
+///    dropped.
+///
+/// Everything else the block-local clause guards against is already discharged
+/// by promotion itself: aliasing (any non-`ptr` use disqualifies) and type
+/// punning (a mismatched access type disqualifies).
+fn promoted_cell_alloca_is_admissible(
+    function: &Function,
+    alloca_result: ValueId,
+    ty: &Ty,
+) -> bool {
+    let result = alloca_result.index();
+
+    // The instruction being admitted must be the metadata-less, exact-typed
+    // single-cell Alloca that defines this value.
+    let defines_exact_cell = function.blocks.iter().any(|block| {
+        block.body.iter().any(|node| {
+            node.results.iter().any(|value| value.index() == result)
+                && matches!(
+                    &node.inst,
+                    Inst::Alloca { ty: cell_ty, count: None, align: None } if cell_ty == ty
+                )
+        })
+    });
+    if !defines_exact_cell {
+        return false;
+    }
+
+    // The translator's own promotion verdict — not a restatement of it.
+    let (promoted, _) = compute_promotable_cells_of(function);
+    if !promoted.iter().any(|(cell, cell_ty)| cell.index() == result && cell_ty == ty) {
+        return false;
+    }
+
+    // No unmodeled access qualifier anywhere on this cell.
+    for block in &function.blocks {
+        for node in &block.body {
+            match &node.inst {
+                Inst::Load { ptr, volatile, align, .. }
+                | Inst::Store { ptr, volatile, align, .. } => {
+                    if ptr.index() == result && (*volatile || align.is_some()) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    promoted_cell_is_definitely_initialized(function, result)
+}
+
+/// Whether every `Load` of the promoted cell `cell` is preceded on EVERY path
+/// from the function entry by a `Store` to it — the across-blocks form of the
+/// block-local clause's `initialized` flag.
+///
+/// A forward MUST dataflow (meet = AND) over the block CFG: the entry starts
+/// uninitialized, an `Alloca` of the cell RESETS it (matching `translate_alloca`,
+/// which mints a new fresh cell each time the defining block executes — a cell
+/// alloca'd inside a loop is a new local per iteration), a `Store` sets it, and a
+/// `Load` while unset rejects. Interior blocks start optimistically initialized
+/// and the fixpoint only ever moves them to uninitialized, which is the standard
+/// greatest-fixpoint formulation of definite assignment; a loop header whose only
+/// store is inside the loop still meets with the entry's `false` and is rejected.
+///
+/// Every ambiguity fails CLOSED: a duplicate block id, a block with no
+/// terminator, an unrecognized terminator, a successor naming a missing block, a
+/// non-entry block with no predecessor (not reachable from the entry, so its
+/// incoming state is not derivable here), or a fixpoint that has not settled
+/// within its monotone bound all return `false`.
+fn promoted_cell_is_definitely_initialized(function: &Function, cell: u32) -> bool {
+    use std::collections::BTreeMap;
+
+    let count = function.blocks.len();
+    if count == 0 {
+        return false;
+    }
+
+    let mut index_of: BTreeMap<u32, usize> = BTreeMap::new();
+    for (index, block) in function.blocks.iter().enumerate() {
+        if index_of.insert(block.id.index(), index).is_some() {
+            return false;
+        }
+    }
+    let Some(&entry) = index_of.get(&function.entry.index()) else {
+        return false;
+    };
+
+    let mut successors: Vec<Vec<usize>> = Vec::with_capacity(count);
+    for block in &function.blocks {
+        let mut targets = Vec::new();
+        let mut terminated = false;
+        for node in &block.body {
+            if !node.inst.is_terminator() {
+                continue;
+            }
+            if collect_terminator_successors(&node.inst, &mut targets) {
+                return false;
+            }
+            terminated = true;
+            break;
+        }
+        if !terminated {
+            return false;
+        }
+        let mut resolved = Vec::with_capacity(targets.len());
+        for target in targets {
+            let Some(&index) = index_of.get(&target.index()) else {
+                return false;
+            };
+            resolved.push(index);
+        }
+        successors.push(resolved);
+    }
+
+    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (from, targets) in successors.iter().enumerate() {
+        for &target in targets {
+            predecessors[target].push(from);
+        }
+    }
+
+    let mut incoming = vec![true; count];
+    let mut outgoing = vec![true; count];
+    incoming[entry] = false;
+
+    // Knock every block that is NOT REACHABLE FROM ENTRY off the optimistic top.
+    //
+    // An earlier version tested `predecessors[block].is_empty()` instead. That fails
+    // OPEN, and adversarial review measured it: a non-entry block that is unreachable
+    // from `entry` but lies in a MUTUALLY-REFERENTIAL region has predecessors (each
+    // other), so it kept `incoming = true` forever — the AND over its own cycle never
+    // introduces a `false`. A Load of a never-stored cell inside such a region would
+    // then be treated as definitely initialized, which is the exact fail-open this
+    // predicate exists to prevent. Pred-count is not reachability; compute reachability.
+    //
+    // Unreachable code cannot initialize anything on any real execution, so `false`
+    // ("not definitely initialized") is both the sound and the honest value: a Load
+    // there declines admission rather than being waved through.
+    let mut reachable = vec![false; count];
+    reachable[entry] = true;
+    let mut stack = vec![entry];
+    while let Some(block) = stack.pop() {
+        for &next in &successors[block] {
+            if next < count && !reachable[next] {
+                reachable[next] = true;
+                stack.push(next);
+            }
+        }
+    }
+    for block in 0..count {
+        if block != entry && !reachable[block] {
+            incoming[block] = false;
+        }
+    }
+
+    // Monotone descent from the optimistic top: each of the 2*count lattice
+    // slots can flip true -> false at most once, so 2*count + 1 rounds is a hard
+    // bound on convergence. Not converging is a contradiction, not a verdict.
+    let mut settled = false;
+    for _ in 0..(2 * count + 1) {
+        let mut changed = false;
+        for block in 0..count {
+            let (out, _) =
+                promoted_cell_block_transfer(&function.blocks[block], cell, incoming[block]);
+            if outgoing[block] != out {
+                outgoing[block] = out;
+                changed = true;
+            }
+        }
+        for block in 0..count {
+            if block == entry || predecessors[block].is_empty() {
+                continue;
+            }
+            let next = predecessors[block].iter().all(|&pred| outgoing[pred]);
+            if incoming[block] != next {
+                incoming[block] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            settled = true;
+            break;
+        }
+    }
+    if !settled {
+        return false;
+    }
+
+    (0..count)
+        .all(|block| promoted_cell_block_transfer(&function.blocks[block], cell, incoming[block]).1)
+}
+
+/// One block's contribution to [`promoted_cell_is_definitely_initialized`]:
+/// `(state at the terminator, no load of an uninitialized cell in this block)`.
+///
+/// An `Alloca` of the cell RESETS the state, matching `translate_alloca`, which
+/// mints a fresh unconstrained cell every time the defining block executes.
+fn promoted_cell_block_transfer(block: &Block, cell: u32, mut state: bool) -> (bool, bool) {
+    for node in &block.body {
+        match &node.inst {
+            Inst::Alloca { .. } if node.results.iter().any(|value| value.index() == cell) => {
+                state = false;
+            }
+            Inst::Store { ptr, .. } if ptr.index() == cell => state = true,
+            Inst::Load { ptr, .. } if ptr.index() == cell && !state => return (state, false),
+            _ => {}
+        }
+        if node.inst.is_terminator() {
+            break;
+        }
+    }
+    (state, true)
+}
+
 /// Whether proof-grade native ingestion may admit a metadata-less, single-cell
 /// `Alloca` without importing source authority.
 ///
-/// This deliberately mirrors the CHC translator's tracked-versus-opaque split.
-/// A precise scalar or trackable aggregate is admitted only when its pointer is
+/// This deliberately mirrors the CHC translator's tracked-versus-opaque split,
+/// which has TWO exact lanes. The first (below) is the per-block `stack_cells`
+/// lane: a precise scalar or trackable aggregate is admitted when its pointer is
 /// used exclusively in its defining block as the direct operand of same-type,
 /// non-volatile loads and stores with no caller-asserted alignment, and every
 /// load follows a store. That prevents an uninitialized read, alias, volatile
@@ -4369,11 +4632,25 @@ fn aggregate_field_tys_of(module: &Module, ty: &Ty) -> Option<Vec<Ty>> {
 /// surface merely because the value model is imprecise. The translator's
 /// independent indirect-store invalidation remains a second line of defense
 /// rather than an admission premise.
+///
+/// The second lane is `promoted_cell_alloca_is_admissible` — the mem2reg
+/// promotion the translator already performs, which models an un-aliased scalar
+/// cell exactly ACROSS blocks. Neither lane subsumes the other: the block-local
+/// one also covers aggregates (never promoted), the promoted one also covers
+/// cross-block and uninitialized-on-some-path cells.
 pub fn single_cell_alloca_is_admissible(
     function: &Function,
     alloca_result: ValueId,
     ty: &Ty,
 ) -> bool {
+    block_local_alloca_is_admissible(function, alloca_result, ty)
+        || promoted_cell_alloca_is_admissible(function, alloca_result, ty)
+}
+
+/// Lane 1 of [`single_cell_alloca_is_admissible`]: the per-block `stack_cells`
+/// model. Unchanged behavior — split out only so the two lanes can be measured
+/// independently.
+fn block_local_alloca_is_admissible(function: &Function, alloca_result: ValueId, ty: &Ty) -> bool {
     let aggregate = matches!(
         ty,
         Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, _) | Ty::Unit | Ty::Closure(_) | Ty::Enum(_)
@@ -5216,5 +5493,242 @@ mod mem2reg_tests {
             !promoted_ids.contains(&escaped.index()),
             "an alloca whose pointer is stored as a Store value escaped — must NOT be promoted"
         );
+    }
+
+    /// The `let k = if i < 8 { i } else { 7 };` shape, exactly as rustc's MIR and
+    /// `trust-ir-bridge::promote_local_to_memory` lower a local written in more
+    /// than one block: ALLOCA in the entry block, a STORE in each arm, a LOAD in
+    /// the join. Returns `(module, cell, join_block)`.
+    fn build_clamp_join(
+        volatile_join_store: bool,
+        aligned_join_store: bool,
+        alias_the_cell: bool,
+    ) -> (Module, ValueId, BlockId) {
+        let mut mb = ModuleBuilder::new("mem2reg_clamp_join");
+        let ft = mb.add_func_type(vec![Ty::U64], vec![Ty::U64]);
+        let mut fb = mb.function("slot_index", ft);
+
+        let entry = fb.create_block();
+        let then_block = fb.create_block();
+        let else_block = fb.create_block();
+        let join = fb.create_block();
+        fb.set_entry(entry);
+
+        fb.switch_to_block(entry);
+        let i = fb.add_block_param(entry, Ty::U64);
+        let cell = fb.alloca(Ty::U64);
+        let eight = fb.iconst(Ty::U64, 8);
+        let lt = fb.icmp(ICmpOp::Ult, Ty::U64, i, eight);
+        fb.condbr(lt, then_block, vec![], else_block, vec![]);
+
+        // then: k = i
+        fb.switch_to_block(then_block);
+        fb.store(Ty::U64, cell, i);
+        fb.br(join, vec![]);
+
+        // else: k = 7
+        fb.switch_to_block(else_block);
+        let seven = fb.iconst(Ty::U64, 7);
+        if volatile_join_store {
+            fb.store_volatile(Ty::U64, cell, seven);
+        } else if aligned_join_store {
+            fb.store_aligned(Ty::U64, cell, seven, 8);
+        } else {
+            fb.store(Ty::U64, cell, seven);
+        }
+        fb.br(join, vec![]);
+
+        // join: return k  (optionally leaking the cell pointer first)
+        fb.switch_to_block(join);
+        if alias_the_cell {
+            let sink = fb.alloca(Ty::Ptr);
+            fb.store(Ty::Ptr, sink, cell);
+        }
+        let k = fb.load(Ty::U64, cell);
+        fb.ret(vec![k]);
+        fb.build();
+
+        (mb.build(), cell, join)
+    }
+
+    /// THE gap this lane closes: the cross-block clamp/join cell is modeled
+    /// EXACTLY by mem2reg, but the block-local admission clause rejects it
+    /// because its accesses are not in the defining block. Both halves are
+    /// asserted so the differential — not just the final verdict — is pinned.
+    #[test]
+    fn admits_cross_block_promoted_cell_the_block_local_clause_rejects() {
+        let (module, cell, _join) = build_clamp_join(false, false, false);
+        let func = &module.functions[0];
+
+        assert!(
+            !block_local_alloca_is_admissible(func, cell, &Ty::U64),
+            "the store/load are outside the defining block, so lane 1 must still reject"
+        );
+        assert!(
+            promoted_cell_alloca_is_admissible(func, cell, &Ty::U64),
+            "an un-aliased scalar cell the translator promotes is exactly modeled across blocks"
+        );
+        assert!(single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+
+        // The admission premise must be the translator's OWN verdict.
+        let options = TranslateOptions::default();
+        let translator = ChcFuncTranslator::new(func, &module, &options);
+        let (promoted, _def) = translator.compute_promotable_cells();
+        assert!(
+            promoted.iter().any(|(value, _)| value.index() == cell.index()),
+            "admission is granted only for a cell the translator actually promotes"
+        );
+    }
+
+    /// A volatile STORE to a promoted cell in a non-def block is classified
+    /// `NoTrackedTarget` (no `ptr_provenance` outside the def block, nothing
+    /// escaped), so the cell keeps its PRE-store value while `stack_ptrs`
+    /// suppresses the fail-closed error — a stale read, i.e. a false-prove
+    /// generator. It must never reach the proof lane.
+    #[test]
+    fn rejects_volatile_access_on_a_promoted_cell() {
+        let (module, cell, _join) = build_clamp_join(true, false, false);
+        let func = &module.functions[0];
+        let options = TranslateOptions::default();
+        let translator = ChcFuncTranslator::new(func, &module, &options);
+        let (promoted, _def) = translator.compute_promotable_cells();
+        assert!(
+            promoted.iter().any(|(value, _)| value.index() == cell.index()),
+            "the promotion analysis itself ignores `volatile` — which is exactly why \
+             admission must not"
+        );
+        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+    }
+
+    /// The translator ignores `align` entirely, so a caller-asserted alignment is
+    /// an unmodeled claim and must stay out of the proof lane.
+    #[test]
+    fn rejects_caller_asserted_alignment_on_a_promoted_cell() {
+        let (module, cell, _join) = build_clamp_join(false, true, false);
+        let func = &module.functions[0];
+        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+    }
+
+    /// An aliased cell is not promoted, so neither lane may admit it.
+    #[test]
+    fn rejects_aliased_cross_block_cell() {
+        let (module, cell, _join) = build_clamp_join(false, false, true);
+        let func = &module.functions[0];
+        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+    }
+
+    /// An uninitialized read must stay fail-closed. The translator seeds an
+    /// un-stored cell with ONE stable fresh symbol, which is self-consistent
+    /// across reads — strictly weaker than `undef`, hence a false-prove shape
+    /// rather than an over-approximation.
+    #[test]
+    fn rejects_a_cross_block_load_of_an_unstored_cell() {
+        let mut mb = ModuleBuilder::new("mem2reg_uninit_join");
+        let ft = mb.add_func_type(vec![Ty::Bool], vec![Ty::U64]);
+        let mut fb = mb.function("uninit_join", ft);
+
+        let entry = fb.create_block();
+        let stores = fb.create_block();
+        let skips = fb.create_block();
+        let join = fb.create_block();
+        fb.set_entry(entry);
+
+        fb.switch_to_block(entry);
+        let cond = fb.add_block_param(entry, Ty::Bool);
+        let cell = fb.alloca(Ty::U64);
+        fb.condbr(cond, stores, vec![], skips, vec![]);
+
+        // Only ONE arm writes the cell.
+        fb.switch_to_block(stores);
+        let seven = fb.iconst(Ty::U64, 7);
+        fb.store(Ty::U64, cell, seven);
+        fb.br(join, vec![]);
+
+        fb.switch_to_block(skips);
+        fb.br(join, vec![]);
+
+        fb.switch_to_block(join);
+        let k = fb.load(Ty::U64, cell);
+        fb.ret(vec![k]);
+        fb.build();
+
+        let module = mb.build();
+        let func = &module.functions[0];
+        let options = TranslateOptions::default();
+        let translator = ChcFuncTranslator::new(func, &module, &options);
+        let (promoted, _def) = translator.compute_promotable_cells();
+        assert!(
+            promoted.iter().any(|(value, _)| value.index() == cell.index()),
+            "the cell is still un-aliased, so promotion alone would admit it — which is \
+             exactly why admission also demands definite initialization"
+        );
+        assert!(!promoted_cell_is_definitely_initialized(func, cell.index()));
+        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+    }
+
+    /// A loop whose only store is inside the body does NOT initialize the header's
+    /// load: the header's meet includes the entry's uninitialized state. Pins that
+    /// the optimistic-top fixpoint does not fabricate initialization around a back
+    /// edge.
+    #[test]
+    fn rejects_a_loop_header_load_initialized_only_inside_the_loop() {
+        let mut mb = ModuleBuilder::new("mem2reg_loop_uninit");
+        let ft = mb.add_func_type(vec![], vec![]);
+        let mut fb = mb.function("loop_uninit", ft);
+
+        let entry = fb.create_block();
+        let header = fb.create_block();
+        let body = fb.create_block();
+        let exit = fb.create_block();
+        fb.set_entry(entry);
+
+        fb.switch_to_block(entry);
+        let cell = fb.alloca(Ty::I64);
+        fb.br(header, vec![]);
+
+        fb.switch_to_block(header);
+        let cur = fb.load(Ty::I64, cell); // reads before any store on the first pass
+        let ten = fb.iconst(Ty::I64, 10);
+        let cmp = fb.icmp(ICmpOp::Slt, Ty::I64, cur, ten);
+        fb.condbr(cmp, body, vec![], exit, vec![]);
+
+        fb.switch_to_block(body);
+        let one = fb.iconst(Ty::I64, 1);
+        fb.store(Ty::I64, cell, one);
+        fb.br(header, vec![]);
+
+        fb.switch_to_block(exit);
+        fb.ret(vec![]);
+        fb.build();
+
+        let module = mb.build();
+        let func = &module.functions[0];
+        assert!(!promoted_cell_is_definitely_initialized(func, cell.index()));
+        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::I64));
+    }
+
+    /// The counterpart: `build_count_to_ten` stores in the entry block before the
+    /// loop, so the same header load IS definitely initialized.
+    #[test]
+    fn admits_a_loop_carried_cell_initialized_before_the_loop() {
+        let (module, acc, ..) = build_count_to_ten();
+        let func = &module.functions[0];
+        assert!(promoted_cell_is_definitely_initialized(func, acc.index()));
+        assert!(single_cell_alloca_is_admissible(func, acc, &Ty::I64));
+    }
+
+    /// The refactor that made the admission predicate call the translator's
+    /// promotion analysis must be behavior-identical for the translator.
+    #[test]
+    fn free_and_method_promotion_analyses_agree() {
+        let (module, ..) = build_count_to_ten();
+        let func = &module.functions[0];
+        let options = TranslateOptions::default();
+        let translator = ChcFuncTranslator::new(func, &module, &options);
+        assert_eq!(
+            translator.compute_promotable_cells().0.len(),
+            compute_promotable_cells_of(func).0.len()
+        );
+        assert_eq!(translator.compute_promotable_cells().1, compute_promotable_cells_of(func).1);
     }
 }

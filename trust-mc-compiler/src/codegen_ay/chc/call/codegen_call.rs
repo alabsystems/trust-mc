@@ -14,6 +14,8 @@
 //! Extracted from include!() to proper module via extension trait pattern.
 //! Part of #2306: include!() to proper module migration.
 
+#[path = "codegen_call_libc_mem.rs"]
+mod codegen_call_libc_mem;
 #[path = "codegen_call_posix_memalign.rs"]
 mod codegen_call_posix_memalign;
 #[path = "codegen_call_struct_map_accessor.rs"]
@@ -21,6 +23,7 @@ mod codegen_call_struct_map_accessor;
 #[path = "codegen_call_sysconf.rs"]
 mod codegen_call_sysconf;
 
+use self::codegen_call_libc_mem::CallDispatchLibcMem;
 use self::codegen_call_posix_memalign::CallDispatchPosixMemalign;
 use self::codegen_call_struct_map_accessor::CallDispatchStructMapAccessor;
 use self::codegen_call_sysconf::CallDispatchSysconf;
@@ -382,6 +385,13 @@ impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
 
         // Part of #3736: direct `libc::posix_memalign` FFI model.
         if self.is_foreign_call(dcx.func) && self.try_dispatch_call_posix_memalign(dcx) {
+            return true;
+        }
+
+        // Part of #3175: direct `libc::{malloc, free, memset}` FFI models. Each
+        // routes to the encoder's existing heap model; a shape the model cannot
+        // encode exactly returns false and keeps the fail-closed error() below.
+        if self.is_foreign_call(dcx.func) && self.try_dispatch_call_libc_mem(dcx) {
             return true;
         }
 

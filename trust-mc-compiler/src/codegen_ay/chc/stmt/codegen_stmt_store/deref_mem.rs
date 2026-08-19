@@ -223,12 +223,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Bounded backward walk answering "does `ptr_local` provably hold
     /// `&_target` with no projections?".
     ///
-    /// Follows only unprojected `Use(Copy|Move)` wrappers, so it never crosses
-    /// a load, a cast, an offset, or a field projection, and it requires every
-    /// local on the chain to be written exactly once so the answer is
-    /// path-independent. Any other shape answers `false`.
+    /// Follows only unprojected `Use(Copy|Move)` wrappers and the
+    /// single-element argument tuple that closure-call inlining introduces, so
+    /// it never crosses a load, a cast, an offset, or a field projection, and
+    /// it requires every local on the chain to be written exactly once so the
+    /// answer is path-independent. Any other shape answers `false`.
     fn ptr_provably_addresses_local(&self, ptr_local: usize, target: usize) -> bool {
-        use rustc_public::mir::{Operand, Rvalue, StatementKind};
+        use rustc_public::mir::{AggregateKind, Operand, Rvalue, StatementKind};
 
         let mut current = ptr_local;
         for _ in 0..8 {
@@ -259,6 +260,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 Some(Rvalue::Ref(_, _, p) | Rvalue::AddressOf(_, p)) => {
                     return p.projection.is_empty() && p.local == target;
+                }
+                // Closure-call inlining packs the callee's arguments into a
+                // one-element tuple and then binds the callee's parameter to
+                // the tuple local itself (`_p = move (_arg,)`, later read as
+                // `*_p`). The tuple has exactly one field, so `_p`'s value IS
+                // that field's value — the same identification the alloc_id
+                // `Aggregate` arm in `propagate_alloc_ids_for_assign` already
+                // makes when it hands `_p` this obj_id in the first place.
+                // Without the hop the walk stops here and a `&Enum`/`&*const T`
+                // ensures-closure parameter keeps the referent SLOT's obj_id,
+                // so `*result` reads the slot's own object instead of the
+                // pointer value stored in it (one deref level short).
+                Some(Rvalue::Aggregate(kind, operands))
+                    if matches!(kind, AggregateKind::Tuple) && operands.len() == 1 =>
+                {
+                    match &operands[0] {
+                        Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => {
+                            current = p.local;
+                        }
+                        _ => return false,
+                    }
                 }
                 _ => return false,
             }

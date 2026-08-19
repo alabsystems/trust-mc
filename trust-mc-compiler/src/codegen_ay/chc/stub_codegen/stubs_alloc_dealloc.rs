@@ -71,6 +71,41 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         args: &[Operand],
         modified_locals: &HashSet<usize>,
     ) -> Option<AllocCallResult> {
+        self.translate_dealloc_object(args, modified_locals, false)
+    }
+
+    /// Translate `libc::free(ptr)` to CHC constraints.
+    ///
+    /// Same free model as [`Self::translate_rust_dealloc`] — obj_valid is
+    /// cleared, the double-free and base-address obligations are emitted — with
+    /// the two differences the C contract dictates:
+    ///
+    /// - `free` carries NO size/align: those are the allocator's record, not the
+    ///   caller's. That is not an unresolved argument, so no sound-fallback is
+    ///   recorded for it and the Rust-only size-mismatch obligation is not
+    ///   applicable (it would compare the recorded size against nothing).
+    /// - `free(NULL)` is a defined no-op, so every obligation is exempted on a
+    ///   null pointer instead of reporting a double free.
+    ///
+    /// Part of #3175.
+    pub(in crate::codegen_ay::chc) fn translate_libc_free(
+        &mut self,
+        args: &[Operand],
+        modified_locals: &HashSet<usize>,
+    ) -> Option<AllocCallResult> {
+        self.translate_dealloc_object(args, modified_locals, true)
+    }
+
+    /// Shared free model behind `translate_rust_dealloc` / `translate_libc_free`.
+    ///
+    /// `libc_free` selects the C contract described on `translate_libc_free`;
+    /// `false` reproduces the Rust deallocator contract byte-for-byte.
+    fn translate_dealloc_object(
+        &mut self,
+        args: &[Operand],
+        modified_locals: &HashSet<usize>,
+        libc_free: bool,
+    ) -> Option<AllocCallResult> {
         // Address-vs-value: which argument is the FREED ADDRESS is read off the
         // Rust types in MIR, never off a width.
         //
@@ -142,6 +177,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             (raw_size_or_layout_expr, raw_align_expr)
         {
             (size_expr, align_expr, true)
+        } else if libc_free {
+            // `free(ptr)` has no size/align by construction — nothing failed to
+            // resolve, so this is NOT a fallback. `args_resolved = false` keeps
+            // the size-mismatch obligation (which has no operand to compare
+            // against here) unemitted; the placeholder size is never read.
+            (
+                Expr::bitvec_const(0u64, POINTER_WIDTH),
+                Expr::bitvec_const(0u64, POINTER_WIDTH),
+                false,
+            )
         } else {
             warn!(
                 "RustDealloc: failed to resolve size/align arguments; \
@@ -172,6 +217,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             safety_checks.extend(self.power_of_two_bv_check(align_expr.clone(), POINTER_WIDTH));
             safety_checks.extend(self.nonzero_bv_check(align_expr, POINTER_WIDTH));
         }
+
+        // `free(NULL)` is a defined no-op in C. Every obligation below is a
+        // property of a REAL allocation, so each one is exempted on the null
+        // pointer rather than reporting a double free on a legal call. Built
+        // before the pointer is consumed; `None` for the Rust ABI, where a null
+        // `__rust_dealloc` argument is undefined and must stay reportable.
+        let null_ptr_exemption = if libc_free {
+            ptr_expr.as_ref().and_then(|ptr| {
+                let width = ptr.sort().bitvec_width()?;
+                Some(ptr.clone().eq(Expr::bitvec_const(0u64, width)))
+            })
+        } else {
+            None
+        };
 
         if let Some(ptr) = ptr_expr {
             let (raw_obj_id_expr, raw_offset_expr) = match self.split_pointer(&ptr) {
@@ -287,6 +346,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.mark_heap_metadata_modified();
 
             debug!("CHC: RustDealloc - marked heap object as freed with double-free check");
+        }
+
+        if let Some(is_null) = null_ptr_exemption {
+            safety_checks =
+                safety_checks.into_iter().map(|check| Expr::or(is_null.clone(), check)).collect();
         }
 
         Some(AllocCallResult {

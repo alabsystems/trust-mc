@@ -10,9 +10,11 @@
 //! fallback and the entry rule never constrains the memory array. This module
 //! fixes the phase ordering by discovering callee statics during declaration.
 
+use std::collections::HashSet;
+
 use rustc_public::CrateDef;
 use rustc_public::mir::alloc::GlobalAlloc;
-use rustc_public::mir::{Operand, Rvalue, StatementKind};
+use rustc_public::mir::{AggregateKind, Operand, Rvalue, StatementKind};
 use tracing::debug;
 
 use super::ChcCtx;
@@ -152,8 +154,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // holds for arbitrary ambient state; pinning is fail-open).
                 // Interior-mut immutable statics flow through the per-field
                 // gate inside `register_static_memory_init_entries`.
-                let contract_havoc_mut_static =
-                    self.contract_static_havoc && self.tcx.is_mutable_static(internal_def_id);
+                // Kani-INTERNAL statics stay pinned, exactly as on the
+                // harness-side path (codegen_decl_static.rs, P2-S1): the
+                // contract machinery's `#[kanitool::recursion_tracker]`
+                // reentry flag must start at its initializer (`false`).
+                // Havocking it lets the solver enter the RECURSION/REPLACE
+                // arm on the OUTERMOST call, where `requires` is an
+                // ASSERTION rather than an assumption — a spurious CEX for
+                // every contract harness. The tracker is emitted INSIDE the
+                // contracted callee, so it always reaches this
+                // callee-discovered path and never the harness-side one.
+                // This narrows the havoc to ambient program state; it is
+                // not an exemption for anything the program can observe.
+                let is_kani_internal_static =
+                    crate::kani_middle::attributes::KaniAttributes::for_item(
+                        self.tcx,
+                        internal_def_id,
+                    )
+                    .is_recursion_tracker();
+                let contract_havoc_mut_static = self.contract_static_havoc
+                    && !is_kani_internal_static
+                    && self.tcx.is_mutable_static(internal_def_id);
 
                 if contract_havoc_mut_static {
                     debug!(
@@ -177,6 +198,56 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
         }
+    }
+
+    /// How many closure-nesting levels the static pre-scan descends.
+    ///
+    /// A closure constructed inside a body is machinery *of* that body, so
+    /// following it is a bounded, well-targeted descent — unlike following
+    /// every `Call` terminator, which would open the whole call graph.
+    /// Depth 1 is what reaches Kani's contract recursion tracker; 3 covers
+    /// the nested check/replace closures the contract expansion builds
+    /// underneath it.
+    const MAX_CLOSURE_PRESCAN_DEPTH: usize = 3;
+
+    /// Resolves the bodies of closures **constructed** inside `body`.
+    ///
+    /// `seen` de-duplicates by closure `DefId` so a body reached along two
+    /// paths is scanned once and the descent always terminates.
+    fn prescan_closure_bodies(
+        body: &rustc_public::mir::Body,
+        seen: &mut HashSet<rustc_public::DefId>,
+    ) -> Vec<rustc_public::mir::Body> {
+        use rustc_public::mir::mono::Instance;
+        use rustc_public::ty::ClosureKind;
+
+        let mut bodies = Vec::new();
+        for bb_data in &body.blocks {
+            for stmt in &bb_data.statements {
+                let StatementKind::Assign(_lhs, rhs) = &stmt.kind else {
+                    continue;
+                };
+                let Rvalue::Aggregate(AggregateKind::Closure(closure_def, closure_args), _) = rhs
+                else {
+                    continue;
+                };
+                if !seen.insert(closure_def.def_id()) {
+                    continue;
+                }
+                // The call kind is not recorded at the construction site; try
+                // each shape and take the first that yields a body.
+                for kind in [ClosureKind::FnOnce, ClosureKind::FnMut, ClosureKind::Fn] {
+                    if let Ok(instance) =
+                        Instance::resolve_closure(*closure_def, closure_args, kind)
+                        && let Some(closure_body) = instance.body()
+                    {
+                        bodies.push(closure_body);
+                        break;
+                    }
+                }
+            }
+        }
+        bodies
     }
 
     /// Pre-scans harness body Call terminators for callee statics.
@@ -211,6 +282,43 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         for callee_body in &callee_bodies {
             self.register_callee_body_statics(callee_body);
+        }
+
+        // Part of #4014 (completion): a static can sit one or more CLOSURE
+        // levels below the harness's direct callee, where a depth-1 Call scan
+        // never sees it. Kani's contract expansion has exactly that shape —
+        // the `#[kanitool::recursion_tracker]` REENTRY flag is declared inside
+        // `<contracted fn>::{closure#0}`, never in the contracted fn's own
+        // body. Discovered only later by the inline walker, its memory init
+        // arrives after `emit_entry_rule()` has already run, so the flag stays
+        // UNCONSTRAINED: the solver reads REENTRY = true on the OUTERMOST call,
+        // enters the contract's replace arm — where `requires` is an ASSERTION
+        // rather than an assumption — and reports a spurious counterexample on
+        // every recursive-contract harness. Seeding the queue from the harness
+        // body as well as its callees keeps closures created at either level in
+        // scope.
+        let mut seen_closures: HashSet<rustc_public::DefId> = HashSet::new();
+        let mut queue: Vec<(rustc_public::mir::Body, usize)> =
+            Self::prescan_closure_bodies(self.body, &mut seen_closures)
+                .into_iter()
+                .map(|b| (b, 1))
+                .collect();
+        for callee_body in &callee_bodies {
+            queue.extend(
+                Self::prescan_closure_bodies(callee_body, &mut seen_closures)
+                    .into_iter()
+                    .map(|b| (b, 1)),
+            );
+        }
+        while let Some((closure_body, depth)) = queue.pop() {
+            self.register_callee_body_statics(&closure_body);
+            if depth < Self::MAX_CLOSURE_PRESCAN_DEPTH {
+                queue.extend(
+                    Self::prescan_closure_bodies(&closure_body, &mut seen_closures)
+                        .into_iter()
+                        .map(|b| (b, depth + 1)),
+                );
+            }
         }
     }
 }

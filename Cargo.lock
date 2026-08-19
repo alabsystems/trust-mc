@@ -856,8 +856,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clean-kernel"
-version = "1.6.0"
-source = "git+https://github.com/alabsystems/clean.git?rev=bc2923ca9a1d0b7ec060803dc922b5e621309378#bc2923ca9a1d0b7ec060803dc922b5e621309378"
+version = "0.1.0"
+source = "git+https://github.com/alabsystems/clean.git?rev=ea0c5cee951ed4a6e085057f614bc6c98c7ab679#ea0c5cee951ed4a6e085057f614bc6c98c7ab679"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "kani"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kani_core",
  "kani_macros",
@@ -1383,14 +1383,14 @@ dependencies = [
 
 [[package]]
 name = "kani_core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kani_macros",
 ]
 
 [[package]]
 name = "kani_macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro-error2",
  "proc-macro2",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "std"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kani",
 ]
@@ -2698,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "home",
@@ -2764,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ay-bindings",
  "num-bigint",
@@ -2776,7 +2776,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-cov"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-driver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ay",

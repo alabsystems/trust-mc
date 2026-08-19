@@ -29,7 +29,7 @@ use super::codegen_call_cmp_string::cmp_slice_backing::{
 };
 use super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto};
 use super::codegen_call_kani_model_dst::is_zst_ty;
-use super::codegen_call_misc::CallMisc;
+use super::codegen_call_misc::{CallMisc, Referent};
 use super::codegen_expr_signedness::arg_signedness_for_cmp;
 use super::codegen_rules::CodegenRules;
 use tracing::debug;
@@ -78,19 +78,36 @@ impl<'tcx, 'body> CallCmp for ChcCtx<'tcx, 'body> {
         }
 
         // Part of #3041: Full 6-tier referent resolution (const refs, arg pointees).
-        let lhs = self.resolve_ref_or_const_referent(&cx.args[0], cx.modified_locals);
-        let rhs = self.resolve_ref_or_const_referent(&cx.args[1], cx.modified_locals);
+        // Tagged: the tier that answered is what says whether the term is the
+        // REFERENT's datum or the operand's own POINTER. At POINTER_WIDTH those
+        // are indistinguishable as bare `Expr`s, and the deref step below needs
+        // the distinction per operand — the two sides are routinely answered by
+        // different tiers (`&Enum` runtime value vs. promoted-constant tag).
+        let lhs = self.resolve_ref_or_const_referent_tagged(&cx.args[0], cx.modified_locals);
+        let rhs = self.resolve_ref_or_const_referent_tagged(&cx.args[1], cx.modified_locals);
 
-        let (Some(mut lhs), Some(mut rhs)) = (lhs, rhs) else {
+        let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
             // Part of #3041: decline so fn_inline can try the actual method body.
             return false;
         };
+        let lhs_is_own_pointer = matches!(lhs, Referent::Unreported(_));
+        let rhs_is_own_pointer = matches!(rhs, Referent::Unreported(_));
+        let mut lhs = lhs.into_expr();
+        let mut rhs = rhs.into_expr();
 
         // Part of #3248: use ZST-aware signedness for comparisons to avoid
         // spurious fallback counts on empty tuples and fieldless structs.
         let is_signed = arg_signedness_for_cmp(&cx.args[0], self.body.locals());
 
-        if self.prepare_cmp_operands(cx, dest_local, is_signed, &mut lhs, &mut rhs) {
+        if self.prepare_cmp_operands(
+            cx,
+            dest_local,
+            is_signed,
+            &mut lhs,
+            &mut rhs,
+            lhs_is_own_pointer,
+            rhs_is_own_pointer,
+        ) {
             return true;
         }
 
@@ -283,6 +300,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         is_signed: bool,
         lhs: &mut Expr,
         rhs: &mut Expr,
+        lhs_is_own_pointer: bool,
+        rhs_is_own_pointer: bool,
     ) -> bool {
         // Part of #4030: Raw pointer Ord compares addresses, not content.
         if !is_raw_ptr_cmp_arg(&cx.args[0], self.body.locals()) {
@@ -297,7 +316,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 return true;
             }
             // #3270: deref pointer operands to pointee values.
-            self.deref_cmp_operands_if_needed(lhs, rhs, &cx.args, cx.modified_locals);
+            self.deref_cmp_operands_if_needed(
+                lhs,
+                rhs,
+                &cx.args,
+                cx.modified_locals,
+                lhs_is_own_pointer,
+                rhs_is_own_pointer,
+            );
         }
         // Part of #4030: Double-ref raw pointer case (`&&*const T`).
         self.resolve_double_ref_raw_ptr_cmp(lhs, rhs, &cx.args, cx.modified_locals);

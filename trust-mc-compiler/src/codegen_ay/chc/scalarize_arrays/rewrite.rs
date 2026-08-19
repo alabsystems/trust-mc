@@ -404,15 +404,101 @@ fn build_scalar_store_constraints(
     constraints
 }
 
-/// Expand a relation application's args: replace Array-sorted Var expressions
-/// with scalar Var expressions.
+/// What a relation's column at one position is known to hold.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlanSlot {
+    /// No application has named a slot here yet.
+    Unknown,
+    /// Every naming application named the array with this `infos` index.
+    Array(usize),
+    /// Applications disagree, or one names something that is not a
+    /// scalarizable array — leave the column alone.
+    Conflict,
+}
+
+/// Per-relation, per-position scalarization plan.
+///
+/// A relation's column set is a property of the RELATION, but the ARGUMENT at a
+/// column varies per rule: the body application names the array `X`, the head
+/// names `X__out`, a fragment-composed application may name a `__mid_bbN` alias,
+/// and after constant propagation an application can carry a literal array
+/// (`((as const …) true)`) with no name at all. Expanding only the recognised
+/// NAMES therefore replaced the column in some applications of a relation and
+/// left it whole in others — the arities diverged, the sort-only fixup padded
+/// the short ones at the TAIL, and every column past the array shifted. That
+/// misalignment re-bound a loop counter's `Range { start, end }` to the wrong
+/// slots and made the `for` body unreachable (`kani/Intrinsics/Count/ctlz.rs`).
+///
+/// The plan records, per column, the array every naming application agrees the
+/// column holds, so the expansion can be applied by POSITION to every
+/// application — including the ones that do not name it.
+fn scalarize_position_plan(
+    vc: &ChcVc,
+    maps: &RewriteMaps,
+) -> HashMap<String, Vec<Option<usize>>> {
+    let decl_arity: HashMap<&str, usize> =
+        vc.relations.iter().map(|r| (r.name.as_str(), r.arg_sorts.len())).collect();
+    let mut acc: HashMap<String, Vec<PlanSlot>> = HashMap::new();
+    let observe = |app: &RelationApp, acc: &mut HashMap<String, Vec<PlanSlot>>| {
+        let Some(&arity) = decl_arity.get(app.name.as_str()) else { return };
+        let columns = acc.entry(app.name.to_string()).or_insert_with(|| vec![PlanSlot::Unknown; arity]);
+        if app.args.len() != arity {
+            // Arities already diverge here: positions are not comparable, so
+            // this relation gets no positional expansion.
+            columns.iter_mut().for_each(|slot| *slot = PlanSlot::Conflict);
+            return;
+        }
+        for (k, arg) in app.args.iter().enumerate() {
+            let ExprValue::Var { name } = arg.value() else { continue };
+            let named = maps.by_input.get(name).or_else(|| maps.by_output.get(name)).copied();
+            columns[k] = match (columns[k], named) {
+                (PlanSlot::Conflict, _) | (_, None) => PlanSlot::Conflict,
+                (PlanSlot::Unknown, Some(info_idx)) => PlanSlot::Array(info_idx),
+                (PlanSlot::Array(seen), Some(info_idx)) if seen == info_idx => {
+                    PlanSlot::Array(seen)
+                }
+                (PlanSlot::Array(_), Some(_)) => PlanSlot::Conflict,
+            };
+        }
+    };
+    for rule in &vc.rules {
+        observe(&rule.head, &mut acc);
+        if let Some(ref body_rel) = rule.body.relation {
+            observe(body_rel, &mut acc);
+        }
+    }
+    acc.into_iter()
+        .map(|(name, columns)| {
+            let plan = columns
+                .into_iter()
+                .map(|slot| match slot {
+                    PlanSlot::Array(info_idx) => Some(info_idx),
+                    _ => None,
+                })
+                .collect();
+            (name, plan)
+        })
+        .collect()
+}
+
+/// Expand a relation application's args: replace Array-sorted arguments with
+/// the array's tracked scalar lanes.
+///
+/// Named arguments (`X` / `X__out`) become the input/output lane variables. Any
+/// OTHER argument sitting in a column the plan says holds that array is expanded
+/// to `select(arg, idx)` per tracked lane — exact by definition of `select`, and
+/// it keeps the column count identical across every application of the relation.
+/// An array scalarized to ZERO lanes (nothing ever reads it) drops the column in
+/// both cases.
 pub(super) fn expand_relation_app(
     app: &RelationApp,
     infos: &[ScalarInfo],
     maps: &RewriteMaps,
+    plan: &HashMap<String, Vec<Option<usize>>>,
 ) -> RelationApp {
+    let columns = plan.get(app.name.as_str());
     let mut new_args = Vec::new();
-    for arg in app.args.iter() {
+    for (k, arg) in app.args.iter().enumerate() {
         if let ExprValue::Var { name } = arg.value() {
             if let Some(&info_idx) = maps.by_input.get(name) {
                 let info = &infos[info_idx];
@@ -428,6 +514,14 @@ pub(super) fn expand_relation_app(
                 }
                 continue;
             }
+        }
+        if let Some(&Some(info_idx)) = columns.and_then(|cols| cols.get(k)) {
+            let info = &infos[info_idx];
+            for idx in info.index_to_scalar.keys() {
+                let index = Expr::bitvec_const(idx.value.clone(), idx.width);
+                new_args.push(arg.clone().select(index));
+            }
+            continue;
         }
         new_args.push(arg.clone());
     }
@@ -449,6 +543,7 @@ fn stage_rule_rewrites(
     maps: &RewriteMaps,
     rewrite_ctx: &mut RewriteContext,
 ) -> Vec<StagedRule> {
+    let plan = &scalarize_position_plan(vc, maps);
     vc.rules
         .iter()
         .map(|rule| {
@@ -462,12 +557,12 @@ fn stage_rule_rewrites(
                 new_constraints.iter().map(|c| rewrite_expr(c, infos, maps, rewrite_ctx)).collect();
             StagedRule {
                 constraints: final_constraints,
-                head: expand_relation_app(&rule.head, infos, maps),
+                head: expand_relation_app(&rule.head, infos, maps, plan),
                 body_relation: rule
                     .body
                     .relation
                     .as_ref()
-                    .map(|body_rel| expand_relation_app(body_rel, infos, maps)),
+                    .map(|body_rel| expand_relation_app(body_rel, infos, maps, plan)),
             }
         })
         .collect()

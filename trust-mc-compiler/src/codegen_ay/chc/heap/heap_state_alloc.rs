@@ -104,6 +104,42 @@ impl ChcHeapState {
         self.provably_valid_backing_ids.contains(&obj_id)
     }
 
+    /// Mints the base address of a brand-new collection backing buffer:
+    /// `(concat obj_id:bv32 #x00000000)` — a fresh object id in the high half,
+    /// offset 0 in the low half — and registers the id as a provably-valid
+    /// backing so `heap_access_checks` does not read a free `obj_valid` entry
+    /// for it.
+    ///
+    /// This is PRECISION, not over-approximation. Callers are collection
+    /// constructors that always COPY into a freshly allocated buffer
+    /// (`slice::to_vec`, `<Vec<T> as From<&[T]>>::from`, …). The real allocator
+    /// hands back a live, non-null, correctly aligned base address that aliases
+    /// no other object, which is exactly the state pinned here. Leaving the
+    /// pointer a wholly free 64-bit word instead admits misaligned and dangling
+    /// addresses that no execution of the program can produce, which is what
+    /// fabricates alignment/validity counterexamples on safe code.
+    ///
+    /// Size 0 is recorded deliberately: the zero-size exemption in
+    /// `heap_access_checks` keeps this buffer's bounds checks vacuous, matching
+    /// what an unconstrained pointer already did (a non-constant obj_id skips
+    /// the bounds check entirely), and no concrete byte size is available —
+    /// capacity is symbolic and element contents are modeled by the
+    /// collection's `data` array rather than by byte offsets into this object.
+    ///
+    /// SOUNDNESS: only for constructors that allocate a fresh buffer. A
+    /// constructor that adopts caller-supplied memory (`Vec::from_raw_parts`)
+    /// or reuses an existing allocation (`<[T]>::into_vec`) must NOT use this —
+    /// there the pointer's validity is the property under test.
+    ///
+    /// Returns `None` on allocation-id overflow; callers fall back to their
+    /// previous unconstrained pointer.
+    pub(in crate::codegen_ay::chc) fn fresh_valid_backing_ptr(&mut self) -> Option<Expr> {
+        let obj_id = self.next_heap_alloc_id()?;
+        self.record_heap_alloc_size(obj_id, 0);
+        self.mark_provably_valid_backing(obj_id);
+        Some(Expr::bitvec_const(i128::from(obj_id), 32).concat(Expr::bitvec_const(0u64, 32)))
+    }
+
     /// Gets or creates a type-indexed memory array for the given type key.
     ///
     /// Type-indexed arrays partition memory by type signature for scalability.

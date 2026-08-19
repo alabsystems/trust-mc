@@ -13,6 +13,44 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, warn};
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Alignment a C `malloc` result is guaranteed to carry.
+    ///
+    /// C requires the returned block to be suitably aligned for any object with
+    /// a fundamental alignment requirement (`_Alignof(max_align_t)`), which is
+    /// 16 on every 64-bit target trust-mc encodes. The `libc::malloc` ABI has no
+    /// alignment ARGUMENT, so this is a property of the callee, not of the call
+    /// site — modelling it as anything weaker would under-align the result and
+    /// produce spurious alignment violations on the first typed access.
+    ///
+    /// Part of #3175: direct `libc::malloc` FFI model.
+    pub(in crate::codegen_ay::chc) const LIBC_MALLOC_ALIGN: u64 = 16;
+
+    /// Translate `libc::malloc(size)` to CHC constraints.
+    ///
+    /// Same object model as [`Self::translate_rust_alloc`] with two differences
+    /// that come straight from the C contract rather than from Rust's:
+    /// - the alignment is [`Self::LIBC_MALLOC_ALIGN`], not a call argument;
+    /// - `malloc(0)` is LEGAL (implementation-defined result), so the
+    ///   `size != 0` precondition Rust's allocator carries is not emitted.
+    ///
+    /// Returns `None` when the size operand does not translate — the caller
+    /// then falls through to the fail-closed undefined-foreign `error()` path
+    /// rather than inventing an allocation.
+    ///
+    /// Part of #3175.
+    pub(in crate::codegen_ay::chc) fn translate_libc_malloc(
+        &mut self,
+        args: &[Operand],
+        modified_locals: &HashSet<usize>,
+    ) -> Option<AllocCallResult> {
+        self.translate_alloc_object(
+            StubKind::RustAlloc,
+            args,
+            modified_locals,
+            Some(Self::LIBC_MALLOC_ALIGN),
+        )
+    }
+
     /// Translate `__rust_alloc` / `__rust_alloc_zeroed` to CHC constraints.
     ///
     /// Per design:
@@ -26,6 +64,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         args: &[Operand],
         modified_locals: &HashSet<usize>,
     ) -> Option<AllocCallResult> {
+        self.translate_alloc_object(stub, args, modified_locals, None)
+    }
+
+    /// Shared allocation-object model behind `translate_rust_alloc` and
+    /// `translate_libc_malloc`.
+    ///
+    /// `callee_align` is `Some(a)` only for an ABI whose alignment is fixed by
+    /// the CALLEE (C `malloc`) instead of passed as an argument; it also selects
+    /// the C zero-size rule. `None` reproduces the Rust allocator contract
+    /// byte-for-byte, so every pre-existing caller is unaffected.
+    fn translate_alloc_object(
+        &mut self,
+        stub: StubKind,
+        args: &[Operand],
+        modified_locals: &HashSet<usize>,
+        callee_align: Option<u64>,
+    ) -> Option<AllocCallResult> {
         // Support both alloc ABIs:
         // - __rust_alloc(size, align)
         // - std::alloc::alloc(layout) / alloc_zeroed(layout)
@@ -33,7 +88,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             args.first().and_then(|arg| self.resolve_layout_operand_expr(arg, modified_locals));
         let arg1_expr =
             args.get(1).and_then(|arg| self.resolve_layout_operand_expr(arg, modified_locals));
-        let (size_expr, align_expr, args_resolved) = if let Some((size, align)) = arg0_expr
+        let (size_expr, align_expr, args_resolved) = if let Some(align) = callee_align {
+            // C `malloc(size)`: one argument, alignment fixed by the callee.
+            let size = args
+                .first()
+                .and_then(|arg| self.translate_operand_with_modified(arg, modified_locals))?;
+            let size = crate::codegen_ay::types::coerce_bitvec_width_safe(
+                size,
+                POINTER_WIDTH,
+                crate::codegen_ay::types::SignExtension::ZeroExtend,
+            );
+            size.sort().bitvec_width()?;
+            (size, Expr::bitvec_const(u128::from(align), POINTER_WIDTH), true)
+        } else if let Some((size, align)) = arg0_expr
             .clone()
             .and_then(Self::extract_layout_size_align)
             .or_else(|| arg1_expr.clone().and_then(Self::extract_layout_size_align))
@@ -254,7 +321,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 ExprValue::BitVecConst { value, .. }
                     if u64::try_from(value).ok() == Some(0)
             );
-            if !is_zero_size {
+            // C `malloc(0)` is legal (implementation-defined result), so the
+            // Rust-allocator `size != 0` precondition must not be emitted for
+            // it — doing so reports a violation on a well-defined program.
+            if !is_zero_size && callee_align.is_none() {
                 safety_checks.extend(self.nonzero_bv_check(size_expr.clone(), 64));
             }
             safety_checks.extend(self.power_of_two_bv_check(align_expr.clone(), POINTER_WIDTH));

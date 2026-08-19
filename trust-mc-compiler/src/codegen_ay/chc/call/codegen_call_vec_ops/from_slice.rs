@@ -104,15 +104,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 return;
             };
 
-            let ptr = declare_pending_var(
-                {
-                    let mut n = String::with_capacity(ptr_name.len() + 15);
-                    n.push_str(&ptr_name);
-                    n.push_str("_slice_vec_ptr");
-                    n
-                },
-                ptr_sort_val,
-            );
+            // The buffer of a `to_vec` / `Vec::from(&[T])` result is a fresh
+            // allocation: live, non-null, aliasing nothing, and returned by the
+            // allocator at the base of its own object. Pin it to that address.
+            // A free 64-bit word instead admits misaligned and dangling
+            // pointers no execution can produce, and the heap access checks of
+            // any later `Vec` method (`truncate`, drop, indexing) then split it
+            // into (obj_id, offset) and report a fabricated misalignment.
+            let ptr = (ptr_sort_val == ptr_sort())
+                .then(|| self.heap_state.fresh_valid_backing_ptr())
+                .flatten()
+                .unwrap_or_else(|| {
+                    declare_pending_var(
+                        {
+                            let mut n = String::with_capacity(ptr_name.len() + 15);
+                            n.push_str(&ptr_name);
+                            n.push_str("_slice_vec_ptr");
+                            n
+                        },
+                        ptr_sort_val,
+                    )
+                });
             let data = if let Some(backing) = slice_backing.as_ref() {
                 let uses_exact_data = backing.data.as_expr().sort() == &data_sort
                     && Self::is_zero_pointer_width_bitvec(backing.offset.as_expr());
@@ -197,15 +209,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .first()
                 .and_then(|c| c.field_sort(vec_layout::FLD_CAP))
                 .unwrap_or_else(ptr_sort);
-            let ptr = declare_pending_var(
-                {
-                    let mut n = String::with_capacity(out_name.len() + 15);
-                    n.push_str(&out_name);
-                    n.push_str("_slice_vec_ptr");
-                    n
-                },
-                ptr_sort(),
-            );
+            // Same fresh-allocation pin as the projected-Vec path above.
+            let ptr = self.heap_state.fresh_valid_backing_ptr().unwrap_or_else(|| {
+                declare_pending_var(
+                    {
+                        let mut n = String::with_capacity(out_name.len() + 15);
+                        n.push_str(&out_name);
+                        n.push_str("_slice_vec_ptr");
+                        n
+                    },
+                    ptr_sort(),
+                )
+            });
             let data_sort = dt
                 .constructors
                 .first()
