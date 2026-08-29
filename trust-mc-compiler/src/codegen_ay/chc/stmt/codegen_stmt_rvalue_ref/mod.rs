@@ -7,11 +7,13 @@
 //! Split from codegen_stmt_rvalue.rs per #3199.
 //! Submodules:
 //! - `cast_dispatch`: `translate_rvalue_cast` + fn-pointer reification
+//! - `collection_elem_ref`: `&((*index_result).field)` value-lane resolution
 //! - `ref_address`: translate_ref_or_addressof (Ref/AddressOf encoding)
 //! - `transmute_reinterpret`: fixed-layout transmute helpers
 //! - `unsize_dyn`: PointerCoercion::Unsize helpers
 
 mod cast_dispatch;
+mod collection_elem_ref;
 mod ref_address;
 mod transmute_reinterpret;
 mod unsize_dyn;

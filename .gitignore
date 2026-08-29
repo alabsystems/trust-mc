@@ -48,7 +48,30 @@ secrets.json
 # Kani/trust-mc local artifact outputs
 *.rlib
 *.symtab.smt2
+# ay writes an Alethe certificate next to the input on UNSAT. Nothing consumes
+# it — the driver reads sat/unsat and no more — but it is no longer suppressed:
+# `--no-proof` stopped disabling ay's proof tracker and had become a net cost,
+# so the flag was dropped. These land in tests/expected/ during a run.
+*.alethe
+# ...and the partial files ay writes while producing one.
+*.alethe.tmp-*
 *.symtab.z3_fixed.smt2
+# The one that got away: a corpus run left a `*.symtab.cover_check.smt2` beside
+# a test and `git add -A` committed it (97ec8a7a5, removed in the commit that
+# added this line). The two rules above already covered its siblings.
+#
+# Deliberately NOT ignoring `*.symtab.vc.json` or `*.symtab.out`, which look
+# like the same family: tools/soundness-duals/ commits .symtab.vc.json files on
+# purpose, and a blanket rule would silently swallow the next one added.
+*.symtab.cover_check.smt2
+# Same family, same story: running a dual harness leaves a
+# `<crate>.kani-metadata.json` beside its source and `git add -A` committed one
+# (tools/soundness-duals/dual_d_field_ref_body.kani-metadata.json, removed in the
+# commit that added this line). It is pure build output — nothing in the tree
+# reads it — and it embeds ABSOLUTE `original_file` / `model_file` paths from
+# the machine that generated it, which is how it failed the publication
+# forbidden-content guard.
+*.kani-metadata.json
 mir_dump/
 out/
 doc/

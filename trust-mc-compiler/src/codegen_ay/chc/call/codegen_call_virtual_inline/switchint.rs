@@ -37,13 +37,15 @@ use super::{InlineReturn, MAX_SWITCHINT_DEPTH, switchint_walk_node_budget};
 /// call-site block and could not distinguish two different SwitchInt sites
 /// in the same callee body.
 fn switchint_branch_fallback<'tcx, 'body>(
-    ctx: &ChcCtx<'tcx, 'body>,
+    ctx: &mut ChcCtx<'tcx, 'body>,
     walk_ctx: &InlineWalkCtx<'_>,
     switchint_bb: usize,
     target_bb: usize,
 ) -> Option<InlineReturn> {
     let key = (switchint_bb, target_bb);
     if let Some(cached) = walk_ctx.switchint_overapprox_cache.borrow().get(&key) {
+        // Cache HIT mints nothing: the same freed variable is reused, so the
+        // taint count and the accounted-identity count stay in step.
         return Some(InlineReturn::value_only(cached.clone()));
     }
     let ret_ty = ctx.resolve_inline_local_ty(walk_ctx.body, 0).unwrap_or(walk_ctx.locals[0].ty);
@@ -51,6 +53,17 @@ fn switchint_branch_fallback<'tcx, 'body>(
     // Do NOT unwrap with option_value_sort here — the sibling branch results
     // use the raw return sort, and ITE merge requires matching sorts.
     let name = chc_fresh_name("__switchint_branch_overapprox");
+    // ACCOUNT the fresh symbol. This variable lands in a VALUE position — it
+    // becomes the inlined call's result — so a counterexample may be reading a
+    // value the real program can never produce. Recording it on the
+    // sound-fallback channel (with its SMT identity) is what lets
+    // `classify_ctrex` demote a counterexample that DEPENDS on it, while
+    // `recertify_overapprox_ctrex` still certifies Genuine a counterexample
+    // that is provably independent of it. Booking NOTHING — the previous
+    // behaviour — made every such counterexample certify Genuine, which is how
+    // a hand-written reference loop that merely outran the replay budget was
+    // reported as a failed assertion.
+    ctx.record_sound_fallback_reason_identified("switchint_branch_overapprox", Some(&name));
     let var = declare_pending_var(name, ret_sort);
     walk_ctx.switchint_overapprox_cache.borrow_mut().insert(key, var.clone());
     Some(InlineReturn::value_only(var))

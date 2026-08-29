@@ -8,16 +8,16 @@
 
 use std::collections::HashSet;
 
-use ay_bindings::{Expr, Sort};
+use ay_bindings::Expr;
+use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{BasicBlockIdx, Mutability, Operand};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
-use trust_mc_core::decl::Decl;
 
 use super::super::ChcCtx;
 use super::super::codegen_call_coerce::CallCoerce;
-use super::super::codegen_ctx::diagnostics::CellCounter;
 use super::super::codegen_rules::CodegenRules;
+use crate::codegen_ay::chc::call_uf_table::established_pure_scalar_callee;
 
 /// Outcome of the receiver-sensitive tail fallback decision.
 ///
@@ -56,15 +56,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && let Some(constraint) =
                 self.try_build_inferable_constraint(func, args, dest_local, modified_locals)
         {
-            self.diagnostics.inferable_predicate.inc();
-            // Part of #4031: record exact P_inf_<callee> name for provenance.
-            if let Some(callee_path) = self.resolve_callee_path(func) {
-                let summary_name = format!("P_inf_{}", callee_path);
-                super::super::codegen_ctx::record_inferable_summary_name_for_fn(
-                    &self.fn_name,
-                    &summary_name,
-                );
-            }
+            // NOTE: deliberately does NOT touch `diagnostics.inferable_predicate`
+            // or `record_inferable_summary_name_for_fn`. That counter is the
+            // DEMOTING category for the old, un-gated `P_inf_<callee>`
+            // declare-fun summary, which assumed callee determinism with no
+            // established purity fact (see `try_build_inferable_constraint`);
+            // it stays intact with zero producers. The congruent-table lane is
+            // a different construct with its own accounting — the builder
+            // records `call_uf_congruent_summary` with the destination's var
+            // identity, exactly once per event.
             self.emit_goto_rule_extra(
                 from_app,
                 target,
@@ -123,15 +123,59 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(_, _, Mutability::Mut)))
     }
 
-    /// Try to build a solver-inferable constraint for an unhandled call (Part of #3395).
+    /// Summarise an unhandled call as an UNINTERPRETED FUNCTION of its
+    /// arguments — but only behind an ESTABLISHED purity fact (Part of #4270 /
+    /// TL18; supersedes the #3395 `P_inf_<callee>` declare-fun lane).
     ///
-    /// Instead of leaving the destination completely unconstrained, declares an
-    /// uninterpreted function `P_inf_<callee>(arg_sorts) -> ret_sort` and constrains
-    /// the destination to equal the function application. PDR must synthesize a
-    /// consistent function summary that satisfies the proof obligation.
+    /// Returns `Some(constraint)` binding the destination's output state var to
+    /// a congruent summary term, or `None` to leave the caller's sound
+    /// over-approximation (destination havoced) in place.
     ///
-    /// Returns `Some(constraint)` if the inferable function was successfully built,
-    /// or `None` if arguments couldn't be translated or sorts are incompatible.
+    /// # Why there is no `declare-fun` here any more
+    ///
+    /// The original lane declared `P_inf_<callee>(arg_sorts) -> ret_sort` and
+    /// equated the destination to its application. `ay-chc`'s parser REJECTS
+    /// any `declare-fun` whose return sort is not Bool (parser/commands.rs:
+    /// "Non-predicate function declaration: '<name>' with return sort <S>.
+    /// Only Bool-returning functions (predicates) are supported in ay-chc."),
+    /// and that error aborts the parse of the WHOLE problem — a single such
+    /// declaration cost the harness its entire verification, coming back
+    /// UNKNOWN having never been solved. Observed in the corpus:
+    ///   P_inf_std::…::alloc_zeroed  ((_ BitVec 64) (_ BitVec 128)) (_ BitVec 64)
+    ///   P_inf_std::…::alloc         ((_ BitVec 64) (_ BitVec 128)) (_ BitVec 64)
+    ///   P_inf_std::collections::VecDeque::<T>::new  ()             (_ BitVec 64)
+    /// There is also no global-constant escape hatch: ay-chc aliases
+    /// `declare-const` to `declare-var`, and any free symbol becomes a
+    /// PER-CLAUSE universally quantified variable. Two calls are always two
+    /// different Horn rules, so a shared free variable gives no sharing at all.
+    /// `call_uf_table.rs` therefore encodes the UF the way this codebase
+    /// already encodes symbolic float arithmetic: a frozen `Array` column
+    /// threaded through every relation and never modified, so `select` over it
+    /// is congruent along a trace while staying universally quantified.
+    ///
+    /// # Why the gate, and why it is not the signature
+    ///
+    /// A UF makes two calls with equal arguments return equal values. For
+    /// alloc, RNG and I/O that is FALSE, and asserting it fabricates proofs.
+    /// Demonstrated on the emitted shape `d1 := g(x); d2 := g(x); if d1 != d2
+    /// { error }`:
+    ///
+    ///   UF summary  ->  sat    (a PROOF that d1 == d2)
+    ///   havoc       ->  unsat  (error is reachable -- the sound answer)
+    ///
+    /// Same program, and the summary fabricates a proof the sound encoding
+    /// refutes. Nor does an all-by-value-scalar prototype license it:
+    /// `uint32_t takes_int(uint32_t i) { return i + c++; }` has exactly that
+    /// prototype and `takes_int(x) != takes_int(x)`
+    /// (see `codegen_call_foreign.rs`). SIGNATURE SHAPE IS NOT, AND MUST NEVER
+    /// BECOME, THE GATE.
+    ///
+    /// `established_pure_scalar_callee` reads the callee's MIR body instead and
+    /// admits it only with no `Deref`, no reference/raw-pointer constant, no
+    /// pointer-creating rvalue, no memory intrinsic, no panicking terminator,
+    /// and no nested call outside the same gate — see `call_uf_table.rs` for
+    /// the full clause list and the soundness argument. A callee that fails it
+    /// keeps the pre-existing fail-closed havoc.
     pub(in crate::codegen_ay::chc) fn try_build_inferable_constraint(
         &mut self,
         func: &Operand,
@@ -141,110 +185,54 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> Option<Expr> {
         let dest_vec_idx = self.state_var_mgr.try_state_idx_for_local(dest_local)?;
         let out_sort = self.state_var_mgr.output_state_vars[dest_vec_idx].1.clone();
-        let dest_var_name = &self.state_var_mgr.output_state_vars[dest_vec_idx].0;
-        let _dest_var = Expr::var(&**dest_var_name, out_sort.clone());
+        let dest_var_name = self.state_var_mgr.output_state_vars[dest_vec_idx].0.to_string();
+        let dest_var = Expr::var(&*dest_var_name, out_sort.clone());
+
+        // THE GATE FIRST — nothing is translated for a callee we may not
+        // summarise, so a refusal costs no work and leaves no residue.
+        if !self.call_uf_table_declared() {
+            return None;
+        }
+        let callee_path = self.resolve_callee_path(func)?;
+        if callee_path.contains("Drop>::drop") {
+            return None;
+        }
+        let func_ty = func.ty(self.body.locals()).ok()?;
+        let TyKind::RigidTy(RigidTy::FnDef(fn_def, fn_args)) = func_ty.kind() else {
+            return None;
+        };
+        let instance = Instance::resolve(fn_def, &fn_args).ok()?;
+        if !established_pure_scalar_callee(&instance) {
+            debug!(
+                callee = %callee_path,
+                ?out_sort,
+                "UF summary refused: callee purity not ESTABLISHED — keeping sound havoc"
+            );
+            return None;
+        }
 
         let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len());
         for arg in args {
             arg_exprs.push(self.translate_operand_with_modified(arg, modified_locals)?);
         }
 
-        let callee_path = self.resolve_callee_path(func)?;
-        if callee_path.contains("Drop>::drop") {
-            return None;
-        }
-        // Part of #4270 (TL18): ay-chc's parser REJECTS any `declare-fun` whose
-        // return sort is not Bool (parser/commands.rs: "Non-predicate function
-        // declaration: '<name>' with return sort <S>. Only Bool-returning
-        // functions (predicates) are supported in ay-chc."). That error aborts
-        // the parse of the WHOLE problem, so a single such declaration costs the
-        // harness its entire verification — it comes back UNKNOWN having never
-        // been solved at all. Skip the summary so the caller falls back to sound
-        // over-approximation (destination havoced) instead.
-        //
-        // This guard used to test `callee_path.contains("::{closure#")`, i.e. it
-        // keyed on the NAME of the one callee shape that had been observed
-        // failing. The reject is a property of the SORT, not the name, so every
-        // other non-Bool callee still poisoned its file. Observed in the corpus:
-        //   P_inf_std::…::alloc_zeroed  ((_ BitVec 64) (_ BitVec 128)) (_ BitVec 64)
-        //   P_inf_std::…::alloc         ((_ BitVec 64) (_ BitVec 128)) (_ BitVec 64)
-        //   P_inf_std::collections::VecDeque::<T>::new  ()             (_ BitVec 64)
-        // (kani/LibC/posix_memalign.rs and expected/vecdq/main.rs both die this
-        // way.) Keying on the sort subsumes the closure case: a closure returning
-        // BitVec(32) is refused by this check too.
-        //
-        // The lane is refused UNCONDITIONALLY, for two independent reasons.
-        //
-        // (1) Non-Bool return sorts abort the ay-chc parse (see above), costing
-        //     the harness its entire verification.
-        //
-        // (2) A Bool-returning summary is not safe either -- but NOT for the
-        //     reason previously claimed here. That earlier note asserted the
-        //     solver would pick `P_inf_f = false` to vacuously satisfy the rule
-        //     bodies. That was tested directly against ay and is FALSE: ay
-        //     treats a head-less `declare-fun` as an arbitrary symbol, not one
-        //     whose interpretation it may choose to suit a proof. Both the
-        //     0-ary and the with-arguments shapes return unsat (UNSAFE), which
-        //     is the sound answer, and a control with a genuinely unreachable
-        //     error returns sat -- so the result is not vacuous.
-        //
-        //     The real defect is FUNCTIONAL CONSISTENCY. A UF makes two calls
-        //     with equal arguments return equal values. The callees that reach
-        //     this lane are exactly the ones for which that is false: alloc,
-        //     RNG, and I/O may legitimately return different values for
-        //     identical arguments. Demonstrated on the emitted shape --
-        //     `d1 := g(x); d2 := g(x); if d1 != d2 { error }`:
-        //
-        //       UF summary  ->  sat    (a PROOF that d1 == d2)
-        //       havoc       ->  unsat  (error is reachable -- the sound answer)
-        //
-        //     Same program, and the summary fabricates a proof the sound
-        //     encoding refutes. That is a false-proof route, so the lane stays
-        //     closed and the destination is havoced instead.
-        //
-        // Re-enabling would require a determinism oracle establishing that the
-        // callee is a pure function of the arguments actually passed to the
-        // summary; nothing here supplies one. The lane converts nothing today
-        // (0 Bool-returning summaries in the corpus), so closing it costs no
-        // parity.
-        // Deliberately records NOTHING here. Returning None lands in
-        // `resolve_tail_fallback`'s final `else`, which already records
-        // `call_dispatch_fallback_prebuilt` via
-        // `record_sound_fallback_reason_identified` WITH the freed var identity
-        // (Task #78). Recording a second reason here would double-account one
-        // fallback event -- the same defect that made
-        // `accounted_approximations == 2 * count` and rendered the Genuine-cert
-        // lane unsatisfiable -- and an unlisted reason string additionally
-        // defaults to `FallbackSoundness::FailClose`, which would force every
-        // Success harness reaching this lane to Unknown.
+        let summary = self.call_uf_summary_term(&instance, &arg_exprs, &out_sort)?;
+
+        // Accounted exactly once, with the destination's var identity (Task
+        // #78). `call_uf_congruent_summary` is blessed SoundHavoc in
+        // `codegen_ctx::fallback_soundness` under the audit written there and
+        // in `call_uf_table.rs`; the un-gated `call_dispatch_fallback_prebuilt`
+        // fail-close still covers every callee this gate refuses.
+        self.record_sound_fallback_reason_identified(
+            "call_uf_congruent_summary",
+            Some(dest_var_name.as_str()),
+        );
         debug!(
             callee = %callee_path,
             ?out_sort,
-            "inferable summary refused: UF summary would assume callee determinism"
+            "UF summary EMITTED: established-pure scalar callee, congruent table term"
         );
-        return None;
-
-        #[allow(unreachable_code)]
-        let summary_name = format!("P_inf_{}", callee_path);
-        let arg_sorts: Vec<Sort> = arg_exprs.iter().map(|expr| expr.sort().clone()).collect();
-
-        if let Some((existing_sorts, existing_ret)) = self.declared_inferable_fns.get(&summary_name)
-        {
-            if existing_sorts != &arg_sorts || *existing_ret != out_sort {
-                return None;
-            }
-        } else {
-            self.vc.add_decl(Decl::Fun {
-                name: summary_name.clone(),
-                arg_sorts: arg_sorts.clone(),
-                ret_sort: out_sort.clone(),
-            });
-            self.declared_inferable_fns.insert(summary_name.clone(), (arg_sorts, out_sort));
-        }
-
-        let summary_app =
-            Expr::func_app_with_sort(&summary_name, arg_exprs, _dest_var.sort().clone());
-        Some(_dest_var.eq(summary_app))
+        Some(dest_var.eq(summary))
     }
 
     /// Detect known standard library functions that are too complex to model

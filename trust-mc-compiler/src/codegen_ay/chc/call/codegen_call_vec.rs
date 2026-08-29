@@ -391,9 +391,39 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
                     );
                 }
             }
-            // Part of #4135: permutation operations — preserve len, data unconstrained.
-            StubKind::VecSort | StubKind::VecReverse | StubKind::VecSwap => {
-                self.vec_op_permutation(collection_local, &format!("{stub:?}"));
+            // Reversal has an EXACT element mapping (`new[i] == old[len-1-i]`),
+            // so it does not belong in the unconstrained-permutation family.
+            // Falls back to that family only if the receiver's data array or
+            // length cannot be resolved.
+            StubKind::VecReverse => {
+                // A length past the unroll bound is handled INSIDE the exact
+                // model (that array is left unconstrained), so `false` here means
+                // only one thing: the receiver's Vec representation could not be
+                // recovered, and NOTHING was emitted.
+                let modeled = self.vec_op_reverse(
+                    collection_local,
+                    modified_locals,
+                    &mut CallAccumulator::new(&mut extra_constraints, &mut extra_dests),
+                );
+                if !modeled {
+                    // The receiver's data array is UNTOUCHED, i.e. the reversal
+                    // became an identity. That is the shape that proves false
+                    // post-conditions, so fail closed.
+                    self.record_sound_fallback_reason("vec_permutation_receiver_unresolved");
+                }
+            }
+            // Part of #4135: permutation operations — preserve len, re-bind data
+            // to a permutation of the input (see `vec_op_permutation`).
+            StubKind::VecSort | StubKind::VecSwap => {
+                let modeled = self.vec_op_permutation(
+                    collection_local,
+                    modified_locals,
+                    &mut CallAccumulator::new(&mut extra_constraints, &mut extra_dests),
+                    &format!("{stub:?}"),
+                );
+                if !modeled {
+                    self.record_sound_fallback_reason("vec_permutation_receiver_unresolved");
+                }
             }
             // Part of #4135: Vec::append(&mut self, &mut other).
             StubKind::VecAppend | StubKind::VecAppendElements => {

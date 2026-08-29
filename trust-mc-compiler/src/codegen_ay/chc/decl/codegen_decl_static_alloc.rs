@@ -161,6 +161,65 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         })
     }
 
+    /// Read a single-variant ADT constant out of an allocation using the
+    /// **real ABI field offsets** instead of declaration-order packing.
+    ///
+    /// `read_composite_from_allocation` walks a Datatype sort's fields in
+    /// declaration order and advances a running offset by each field's width.
+    /// That is only correct for a layout rustc did not reorder. `repr(Rust)`
+    /// makes no such promise, and it really does reorder: `RangeInclusive<u8>`
+    /// is declared `{ start, end, exhausted }` but laid out
+    /// `start@0, exhausted@1, end@2`, so the sequential reader decoded the
+    /// constant `0..=1` as `start=0, end=0, exhausted=true` — a range that
+    /// contains nothing.
+    ///
+    /// This reader asks rustc for `field_offset(i)` and reads each field there,
+    /// recursing so nested ADT fields are decoded by their own layout too. It
+    /// applies ONLY when the Datatype sort's constructor is the generic
+    /// per-declared-field encoding (same field count, `fld_<name>` names from
+    /// `adt_struct_field_name`); the specialised sorts (String, Vec, IndexRange,
+    /// dyn fat pointers, …) do not describe declared fields and fall back to the
+    /// sequential reader unchanged.
+    pub(in crate::codegen_ay::chc) fn read_adt_composite_from_allocation(
+        alloc: &rustc_public::ty::Allocation,
+        offset: usize,
+        ty: rustc_public::ty::Ty,
+        sort: &ay_bindings::Sort,
+    ) -> Option<ay_bindings::Expr> {
+        let sequential = || Self::read_composite_from_allocation(alloc, offset, sort);
+
+        let Some(dt) = sort.datatype_sort() else { return sequential() };
+        let Some(ctor) = dt.constructors.first() else { return sequential() };
+        if dt.constructors.len() != 1 {
+            return sequential();
+        }
+        // Per-declared-field types, in the order the Datatype sort declares its
+        // fields. `None` means the sort is one of the specialised encodings
+        // (String, Vec, IndexRange, dyn fat pointer, …) whose fields do not
+        // correspond to declared fields — those keep the sequential reader.
+        let Some(field_tys) = declared_field_tys_for_sort(ty, ctor) else { return sequential() };
+
+        let layout = crate::kani_middle::abi::LayoutOf::new(ty);
+        let mut field_exprs = Vec::with_capacity(ctor.fields.len());
+        for (i, (sort_field, field_ty)) in ctor.fields.iter().zip(field_tys.iter()).enumerate() {
+            // No `Arbitrary` field shape (unions, primitives) means there are no
+            // offsets to trust: fall back rather than invent one.
+            let Some(field_offset) = layout.field_offset(i) else { return sequential() };
+            field_exprs.push(Self::read_adt_composite_from_allocation(
+                alloc,
+                offset + field_offset,
+                *field_ty,
+                &sort_field.sort,
+            )?);
+        }
+        Some(ay_bindings::Expr::datatype_constructor(
+            &*dt.name,
+            &*ctor.name,
+            field_exprs,
+            sort.clone(),
+        ))
+    }
+
     /// Like `read_composite_from_bytes` but preserves function provenance.
     pub(in crate::codegen_ay::chc) fn read_composite_from_allocation(
         alloc: &rustc_public::ty::Allocation,
@@ -662,9 +721,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let pointee_sort = Self::translate_ty(pointee_ty)?;
         let target_addr = self.mint_static_address(resolved_target_alloc_id)?;
 
+        // The pointee is its own allocation and needs its own layout record, or
+        // `obj_size[obj]` stays unconstrained and every in-bounds obligation on
+        // `*STATIC` is refutable.
+        if let Some(obj_id) = Self::try_extract_obj_id(target_addr.as_expr())
+            && let Some(size) = self.get_type_size(pointee_ty)
+        {
+            let align = self.get_type_align(pointee_ty).unwrap_or(1);
+            self.ref_resolution.static_alloc_sizes.push((obj_id, size as u32, align));
+        }
+
         if let Some(init_val) =
             self.static_init_from_alloc(&target_alloc_data, &pointee_sort, pointee_ty)
         {
+            // Keep the pointee's initial value reachable by allocation id: the
+            // static's own `static_initial_values` entry is the POINTER, so a
+            // `*STATIC` read has nowhere else to find what it points at.
+            self.ref_resolution
+                .static_alloc_init_values
+                .insert(resolved_target_alloc_id, init_val.as_expr().clone());
             self.register_static_memory_init_entries(pointee_ty, init_val, target_addr.clone());
 
             if matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::Str)) {
@@ -692,6 +767,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let (resolved_target_alloc_id, target_addr) =
             self.resolve_static_target_init_expr(target_alloc_id, pointee_ty)?;
 
+        self.ref_resolution.static_pointee_addrs.insert(vec_idx, target_addr.as_expr().clone());
+        if let Some(init) =
+            self.ref_resolution.static_alloc_init_values.get(&resolved_target_alloc_id).cloned()
+        {
+            self.ref_resolution.static_pointee_init_values.insert(vec_idx, init);
+        }
+
         tracing::debug!(
             vec_idx,
             static_name = %static_name,
@@ -700,5 +782,53 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             "CHC: resolved pointer static to concrete target address (#3496)"
         );
         Some(target_addr)
+    }
+}
+
+/// The declared field types behind a Datatype sort's sole constructor, in the
+/// constructor's field order — or `None` when the sort is not the generic
+/// per-declared-field encoding of `ty`.
+///
+/// The name check is what makes the correspondence sound: `translate_adt_sort`
+/// builds struct sorts by mapping declared field `f` to
+/// `adt_struct_field_name(f)` in declaration order, and tuple sorts by mapping
+/// element `i` to `tuple_field_name(i)`. Any sort whose field names do not
+/// reproduce that mapping is a specialised encoding whose field `i` is NOT
+/// declared field `i`, so its constant must not be decoded by ABI offsets.
+fn declared_field_tys_for_sort(
+    ty: rustc_public::ty::Ty,
+    ctor: &ay_bindings::DatatypeConstructor,
+) -> Option<Vec<rustc_public::ty::Ty>> {
+    use rustc_public::ty::{RigidTy, TyKind};
+
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+            let variants = def.variants();
+            let [variant] = &variants[..] else { return None };
+            let decl_fields = variant.fields();
+            if ctor.fields.len() != decl_fields.len() {
+                return None;
+            }
+            let matches = ctor.fields.iter().zip(decl_fields.iter()).all(|(sort_field, decl)| {
+                *sort_field.name == *crate::codegen_ay::names::adt_struct_field_name(&decl.name)
+            });
+            if !matches {
+                return None;
+            }
+            Some(decl_fields.iter().map(|f| f.ty_with_args(&args)).collect())
+        }
+        TyKind::RigidTy(RigidTy::Tuple(elem_tys)) => {
+            if ctor.fields.len() != elem_tys.len() {
+                return None;
+            }
+            let matches = ctor.fields.iter().enumerate().all(|(i, sort_field)| {
+                *sort_field.name == *crate::codegen_ay::names::tuple_field_name(i)
+            });
+            if !matches {
+                return None;
+            }
+            Some(elem_tys)
+        }
+        _ => None,
     }
 }

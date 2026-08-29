@@ -82,6 +82,7 @@ struct InlineParentState {
     /// Pre-resolved fn_ptr callees from the caller's body scan.
     /// Enables nested fn_ptr resolution when the fn_ptr is received as a parameter.
     parent_fn_ptr_callees: Vec<(Instance, bool)>,
+    parent_foreign_fn_ptrs: Vec<String>,
 }
 
 pub(in crate::codegen_ay::statement) struct InlineArgValue {
@@ -194,6 +195,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let inherited_state = self.capture_inline_parent_state();
         let parent_fn = self.ctx.current_fn().cloned();
+        // Per-call-site SSA namespace (see `next_inline_frame_salt`). Two call
+        // sites of the SAME instance in one harness would otherwise share the
+        // frame name `<callee>::local_N`, and because each inline frame builds a
+        // fresh `StatementCodegen` (SSA versions restart at 0) both sites define
+        // `<callee>::local_N_0`. When both sites are unconditionally reached,
+        // that equates two different values and the whole harness becomes
+        // infeasible — every check passes vacuously. See
+        // `docs/findings/2026-08-20-vacuous-proofs-in-the-corpus.md`.
+        let frame_salt = self.ctx.next_inline_frame_salt();
+        let prev_salt = self.ctx.set_inline_frame_salt(Some(frame_salt));
         self.ctx.set_current_fn(instance);
         self.ctx.bmc_mini_inline_stack.push(instance_key);
         let result = {
@@ -203,9 +214,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             inline_codegen.execute_dag_inline_body(params)
         };
         self.ctx.bmc_mini_inline_stack.pop();
-        if let Some(parent_fn) = parent_fn {
-            self.ctx.set_current_fn(parent_fn.instance);
-        }
+        self.ctx.set_inline_frame_salt(prev_salt);
+        // Restore the parent frame VERBATIM so it keeps the exact namespace it
+        // had on entry (re-deriving it would re-apply whatever salt is active).
+        self.ctx.restore_current_fn(parent_fn);
 
         let result = result?;
         self.propagate_inline_return_ref_pointees(
@@ -278,6 +290,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let inherited_state = self.capture_inline_parent_state();
         let parent_fn = self.ctx.current_fn().cloned();
+        // Per-call-site SSA namespace — same reason as in
+        // `try_inline_small_instance_call` above.
+        let frame_salt = self.ctx.next_inline_frame_salt();
+        let prev_salt = self.ctx.set_inline_frame_salt(Some(frame_salt));
         self.ctx.set_current_fn(instance);
         self.ctx.bmc_mini_inline_stack.push(instance_key);
         let result = {
@@ -287,6 +303,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             inline_codegen.execute_dag_inline_body(params)
         };
         self.ctx.bmc_mini_inline_stack.pop();
+        self.ctx.set_inline_frame_salt(prev_salt);
         // Restore the parent frame VERBATIM (name included) rather than
         // re-deriving it through the active `inline_frame_salt`: an outermost
         // pop returns to a caller frame that must keep its own (un-salted, or
@@ -346,6 +363,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // can find them when fn pointers are passed as parameters.
         let mut parent_fn_ptr_callees = self.parent_fn_ptr_callees.clone();
         parent_fn_ptr_callees.extend(self.resolve_all_fn_ptr_callees());
+        let mut parent_foreign_fn_ptrs = self.parent_foreign_fn_ptrs.clone();
+        parent_foreign_fn_ptrs.extend(self.resolve_all_foreign_fn_ptr_names());
 
         InlineParentState {
             path_condition: self.current_path_condition.clone(),
@@ -362,6 +381,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ssa_concrete_values: self.ssa_concrete_values.clone(),
             stub_indexed_refs: self.stub_indexed_refs.clone(),
             parent_fn_ptr_callees,
+            parent_foreign_fn_ptrs,
         }
     }
 
@@ -380,6 +400,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.ssa_concrete_values.extend(state.ssa_concrete_values);
         self.stub_indexed_refs.extend(state.stub_indexed_refs);
         self.parent_fn_ptr_callees = state.parent_fn_ptr_callees;
+        self.parent_foreign_fn_ptrs = state.parent_foreign_fn_ptrs;
     }
 
     fn seed_inline_params(&mut self, params: &[InlineArgValue]) -> Option<()> {

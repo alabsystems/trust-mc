@@ -1,3 +1,7 @@
+// Oracle (per harness) — both are SAFE (the no-op must preserve the value):
+//   zero_count_preserves_value -> VERIFICATION:- SUCCESSFUL
+//   zero_count_niche_noop      -> VERIFICATION:- SUCCESSFUL
+//
 // WRITE_BYTES_ZERO_COUNT_NOOP dual — soundness net for the zero-count
 // `write_bytes` no-op fix (codegen_call_cmp_string/misc_intrinsics_write_bytes.rs,
 // marker `WRITE_BYTES_ZERO_COUNT_NOOP`).

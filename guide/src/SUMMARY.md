@@ -5,6 +5,10 @@
     - [Building from source](./build-from-source.md)
     - [GitHub CI Action](./install-github-ci.md)
   - [Using trust-mc](./usage.md)
+    - [Usage on a single file](./trust-mc-single-file.md)
+    - [Usage on a package](./cargo-trust-mc.md)
+  - [Migrating from Kani](./migrating-from-kani.md)
+  - [Troubleshooting](./troubleshooting.md)
   - [Verification results](./verification-results.md)
 
 - [Crates Documentation](./crates/index.md)

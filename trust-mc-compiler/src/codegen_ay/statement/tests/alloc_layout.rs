@@ -327,9 +327,11 @@ fn test_layout_dangling_extra_checks_invalidates_provenance() {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
+        // The liveness range is `(_ BitVec 1)`, so freed is `#b0` — see
+        // `AYCtx::heap_valid_bit` for why it is not `Bool`.
         assert!(
-            rendered_constraints.contains("false"),
-            "extra-pointer-checks Layout::dangling should store false into obj_valid: {rendered_constraints}"
+            rendered_constraints.contains("#b0"),
+            "extra-pointer-checks Layout::dangling should store the freed bit into obj_valid: {rendered_constraints}"
         );
     });
 }

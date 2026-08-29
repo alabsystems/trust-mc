@@ -28,7 +28,8 @@ bundle = "run -p build-trust-mc -- bundle"
 RAYON_NUM_THREADS = { value = "2", force = true }
 RUST_TEST_THREADS = { value = "2", force = true }
 [target.'cfg(all())']
-rustflags = [ # Global lints/warnings. Need to use underscore instead of -.
+rustflags = [
+    "-Ztrust-verify=off", # Global lints/warnings. Need to use underscore instead of -.
     # PIN-COUPLED FLAG, currently disabled: the pin reverted to
     # nightly-2025-12-03 on 2026-08-01 (see rust-toolchain.toml — trust's
     # rustc-dev closure is incomplete), and upstream nightly rejects the flag
@@ -36,8 +37,9 @@ rustflags = [ # Global lints/warnings. Need to use underscore instead of -.
     # `--print` probes. REINSTATE the line below when the pin returns to
     # `trust`: its verifier is FAIL-CLOSED by default and tries to prove
     # panic-freedom for EVERY unit including third-party build scripts —
-    # without it the build dies in `libc`'s build script. SPELLING must match
-    # the INSTALLED stage2 (wave-2 deleted `-Zno-trust-verify=yes`).
+    # without it the build dies in `libc`'s build script. SPELLING: both work on the
+    # linked stage (re-probed 2026-08-26); `-Ztrust-verify=off` is the one
+    # `-Z help` advertises. "wave-2 deleted -Zno-trust-verify=yes" was wrong.
     # Probe: `rustc +trust -Z help | grep trust-verify`.
     # "-Ztrust-verify=off",
 

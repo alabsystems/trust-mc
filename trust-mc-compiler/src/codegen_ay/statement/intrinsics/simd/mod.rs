@@ -215,10 +215,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
                 let array_sort = Sort::array(ptr_sort(), elem_sort.clone());
                 let base_name = self.ctx.fresh_name("simd_arr");
-                let mut array_expr = self.ctx.declare_var(&base_name, array_sort.clone());
+                let array_expr = self.ctx.declare_var(&base_name, array_sort.clone());
+                // Constrain the fresh array per-index with select equalities
+                // instead of folding a store-chain into the datatype
+                // constructor. AY reports `unknown (:reason-unknown
+                // incomplete)` on the store-chain shape when the element
+                // values are themselves selects out of a constructor-equated
+                // array (the exact query simd_insert emits — see
+                // tests/expected/intrinsics/simd-insert-out-of-bounds), which
+                // turned a Genuine out-of-bounds CTREX into INCONCLUSIVE. The
+                // two encodings constrain exactly the same indices (0..len;
+                // everything else is free in both), so this is a pure
+                // solver-shape change, not a strengthening or weakening.
                 for (i, elem) in elements.into_iter().enumerate() {
                     let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
-                    array_expr = array_expr.store(idx, elem);
+                    self.ctx.assert(array_expr.clone().select(idx).eq(elem));
                 }
                 let simd_sort = struct_sort(&adt_name, [(field_name.clone(), array_sort)]);
                 Some(Expr::datatype_constructor(adt_name, cons_name, vec![array_expr], simd_sort))

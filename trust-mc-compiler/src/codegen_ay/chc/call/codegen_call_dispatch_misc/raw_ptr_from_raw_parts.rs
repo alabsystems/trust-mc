@@ -75,7 +75,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         for projection in &ref_target.projections {
             match projection {
                 ProjectionElem::ConstantIndex { offset: idx, min_length, from_end } => {
-                    let actual = super::super::constant_index_offset(*idx, *min_length, *from_end);
+                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                    let Some(actual) =
+                        super::super::constant_index_offset(*idx, *min_length, *from_end)
+                    else {
+                        return None;
+                    };
                     offset = offset.bvadd(Expr::bitvec_const(actual as u128, POINTER_WIDTH));
                 }
                 ProjectionElem::Index(index_local) => {

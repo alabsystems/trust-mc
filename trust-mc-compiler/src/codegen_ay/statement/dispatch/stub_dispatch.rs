@@ -43,7 +43,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
 
         if target.is_none() && bmc_is_no_return_panic_helper(&callee_path) {
-            self.record_violation_guarded(Expr::bool_const(true), "panic");
+            // These shims take the panic message as a leading `&str` (e.g.
+            // `core::panicking::panic(msg)`, `Result::unwrap_failed(msg, _)`).
+            // Name it on the Failed Checks line; None keeps "panic reached".
+            let message = self.panic_message_from_args(args);
+            self.record_violation_guarded_with_message(Expr::bool_const(true), "panic", message);
             return CallDispatchOutcome::Diverge;
         }
 
@@ -52,6 +56,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             self.try_codegen_btree_internal_precheck(func, &callee_path, args, destination, target)
         {
             return CallDispatchOutcome::from_nested_target(Some(result));
+        }
+
+        // `<String as BoundedArbitrary>::bounded_any::<N>` — model the bound the
+        // API promises instead of the UTF-8 chunking the library goes through.
+        if let Some(result) =
+            self.try_codegen_bounded_string_precheck(func, &callee_path, destination, target)
+        {
+            return CallDispatchOutcome::from_handled_target(result);
         }
 
         // Pre-check for Cow<str>::to_string() which has path that doesn't contain "Cow" (Part of #1738)
@@ -83,7 +95,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         if let Some(result) =
-            self.try_codegen_slice_comparison_stub(stub_kind, args, destination, target)
+            self.try_codegen_slice_comparison_stub(stub_kind, func, args, destination, target)
         {
             return CallDispatchOutcome::from_nested_target(Some(result));
         }
@@ -129,6 +141,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ));
         }
         if stub_in(VEC_STUBS, stub_kind) {
+            // MEMUB fail-closed: the abstract Vec model has no shadow-init
+            // integration — Vec bodies are prefix-abstracted
+            // (reachability.rs: "std::vec::Vec::"), so the UninitPass never
+            // sees their reads and the stub blesses whatever bytes the model
+            // holds. Under -Z uninit-checks that let
+            // `Vec::with_capacity` + `set_len` + `index` (an uninitialized
+            // read, corpus uninit/vec-read-bad-len) verify SUCCESSFUL with
+            // PROOF_QUALIFIERS:clean — a false proof. Until the Vec stubs
+            // track per-element init state, record a demoting fallback so the
+            // harness reports INCONCLUSIVE instead of a clean proof. Scoped
+            // to uninit-checks runs: no other corpus family passes the flag.
+            if self.ctx.config.uninit_checks {
+                self.ctx
+                    .unsupported_with_fallback("uninit_checks_abstract_vec", callee_path.clone());
+            }
             return CallDispatchOutcome::from_handled_target(self.codegen_vec_stub(
                 stub_kind,
                 args,
@@ -202,6 +229,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     fn try_codegen_slice_comparison_stub(
         &mut self,
         stub_kind: StubKind,
+        func: &Operand,
         args: &[Operand],
         destination: &Place,
         target: Option<BasicBlockIdx>,
@@ -210,10 +238,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             StubKind::SlicePartialEqEqual => {
                 Some(self.codegen_slice_partial_eq_stub(args, destination, target))
             }
-            StubKind::SliceIndexIndex
-            | StubKind::IndexIndex
-            | StubKind::IndexMut
-            | StubKind::SliceGetUnchecked => {
+            StubKind::SliceIndexIndex | StubKind::IndexIndex | StubKind::IndexMut => {
+                self.authenticated_core_index_args(func, args)?;
+                Some(self.codegen_slice_index_stub(args, destination, target))
+            }
+            StubKind::SliceGetUnchecked => {
                 Some(self.codegen_slice_index_stub(args, destination, target))
             }
             StubKind::SliceIsEmpty => {

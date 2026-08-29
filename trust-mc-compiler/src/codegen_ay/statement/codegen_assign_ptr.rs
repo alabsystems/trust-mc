@@ -14,6 +14,10 @@ use rustc_public::mir::{Operand, Place, ProjectionElem, Rvalue};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, trace, warn};
 
+/// Bound on the `&x` -> `&raw mut (*_)` pointee-chain walk. Two steps is the
+/// observed shape; the cap makes a malformed table terminate rather than spin.
+const MAX_POINTEE_CHAIN: usize = 8;
+
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Handle raw pointer deref assignment: `*ptr = value` stores to memory.
     ///
@@ -34,6 +38,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Emit pointer validity checks for raw pointer dereference (#430, #508).
         self.emit_raw_ptr_deref_checks(lhs);
+
+        // FC-06 (BMC): a raw-pointer store (including `static mut` writes)
+        // inside a modifies frame with an empty declared footprint is an
+        // assigns violation (see `statement::modifies_frame`).
+        self.bmc_modifies_check_raw_store(lhs);
 
         // Handle projections after Deref (e.g., (*ptr).field = value)
         if lhs.projection.len() > 1 {
@@ -146,9 +155,112 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // #1039: Propagate mutation back to source Box.
             if let Some(source_box) = self.ptr_source_map.get(ptr_base.as_ref()).cloned() {
                 debug!("codegen_assign: propagating mutation to source box={}", source_box);
-                self.heap_pointees.insert(source_box, value_expr);
+                self.heap_pointees.insert(source_box, value_expr.clone());
             }
+
+            // Propagate the mutation back to a STACK-LOCAL pointee.
+            //
+            // Without this, a write through a raw pointer never reached the
+            // thing pointed at. The byte-level store above and the
+            // `heap_pointees` entry are both keyed by the POINTER, and the only
+            // write-back was the Box case immediately above, so
+            //
+            //     let mut x: u8 = 3;
+            //     let p: *mut u8 = &mut x;
+            //     unsafe { *p = 9; }
+            //     assert!(x == 3);
+            //
+            // reported SUCCESSFUL with PROOF_QUALIFIERS:clean — a FALSE PROOF
+            // of a statement native Rust panics on — because reads of `x` still
+            // resolved to its pre-store SSA value. `ref_pointees` is where the
+            // pointer-to-local relationship lives, and nothing consulted it.
+            self.write_back_to_stack_pointee(&ptr_base, &value_expr);
         }
+    }
+
+    /// Update a stack local's SSA value after a store through a pointer to it.
+    ///
+    /// Sort-guarded on purpose: a pointer produced by a CAST can address a
+    /// local of a different width, and overwriting that local with a
+    /// differently-sorted value would trade one wrong answer for another. When
+    /// the sorts disagree the byte-level memory store still stands, so this
+    /// only declines to ALSO update the scalar view.
+    fn write_back_to_stack_pointee(
+        &mut self,
+        ptr_base: &std::sync::Arc<str>,
+        value_expr: &Expr,
+    ) {
+        let Some(mut pointee_base) = self.ref_pointees.get(ptr_base.as_ref()).cloned() else {
+            return;
+        };
+        // Follow the chain to the REAL local. `let p: *mut u8 = &mut x` lowers
+        // to two steps — `_3 = &mut x` then `_2 = &raw mut (*_3)` — and records
+        //
+        //     ref_pointees[local_3] = local_1          (x itself)
+        //     ref_pointees[local_2] = local_3_deref    (a synthetic)
+        //
+        // so one lookup from the raw pointer lands on `local_3_deref`, which no
+        // read of `x` resolves to. Strip the `_deref` marker and look through
+        // again until it settles on a base the environment actually holds.
+        for _ in 0..MAX_POINTEE_CHAIN {
+            let Some(stem) = pointee_base.as_ref().strip_suffix("_deref") else {
+                break;
+            };
+            let Some(next) = self.ref_pointees.get(stem).cloned() else {
+                break;
+            };
+            pointee_base = next;
+        }
+        // An element-qualified pointee (`<array>_idx_by_<local>`, written by
+        // the as_ptr/offset provenance) names ONE SLOT of an array, not a
+        // scalar local. Overwriting the whole local with a single element's
+        // value would be a fresh wrong answer, so hand it to the helper that
+        // already knows how to store into an array at an index — the same one
+        // the `&mut a[i]` path uses.
+        if pointee_base.contains("_idx_by_") {
+            let fn_name = self.ctx.current_fn_name().to_string();
+            debug!("codegen_assign: raw ptr store -> indexed array write {}", pointee_base);
+            self.try_propagate_indexed_ref_write_to_array(
+                &fn_name,
+                pointee_base.as_ref(),
+                value_expr.clone(),
+            );
+            return;
+        }
+        // The pointee resolves to a whole ARRAY while the value is one ELEMENT:
+        // this is `a.as_mut_ptr()` with no offset, which addresses element 0.
+        // Overwriting the array with a scalar would be nonsense, and declining
+        // (what the sort guard below would do) leaves the store dropped and the
+        // old value provable. Store at index 0 instead.
+        if let Some(current) = self.env_lookup(pointee_base.as_ref()).cloned()
+            && let Some(arr) = current.sort().array_sort()
+            && arr.element_sort == *value_expr.sort()
+        {
+            debug!("codegen_assign: raw ptr store -> array element 0 of {}", pointee_base);
+            let zero = Expr::bitvec_const(0u128, POINTER_WIDTH);
+            let stored = current.store(zero, value_expr.clone());
+            let new_name = self.ssa_name_from_base(pointee_base.as_ref(), true);
+            let new_var = self.ctx.declare_var(&new_name, stored.sort().clone());
+            self.assert_ssa_def(new_var.clone(), stored, pointee_base.as_ref());
+            self.env_update(std::sync::Arc::clone(&pointee_base), new_var);
+            return;
+        }
+        if let Some(current) = self.env_lookup(pointee_base.as_ref())
+            && current.sort() != value_expr.sort()
+        {
+            debug!(
+                "codegen_assign: raw ptr store to {} skipped — sort {:?} != {:?}",
+                pointee_base,
+                current.sort(),
+                value_expr.sort()
+            );
+            return;
+        }
+        debug!("codegen_assign: raw ptr store writes back to stack local {}", pointee_base);
+        let pointee_name = self.ssa_name_from_base(pointee_base.as_ref(), true);
+        let pointee_var = self.ctx.declare_var(&pointee_name, value_expr.sort().clone());
+        self.assert_ssa_def(pointee_var.clone(), value_expr.clone(), pointee_base.as_ref());
+        self.env_update(std::sync::Arc::clone(&pointee_base), pointee_var);
     }
 
     /// Handle Box unwrap assignment patterns (#1039).

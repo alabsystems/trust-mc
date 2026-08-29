@@ -217,7 +217,27 @@ pub(in crate::codegen_ay::chc) fn extract_payload_from_alloc(
     }
 
     if payload_sort.is_bool() {
-        let b = (*alloc.bytes.get(1)?)?;
+        // Same tagged-vs-niche offset rule as the bitvec branch above. The
+        // hard-coded `1` assumed a TAGGED layout (tag byte, then payload); a
+        // niche-encoded `enum E { A, B(bool) }` is ONE byte with the payload
+        // in place at offset 0, so that read ran past the end, returned None,
+        // and dropped the ENTIRE promoted constant — its memory image was
+        // never seeded, and `x == E::B(true)` compared against an
+        // unconstrained byte.
+        // A ONE-BYTE allocation is unambiguously niche-encoded: there is no room
+        // for a tag, so the payload is in place at 0. Anything larger is read at
+        // the alignment boundary like the bitvec branch, and an out-of-range
+        // offset FAILS CLOSED (`?` -> constant dropped) rather than falling back
+        // to 0. The fallback would mis-decode a tagged layout whose payload does
+        // not start at 0 -- reading the tag as the payload -- and a wrong
+        // constant can make an assertion PASS that should fail, which is the
+        // missed-bug direction. Dropping the constant is merely imprecise.
+        let offset = if alloc.bytes.len() == 1 {
+            0
+        } else {
+            LayoutOf::new(concrete_ty).align_of().unwrap_or(1)
+        };
+        let b = (*alloc.bytes.get(offset)?)?;
         return Some(Expr::bool_const(b != 0));
     }
 

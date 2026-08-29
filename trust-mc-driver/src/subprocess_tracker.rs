@@ -29,14 +29,35 @@
 //! // Process is automatically unregistered when guard is dropped
 //! ```
 
-use std::collections::HashSet;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use once_cell::sync::Lazy;
+/// Capacity of the lock-free PID table.
+///
+/// Slots are released on unregister, so this bounds *concurrently live*
+/// children, not children over the run. The driver's solver fan-out is
+/// bounded by harness count times lane count, orders of magnitude below this.
+const PID_SLOTS: usize = 1024;
 
-/// Global registry of active subprocess PIDs.
-static TRACKED_PIDS: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+/// A free slot. Named so the array initializer below stays a const expression
+/// (`AtomicU32` is not `Copy`, so `[AtomicU32::new(0); N]` will not compile).
+#[allow(clippy::declare_interior_mutable_const)]
+const FREE: AtomicU32 = AtomicU32::new(0);
+
+/// Global registry of active subprocess PIDs, as a fixed lock-free table.
+///
+/// Deliberately NOT a `Mutex<HashSet>`. `cleanup_all` runs from a signal
+/// handler, where taking a mutex is not async-signal-safe: the handler can
+/// interrupt a thread that already holds the lock, and blocking there
+/// deadlocks the process. The previous code avoided the deadlock with
+/// `try_lock` — but that traded it for a silent total failure, because losing
+/// the race meant returning having killed *nothing*, exactly when cleanup
+/// mattered most. Under a corpus run the registry is written constantly, so
+/// that race was not hypothetical.
+///
+/// Plain atomics have no such failure mode: the handler always sees a
+/// consistent view and always kills what is there. PID 0 marks a free slot,
+/// which is safe because no child is ever pid 0.
+static SLOTS: [AtomicU32; PID_SLOTS] = [FREE; PID_SLOTS];
 
 /// Flag indicating whether signal handlers have been installed.
 static HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -59,18 +80,39 @@ impl SubprocessTracker {
         // Ensure signal handlers are installed on first registration
         Self::install_handlers();
 
-        if let Ok(mut pids) = TRACKED_PIDS.lock() {
-            pids.insert(pid);
+        if pid == 0 {
+            return;
         }
+        for slot in SLOTS.iter() {
+            if slot.compare_exchange(0, pid, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                return;
+            }
+        }
+        // Table full: the child runs untracked rather than silently displacing
+        // another entry. Loud, because it means cleanup can now leak.
+        crate::raw_io::write_stderr_parts(&[
+            b"[trust_mc] subprocess table full; a child will not be tracked for cleanup\n",
+        ]);
     }
 
     /// Unregister a child process PID.
     ///
     /// Call this when a child process has completed normally.
     pub(crate) fn unregister(pid: u32) {
-        if let Ok(mut pids) = TRACKED_PIDS.lock() {
-            pids.remove(&pid);
+        if pid == 0 {
+            return;
         }
+        for slot in SLOTS.iter() {
+            if slot.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                return;
+            }
+        }
+    }
+
+    /// Whether `pid` is currently tracked. Test helper.
+    #[cfg(test)]
+    pub(crate) fn is_tracked(pid: u32) -> bool {
+        SLOTS.iter().any(|s| s.load(Ordering::SeqCst) == pid)
     }
 
     /// Clean up all tracked subprocesses by sending SIGKILL.
@@ -92,19 +134,20 @@ impl SubprocessTracker {
             return;
         }
 
-        // Use try_lock to be async-signal-safe: if the mutex is already held
-        // (e.g., signal arrived during register/unregister), we cannot safely
-        // acquire it. In that case, skip cleanup rather than deadlock.
-        // Part of #2137 F2: signal handler must not call Mutex::lock().
-        let pids: Vec<u32> = match TRACKED_PIDS.try_lock() {
-            Ok(pids) => pids.iter().copied().collect(),
-            Err(_) => {
-                // Mutex held — cannot safely enumerate PIDs from signal context.
-                // Reset flag and return; the holder will complete normally.
-                CLEANUP_IN_PROGRESS.store(false, Ordering::SeqCst);
-                return;
+        // Claim every occupied slot with an atomic swap. No lock is taken, so
+        // unlike the previous `try_lock` this can never bail out having killed
+        // nothing; and swapping (rather than reading) means a concurrent
+        // cleanup cannot double-kill a PID the OS may have already recycled.
+        let mut pids = [0u32; PID_SLOTS];
+        let mut n = 0usize;
+        for slot in SLOTS.iter() {
+            let pid = slot.swap(0, Ordering::SeqCst);
+            if pid != 0 {
+                pids[n] = pid;
+                n += 1;
             }
-        };
+        }
+        let pids = &pids[..n];
 
         if !pids.is_empty() {
             // Raw write — eprintln! would take the stderr lock, which is
@@ -119,13 +162,10 @@ impl SubprocessTracker {
         }
 
         for pid in pids {
-            Self::kill_process(pid);
+            Self::kill_process(*pid);
         }
 
-        // Clear the registry (also try_lock for signal safety)
-        if let Ok(mut pids) = TRACKED_PIDS.try_lock() {
-            pids.clear();
-        }
+        // No registry clear needed: the swap above already emptied every slot.
 
         CLEANUP_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
@@ -171,6 +211,15 @@ impl SubprocessTracker {
 
             // Install handler for SIGTERM (common for OOM killer and system shutdown)
             libc::signal(libc::SIGTERM, handler);
+
+            // Install handler for SIGHUP. The front door forwards SIGHUP, and
+            // without a handler here the default disposition kills the driver
+            // *without* running cleanup, orphaning the solver subtree — the
+            // exact leak this module exists to prevent. Installing a handler
+            // also overrides an inherited SIG_IGN (e.g. under `nohup`), which
+            // would otherwise make the driver ignore the forwarded signal and
+            // survive as an orphan.
+            libc::signal(libc::SIGHUP, handler);
 
             // Install handler for SIGINT (Ctrl+C)
             libc::signal(libc::SIGINT, handler);
@@ -260,10 +309,10 @@ mod tests {
     fn test_register_unregister() {
         let pid = 12345;
         SubprocessTracker::register(pid);
-        assert!(TRACKED_PIDS.lock().unwrap().contains(&pid));
+        assert!(SubprocessTracker::is_tracked(pid));
 
         SubprocessTracker::unregister(pid);
-        assert!(!TRACKED_PIDS.lock().unwrap().contains(&pid));
+        assert!(!SubprocessTracker::is_tracked(pid));
     }
 
     #[test]
@@ -271,10 +320,10 @@ mod tests {
         let pid = 12346;
         {
             let _guard = SubprocessGuard::new(pid);
-            assert!(TRACKED_PIDS.lock().unwrap().contains(&pid));
+            assert!(SubprocessTracker::is_tracked(pid));
         }
         // Guard dropped, PID should be unregistered
-        assert!(!TRACKED_PIDS.lock().unwrap().contains(&pid));
+        assert!(!SubprocessTracker::is_tracked(pid));
     }
 
     #[test]
@@ -290,15 +339,106 @@ mod tests {
         SubprocessTracker::register(pid1);
         SubprocessTracker::register(pid2);
 
-        // Verify both PIDs are tracked (membership, not count — parallel tests share TRACKED_PIDS)
-        assert!(TRACKED_PIDS.lock().unwrap().contains(&pid1));
-        assert!(TRACKED_PIDS.lock().unwrap().contains(&pid2));
+        // Verify both PIDs are tracked (membership, not count — parallel tests share the table)
+        assert!(SubprocessTracker::is_tracked(pid1));
+        assert!(SubprocessTracker::is_tracked(pid2));
 
         SubprocessTracker::unregister(pid1);
         SubprocessTracker::unregister(pid2);
 
         // Verify PIDs are no longer tracked
-        assert!(!TRACKED_PIDS.lock().unwrap().contains(&pid1));
-        assert!(!TRACKED_PIDS.lock().unwrap().contains(&pid2));
+        assert!(!SubprocessTracker::is_tracked(pid1));
+        assert!(!SubprocessTracker::is_tracked(pid2));
+    }
+}
+
+/// Environment variable that disables the parent-death watchdog.
+///
+/// Set this when the driver is intentionally run detached and is expected to
+/// outlive whatever launched it.
+pub(crate) const NO_PARENT_WATCH: &str = "TRUST_MC_NO_PARENT_WATCH";
+
+/// Terminate the solver subtree if the process that launched us dies.
+///
+/// Signal forwarding from the front door covers the catchable signals, but
+/// SIGKILL cannot be caught, and a front door that dies by panic, crash, or
+/// `kill -9` leaves no opportunity to forward anything. In every one of those
+/// cases the driver is reparented to init and keeps its solvers running
+/// against a build directory nobody is waiting on. Five such orphaned `ay`
+/// pairs were found on a single developer machine, the oldest 68 minutes old,
+/// which is also enough background CPU load to skew the very timing
+/// measurements the suite depends on.
+///
+/// The watchdog compares the current parent against the one recorded at
+/// startup. Reparenting is one-way and unambiguous: once the launching parent
+/// exits, `getppid` changes and never changes back.
+///
+/// Deliberately a no-op when the initial parent is already init (pid 1). A
+/// driver started detached — `nohup`, a daemon supervisor, an orphaned CI
+/// shell — has no launching parent to outlive, and treating that as a death
+/// would kill legitimate runs at startup.
+pub(crate) fn watch_parent_death() {
+    #[cfg(unix)]
+    {
+        // SAFETY: getppid takes no arguments and cannot fail.
+        let initial = unsafe { libc::getppid() };
+        if !should_watch_parent(initial, std::env::var_os(NO_PARENT_WATCH).is_some()) {
+            return;
+        }
+
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                // SAFETY: as above.
+                let current = unsafe { libc::getppid() };
+                if current != initial {
+                    crate::raw_io::write_stderr_parts(&[
+                        b"[trust_mc] parent process exited; terminating solver subprocesses\n",
+                    ]);
+                    SubprocessTracker::cleanup_all();
+                    // 128 + SIGTERM: the conventional status for a run ended by
+                    // termination, which is what a cancelled CI step expects.
+                    std::process::exit(143);
+                }
+            }
+        });
+    }
+}
+
+/// Whether the parent-death watchdog should run, given the parent recorded at
+/// startup and whether the opt-out is set.
+///
+/// Split out from [`watch_parent_death`] so the two guards can be tested
+/// without spawning processes. Both guards exist to prevent a false positive
+/// that would kill a legitimate run:
+///
+/// * `opted_out` is the explicit escape hatch for intentionally detached runs.
+/// * `initial_ppid <= 1` means we were *started* with no launching parent —
+///   already reparented to init, or started by init. There is nothing to
+///   outlive, and treating that as a parent death would abort at startup.
+fn should_watch_parent(initial_ppid: i32, opted_out: bool) -> bool {
+    !opted_out && initial_ppid > 1
+}
+
+#[cfg(test)]
+mod parent_watch_tests {
+    use super::should_watch_parent;
+
+    #[test]
+    fn watches_a_normal_launching_parent() {
+        assert!(should_watch_parent(4321, false));
+    }
+
+    #[test]
+    fn the_opt_out_disables_the_watchdog() {
+        assert!(!should_watch_parent(4321, true));
+    }
+
+    #[test]
+    fn a_process_started_detached_has_no_parent_to_outlive() {
+        // Reparented to (or started by) init: `getppid` is already 1, so a
+        // later change cannot signal that our launcher died.
+        assert!(!should_watch_parent(1, false));
+        assert!(!should_watch_parent(0, false));
     }
 }

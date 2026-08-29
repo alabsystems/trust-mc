@@ -19,10 +19,112 @@ use crate::codegen_ay::statement::StatementCodegen;
 use crate::kani_middle::abi::LayoutOf;
 use rustc_public::mir::mono::Instance;
 use rustc_public::rustc_internal;
+use rustc_span::sym;
 
 use super::super::IntoOption;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
+    fn function_implements_exact_trait_method(
+        &self,
+        direct_def_id: rustc_hir::def_id::DefId,
+        trait_def_id: rustc_hir::def_id::DefId,
+        allowed_names: &[&str],
+    ) -> bool {
+        let direct_trait_item = self
+            .ctx
+            .tcx
+            .opt_associated_item(direct_def_id)
+            .and_then(|item| item.trait_item_def_id());
+        self.ctx.tcx.associated_item_def_ids(trait_def_id).iter().copied().any(|trait_method| {
+            allowed_names.contains(&self.ctx.tcx.item_name(trait_method).as_str())
+                && (direct_def_id == trait_method || direct_trait_item == Some(trait_method))
+        })
+    }
+
+    fn is_authenticated_index_carrier(&self, op: &Operand) -> bool {
+        let Some(mut ty) = op.ty(self.body.locals()).into_option() else {
+            return false;
+        };
+        for _ in 0..8 {
+            match ty.kind() {
+                TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => {
+                    ty = inner;
+                }
+                TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Array(..) | RigidTy::Str) => {
+                    return true;
+                }
+                TyKind::RigidTy(RigidTy::Adt(def, _)) => {
+                    let def_id = rustc_internal::internal(self.ctx.tcx, def.def_id());
+                    let path = self.ctx.tcx.def_path_str(def_id);
+                    return self.ctx.tcx.crate_name(def_id.krate).as_str() == "alloc"
+                        && matches!(path.as_str(), "alloc::vec::Vec" | "std::vec::Vec");
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Authenticate the semantic Index/IndexMut stubs independently of the
+    /// suffix-compatible registry. Returns the real `(source, index)` order.
+    pub(in crate::codegen_ay::statement) fn authenticated_core_index_args<'b>(
+        &self,
+        func: &Operand,
+        args: &'b [Operand],
+    ) -> Option<(&'b Operand, &'b Operand)> {
+        if args.len() != 2 {
+            return None;
+        }
+        let func_ty = func.ty(self.body.locals()).into_option()?;
+        let TyKind::RigidTy(RigidTy::FnDef(fn_def, _)) = func_ty.kind() else {
+            return None;
+        };
+        let direct_def_id = rustc_internal::internal(self.ctx.tcx, fn_def.def_id());
+        if !matches!(
+            self.ctx.tcx.crate_name(direct_def_id.krate).as_str(),
+            "core" | "alloc" | "std"
+        ) {
+            return None;
+        }
+        let (source, index) = if self.function_implements_exact_trait_method(
+            direct_def_id,
+            self.ctx.tcx.lang_items().index_trait()?,
+            &["index"],
+        ) || self.function_implements_exact_trait_method(
+            direct_def_id,
+            self.ctx.tcx.lang_items().index_mut_trait()?,
+            &["index_mut"],
+        ) {
+            (&args[0], &args[1])
+        } else if let Some(slice_index_trait) = self.ctx.tcx.get_diagnostic_item(sym::SliceIndex)
+            && self.function_implements_exact_trait_method(
+                direct_def_id,
+                slice_index_trait,
+                &["index", "index_mut"],
+            )
+        {
+            (&args[1], &args[0])
+        } else {
+            return None;
+        };
+        self.is_authenticated_index_carrier(source).then_some((source, index))
+    }
+
+    pub(in crate::codegen_ay::statement) fn is_exact_core_range_full_operand(
+        &self,
+        op: &Operand,
+    ) -> bool {
+        let Some(ty) = op.ty(self.body.locals()).into_option() else {
+            return false;
+        };
+        matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(def, _)) if {
+            let def_id = rustc_internal::internal(self.ctx.tcx, def.def_id());
+            let path = self.ctx.tcx.def_path_str(def_id);
+            self.ctx.tcx.crate_name(def_id.krate).as_str() == "core"
+                && matches!(path.as_str(), "core::ops::range::RangeFull" | "std::ops::RangeFull")
+        })
+    }
+
     /// Resolve a call operand to its canonical def path.
     pub(in crate::codegen_ay::statement) fn resolve_callee_path(
         &self,
@@ -61,6 +163,33 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             _ => return false,
         };
         let internal_def_id = rustc_internal::internal(self.ctx.tcx, fn_def.def_id());
+        self.ctx.tcx.is_foreign_item(internal_def_id)
+    }
+
+    /// The last path segment of a call operand's `FnDef` name, for messages.
+    /// `"<unknown>"` when the operand is not a named `FnDef`. Display only —
+    /// no obligation ever keys on it.
+    pub(in crate::codegen_ay::statement) fn callee_display_name(&self, func: &Operand) -> String {
+        let Some(func_ty) = func.ty(self.body.locals()).into_option() else {
+            return "<unknown>".to_string();
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(def, _)) = func_ty.kind() else {
+            return "<unknown>".to_string();
+        };
+        let name = def.trimmed_name();
+        name.rsplit("::").next().unwrap_or(&name).to_string()
+    }
+
+    /// As [`is_foreign_call`], for an already-resolved [`Instance`] — the shape
+    /// a function POINTER callee arrives in. `func(x)` through an
+    /// `extern "C" fn(u32) -> u32` pointer never carries a `FnDef` operand, so
+    /// the operand-based test cannot see its foreignness; the resolved instance
+    /// can.
+    pub(in crate::codegen_ay::statement) fn is_foreign_instance(
+        &self,
+        instance: &rustc_public::mir::mono::Instance,
+    ) -> bool {
+        let internal_def_id = rustc_internal::internal(self.ctx.tcx, instance.def.def_id());
         self.ctx.tcx.is_foreign_item(internal_def_id)
     }
 

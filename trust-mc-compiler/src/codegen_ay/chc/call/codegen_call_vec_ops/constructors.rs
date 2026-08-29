@@ -19,6 +19,7 @@ use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH, ptr_sort};
 use super::super::ChcCtx;
 use super::super::codegen_ctx::globals::declare_pending_var;
 use super::super::codegen_ctx::types::CollectionProjectionKind;
+use super::super::codegen_types::CodegenTypes;
 use super::shared::{ProjectedVecState, coerce_array_element};
 
 pub(in crate::codegen_ay::chc) struct VecOpNewContext<'a> {
@@ -304,6 +305,69 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// Maximum `vec![e; n]` fill materialized byte-for-byte into the memory
+    /// image. Past this the byte lane keeps the previous behaviour (collection
+    /// model only) rather than emitting an unusable store chain.
+    const MAX_FROM_ELEM_MATERIALIZED: u64 = 512;
+
+    /// Put `vec![elem; n]` WHERE THE READER WILL LOOK.
+    ///
+    /// `from_elem` was modelled purely in the collection domain: `data` became
+    /// `const_array(elem)` and the returned pointer was a FREE 64-bit word. A
+    /// harness that then reads through `as_ptr()` — `*ptr.wrapping_byte_offset(i)`
+    /// — goes to the byte-memory image instead, which nothing had ever written,
+    /// so every element read back unconstrained and any property over the fill
+    /// was refutable. Two independent fabrications: an unbound pointer (an
+    /// address that denotes no allocation) and a fill that exists in only one of
+    /// the two images.
+    ///
+    /// This binds the returned pointer to a freshly allocated, provably-valid
+    /// backing object and writes the element into that object's memory image
+    /// once per slot, so the byte view reachable through `as_ptr()` and the
+    /// collection `data` array are the SAME store.
+    ///
+    /// Returns the base address on success; `None` leaves the caller's previous
+    /// unconstrained-pointer behaviour untouched (count not statically known,
+    /// too large, or an element with no byte image).
+    fn try_materialize_from_elem_backing(
+        &mut self,
+        args: &[Operand],
+        elem_expr: Option<&Expr>,
+        count_expr: &Expr,
+    ) -> Option<Expr> {
+        let elem = elem_expr?;
+        let folded = trust_mc_core::chc_const_prop::eval::try_eval_to_const(count_expr)?;
+        let ay_bindings::ExprValue::BitVecConst { value, .. } = folded.value() else {
+            return None;
+        };
+        let count = u64::try_from(value.clone()).ok()?;
+        if count == 0 || count > Self::MAX_FROM_ELEM_MATERIALIZED {
+            return None;
+        }
+        let elem_ty = args.first()?.ty(self.body.locals()).ok()?;
+        let type_key = Self::type_key_for_ty(elem_ty).into_owned();
+        let elem_sort = <Self as CodegenTypes>::translate_ty(elem_ty)?;
+        let stride = u64::try_from(Self::copyable_elem_bytes(&elem_sort)?).ok()?;
+        let base = self.heap_state.fresh_valid_backing_ptr()?;
+        let signed = type_key.starts_with('i');
+        for k in 0..count {
+            let byte_offset = k.checked_mul(stride)?;
+            let addr = if byte_offset == 0 {
+                base.clone()
+            } else {
+                base.clone().bvadd(Expr::bitvec_const(byte_offset, POINTER_WIDTH))
+            };
+            self.store_to_type_array(addr, elem.clone(), &type_key, elem_sort.clone(), signed);
+        }
+        tracing::debug!(
+            count,
+            stride,
+            %type_key,
+            "vec![elem; n]: fill materialized into the byte-memory image"
+        );
+        Some(base)
+    }
+
     /// VecFromElem: `vec![elem; n]` → Vec with data = const_array(elem), len = n, cap = n.
     /// Part of #3348: models alloc::vec::from_elem(elem, n) as a populated Vec.
     pub(in crate::codegen_ay::chc) fn vec_op_from_elem(
@@ -333,20 +397,30 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Build data array: const_array where every index maps to elem_expr.
         // For projected path
+        let materialized_base =
+            self.try_materialize_from_elem_backing(args, elem_expr.as_ref(), &count_expr);
+        if materialized_base.is_some() {
+            // The fill lives in an accumulated store chain; a call handler emits
+            // its own rule, so the chain has to be drained INTO that rule (the
+            // block-end drain never sees it) or the stores are silently lost.
+            acc.constraints.append(&mut self.heap_state.drain_store_chains(&self.diagnostics));
+        }
         if self.collections.projection_locals.get(&dest_local).copied()
             == Some(CollectionProjectionKind::Vec)
         {
-            let ptr = declare_pending_var(
-                {
-                    use std::fmt::Write;
-                    let mut n = String::with_capacity(24);
-                    n.push_str("from_elem_");
-                    let _ = write!(n, "{dest_local}");
-                    n.push_str("_ptr");
-                    n
-                },
-                ptr_sort(),
-            );
+            let ptr = materialized_base.clone().unwrap_or_else(|| {
+                declare_pending_var(
+                    {
+                        use std::fmt::Write;
+                        let mut n = String::with_capacity(24);
+                        n.push_str("from_elem_");
+                        let _ = write!(n, "{dest_local}");
+                        n.push_str("_ptr");
+                        n
+                    },
+                    ptr_sort(),
+                )
+            });
             let data_sort = self
                 .state_var_mgr
                 .output_state_vars
@@ -391,15 +465,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && dt.constructors.first().is_some_and(|c| c.has_field(vec_layout::FLD_CAP))
         {
             let dt_name = out_sort.datatype_name().expect("has datatype_sort");
-            let ptr = declare_pending_var(
-                {
-                    let mut n = String::with_capacity(out_name.len() + 7);
-                    n.push_str(&out_name);
-                    n.push_str("_fe_ptr");
-                    n
-                },
-                ptr_sort(),
-            );
+            let ptr = materialized_base.unwrap_or_else(|| {
+                declare_pending_var(
+                    {
+                        let mut n = String::with_capacity(out_name.len() + 7);
+                        n.push_str(&out_name);
+                        n.push_str("_fe_ptr");
+                        n
+                    },
+                    ptr_sort(),
+                )
+            });
             let data_sort = dt
                 .constructors
                 .first()

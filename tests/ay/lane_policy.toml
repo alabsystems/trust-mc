@@ -1,0 +1,452 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# Lane policy manifest for scripts/ay-compiletest.sh.
+# Part of #1037 DL1 (capability-routed dual lane).
+#
+# Schema:
+# [[entry]]
+# path = "tests/ay/<file>.rs"   # required
+# harness = "<proof_name>"      # optional; overrides file-level entry when present
+# lane = "chc" | "bmc"          # required
+# unwind = <positive int>       # required when lane = "bmc"
+# reason = "short rationale"    # recommended
+# issue = 1037                  # recommended
+#
+# Keep CHC as the default lane until DL4 seeds bounded BMC candidates.
+
+version = 1
+
+# Kani Arbitrary validity smoke test: finite nondet array/char invariants.
+# CHC/Spacer currently returns UNKNOWN on these acyclic validity checks; direct
+# BMC is the appropriate solver lane once char nondet values are range-bounded.
+[[entry]]
+path = "tests/trust-mc/Arbitrary/arbitrary_impls.rs"
+lane = "bmc"
+unwind = 4
+reason = "Finite Arbitrary validity checks; CHC Spacer returns UNKNOWN on array/char invariants"
+issue = 1037
+
+# Part of #1739: 12-tuple Arbitrary + sequential field-access sums generate 48
+# CHC relations / 188 variables. Spacer times out (60s) on this acyclic BV16
+# arithmetic. No loops or invariants to synthesize — BMC solves in 0.03s.
+[[entry]]
+path = "tests/trust-mc/Tuple/main.rs"
+harness = "test_tuple_size_12"
+lane = "bmc"
+unwind = 1
+reason = "48 CHC relations from 12-tuple field projections overwhelm Spacer; no loops"
+issue = 1739
+
+# Part of #3688: RoundTiesEven symbolic BV IEEE 754 properties.
+# Concrete cases now prove in CHC; keep the symbolic properties in direct BMC.
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/RoundTiesEven/round_ties_even_f32.rs"
+harness = "test_towards_nearest"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV rounding too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/RoundTiesEven/round_ties_even_f64.rs"
+harness = "test_towards_nearest"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV rounding too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/RoundTiesEven/round_ties_even_f32.rs"
+harness = "test_diff_half_one"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV rounding too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/RoundTiesEven/round_ties_even_f64.rs"
+harness = "test_diff_half_one"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV rounding too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+# Second-wave rounding/trunc BMC activation for symbolic properties.
+# Concrete cases now prove in CHC.
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/Round/roundf32.rs"
+harness = "test_towards_closer"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV round too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/Round/roundf64.rs"
+harness = "test_towards_closer"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV round too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/Round/roundf32.rs"
+harness = "test_diff_half_one"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV round too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/Round/roundf64.rs"
+harness = "test_diff_half_one"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV round too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/Trunc/truncf64.rs"
+harness = "test_towards_zero"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV trunc too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Math/Rounding/Trunc/truncf64.rs"
+harness = "test_diff_one"
+lane = "bmc"
+unwind = 1
+reason = "IEEE 754 BV trunc too complex for Spacer; straight-line, no loops"
+issue = 3688
+
+# FloatToInt — f16/f128 already PROOF via BMC auto-retry. f32/f64 went CTREX
+# (possible encoding gap). Lane policy ensures consistent BMC routing.
+[[entry]]
+path = "tests/trust-mc/Intrinsics/FloatToInt/float_to_int.rs"
+lane = "bmc"
+unwind = 1
+reason = "BV IEEE 754 float-to-int extraction too complex for Spacer; no loops"
+issue = 3688
+
+# BitReverse intrinsic: straight-line BV concat/extract relation over a symbolic
+# bit index. Spacer times out/UNKNOWN, while direct BMC proves the bounded
+# obligation quickly with no loop invariant required.
+[[entry]]
+path = "tests/trust-mc/Intrinsics/bitreverse.rs"
+lane = "bmc"
+unwind = 1
+reason = "Straight-line BV bitreverse relation too complex for Spacer; no loops"
+issue = 4069
+
+# Acyclic branch-merge harnesses: Spacer times out on BV32 acyclic CHC with
+# 15+ predicates from MIR intermediaries. Direct BMC proves all in <0.02s.
+# Root cause: ay-chc portfolio BV bit-blasting overwhelms Spacer for acyclic
+# multi-predicate BV32 problems (ay#8540). No loops or invariants needed.
+[[entry]]
+path = "tests/ay/soundness_129_branch_phi.rs"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic branch-merge; Spacer timeout on BV32 multi-predicate CHC"
+issue = 129
+
+[[entry]]
+path = "tests/ay/simple_branch.rs"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic if/else; Spacer timeout on BV32 multi-predicate CHC"
+issue = 129
+
+[[entry]]
+path = "tests/ay/soundness_155_stale_ssa_pass.rs"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic scalar reassign; Spacer timeout on BV32 multi-predicate CHC"
+issue = 155
+
+[[entry]]
+path = "tests/ay/switchint_regression.rs"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic assume + branch; Spacer timeout on BV32 multi-predicate CHC"
+issue = 129
+
+[[entry]]
+path = "tests/ay/soundness_128_assert_true_branch.rs"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic path-condition implication; Spacer timeout on BV32 CHC"
+issue = 128
+
+# Memory store/load: cross-branch and symbolic harnesses need BMC.
+# Concrete store/load harnesses are already PROOF via CHC.
+[[entry]]
+path = "tests/ay/memory_store_load.rs"
+harness = "test_memory_cross_branch"
+lane = "bmc"
+unwind = 1
+reason = "Branch-merge through memory; Spacer timeout on multi-predicate CHC"
+issue = 129
+
+[[entry]]
+path = "tests/ay/memory_store_load.rs"
+harness = "test_memory_store_load_symbolic"
+lane = "bmc"
+unwind = 1
+reason = "Symbolic store/load roundtrip; Spacer timeout on array+BV32 CHC"
+issue = 129
+
+# Mixed-width bitvector: cast + comparison on different BV widths.
+# Spacer times out on BV width coercion chains.
+[[entry]]
+path = "tests/ay/test_mixed_width_bitvec.rs"
+lane = "bmc"
+unwind = 1
+reason = "BV width cast chains too complex for Spacer; no loops"
+issue = 129
+
+# Loop-free cttz intrinsic proofs lower to straight-line bitvector obligations.
+# CHC proves them but spends 20s+ in Spacer; direct BMC is complete and finishes
+# in ~1s with no invariant synthesis needed.
+[[entry]]
+path = "tests/ay/cttz_loopfree.rs"
+lane = "bmc"
+unwind = 1
+reason = "Loop-free cttz BV obligations; CHC spends tens of seconds"
+issue = 1037
+
+# Loop-free ctpop/ctlz intrinsic proofs also lower to straight-line bitvector
+# obligations. At ay 733ba8cd, ctpop hits CHC SAT model-verification
+# failures/UNKNOWN and ctlz returns clean UNKNOWN; direct BMC proves all four
+# harnesses with explicit_bmc_lane provenance and no unsupported fallbacks.
+[[entry]]
+path = "tests/ay/ctpop_loopfree.rs"
+lane = "bmc"
+unwind = 1
+reason = "Loop-free ctpop BV obligations; CHC UNKNOWN/SAT model verification failures"
+issue = 1037
+
+[[entry]]
+path = "tests/ay/ctlz_loopfree.rs"
+lane = "bmc"
+unwind = 1
+reason = "Loop-free ctlz BV obligations; CHC returns UNKNOWN, BMC proves directly"
+issue = 1037
+
+# Guarded div/rem safety is straight-line BV arithmetic with explicit non-zero
+# and signed-overflow assumptions. BMC avoids CHC nondeterminism on division.
+[[entry]]
+path = "tests/ay/test_div_by_zero_pass.rs"
+lane = "bmc"
+unwind = 1
+reason = "Guarded div/rem BV safety; no loops or invariant synthesis"
+issue = 61
+
+# Euclidean div/rem smoke tests are finite straight-line arithmetic checks.
+# CHC is timing-sensitive after false-proof defenses; BMC discharges them
+# directly without requiring invariant synthesis.
+[[entry]]
+path = "tests/ay/test_euclid_div_rem.rs"
+lane = "bmc"
+unwind = 1
+reason = "Bounded Euclidean div/rem arithmetic; no loops"
+issue = 3186
+
+[[entry]]
+path = "tests/ay/test_euclid_div_rem_signed.rs"
+lane = "bmc"
+unwind = 1
+reason = "Bounded signed Euclidean div/rem arithmetic; no loops"
+issue = 3293
+
+# Checked-add boundary proof: straight-line BV overflow/Option encoding with
+# no loop invariant to infer. CHC is timing-sensitive here; BMC is deterministic.
+[[entry]]
+path = "tests/ay/test_arithmetic_overflow.rs"
+harness = "check_checked_add_at_max"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic checked-add overflow boundary; Spacer timeout under load"
+issue = 3114
+
+# `core::intrinsics::assume(false)` is a straight-line panic-reachability
+# obligation. CHC returns UNKNOWN, while direct BMC exposes the counterexample
+# immediately through the panic check.
+[[entry]]
+path = "tests/trust-mc/Intrinsics/Assume/assume_fail.rs"
+lane = "bmc"
+unwind = 1
+reason = "Straight-line assume(false) panic reachability; CHC UNKNOWN, BMC finds CTREX"
+issue = 1037
+
+# copy_nonoverlapping with symbolic counts: no loops in the harness assertions,
+# but the guarded copy/validity state creates a large acyclic CHC problem.
+# Direct BMC proves the two symbolic-count cases while constant/zero-count cases
+# stay on CHC.
+[[entry]]
+path = "tests/ay/copy_dynamic_count.rs"
+harness = "copy_with_dynamic_count"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic symbolic copy assertions; Spacer timeout on guarded array/BV copy state"
+issue = 698
+
+[[entry]]
+path = "tests/ay/copy_dynamic_count.rs"
+harness = "copy_bool_with_dynamic_count"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic symbolic bool copy assertions; Spacer timeout on guarded validity/copy state"
+issue = 698
+
+# typed_swap_nonoverlapping on two symbolic u32 locals is straight-line memory
+# state. CHC/Spacer returns clean UNKNOWN on the scalar swap relation, while
+# direct BMC proves it once the typed-swap lowering mirrors pointee locals.
+[[entry]]
+path = "tests/trust-mc/Intrinsics/typed_swap_nonoverlapping.rs"
+harness = "test_typed_swap_nonoverlapping_u32"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic typed-swap scalar relation; CHC UNKNOWN, BMC proves updated pointee locals"
+issue = 3477
+
+# Factorial: bounded loop (n<=12, unwind 14). ay-chc Spacer regressed
+# UNKNOWN->ERROR after ay bump. BMC handles bounded BV32 multiplication loop.
+[[entry]]
+path = "tests/ay/factorial.rs"
+lane = "bmc"
+unwind = 14
+reason = "Bounded factorial loop with unwind(14); Spacer regressed after ay bump"
+issue = 4225
+
+# Direct BTreeMap stubs lower to SMT Array store/select chains with no loops.
+# Spacer returns clean UNKNOWN on the two-insert isolation relation, but bounded
+# BMC is complete for this straight-line encoding.
+[[entry]]
+path = "tests/ay/btreemap_direct.rs"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic BTreeMap store/select obligations; Spacer UNKNOWN on isolation"
+issue = 3348
+
+[[entry]]
+path = "tests/ay/btreemap_struct_dual_get2.rs"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic struct-wrapped BTreeMap store/select obligation; Spacer UNKNOWN"
+issue = 3348
+
+# kani::any expected-fail smoke: one unconstrained u8 plus one assertion.
+# CHC native counterexample search times out on current AY, while direct BMC
+# finds the genuine assertion counterexample immediately. This is finite and
+# has no loop invariant to synthesize.
+[[entry]]
+path = "tests/ay/kani_any_chc_fail.rs"
+lane = "bmc"
+unwind = 1
+reason = "Finite unconstrained u8 expected-fail; CHC counterexample search times out"
+issue = 1037
+
+# HTR resolve scalar harnesses: finite-domain, straight-line literal/assignment
+# checks. CHC/Spacer returns clean UNKNOWN on these branch-heavy Boolean proof
+# graphs, while direct BMC proves the bounded obligations. Keep
+# ay_htr_binary_exists_detection and ay_htr_resolution_valid on CHC/UNKNOWN for
+# now; the former does not complete under the target timeout and the latter
+# emits an oversized BMC artifact.
+[[entry]]
+path = "tests/ay/ay_self_verify_bootstrap_tier3_htr_resolve.rs"
+harness = "ay_htr_no_duplicate_literals"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic HTR no-duplicate scalar proof; Spacer UNKNOWN, BMC proves directly"
+issue = 3766
+
+[[entry]]
+path = "tests/ay/ay_self_verify_bootstrap_tier3_htr_resolve.rs"
+harness = "ay_htr_resolution_valid_binary"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic HTR binary-resolution proof; Spacer UNKNOWN, BMC proves directly"
+issue = 3766
+
+[[entry]]
+path = "tests/ay/ay_self_verify_bootstrap_tier3_htr_resolve.rs"
+harness = "ay_htr_tautology_rejected"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic HTR tautology rejection proof; Spacer UNKNOWN, BMC proves directly"
+issue = 3766
+
+# Minimal loop-array flat cases have constant loop bounds (len <= 2) and no
+# heap/struct modeling. Spacer returns clean UNKNOWN on the array loop invariant;
+# BMC is complete with unwind 3. The struct-array sibling remains CHC/UNKNOWN.
+[[entry]]
+path = "tests/ay/test_minimal_loop_array.rs"
+harness = "proof_minimal_array_lookup"
+lane = "bmc"
+unwind = 3
+reason = "Constant-bound flat array lookup loop; Spacer UNKNOWN, BMC complete"
+issue = 1037
+
+[[entry]]
+path = "tests/ay/test_minimal_loop_array.rs"
+harness = "proof_minimal_array_search"
+lane = "bmc"
+unwind = 3
+reason = "Constant-bound flat array search loop; Spacer UNKNOWN, BMC complete"
+issue = 1037
+
+# Reduced NIA product-sign associativity: straight-line i32 multiplication over
+# {-1, 1}. CHC Spacer times out even with retries disabled; direct BMC proves
+# the overflow and assertion checks with no loop invariant needed.
+[[entry]]
+path = "tests/ay/ay_self_verify_nia_product_sign_associative.rs"
+harness = "ay_nia_product_sign_associative_reduced"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic bounded NIA product-sign proof; Spacer timeout, BMC proves directly"
+issue = 3925
+
+# Bounds-check pass harnesses are finite array-index safety obligations with no
+# loop invariant to infer. Spacer returns UNKNOWN/timeouts on the array-state CHC
+# graph, while direct BMC discharges the guarded and constant array indices.
+# Keep slice indexing on CHC until the BMC slice-unsize path emits trusted checks.
+[[entry]]
+path = "tests/ay/test_bounds_check_pass.rs"
+harness = "test_2d_array_guarded_pass"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic guarded nested array bounds check; Spacer UNKNOWN on array state"
+issue = 60
+
+[[entry]]
+path = "tests/ay/test_bounds_check_pass.rs"
+harness = "test_array_constant_index_pass"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic constant array bounds checks; Spacer UNKNOWN on array state"
+issue = 60
+
+[[entry]]
+path = "tests/ay/test_bounds_check_pass.rs"
+harness = "test_array_index_guarded_pass"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic guarded array bounds check; Spacer timeout on array state"
+issue = 60
+
+# Enum equality with a promoted ZST-field constant is straight-line:
+# constructing `WithZST::C(ZeroSized)` and comparing it through derived
+# PartialEq has no loop invariant to infer. CHC proves the variable-vs-variable
+# shape but returns UNKNOWN for the promoted-constant shape; direct BMC proves
+# the finite discriminant/ZST equality obligation.
+[[entry]]
+path = "tests/ay/enum_eq_minimal.rs"
+harness = "check_zst_field_promoted"
+lane = "bmc"
+unwind = 1
+reason = "Acyclic enum/ZST promoted-constant equality; Spacer UNKNOWN"
+issue = 3994

@@ -105,6 +105,7 @@ impl ValidateArgs for StandaloneArgs {
         check_no_cargo_opt(!self.verify_opts.cargo.exclude.is_empty(), "--exclude")?;
         check_no_cargo_opt(self.verify_opts.cargo.workspace, "--workspace")?;
         check_no_cargo_opt(self.verify_opts.cargo.manifest_path.is_some(), "--manifest-path")?;
+        check_no_cargo_opt(self.verify_opts.cargo.locked, "--locked")?;
         if self.input.is_some() && self.verify_opts.trust_vc_bundle.is_some() {
             return Err(Error::raw(
                 ErrorKind::ArgumentConflict,
@@ -332,6 +333,31 @@ impl VerificationArgs {
             return Err(Error::raw(
                 ErrorKind::ArgumentConflict,
                 "Conflicting options: --sarif isn't compatible with --only-codegen.",
+            ));
+        }
+        // `--coverage` has no producer in the CHC lane. Source-based coverage
+        // is built by running a per-coverage-point satisfiability check over
+        // the plain SMT encoding (`call_ay.rs`, `build_coverage_results_from_
+        // sat_checks`); the HORN encoding emits no such checks, and every
+        // `VerificationResult` returned from the CHC branches is hard-coded to
+        // `coverage_results: None`.
+        //
+        // The old behaviour was the worst of both: the whole verification ran,
+        // the per-harness verdict was PRINTED, and only then did
+        // `save_coverage_results` die with "harness missing coverage results"
+        // — an obscure failure after a successful-looking answer. Refuse the
+        // combination here instead, before anything is printed, and name the
+        // limitation. Fail-closed: no coverage report is emitted for a lane
+        // that cannot produce one, so nobody reads CHC coverage that is not
+        // there. Lift this when the CHC lane learns to decide coverage points.
+        if self.coverage && self.ay_chc {
+            return Err(Error::raw(
+                ErrorKind::ArgumentConflict,
+                "Conflicting options: --coverage is not supported with --ay-chc. \
+                 Source-based coverage is produced only by the bounded (SMT) lane; \
+                 the CHC/Horn lane emits no coverage checks, so there is nothing to \
+                 report. Drop --ay-chc to get coverage, or drop --coverage to keep \
+                 unbounded verification.",
             ));
         }
         Ok(())

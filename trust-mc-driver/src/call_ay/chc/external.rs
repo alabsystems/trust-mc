@@ -21,10 +21,21 @@ use super::verdict_policy::{ChcOutcomeKind, apply_recursion_unwind_verdict, clas
 
 macro_rules! solver_stdout {
     ($($arg:tt)*) => {{
-        use std::io::Write;
-        let stdout = std::io::stdout();
-        let mut handle = stdout.lock();
-        let _ = writeln!(handle, $($arg)*);
+        // Honor `--quiet` ("no output, just an exit code and requested
+        // artifacts"): this macro used to write straight to stdout, so a quiet
+        // run still printed `[AY:PROOF] CHC verification: ...` and the other
+        // solver markers. The gate lives in the macro rather than at the ~70
+        // call sites because several of them are free functions with no
+        // `&KaniSession` in reach. Only the WRITE is skipped — the verdict and
+        // the exit code are untouched — and with `--quiet` absent the bytes
+        // are identical to before, which is what `scripts/ay-compiletest.sh`
+        // parses.
+        if !crate::args::common::quiet_output() {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            let _ = writeln!(handle, $($arg)*);
+        }
     }};
 }
 

@@ -69,6 +69,48 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         distance: &Expr,
         distance_signed: Option<bool>,
     ) {
+        self.emit_shift_distance_check_msgs(value, distance, distance_signed, None, None);
+    }
+
+    /// Kani's op-specific wording for the SIMD lane checks: "attempt {op}
+    /// with excessive/negative shift distance".
+    pub(super) fn emit_shift_distance_check_named(
+        &mut self,
+        value: &Expr,
+        distance: &Expr,
+        distance_signed: Option<bool>,
+        op_name: Option<&str>,
+    ) {
+        let exc = op_name.map(|op| format!("attempt {op} with excessive shift distance"));
+        let neg = op_name.map(|op| format!("attempt {op} with negative shift distance"));
+        self.emit_shift_distance_check_msgs(value, distance, distance_signed, exc, neg);
+    }
+
+    /// One Kani-identical description applied to BOTH sub-checks: rustc's
+    /// `Assert { msg: Overflow(Shl|Shr, ..) }` is ONE obligation worded
+    /// "attempt to shift {left,right} with overflow"; we encode it as two
+    /// conjunct sub-checks (excessive, negative), so both quote that message.
+    pub(super) fn emit_shift_distance_check_with_message(
+        &mut self,
+        value: &Expr,
+        distance: &Expr,
+        distance_signed: Option<bool>,
+        message: Option<&str>,
+    ) {
+        let m = message.map(str::to_owned);
+        self.emit_shift_distance_check_msgs(value, distance, distance_signed, m.clone(), m);
+    }
+
+    /// The core: distinct optional descriptions for the excessive and
+    /// negative sub-checks. `None` keeps the generic taxonomy wording.
+    fn emit_shift_distance_check_msgs(
+        &mut self,
+        value: &Expr,
+        distance: &Expr,
+        distance_signed: Option<bool>,
+        excessive_msg: Option<String>,
+        negative_msg: Option<String>,
+    ) {
         let Some(value_width) = value.sort().bitvec_width() else {
             return;
         };
@@ -83,14 +125,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let distance_coerced = Self::coerce_to_width_typed(distance.clone(), compare_width, false);
         let width_const = Expr::bitvec_const(value_width as u128, compare_width);
         let valid_distance = distance_coerced.bvult(width_const);
-        self.record_violation_guarded(valid_distance.not(), "shift_distance_check");
+        self.record_violation_guarded_with_message(
+            valid_distance.not(),
+            "shift_distance_check",
+            excessive_msg,
+        );
 
         if distance_signed == Some(true) {
             let distance_signed =
                 Self::coerce_to_width_typed(distance.clone(), compare_width, true);
             let zero = Expr::bitvec_const(0u128, compare_width);
             let negative_distance = distance_signed.bvslt(zero);
-            self.record_violation_guarded(negative_distance, "shift_distance_check_negative");
+            self.record_violation_guarded_with_message(
+                negative_distance,
+                "shift_distance_check_negative",
+                negative_msg,
+            );
         }
     }
 
@@ -322,7 +372,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let rhs_not_neg_one = rhs.eq(neg_one).not();
                 let no_overflow = lhs_not_min.or(rhs_not_neg_one);
 
-                Some((no_overflow, "overflow_check_div"))
+                // Distinct labels: Kani words `/` overflow "attempt to divide
+                // with overflow" and `%` overflow "attempt to calculate the
+                // remainder with overflow" (rustc AssertKind texts), and the
+                // corpus pins both. One shared label could not render both.
+                let label = if matches!(op, BinOp::Div) {
+                    "overflow_check_div"
+                } else {
+                    "overflow_check_rem"
+                };
+                Some((no_overflow, label))
             }
             // Unsigned division cannot overflow (division by zero handled separately).
             // Shift, comparison, and bitwise operations don't overflow.

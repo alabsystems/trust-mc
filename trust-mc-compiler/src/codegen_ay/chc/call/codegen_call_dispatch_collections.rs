@@ -23,6 +23,7 @@ use super::codegen_call_option_result::CallOptionResult;
 use super::codegen_call_slice::CallSlice;
 use super::codegen_call_string::CallString;
 use super::codegen_call_vec::CallVec;
+use super::codegen_call_vec_ops_mutate::slice_permutation_stub_for_path;
 /// Extension trait for numeric + collection-family dispatch in call-terminator codegen.
 pub(in crate::codegen_ay::chc) trait CallDispatchCollections {
     fn try_dispatch_call_numeric_collections(&mut self, dcx: &DispatchCallContext<'_>) -> bool;
@@ -44,6 +45,51 @@ impl<'tcx, 'body> CallDispatchCollections for ChcCtx<'tcx, 'body> {
         // Design rule (Part of #2408 T5): these use type-based detection (BigInt,
         // BigRational, HashMap) or custom path patterns (alloc, iterators) that
         // cannot be reduced to a single StubKind registry lookup yet.
+
+        // `<[T]>::reverse` / `<[T]>::sort*` reached through `Vec: DerefMut`.
+        //
+        // These never carry a `Vec<`/`Vec::` path segment, so the stub registry
+        // returns None for them and `fn_inline` claimed the call and emitted
+        // nothing for the `&mut [T]` receiver — encoding the mutation as the
+        // IDENTITY. That fabricated proofs: `v.reverse(); assert!(v == old_v)`
+        // verified, and `Vectors/any/sorting.rs` (`if v[0] > v[1] { v.reverse() }
+        // assert!(v[0] <= v[1])`) reported a counterexample on the branch where
+        // the reversal was dropped.
+        //
+        // Routing is guarded on the receiver actually resolving to a Vec
+        // representation: a `[T; N]` array reaches the same paths, and handing
+        // one to the Vec handlers would drop ITS mutation instead (the earlier
+        // attempt at this fix made `[1,2,3].reverse(); assert!(a[0] == 1)`
+        // verify). An unresolvable receiver declines here and keeps whatever
+        // the existing chain did.
+        if let Some(stub) =
+            self.resolve_callee_path(func).as_deref().and_then(slice_permutation_stub_for_path)
+            && self
+                .resolve_collection_local(args)
+                .and_then(|recv| self.resolve_reversible_vec_local(recv))
+                .is_some()
+        {
+            if let Some(target) = target {
+                let cx = ChcCallContext {
+                    stub,
+                    args,
+                    destination,
+                    target: *target,
+                    from_app,
+                    stmt_constraints,
+                    modified_locals,
+                };
+                self.codegen_call_vec_core(&cx);
+                return true;
+            }
+            self.record_diverging_call_drop(
+                func,
+                Some(bb_idx),
+                "collections::slice_permutation",
+                Some(stub),
+            );
+            return true;
+        }
 
         // `num_bigint::Sign::mul` stays a real library call after BigInt aggregate
         // scalarization. Handle it before generic BigInt stub detection so CHC
@@ -371,6 +417,18 @@ impl<'tcx, 'body> CallDispatchCollections for ChcCtx<'tcx, 'body> {
             Some(s) => s,
             None => return false,
         };
+
+        // The registry deliberately recognizes suffix-compatible Index paths,
+        // including downstream lookalikes. That is useful for routing but is
+        // not proof authority: slice index stubs derive bounds, contents, and
+        // subslice lengths. Require the exact core trait method DefId whenever
+        // the registry selects an authority-bearing Index stub; otherwise
+        // leave the real call to the ordinary inline/fallback chain.
+        if matches!(stub, StubKind::IndexIndex | StubKind::SliceIndexIndex | StubKind::IndexMut)
+            && self.authenticated_core_slice_index_args(func, args).is_none()
+        {
+            return false;
+        }
 
         // SliceIntoVec — vec![...] macro expansion (#2967)
         // Custom handler because we need `func` operand for generic type extraction.

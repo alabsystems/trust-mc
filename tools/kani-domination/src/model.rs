@@ -65,6 +65,21 @@ pub enum Classification {
     /// trust-mc failed to produce a verdict: compile error, unsupported
     /// flag, or no `VERIFICATION:-` line at all.
     Error,
+    /// The harness produced NO verification conditions, so trust-mc honestly
+    /// refused to call it proven (`[AY:VACUOUS:no-checks]`,
+    /// `VERIFICATION:- INCONCLUSIVE (no checks)`).
+    ///
+    /// This is a trust-mc **encoding** gap — Kani generates checks for these
+    /// harnesses and we generate none — but it is emphatically NOT breakage,
+    /// and keeping it inside `Error` was actively misleading: a 2026-08-22 run
+    /// showed `error=46` of which **33 were vacuity refusals and only 3 were
+    /// real compile failures**, so the headline read like a crash wave when it
+    /// was mostly the tool being honest.
+    ///
+    /// Non-parity either way, and it stays in the denominator: Kani verifies
+    /// these files, so failing to emit checks is our gap to close, not a
+    /// corpus defect to quarantine.
+    Vacuous,
     /// The verifier (or its compiler subprocess) died on a signal (SIGABRT,
     /// SIGSEGV, …) — a real trust-mc crash, kept distinct from generic
     /// `Error` so the burndown points at hard defects.
@@ -114,6 +129,7 @@ impl Classification {
             Classification::ExceedsOracle => "exceeds_oracle",
             Classification::Unknown => "unknown",
             Classification::Error => "error",
+            Classification::Vacuous => "vacuous",
             Classification::Crash => "crash",
             Classification::BuildUnavailable => "build_unavailable",
             Classification::CorpusInvalid => "corpus_invalid",
@@ -183,8 +199,69 @@ pub struct TestResult {
     /// `EncodingGap`, `OverApproximation`, or `Unknown`.
     #[serde(default)]
     pub ctrex_category: Option<String>,
+    /// EVERY raw `[AY:CTREX_CAT:…]` value in the run, detail included.
+    ///
+    /// [`Self::ctrex_category`] keeps only the leading token, so
+    /// `OverApproximation:chc_translation_drop=4` is recorded as bare
+    /// `OverApproximation` — which names the SYMPTOM and discards the CAUSE.
+    /// A 2026-08-22 audit of the 52 fastest non-parity rows had to re-run the
+    /// driver on every one of them to recover a string the run had already
+    /// printed; 33 of the 52 were blanked this way.
+    ///
+    /// A LIST rather than one string on purpose: a multi-harness file prints
+    /// one marker per failing harness, and `reattribute_multi_harness_markers`
+    /// rewrites `ctrex_category` to the first FAILING harness. A single detail
+    /// string could therefore describe a different harness than the category
+    /// beside it. Keeping all of them cannot disagree with anything.
+    ///
+    /// Measurement ONLY — feeds no classification, and `ctrex_category` is
+    /// untouched so every existing rollup keys exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ctrex_categories_raw: Vec<String>,
+    /// Every `[AY:TRANSLATION_DROP_REASON:<fn>:<why>=<n>]` line in the run.
+    ///
+    /// These name the exact construct the compiler could not translate
+    /// (`iter_fold_advance_failed`, `str_chars_nth_no_backing`,
+    /// `boxnew_payload_store_drop`, …), which is the natural cluster key for
+    /// the encoding-gap population — the single largest source of non-parity
+    /// rows. The driver has always printed them (`trust-mc-driver
+    /// src/main.rs:580`) and the scoreboard parsed them nowhere, so the gate
+    /// could count the bucket but never say what was IN it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub translation_drops: Vec<String>,
+    /// Every `[AY:AGGREGATE_GAP_REASON:<fn>:<reason>=<n>]` line.
+    ///
+    /// For the nested-call lane the reason carries the CALLEE
+    /// (`inline_nested_call_fallback_symbolic@<callee_path>`), which is the
+    /// natural cluster key for the largest non-parity population in the corpus:
+    /// a 2026-08-23 run had `nested_call_overapprox` on 62 non-parity rows, 42
+    /// of them `oracle=success, observed=fail` — spurious counterexamples built
+    /// on an invented return value. Measurement ONLY; feeds no classification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregate_gap_reasons: Vec<String>,
+    /// The run emitted `[AY:VACUOUS:…]` — at least one harness produced no
+    /// verification conditions, so any "proof" of it is vacuous.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vacuous: bool,
+    /// The run verified nothing because no harness was discovered
+    /// (`[AY:NO_HARNESSES]`, printed with `VERIFICATION:- INCONCLUSIVE`).
+    ///
+    /// This is a harness-DISCOVERY gap — a `cfg`-ed-out or commented-out
+    /// `#[kani::proof]` — not an indeterminate solver verdict, but it lands in
+    /// the same `unknown` bucket and is indistinguishable there. Recorded so
+    /// the two can be told apart. Measurement ONLY; classification unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_harnesses: bool,
     /// `[AY:UNKNOWN_REASON:…]` (e.g. `SolverError`, `Timeout`,
     /// `PreSolveDeadline`, `UndecidedModel`).
+    ///
+    /// NOTE: this is a CHC-SOLVER-ERROR field, not a general "why is this row
+    /// not parity" field. Its only producing site is the `Err(e)` arm at
+    /// `trust-mc-driver src/call_ay.rs:348`; every path where the solver
+    /// actually ANSWERS hardcodes `None`. A row with a definite verdict that
+    /// was later demoted therefore has no reason to lose, and `None` here is
+    /// correct rather than missing. Use [`Self::ctrex_category_detail`] /
+    /// [`Self::translation_drops`] / [`Self::demotion_reasons`] for those.
     #[serde(default)]
     pub unknown_reason: Option<String>,
     /// NORMALIZED `[AY:UNKNOWN-CATEGORY]` key — `ArrayParamLimit`, `PdrTimeout`,

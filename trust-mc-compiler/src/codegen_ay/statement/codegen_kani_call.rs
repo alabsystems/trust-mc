@@ -108,7 +108,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 KaniFunction::Hook(KaniHook::Panic) => {
                     // Part of #4217: Skip panic violations in prove_safety_only mode.
                     if !self.ctx.config.prove_safety_only {
-                        self.record_violation_guarded(Expr::bool_const(true), "panic");
+                        // `kani::panic(message: &'static str)` — the std `panic!` /
+                        // `unreachable!` shims deliberately thread the message
+                        // through as a literal (library/std/src/lib.rs). Recover it
+                        // so the Failed Checks line names WHICH panic fired instead
+                        // of the generic label-derived "panic reached"; None (no
+                        // literal to read) keeps the old wording.
+                        let message = self.panic_message_from_args(args);
+                        self.record_violation_guarded_with_message(
+                            Expr::bool_const(true),
+                            "panic",
+                            message,
+                        );
                     }
                     CallDispatchOutcome::from_handled_target(target)
                 }
@@ -117,8 +128,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     CallDispatchOutcome::from_handled_target(target)
                 }
                 KaniFunction::Hook(KaniHook::SafetyCheck) => {
+                    // Assert-assume, like the Assert hook above. The assume
+                    // half MUST be ordered (suffix-scoped): safety checks are
+                    // emitted for conditions that can be statically false
+                    // (e.g. ValidValuePass on a deliberately-invalid
+                    // constant), and a GLOBAL assume of that same condition
+                    // makes the whole system UNSAT — masking this assert's
+                    // own violation and every other check in the harness
+                    // (corpus: valid-value-checks/constants reported VACUOUS
+                    // instead of its expected Failed Checks).
                     self.codegen_kani_assert(args);
-                    self.codegen_kani_assume(args);
+                    self.codegen_kani_assume_ordered(args);
                     CallDispatchOutcome::from_handled_target(target)
                 }
                 KaniFunction::Hook(KaniHook::SafetyCheckNoAssume) => {
@@ -126,20 +146,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     CallDispatchOutcome::from_handled_target(target)
                 }
                 KaniFunction::Hook(KaniHook::UntrackedDeref) => {
-                    if !args.is_empty()
-                        && let Some(val) = self.codegen_operand(&args[0])
-                    {
-                        let base_name = self.ssa_base_name(destination);
-                        self.env_update(base_name, val);
-                    }
+                    self.codegen_untracked_deref(args, destination);
                     CallDispatchOutcome::from_handled_target(target)
                 }
                 KaniFunction::Hook(KaniHook::InitContracts) => {
                     CallDispatchOutcome::from_handled_target(target)
                 }
-                // FC-06: modifies frame markers are only enforced by the CHC
-                // backend; BMC treats them as control-flow no-ops.
-                KaniFunction::Hook(KaniHook::ModifiesFrameEnter | KaniHook::ModifiesFrameExit) => {
+                // FC-06: modifies frame markers — BMC enforces the empty
+                // declared footprint (see `statement::modifies_frame`); the
+                // CHC backend enforces the full footprint.
+                KaniFunction::Hook(KaniHook::ModifiesFrameEnter) => {
+                    self.bmc_modifies_frame_enter(args);
+                    CallDispatchOutcome::from_handled_target(target)
+                }
+                KaniFunction::Hook(KaniHook::ModifiesFrameExit) => {
+                    self.bmc_modifies_frame_exit();
                     CallDispatchOutcome::from_handled_target(target)
                 }
                 KaniFunction::Hook(KaniHook::Check) => {
@@ -160,7 +181,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // Part of #4217: PanicStub comes from user assert!() failures —
                     // suppress in prove_safety_only mode.
                     if !self.ctx.config.prove_safety_only {
-                        self.record_violation_guarded(Expr::bool_const(true), "panic_stub");
+                        // `panic_stub(t: &str)` carries the message the same way
+                        // `kani::panic` does; see the Panic hook above.
+                        let message = self.panic_message_from_args(args);
+                        self.record_violation_guarded_with_message(
+                            Expr::bool_const(true),
+                            "panic_stub",
+                            message,
+                        );
                     }
                     CallDispatchOutcome::from_handled_target(target)
                 }
@@ -417,6 +445,43 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.try_codegen_named_call(&fn_name, &instance_opt, func, args, destination, target)
     }
 
+    /// Recover a quantifier bound from the MIR when SSA has made it a guarded
+    /// expression.
+    ///
+    /// Sound because of the condition it insists on: the operand must be a
+    /// literal, or a local with EXACTLY ONE assignment in the whole body and
+    /// that assignment a constant. A local defined once cannot hold a different
+    /// value on a different path, so reading its constant needs no knowledge of
+    /// the path condition — which is precisely what folding the `Ite` would
+    /// have required. A local assigned twice is left alone and the quantifier
+    /// declines as before.
+    fn quantifier_bound_from_mir(&mut self, operand: &Operand) -> Option<Expr> {
+        match operand {
+            Operand::Constant(_) => self.codegen_operand(operand),
+            Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+                let mut found: Option<Operand> = None;
+                for block in &self.body.blocks {
+                    for stmt in &block.statements {
+                        let StatementKind::Assign(lhs, rhs) = &stmt.kind else { continue };
+                        if lhs.local != place.local || !lhs.projection.is_empty() {
+                            continue;
+                        }
+                        // A second definition means the value is path-dependent.
+                        if found.is_some() {
+                            return None;
+                        }
+                        match rhs {
+                            Rvalue::Use(c @ Operand::Constant(_)) => found = Some(c.clone()),
+                            _ => return None,
+                        }
+                    }
+                }
+                self.codegen_operand(&found?)
+            }
+            _ => None,
+        }
+    }
+
     fn codegen_kani_bounded_quantifier(
         &mut self,
         func: &Operand,
@@ -436,6 +501,33 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
         let lower = self.resolve_concrete_expr(&lower);
         let upper = self.resolve_concrete_expr(&upper);
+        // SSA can turn a literal bound into a GUARDED definition, and then the
+        // range is no longer readable as a constant:
+        //
+        //     lower = Ite { cond: Var("h::local_3_0"),
+        //                   then_expr: BitVecConst { value: 0, .. }, .. }
+        //
+        // An array access is enough to cause it — its bounds check introduces a
+        // branch, so the value at the use site becomes "if this path was taken,
+        // 0, else what it was before". That made `forall!`/`exists!` decline in
+        // any harness that indexed an array, even when the predicate never
+        // touched it:
+        //
+        //     let a: [u8; 4] = [0; 4];
+        //     let _ = a[2];                                  // remove this and
+        //     assert!(kani::forall!(|i in (0,4)| i < 4));    // it proves
+        //
+        // Folding the `Ite` is not the answer: its arms are the constant and
+        // the PRIOR value, so collapsing to the `then` arm would assume the
+        // path condition holds. Go back to the MIR instead, where the bound is
+        // still the literal the user wrote.
+        let (lower, upper) = match extract_constant_bounds(&lower, &upper) {
+            Some(_) => (lower, upper),
+            None => (
+                self.quantifier_bound_from_mir(&args[0]).unwrap_or(lower),
+                self.quantifier_bound_from_mir(&args[1]).unwrap_or(upper),
+            ),
+        };
         let Some((lower_val, upper_val, bv_width)) = extract_constant_bounds(&lower, &upper) else {
             return false;
         };

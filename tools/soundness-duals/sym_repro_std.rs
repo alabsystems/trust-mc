@@ -1,4 +1,7 @@
 // ADVERSARIAL SOUNDNESS AUDIT — LATENT FALSE SAFE
+//
+// Oracle: MUST FAIL. This is a bug file: if it verifies, the OOB deref went
+// undetected. (Added after an audit found the wall could not classify it.)
 // Family: symbolic byte-offset OOB DEREF, stack-provenance (keystone #52)
 //
 // A symbolic offset is added to a real stack allocation's exposed address with

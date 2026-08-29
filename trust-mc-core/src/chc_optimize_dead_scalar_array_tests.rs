@@ -46,7 +46,10 @@ fn test_prune_dead_identity_scalars_removes_identity_only_pair() {
     );
     vc.add_rule(step);
 
-    assert_eq!(vc.prune_dead_identity_scalars(), 1);
+    // The return value counts relation COLUMNS removed (the documented
+    // contract on `prune_dead_identity_scalars`), not variable pairs: the one
+    // dead pair occupies a column in EACH of bb0 and bb1.
+    assert_eq!(vc.prune_dead_identity_scalars(), 2);
     assert_eq!(vc.relations[0].arity(), 1);
     assert_eq!(vc.relations[1].arity(), 1);
     assert_eq!(vc.rules[0].head.args.len(), 1);
@@ -100,7 +103,9 @@ fn test_prune_dead_identity_scalars_removes_init_select_write_only_array() {
         RelationApp::new("bb1", vec![obj_size_out, live_out]),
     ));
 
-    assert_eq!(vc.prune_dead_identity_scalars(), 1);
+    // Column count again: the dead array pair spans one column in each of
+    // the two relations.
+    assert_eq!(vc.prune_dead_identity_scalars(), 2);
     assert_eq!(vc.relations[0].arity(), 1);
     assert_eq!(vc.relations[1].arity(), 1);
     assert_eq!(vc.rules[0].head.args.len(), 1);

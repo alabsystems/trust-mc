@@ -233,7 +233,7 @@ fn test_constant_index_on_array_selects() {
     });
 }
 
-/// ConstantIndex from_end returns Unsupported (not implemented).
+/// ConstantIndex from_end fails closed when no runtime slice length is available.
 #[test]
 fn test_constant_index_from_end_unsupported() {
     with_test_ay_ctx_for_source(ENUM_DEREF_PROBE, |mut ctx| {
@@ -245,23 +245,18 @@ fn test_constant_index_from_end_unsupported() {
 
         let arr_sort = Sort::array(Sort::bitvec(POINTER_WIDTH), Sort::bitvec(32));
         let arr_expr = Expr::var("test_array", arr_sort);
-        // Part of #3186: from_end is now supported — actual_offset = min_length - offset = 4 - 1 = 3
+        // This synthetic array-shaped expression does not carry a runtime slice
+        // length. `min_length` is only the pattern minimum and cannot authorize
+        // selecting cell 3 (or any other cell).
         let projections =
             vec![ProjectionElem::ConstantIndex { offset: 1, min_length: 4, from_end: true }];
         let result =
             codegen.apply_post_deref_projections(arr_expr, &projections, false, false, "test");
 
-        match result {
-            DerefProjectionResult::Success(expr) => {
-                assert!(expr.sort().is_bitvec(), "from_end select should produce bitvec element");
-            }
-            DerefProjectionResult::Fallthrough => {
-                panic!("ConstantIndex from_end should succeed, got Fallthrough")
-            }
-            DerefProjectionResult::Unsupported => {
-                panic!("ConstantIndex from_end should succeed, got Unsupported")
-            }
-        }
+        assert!(
+            matches!(result, DerefProjectionResult::Unsupported),
+            "from_end without an authenticated runtime length must be Unsupported"
+        );
     });
 }
 
@@ -706,7 +701,7 @@ fn test_constant_index_non_array_no_fld_data_unsupported() {
     });
 }
 
-/// Part of #3186: ConstantIndex from_end is now supported — succeeds even with fallthrough enabled.
+/// With fallthrough enabled, an unauthenticated from_end index yields Fallthrough.
 #[test]
 fn test_constant_index_from_end_fallthrough() {
     with_test_ay_ctx_for_source(ENUM_DEREF_PROBE, |mut ctx| {
@@ -718,23 +713,16 @@ fn test_constant_index_from_end_fallthrough() {
 
         let arr_sort = Sort::array(Sort::bitvec(POINTER_WIDTH), Sort::bitvec(32));
         let arr_expr = Expr::var("test_array", arr_sort);
-        // from_end: actual_offset = min_length - offset = 4 - 1 = 3
+        // `min_length=4` still does not mean the runtime slice length is 4.
         let projections =
             vec![ProjectionElem::ConstantIndex { offset: 1, min_length: 4, from_end: true }];
         let result =
             codegen.apply_post_deref_projections(arr_expr, &projections, false, true, "test");
 
-        match result {
-            DerefProjectionResult::Success(expr) => {
-                assert!(expr.sort().is_bitvec(), "from_end select should produce bitvec element");
-            }
-            DerefProjectionResult::Fallthrough => {
-                panic!("ConstantIndex from_end should succeed, got Fallthrough")
-            }
-            DerefProjectionResult::Unsupported => {
-                panic!("ConstantIndex from_end should succeed, got Unsupported")
-            }
-        }
+        assert!(
+            matches!(result, DerefProjectionResult::Fallthrough),
+            "from_end without an authenticated runtime length must fall through"
+        );
     });
 }
 

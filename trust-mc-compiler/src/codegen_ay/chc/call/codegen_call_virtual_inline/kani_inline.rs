@@ -170,8 +170,44 @@ pub(in crate::codegen_ay::chc) fn try_handle_kani_call_inline<'tcx, 'body>(
         .and_then(|inst| attributes::fn_marker(inst.def))
         .or_else(|| attributes::fn_marker(fn_def));
 
-    if let Some(fn_marker) = fn_marker
-        && let Some(kani_fn) = try_get_kani_function(&fn_marker)
+    // The RAW intrinsic carries no `fn_marker`, so the SizeOfVal/AlignOfVal arm
+    // below could never fire for it.
+    //
+    // `RustcIntrinsicsPass` rewrites `Intrinsic::SizeOfVal` to the marked Kani
+    // model (kani_middle/transform/rustc_intrinsics.rs), but
+    // `walker_wants_transformed` (kani_middle/transform/mod.rs) runs the
+    // transform pipeline ONLY for contract-relevant bodies. `core::mem::size_of_val`
+    // is an ordinary stdlib helper, so the walker gets `instance.body()` raw and
+    // sees `std::intrinsics::size_of_val` — unmarked, hence havoced, hence a
+    // fresh unconstrained size feeding whatever the harness asserts about it.
+    //
+    // Route the raw name to the SAME handler. Deliberately NOT via
+    // `StubKind::MemSizeOf`: that path uses `get_type_size`, which is an
+    // ELEMENT-level layout query (`RigidTy::Str => 1`,
+    // `Slice(e) => get_type_size(e)`, memory_impl_layout_query.rs), so it would
+    // fold `size_of_val::<str>(buf)` to 1 instead of the fat-pointer length.
+    // `compute_size_or_align_value` is the one that consults the pointer metadata.
+    //
+    // `_raw` variants are excluded because they already resolve through the stub
+    // registry (`std::mem::size_of_val_raw -> Some(MemSizeOf)`), and `ends_with`
+    // on the bare name does not match them.
+    let raw_layout_fn = if fn_marker.is_none() {
+        let name = fn_def.name();
+        if name.ends_with("size_of_val") {
+            Some(KaniFunction::Model(KaniModel::SizeOfVal))
+        } else if name.ends_with("align_of_val") {
+            Some(KaniFunction::Model(KaniModel::AlignOfVal))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(kani_fn) = fn_marker
+        .as_ref()
+        .and_then(|m| try_get_kani_function(m))
+        .or(raw_layout_fn)
     {
         match kani_fn {
             KaniFunction::Model(KaniModel::Any)
@@ -274,6 +310,17 @@ pub(in crate::codegen_ay::chc) fn try_handle_kani_call_inline<'tcx, 'body>(
 
     let callee_path = resolve_inline_kani_callee_path(ctx, func, locals)?;
     let tail = callee_path.rsplit("::").next();
+    // `<T as kani::Arbitrary>::any` is NOT a nondet leaf: its body is where the
+    // type's invariant is stated (a hand-written `any()` ends in
+    // `kani::assume(..)`, a container impl builds its payload from `T::any()`).
+    // Replacing it with a fresh unconstrained var discards that — sound, but it
+    // refutes assertions the program guarantees. Fall through to the nested-body
+    // walker; if the body cannot be inlined, the walker's own fallback still
+    // produces a fresh symbolic var (and books the gap).
+    if callee_path.contains("kani::Arbitrary") && tail == Some("any") {
+        debug!(dest_local, %callee_path, "inline Arbitrary::any → inline the impl body, not a fresh var");
+        return None;
+    }
     if callee_path.contains("kani::")
         && matches!(
             tail,
@@ -288,10 +335,6 @@ pub(in crate::codegen_ay::chc) fn try_handle_kani_call_inline<'tcx, 'body>(
         )
     {
         debug!(dest_local, %callee_path, "inline unmarked kani any path → fresh var");
-        return Some(fresh_inline_any_expr(ctx, locals, dest_local));
-    }
-    if callee_path.contains("kani::Arbitrary") && tail == Some("any") {
-        debug!(dest_local, %callee_path, "inline unmarked Arbitrary::any path → fresh var");
         return Some(fresh_inline_any_expr(ctx, locals, dest_local));
     }
     if callee_path.contains("kani::") && matches!(tail, Some("assume")) {

@@ -88,6 +88,24 @@ impl KaniSession {
         }
         if self.args.assertion_reach_checks() {
             flags.push("--assertion-reach-checks".into());
+        } else {
+            // The reachability companions are what let a discharged check be
+            // reported UNREACHABLE, and the V4 dead-check vacuity gate triggers
+            // on "every non-cover check is UNREACHABLE". Turning the companions
+            // off (Kani parity: the checks then report the solver's own SUCCESS)
+            // therefore also disables that gate, so say so instead of letting a
+            // would-be INCONCLUSIVE quietly render as a clean proof. The
+            // whole-harness probe (`probe_harness_reachable`) does NOT use these
+            // flags, so vacuity from contradictory assumptions is still caught.
+            static NOTED: std::sync::Once = std::sync::Once::new();
+            NOTED.call_once(|| {
+                eprintln!(
+                    "[trust_mc] note: --no-assertion-reach-checks also turns off the dead-check \
+                     vacuity gate; checks on unreachable code report SUCCESS rather than \
+                     UNREACHABLE, and a harness whose every check is dead is no longer reported \
+                     INCONCLUSIVE. Drop the flag to restore it."
+                );
+            });
         }
 
         if self.args.is_stubbing_enabled() {
@@ -123,6 +141,15 @@ impl KaniSession {
 
         if self.args.exact {
             flags.push("--exact".into());
+        }
+
+        // `--c-lib` files are LINKED by the C-FFI lane, but the encoder also
+        // needs to know they exist: an `extern "C"` symbol the user supplied a
+        // definition for is a call to a concrete C function (model it with a
+        // sound effect frame), while a symbol nobody supplied keeps Kani's
+        // fail-closed `assert(false)`.
+        for c_lib in &self.args.c_lib {
+            flags.push(format!("--c-lib {}", c_lib.display()).into());
         }
 
         if let Some(args) = &self.autoharness_compiler_flags {
@@ -163,6 +190,12 @@ impl KaniSession {
             }
             if self.args.checks.no_unwinding_checks {
                 flags.push("--no-unwinding-checks".into());
+            }
+            // NaN-generation obligation (Kani `--nan-check`). Without this
+            // forward the compiler flag is unreachable and any NaN tripwire
+            // passes vacuously.
+            if self.args.checks.nan_check {
+                flags.push("--nan-check".into());
             }
 
             // Pass emit_bmc flag to use abstract IR emission path.
@@ -254,6 +287,17 @@ impl KaniSession {
             ]
             .map(RustcArg::from),
         );
+
+        // Forward an explicitly requested edition. Unset leaves rustc's default
+        // (2015) in place, which is what Kani's compiletest uses when no header
+        // supplies one — matching it is what keeps trust-mc verifying the same
+        // program. A `// compile-flags: --edition ...` header still arrives via
+        // RUSTFLAGS in `base_rustc_flags`; this flag is the command-line route,
+        // which previously did not exist at all.
+        if let Some(edition) = &self.args.edition {
+            flags.push("--edition".into());
+            flags.push(edition.as_str().into());
+        }
 
         if self.args.no_codegen {
             flags.push("-Z".into());

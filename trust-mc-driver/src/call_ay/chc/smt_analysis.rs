@@ -17,6 +17,18 @@ pub(crate) fn smt_has_recursive_unwind_assertion(smt_content: &str) -> bool {
         || smt_content.contains("__assert_fail_inline_recursive_unwind")
 }
 
+/// Whether the compiler's straight-line discharge proved this harness's
+/// obligations UNREACHABLE rather than SAFE.
+///
+/// The discharge replaces the rule system with `false => error`, which is
+/// byte-identical for a genuine proof and for a harness whose own guards
+/// cannot all hold — so the distinction cannot be recovered from the emitted
+/// program and rides this marker instead. See
+/// `straightline_proof::StraightlineOutcome`.
+pub(crate) fn smt_has_vacuous_checks_marker(smt_content: &str) -> bool {
+    smt_content.contains("; VACUOUS_ALL_CHECKS_UNREACHABLE:")
+}
+
 /// Detect CHC systems where `error` is queried but no rule can derive it.
 ///
 /// A rule with an explicitly false body, such as `(rule (=> false error))`,

@@ -432,16 +432,14 @@ enum PlanSlot {
 /// The plan records, per column, the array every naming application agrees the
 /// column holds, so the expansion can be applied by POSITION to every
 /// application — including the ones that do not name it.
-fn scalarize_position_plan(
-    vc: &ChcVc,
-    maps: &RewriteMaps,
-) -> HashMap<String, Vec<Option<usize>>> {
+fn scalarize_position_plan(vc: &ChcVc, maps: &RewriteMaps) -> HashMap<String, Vec<Option<usize>>> {
     let decl_arity: HashMap<&str, usize> =
         vc.relations.iter().map(|r| (r.name.as_str(), r.arg_sorts.len())).collect();
     let mut acc: HashMap<String, Vec<PlanSlot>> = HashMap::new();
     let observe = |app: &RelationApp, acc: &mut HashMap<String, Vec<PlanSlot>>| {
         let Some(&arity) = decl_arity.get(app.name.as_str()) else { return };
-        let columns = acc.entry(app.name.to_string()).or_insert_with(|| vec![PlanSlot::Unknown; arity]);
+        let columns =
+            acc.entry(app.name.to_string()).or_insert_with(|| vec![PlanSlot::Unknown; arity]);
         if app.args.len() != arity {
             // Arities already diverge here: positions are not comparable, so
             // this relation gets no positional expansion.

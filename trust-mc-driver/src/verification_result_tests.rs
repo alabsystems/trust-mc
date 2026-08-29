@@ -31,6 +31,8 @@ fn test_render_nia_success_shows_unvalidated() {
         FailedProperties::None,
         true,
         ValidationStatus::Unvalidated,
+        None,
+        HarnessFeasibility::Undetermined,
     );
     assert!(
         output.contains("SUCCESSFUL (UNVALIDATED)"),
@@ -51,6 +53,8 @@ fn test_render_validated_success_shows_successful() {
         FailedProperties::None,
         true,
         ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Undetermined,
     );
     assert!(output.contains("SUCCESSFUL"), "Validated PROOF should show SUCCESSFUL, got: {output}");
     assert!(!output.contains("UNVALIDATED"), "Validated PROOF must not show UNVALIDATED");
@@ -65,6 +69,8 @@ fn test_render_nia_failure_shows_failed_not_unvalidated() {
         FailedProperties::Other,
         true,
         ValidationStatus::Unvalidated,
+        None,
+        HarnessFeasibility::Undetermined,
     );
     assert!(
         output.contains("UNVALIDATED (DT+BV)"),
@@ -81,6 +87,8 @@ fn test_render_validated_failure_shows_failed() {
         FailedProperties::Other,
         true,
         ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Undetermined,
     );
     assert!(output.contains("FAILED"), "Validated failure should show FAILED, got: {output}");
     assert!(!output.contains("UNVALIDATED"), "Validated failure must not show UNVALIDATED");
@@ -95,6 +103,8 @@ fn test_render_should_panic_panics_only_shows_successful() {
         FailedProperties::PanicsOnly,
         true,
         ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Undetermined,
     );
     assert!(
         output.contains("VERIFICATION:- SUCCESSFUL (encountered one or more panics as expected)"),
@@ -145,6 +155,8 @@ fn test_render_zero_checks_shows_inconclusive() {
         FailedProperties::Other,
         true,
         ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Undetermined,
     );
     assert!(
         output.contains("INCONCLUSIVE (no checks)"),
@@ -164,6 +176,8 @@ fn test_render_zero_checks_success_still_shows_successful() {
         FailedProperties::None,
         true,
         ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Undetermined,
     );
     assert!(
         output.contains("SUCCESSFUL"),
@@ -256,6 +270,8 @@ fn v4_renders_vacuous_not_failed() {
         FailedProperties::Other,
         true,
         ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Undetermined,
     );
     assert!(output.contains("VACUOUS"), "all-unreachable Failure should render VACUOUS: {output}");
     assert!(!output.contains("FAILED"), "vacuous should not render as a plain FAILED: {output}");
@@ -271,6 +287,8 @@ fn v4_should_panic_is_exempt_from_vacuous_label() {
         FailedProperties::None,
         true,
         ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Undetermined,
     );
     assert!(!output.contains("VACUOUS"), "should_panic is exempt from the V4 label: {output}");
 }
@@ -316,4 +334,166 @@ fn v5_conformance_requires_a_satisfied_cover() {
         "a passing non-cover check is not a cover witness ⇒ conformance claim vacuous"
     );
     assert!(!has_satisfied_cover(&[]), "no covers at all ⇒ conformance claim vacuous");
+}
+
+/// An empty property list plus a solver reason does NOT always mean "we could
+/// not decide". `tests/expected/slice_c_str` pins `SolverError` together with
+/// `INCONCLUSIVE (no checks)`: there the solver fell over BEFORE there was
+/// anything to decide, so "no checks" is the honest description. Only
+/// `UndecidedModel` and `Timeout` describe an obligation we had and could not
+/// settle.
+///
+/// Getting this wrong is what a corpus run caught — the first cut keyed off
+/// `reason.is_some()` and silently changed that test's verdict.
+#[test]
+fn only_undecidable_reasons_change_the_no_checks_verdict() {
+    let undecided = [SolverUnknownReason::UndecidedModel, SolverUnknownReason::Timeout];
+    for reason in undecided {
+        let output = format_result(
+            &[],
+            VerificationStatus::Failure,
+            false,
+            FailedProperties::Other,
+            true,
+            ValidationStatus::Validated,
+            Some(reason),
+            HarnessFeasibility::Undetermined,
+        );
+        assert!(
+            output.contains("solver undecided"),
+            "{reason:?} should report an undecided solver, got: {output}"
+        );
+        assert!(output.contains("--ay-chc"), "{reason:?} should name the remedy: {output}");
+    }
+
+    let not_undecided = [
+        SolverUnknownReason::SolverError,
+        SolverUnknownReason::ChcParseError,
+        SolverUnknownReason::PreSolveDeadline,
+        SolverUnknownReason::FalseProofRejected,
+    ];
+    for reason in not_undecided {
+        let output = format_result(
+            &[],
+            VerificationStatus::Failure,
+            false,
+            FailedProperties::Other,
+            true,
+            ValidationStatus::Validated,
+            Some(reason),
+            HarnessFeasibility::Undetermined,
+        );
+        assert!(
+            output.contains("INCONCLUSIVE (no checks)"),
+            "{reason:?} must keep the no-checks verdict, got: {output}"
+        );
+        assert!(
+            !output.contains("solver undecided"),
+            "{reason:?} did not leave an undecided obligation: {output}"
+        );
+    }
+
+    // And with no reason at all it is plainly a no-checks harness.
+    let output = format_result(
+        &[],
+        VerificationStatus::Failure,
+        false,
+        FailedProperties::Other,
+        true,
+        ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Undetermined,
+    );
+    assert!(output.contains("INCONCLUSIVE (no checks)"), "{output}");
+}
+
+// --- V4 cause split: unsat assumption vs dead check ---------------------------
+
+/// The two situations that produce the SAME all-UNREACHABLE table, told apart
+/// only by the harness-reachability answer.
+#[test]
+fn v4_split_reachable_harness_is_dead_checks_not_unsat_assumption() {
+    let props = [make_property(CheckStatus::Unreachable)];
+    assert_eq!(
+        classify_vacuity(&props, HarnessFeasibility::Reachable),
+        VacuityShape::DeadChecks,
+        "a harness the solver decided CAN run has no contradictory assumption to blame"
+    );
+    assert_eq!(
+        classify_vacuity(&props, HarnessFeasibility::Infeasible),
+        VacuityShape::UnsatAssumption,
+        "a harness the solver decided cannot run is the case V4 was written for"
+    );
+}
+
+/// Fail-closed: an undecided probe (and every lane that never probes) keeps the
+/// pre-split verdict. Nothing escapes the gate through an inconclusive answer.
+#[test]
+fn v4_split_undetermined_feasibility_stays_unsat_assumption() {
+    let props = [make_property(CheckStatus::Unreachable)];
+    assert_eq!(
+        classify_vacuity(&props, HarnessFeasibility::Undetermined),
+        VacuityShape::UnsatAssumption
+    );
+    assert_eq!(
+        classify_vacuity(&props, HarnessFeasibility::default()),
+        VacuityShape::UnsatAssumption,
+        "the default must be the fail-closed reading"
+    );
+}
+
+/// The split changes only WHICH cause is named — never whether the shape is
+/// vacuity-shaped at all. A live check still means neither arm, on every
+/// feasibility answer.
+#[test]
+fn v4_split_never_invents_vacuity_where_the_shape_is_absent() {
+    let live = [make_property(CheckStatus::Unreachable), make_property(CheckStatus::Success)];
+    for feasibility in [
+        HarnessFeasibility::Reachable,
+        HarnessFeasibility::Infeasible,
+        HarnessFeasibility::Undetermined,
+    ] {
+        assert_eq!(
+            classify_vacuity(&live, feasibility),
+            VacuityShape::None,
+            "a reachable Success check is not vacuity under {feasibility:?}"
+        );
+        assert_eq!(
+            classify_vacuity(&[], feasibility),
+            VacuityShape::None,
+            "no checks is the no-checks case, not vacuity, under {feasibility:?}"
+        );
+    }
+}
+
+/// The renderer's verdict line follows the same split, and the dead-check arm
+/// must not print the word the finding objected to.
+#[test]
+fn v4_split_renders_dead_checks_without_claiming_contradictory_assumptions() {
+    let props = [make_property(CheckStatus::Unreachable)];
+    let dead = format_result(
+        &props,
+        VerificationStatus::Failure,
+        false,
+        FailedProperties::Other,
+        true,
+        ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Reachable,
+    );
+    assert!(dead.contains("INCONCLUSIVE (every check is unreachable"), "{dead}");
+    assert!(!dead.contains("VACUOUS"), "a harness that runs is not vacuous: {dead}");
+    assert!(!dead.contains("unsatisfiable assumptions"), "{dead}");
+
+    let contra = format_result(
+        &props,
+        VerificationStatus::Failure,
+        false,
+        FailedProperties::Other,
+        true,
+        ValidationStatus::Validated,
+        None,
+        HarnessFeasibility::Infeasible,
+    );
+    assert!(contra.contains("VACUOUS"), "the unsat-assumption verdict is unchanged: {contra}");
 }

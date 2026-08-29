@@ -286,23 +286,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     return Some(Expr::bitvec_const(len as u128, POINTER_WIDTH));
                 }
 
-                // Part of #3099: Try to recover array length from Unsize origin.
-                // Works on MIR body analysis — no env dependency.
-                if let Some(len) = self.try_resolve_len_from_unsize(place) {
-                    debug!(
-                        ?place,
-                        len, "CHC: Rvalue::Len in env — recovered length from array unsize"
-                    );
-                    return Some(Expr::bitvec_const(len as u128, POINTER_WIDTH));
-                }
-
-                // Part of #3495: Try to recover length from Subslice ref chain.
-                if let Some(len) = self.try_resolve_len_from_subslice_ref(place) {
-                    debug!(
-                        ?place,
-                        len, "CHC: Rvalue::Len in env — recovered length from subslice ref"
-                    );
-                    return Some(Expr::bitvec_const(len as u128, POINTER_WIDTH));
+                // Recover an exact length only when every MIR producer agrees.
+                // A conflict is sticky: returning here prevents the env/datatype
+                // fallback below from reviving one predecessor's length.
+                match self.resolve_slice_len_evidence_for_place(place) {
+                    Ok(Some(len)) => {
+                        debug!(
+                            ?place,
+                            len, "CHC: Rvalue::Len in env - recovered authenticated exact length"
+                        );
+                        return Some(Expr::bitvec_const(len as u128, POINTER_WIDTH));
+                    }
+                    Err(()) => {
+                        warn!(
+                            ?place,
+                            "CHC: Rvalue::Len in env has conflicting provenance - failing closed"
+                        );
+                        self.record_fallback();
+                        return None;
+                    }
+                    Ok(None) => {}
                 }
 
                 // Part of #3084: Try to resolve Vec/Slice length from Datatype in env.

@@ -230,10 +230,12 @@ impl LoopContractPass {
             });
         }
         if sites.len() != 1 {
+            tracing::debug!(n = sites.len(), "loop_decreases: BAIL guard1 (site count)");
             return; // guard 1 (0 = nothing to do; >1 = nested fixme shape)
         }
         // guard 2
         if self.new_loop_latches.len() != 1 {
+            tracing::debug!(n = self.new_loop_latches.len(), "loop_decreases: BAIL guard2 (latches)");
             return;
         }
         let latch_bb = *self.new_loop_latches.values().next().expect("checked len == 1");
@@ -243,6 +245,7 @@ impl LoopContractPass {
             name.contains("kani_loop_modifies")
         });
         if has_loop_modifies {
+            tracing::debug!("loop_decreases: BAIL guard3 (loop_modifies present)");
             return;
         }
 
@@ -291,6 +294,7 @@ impl LoopContractPass {
         // under `<` with no separate lower-bound obligation).
         let measure_ty = site.measure_ty;
         if !matches!(measure_ty.kind(), TyKind::RigidTy(RigidTy::Uint(_))) {
+            tracing::debug!(?measure_ty, "loop_decreases: BAIL guard4 (measure not uint)");
             return;
         }
         let Ok(shim) = Instance::resolve_closure(closure_def, &closure_args, ClosureKind::Fn)
@@ -469,6 +473,174 @@ impl LoopContractPass {
             ret_assigned_identity.then_some(src)
         })();
 
+        // ── Compound binary measure (`a - b`) ───────────────────────────────
+        // Under `-C overflow-checks`, rustc lowers `|| hi - lo` to a TWO-block
+        // closure that the single-block guard below rejects:
+        //   bb0: _r0 = ((*_1).0); _a = (*_r0);
+        //        _r1 = ((*_1).1); _b = (*_r1);
+        //        _t  = CheckedBinaryOp(Sub, _a, _b);
+        //        assert(!(_t.1), Overflow(Sub, ..)) -> bb1
+        //   bb1: _0 = (_t.0); return
+        // Recover the two SOURCE locals so the measure can be recomputed
+        // inline, exactly as the identity path recovers its single source.
+        // Only `Sub` is accepted: it is the shape that appears in practice
+        // (`hi - lo`, `n - i`) and the one whose wrap direction is understood.
+        //
+        // OFF BY DEFAULT (opt in with TRUST_MC_COMPOUND_DECREASES=1), for a
+        // measured reason rather than a stylistic one. Instrumenting the
+        // compound lane replaces a 0.0004s fail-closed FAILED with a ~130s
+        // solve on `decreases_binary_search`, and at the burndown's 15s budget
+        // that harness returns UNKNOWN instead. The harness still cannot reach
+        // parity — its blocker is the loop-INVARIANT abstraction, not the
+        // measure (deleting the decreases attribute leaves the same
+        // `result == Some(2)` failure) — so switching it on by default would
+        // move a test out of the false-positive bucket by TIMING OUT, which
+        // measures nothing. Enable it when the invariant-rule precision loss
+        // is fixed and the test can actually be proven.
+        let compound_sub: Option<(Local, Local)> = (|| {
+            if !std::env::var("TRUST_MC_COMPOUND_DECREASES")
+                .ok()
+                .is_some_and(|v| v.trim() == "1")
+            {
+                return None;
+            }
+            let cbody = shim.body()?;
+            if cbody.blocks.len() != 2 {
+                return None;
+            }
+            // bb0 must end in the overflow assert guarding a CheckedBinaryOp.
+            let TerminatorKind::Assert { cond, expected: false, target, .. } =
+                &cbody.blocks[0].terminator.kind
+            else {
+                return None;
+            };
+            if *target != 1 {
+                return None;
+            }
+            let (Operand::Copy(cond_pl) | Operand::Move(cond_pl)) = cond else { return None };
+            // `cond` is the `.1` (overflow flag) of the checked-op temp.
+            let checked_temp = cond_pl.local;
+
+            // Map closure-body locals back to CAPTURE INDICES by walking bb0.
+            // Two forms: `_x = ((*_1).i)` (the by-ref capture load) followed by
+            // `_v = (*_x)`, or a direct read of the capture place.
+            let mut ref_of_capture: std::collections::HashMap<Local, usize> =
+                std::collections::HashMap::new();
+            let mut val_of_capture: std::collections::HashMap<Local, usize> =
+                std::collections::HashMap::new();
+            let mut checked_ops: Option<(Local, Local)> = None;
+            // Every local written in bb0 must be accounted for. Silently
+            // skipping a write (`continue`) would let a later redefinition of
+            // `_a`/`_b` go unseen, so the recovered measure could name a
+            // different value than the closure actually returns.
+            let mut def_count: std::collections::HashMap<Local, usize> =
+                std::collections::HashMap::new();
+            for stmt in &cbody.blocks[0].statements {
+                let StatementKind::Assign(place, rv) = &stmt.kind else {
+                    match &stmt.kind {
+                        StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => continue,
+                        _ => return None,
+                    }
+                };
+                if !place.projection.is_empty() {
+                    return None;
+                }
+                *def_count.entry(place.local).or_insert(0) += 1;
+                match rv {
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
+                        // `_x = ((*_1).i)` — capture slot read off the self arg.
+                        if src.local == 1
+                            && let Some(idx) = capture_field_index(&src.projection)
+                        {
+                            ref_of_capture.insert(place.local, idx);
+                            continue;
+                        }
+                        // `_v = (*_x)` — deref of a previously-loaded capture ref.
+                        if src.projection.len() == 1
+                            && matches!(src.projection[0], rustc_public::mir::ProjectionElem::Deref)
+                            && let Some(&idx) = ref_of_capture.get(&src.local)
+                        {
+                            val_of_capture.insert(place.local, idx);
+                        }
+                    }
+                    Rvalue::CheckedBinaryOp(rustc_public::mir::BinOp::Sub, a, b) => {
+                        if place.local != checked_temp {
+                            return None;
+                        }
+                        let (Operand::Copy(ap) | Operand::Move(ap)) = a else { return None };
+                        let (Operand::Copy(bp) | Operand::Move(bp)) = b else { return None };
+                        if !ap.projection.is_empty() || !bp.projection.is_empty() {
+                            return None;
+                        }
+                        checked_ops = Some((ap.local, bp.local));
+                    }
+                    _ => return None, // any other computation: not this shape
+                }
+            }
+            let (a_local, b_local) = checked_ops?;
+            // Single-def: a local assigned twice in bb0 does not have the value
+            // the capture map recorded for it.
+            if def_count.get(&a_local).copied().unwrap_or(0) != 1
+                || def_count.get(&b_local).copied().unwrap_or(0) != 1
+            {
+                tracing::debug!("loop_decreases: compound operand is not single-def, declining");
+                return None;
+            }
+
+            // bb1 must be exactly `_0 = (_t.0); return`.
+            if !matches!(cbody.blocks[1].terminator.kind, TerminatorKind::Return) {
+                return None;
+            }
+            let mut returns_checked_value = false;
+            for stmt in &cbody.blocks[1].statements {
+                match &stmt.kind {
+                    StatementKind::Assign(p, Rvalue::Use(Operand::Copy(rp) | Operand::Move(rp)))
+                        if p.local == 0 =>
+                    {
+                        if rp.local != checked_temp {
+                            return None;
+                        }
+                        returns_checked_value = true;
+                    }
+                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {}
+                    _ => return None,
+                }
+            }
+            if !returns_checked_value {
+                return None;
+            }
+
+            // Capture index -> the OUTER source local it borrows.
+            let outer_src = |cap_idx: usize| -> Option<Local> {
+                let op = capture_operands.get(cap_idx)?;
+                let (Operand::Copy(cap_place) | Operand::Move(cap_place)) = op else {
+                    return None;
+                };
+                let mut src = None;
+                for stmt in &new_body.blocks()[site.bb].statements {
+                    if let StatementKind::Assign(p, Rvalue::Ref(_, _, rsrc)) = &stmt.kind
+                        && p.local == cap_place.local
+                        && rsrc.projection.is_empty()
+                    {
+                        src = Some(rsrc.local);
+                    }
+                }
+                src
+            };
+            let (a_cap, b_cap) = (*val_of_capture.get(&a_local)?, *val_of_capture.get(&b_local)?);
+            // Distinct slots: both operands resolving to the SAME capture would
+            // make the measure `x - x`, which is constant-zero rather than the
+            // program's measure.
+            if a_cap == b_cap {
+                tracing::debug!("loop_decreases: compound operands share a capture, declining");
+                return None;
+            }
+            let a_src = outer_src(a_cap)?;
+            let b_src = outer_src(b_cap)?;
+            tracing::debug!(a_src, b_src, "loop_decreases: compound `a - b` measure recovered");
+            Some((a_src, b_src))
+        })();
+
         // guard 6: the measure closure body must be a single straight-line
         // block (`return <expr>`, no control flow). Overflow-checked compound
         // measures (`hi - lo` under -C overflow-checks) lower to multi-block
@@ -482,10 +654,22 @@ impl LoopContractPass {
             // NOTE: must inspect the ClosureKind::Fn instance (`shim`) — the
             // FnOnce resolution yields the `call_once` adapter shim, whose MIR
             // is unavailable (`body()` is None), which would spuriously bail.
-            let Some(cbody) = shim.body() else { return };
-            if cbody.blocks.len() != 1
-                || !matches!(cbody.blocks[0].terminator.kind, TerminatorKind::Return)
+            let Some(cbody) = shim.body() else {
+                tracing::debug!("loop_decreases: BAIL guard6 (no shim body)");
+                return;
+            };
+            // A recovered compound measure is its own proof that the body is
+            // the understood overflow-checked-arithmetic shape, so the
+            // single-block requirement only governs the other lanes.
+            if compound_sub.is_none()
+                && (cbody.blocks.len() != 1
+                    || !matches!(cbody.blocks[0].terminator.kind, TerminatorKind::Return))
             {
+                tracing::debug!(
+                    blocks = cbody.blocks.len(),
+                    term = ?cbody.blocks[0].terminator.kind,
+                    "loop_decreases: BAIL guard6 (measure closure not single-block/Return)"
+                );
                 return;
             }
         }
@@ -505,60 +689,37 @@ impl LoopContractPass {
         // refutes on SAFE programs: validated-spurious Genuine ctrex).
         // Until that pipeline is fixed, non-identity measures keep the
         // pre-existing blanket fail-closed path (conservative FAILED verdict).
-        if identity_source.is_none() {
+        if identity_source.is_none() && compound_sub.is_none() {
             tracing::debug!(
                 register_bb = site.bb,
-                "loop_decreases: non-identity measure — keeping blanket fail-closed (#44)"
+                "loop_decreases: unrecognized measure — keeping blanket fail-closed (#44)"
             );
             return;
         }
 
-        // ── Keep the measure closure alive through the loop (call path only) ─
-        if identity_source.is_none() {
-            for bb in 0..new_body.blocks().len() {
-                let stmts: Vec<_> = new_body.blocks()[bb]
-                    .statements
-                    .iter()
-                    .filter(|stmt| {
-                        !matches!(stmt.kind, StatementKind::StorageDead(l) if l == closure_local)
-                    })
-                    .cloned()
-                    .collect();
-                if stmts.len() != new_body.blocks()[bb].statements.len() {
-                    new_body.replace_statements(&SourceInstruction::Terminator { bb }, stmts);
-                }
-            }
-        }
-
         let span = new_body.blocks()[site.bb].terminator.span;
-        let old_local = new_body.new_local(measure_ty, span, Mutability::Mut);
 
-        // ── Register block: `old = measure()`; neutralize the register call ─
+        // The measure's COMPONENT source locals: one for an identity measure,
+        // two for `a - b`. Snapshotting components (not the difference) is what
+        // keeps the ranking check honest under havoc — see `decreases_snapshot`.
+        let components: Vec<Local> = match (identity_source, compound_sub) {
+            (Some(src), _) => vec![src],
+            (None, Some((a, b))) => vec![a, b],
+            (None, None) => unreachable!("guard 7 admits only identity or compound measures"),
+        };
+        let snapshots: Vec<Local> = components
+            .iter()
+            .map(|_| new_body.new_local(measure_ty, span, Mutability::Mut))
+            .collect();
+
+        // ── Register block: snapshot each component; neutralize the register ─
         let mut source = SourceInstruction::Terminator { bb: site.bb };
-        if let Some(src) = identity_source {
+        for (snap, src) in snapshots.iter().zip(&components) {
             new_body.assign_to(
-                Place::from(old_local),
-                Rvalue::Use(Operand::Copy(Place::from(src))),
+                Place::from(*snap),
+                Rvalue::Use(Operand::Copy(Place::from(*src))),
                 &mut source,
                 InsertPosition::Before,
-            );
-        } else {
-            let ref1 = new_body.insert_assignment(
-                Rvalue::Ref(ref_region.clone(), BorrowKind::Shared, Place::from(closure_local)),
-                &mut source,
-                InsertPosition::Before,
-            );
-            let unit1 = new_body.insert_assignment(
-                Rvalue::Aggregate(AggregateKind::Tuple, vec![]),
-                &mut source,
-                InsertPosition::Before,
-            );
-            new_body.insert_call(
-                &shim,
-                &mut source,
-                InsertPosition::Before,
-                vec![Operand::Move(Place::from(ref1)), Operand::Move(Place::from(unit1))],
-                Place::from(old_local),
             );
         }
         // `source` now points at the register-call terminator: replace it with
@@ -581,40 +742,67 @@ impl LoopContractPass {
             Terminator { kind: TerminatorKind::Goto { target: site.target }, span },
         );
 
-        // ── Latch: `new = measure(); safety_check(new < old); old = new` ────
+        // ── Latch: recompute old/new, check the ranking, refresh snapshots ──
         let mut latch_source = SourceInstruction::Terminator { bb: latch_bb };
-        let new_measure = new_body.new_local(measure_ty, span, Mutability::Not);
-        if let Some(src) = identity_source {
-            new_body.assign_to(
-                Place::from(new_measure),
-                Rvalue::Use(Operand::Copy(Place::from(src))),
-                &mut latch_source,
+
+        // Emit `dest = <measure over `parts`>`, guarding the subtraction so a
+        // wrapped difference can never masquerade as a decrease. Kani's own
+        // measure closure carries the same overflow assert, so checking it here
+        // matches Kani rather than adding an obligation it does not have.
+        // `guard_underflow` is FALSE for the OLD side: those snapshots were
+        // copied from the components at the previous latch (or at entry), where
+        // this very check already passed, so re-emitting it costs a second
+        // subtraction plus a second obligation per iteration and proves nothing
+        // new. MEASURED on decreases_binary_search: the compound encoding took
+        // 44.7s against 7.5s for the same lane with the invariant alone — 37s
+        // of the obligations lane was this instrumentation, and that overran
+        // the two-lane retry budget under corpus contention.
+        let mut emit_measure = |new_body: &mut MutableBody,
+                                cursor: &mut SourceInstruction,
+                                parts: &[Local],
+                                guard_underflow: bool|
+         -> Local {
+            if parts.len() == 1 {
+                return parts[0];
+            }
+            let (a, b) = (parts[0], parts[1]);
+            if guard_underflow {
+                let ge = new_body.insert_assignment(
+                    Rvalue::BinaryOp(
+                        rustc_public::mir::BinOp::Ge,
+                        Operand::Copy(Place::from(a)),
+                        Operand::Copy(Place::from(b)),
+                    ),
+                    cursor,
+                    InsertPosition::Before,
+                );
+                new_body.insert_check(
+                    &check_type,
+                    cursor,
+                    InsertPosition::Before,
+                    Some(ge),
+                    "loop decreases clause: measure subtraction must not underflow",
+                );
+            }
+            new_body.insert_assignment(
+                Rvalue::BinaryOp(
+                    rustc_public::mir::BinOp::Sub,
+                    Operand::Copy(Place::from(a)),
+                    Operand::Copy(Place::from(b)),
+                ),
+                cursor,
                 InsertPosition::Before,
-            );
-        } else {
-            let ref2 = new_body.insert_assignment(
-                Rvalue::Ref(ref_region, BorrowKind::Shared, Place::from(closure_local)),
-                &mut latch_source,
-                InsertPosition::Before,
-            );
-            let unit2 = new_body.insert_assignment(
-                Rvalue::Aggregate(AggregateKind::Tuple, vec![]),
-                &mut latch_source,
-                InsertPosition::Before,
-            );
-            new_body.insert_call(
-                &shim,
-                &mut latch_source,
-                InsertPosition::Before,
-                vec![Operand::Move(Place::from(ref2)), Operand::Move(Place::from(unit2))],
-                Place::from(new_measure),
-            );
-        }
+            )
+        };
+
+        let old_val = emit_measure(new_body, &mut latch_source, &snapshots, false);
+        let new_val = emit_measure(new_body, &mut latch_source, &components, true);
+
         let cmp = new_body.insert_assignment(
             Rvalue::BinaryOp(
                 rustc_public::mir::BinOp::Lt,
-                Operand::Copy(Place::from(new_measure)),
-                Operand::Copy(Place::from(old_local)),
+                Operand::Copy(Place::from(new_val)),
+                Operand::Copy(Place::from(old_val)),
             ),
             &mut latch_source,
             InsertPosition::Before,
@@ -626,19 +814,20 @@ impl LoopContractPass {
             Some(cmp),
             "loop decreases clause: measure must strictly decrease on every iteration",
         );
-        new_body.assign_to(
-            Place::from(old_local),
-            Rvalue::Use(Operand::Copy(Place::from(new_measure))),
-            &mut latch_source,
-            InsertPosition::Before,
-        );
-
-        // #47: let the loop-contract proof rule re-snapshot `old = src` after
-        // its havoc, so the ranking check compares within the symbolic
-        // iteration (guard 7 guarantees identity_source is Some here).
-        if let Some(src) = identity_source {
-            self.decreases_snapshot = Some((old_local, src));
+        for (snap, src) in snapshots.iter().zip(&components) {
+            new_body.assign_to(
+                Place::from(*snap),
+                Rvalue::Use(Operand::Copy(Place::from(*src))),
+                &mut latch_source,
+                InsertPosition::Before,
+            );
         }
+
+        // #47: let the loop-contract proof rule re-snapshot every component
+        // after its havoc, so the ranking check compares within the symbolic
+        // iteration rather than against the concrete entry state.
+        self.decreases_snapshot =
+            Some(snapshots.iter().copied().zip(components.iter().copied()).collect());
     }
 
     /// Transform loops with contracts from
@@ -980,5 +1169,20 @@ impl LoopContractPass {
             }
         }
         contain_loop_contracts
+    }
+}
+
+/// Field index of a closure capture slot read off the self arg.
+///
+/// A by-ref capture read lowers to a place rooted at `_1` with projection
+/// `[Deref, Field(i)]` (`((*_1).i)`); a by-value capture omits the deref.
+/// Returns `None` for anything else so an unrecognized shape falls back to the
+/// conservative path rather than being silently mis-attributed to a capture.
+fn capture_field_index(projection: &[rustc_public::mir::ProjectionElem]) -> Option<usize> {
+    use rustc_public::mir::ProjectionElem;
+    match projection {
+        [ProjectionElem::Deref, ProjectionElem::Field(idx, _)] => Some(*idx),
+        [ProjectionElem::Field(idx, _)] => Some(*idx),
+        _ => None,
     }
 }

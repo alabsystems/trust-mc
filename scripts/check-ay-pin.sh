@@ -12,6 +12,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="${ROOT_DIR}/Cargo.toml"
 AY_REPO="${ROOT_DIR}/../ay"
+TRUST_MC_CARGO="$("${ROOT_DIR}/scripts/resolve-trust-tool.sh" cargo)"
 AY_PINNED_PACKAGES=(
     ay-dpll
     ay-core
@@ -37,12 +38,15 @@ AY_PATCHED_PACKAGES=(
     ay-encode
 )
 
+# shellcheck source=scripts/lib/python-with-toml.sh
+. "${ROOT_DIR}/scripts/lib/python-with-toml.sh"
+
 die() {
     printf 'check-ay-pin: error: %s\n' "$*" >&2
     exit 1
 }
 
-pin_audit="$(python3 "${ROOT_DIR}/scripts/check_first_party_git_pins.py" \
+pin_audit="$("${PYTHON}" "${ROOT_DIR}/scripts/check_first_party_git_pins.py" \
     "${ROOT_DIR}" ay)" || die "semantic AY manifest audit failed"
 read -r declared_rev manifest_entries <<< "${pin_audit}"
 
@@ -50,9 +54,9 @@ for package in "${AY_PATCHED_PACKAGES[@]}"; do
     checkout_manifest="${AY_REPO}/crates/${package}/Cargo.toml"
     [[ -f "${checkout_manifest}" ]] \
         || die "missing checkout manifest for ${package}: ${checkout_manifest}"
-    resolved_id="$(cargo pkgid --frozen --manifest-path "${MANIFEST}" "${package}")" \
+    resolved_id="$("${TRUST_MC_CARGO}" pkgid --frozen --manifest-path "${MANIFEST}" "${package}")" \
         || die "Cargo could not resolve ${package} from ${MANIFEST}"
-    checkout_id="$(cargo pkgid --frozen --manifest-path "${checkout_manifest}")" \
+    checkout_id="$("${TRUST_MC_CARGO}" pkgid --frozen --manifest-path "${checkout_manifest}")" \
         || die "Cargo could not identify checkout package ${checkout_manifest}"
     [[ "${resolved_id}" == "${checkout_id}" ]] \
         || die "Cargo resolves ${package} as ${resolved_id}, not checkout ${checkout_id}"
@@ -95,7 +99,7 @@ done < <(git -C "${AY_REPO}" remote)
 # reachable from canonical main history, which still fail-closes on a dev-only
 # or rewritten sha. Same idiom as `require_frozen_content_checkout` in
 # scripts/check-shared-pins.sh.
-python3 "${ROOT_DIR}/scripts/check_live_main.py" \
+"${PYTHON}" "${ROOT_DIR}/scripts/check_live_main.py" \
     frozen "${AY_REPO}" "${ay_remote}" "${declared_rev}" >/dev/null \
     || die "AY live ${ay_remote}/main verification failed"
 

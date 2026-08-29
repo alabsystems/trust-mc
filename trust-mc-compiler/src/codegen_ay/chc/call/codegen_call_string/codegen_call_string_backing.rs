@@ -76,6 +76,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if let Operand::Copy(place) | Operand::Move(place) = arg
             && place.projection.is_empty()
         {
+            if self.local_has_multiple_whole_definitions(place.local) {
+                return None;
+            }
             if let Some(backing) = self.resolve_string_backing_local(place.local, modified_locals) {
                 return Some(backing);
             }
@@ -117,6 +120,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         local: usize,
         modified_locals: &HashSet<usize>,
     ) -> Option<StringBacking> {
+        if self.local_has_multiple_whole_definitions(local) {
+            return None;
+        }
         self.resolve_string_backing_with_metadata_local(local, local, modified_locals)
     }
 
@@ -126,6 +132,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         arg: &Operand,
         modified_locals: &HashSet<usize>,
     ) -> bool {
+        let source_local = match arg {
+            Operand::Copy(place) | Operand::Move(place) => Some(place.local),
+            Operand::Constant(_) => None,
+        };
+        if self.local_has_multiple_whole_definitions(dest_local)
+            || source_local.is_some_and(|source| {
+                !self.path_insensitive_metadata_copy_is_unique(source, dest_local)
+            })
+        {
+            self.clear_path_insensitive_ref_metadata(dest_local);
+            return false;
+        }
         let Some(backing) = self.resolve_string_backing(arg, modified_locals) else {
             return false;
         };
@@ -149,6 +167,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         metadata_local: usize,
         modified_locals: &HashSet<usize>,
     ) -> Option<StringBacking> {
+        if self.local_has_multiple_whole_definitions(data_local)
+            || self.local_has_multiple_whole_definitions(metadata_local)
+        {
+            return None;
+        }
         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
         let (len_hint, metadata_offset) = self.string_backing_metadata_for_local(metadata_local);
         if let Some(value) = self.ref_resolution.const_ref_values.get(&data_local).cloned() {

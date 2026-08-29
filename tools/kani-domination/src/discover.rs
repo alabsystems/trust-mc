@@ -110,6 +110,11 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
             continue;
         }
         let (flags, rustflags) = parse_flags(&src);
+        // Paths go relative to the CHECKOUT root (`<kani>`), not the suite
+        // root: the child is spawned with the checkout as its cwd, which is
+        // why sibling headers spell `tests/kani/ForeignItems/lib.c`.
+        let checkout_root = kani_tests.parent().unwrap_or(kani_tests);
+        let flags = augment_prose_c_lib(flags, &src, path, checkout_root);
         if let Some(dir) = path.parent() {
             *per_dir.entry(dir.to_path_buf()).or_insert(0) += 1;
         }
@@ -486,6 +491,68 @@ fn expected_is_compile_error(content: &str) -> bool {
     content.contains("error: aborting due to") || content.contains("error[E")
 }
 
+/// Kani declares a test's C dependencies through two channels: the
+/// `// kani-flags:` header, and — in older tests — prose only, in the form its
+/// own docs use: `//! kani <test>.rs -- lib.c`. Only the header channel was
+/// honored, so a prose-only test was compiled WITHOUT the C definitions it
+/// calls. Every `extern` is then undefined and the run cannot succeed, so the
+/// row scored as a trust-mc `false_positive` — a harness-invocation artifact,
+/// not a verifier defect. The same directory's `main.rs` carries BOTH
+/// spellings and reaches parity, which is what makes the omission visible.
+///
+/// Supply exactly what the test asks for, and nothing else:
+/// - never override an explicit `--c-lib` that a header already set;
+/// - only accept a `.c` file that actually exists beside the test;
+/// - emit link-only flags (`-Z c-ffi --c-lib`). These SUPPLY definitions
+///   rather than relax a check, so they cannot manufacture a vacuous pass —
+///   a missing definition is what makes such a run unverifiable to begin with.
+///   (Measured on `fixme_varadic.rs`: with the library linked the run performs
+///   MORE checks, including `va_arg` bounds and C-side overflow.)
+///
+/// The path is emitted relative to the Kani checkout root because the child is
+/// spawned with that root as its cwd (see `runner.rs`).
+fn augment_prose_c_lib(
+    mut flags: Vec<String>,
+    src: &str,
+    path: &Path,
+    checkout_root: &Path,
+) -> Vec<String> {
+    if flags.iter().any(|f| f == "--c-lib") {
+        return flags;
+    }
+    let Some(dir) = path.parent() else { return flags };
+    for line in src.lines() {
+        let t = line.trim_start();
+        let Some(body) = t.strip_prefix("//!").or_else(|| t.strip_prefix("//")) else {
+            continue;
+        };
+        let body = body.trim();
+        // The documented invocation form: `kani <something> -- <lib>.c ...`.
+        if !body.starts_with("kani ") {
+            continue;
+        }
+        let Some((_, tail)) = body.split_once(" -- ") else { continue };
+        for tok in tail.split_whitespace() {
+            if !tok.ends_with(".c") {
+                continue;
+            }
+            let candidate = dir.join(tok);
+            if !candidate.is_file() {
+                continue;
+            }
+            let rel = candidate.strip_prefix(checkout_root).unwrap_or(&candidate);
+            if !flags.iter().any(|f| f == "c-ffi") {
+                flags.push("-Z".to_string());
+                flags.push("c-ffi".to_string());
+            }
+            flags.push("--c-lib".to_string());
+            flags.push(rel.to_string_lossy().into_owned());
+            return flags;
+        }
+    }
+    flags
+}
+
 /// Parse `// kani-flags:` (→ verifier flags) and `// compile-flags:` (→
 /// RUSTFLAGS) directives, mirroring `tools/compiletest` header parsing.
 fn parse_flags(src: &str) -> (Vec<String>, Vec<String>) {
@@ -527,6 +594,62 @@ mod tests {
     }
 
     const PROOF: &str = "#[kani::proof]\nfn check() {}\n";
+
+    /// A prose-only C dependency (`//! kani x.rs -- lib.c`) is honored, so the
+    /// test is no longer compiled without the definitions it calls.
+    #[test]
+    fn prose_c_lib_is_supplied_when_header_is_absent() {
+        let d = tmpdir("prose-clib");
+        let t = d.join("tests/kani/ForeignItems/fixme_varadic.rs");
+        write(&t, "//! To run this test, do\n//! kani fixme_varadic.rs -- lib.c\n");
+        write(&d.join("tests/kani/ForeignItems/lib.c"), "int my_add(int n, ...);\n");
+        let src = std::fs::read_to_string(&t).unwrap();
+        let got = augment_prose_c_lib(Vec::new(), &src, &t, &d);
+        assert_eq!(
+            got,
+            vec![
+                "-Z".to_string(),
+                "c-ffi".to_string(),
+                "--c-lib".to_string(),
+                "tests/kani/ForeignItems/lib.c".to_string(),
+            ]
+        );
+    }
+
+    /// An explicit header wins: never override what the test already declared.
+    #[test]
+    fn prose_c_lib_never_overrides_an_explicit_header() {
+        let d = tmpdir("prose-clib-hdr");
+        let t = d.join("a.rs");
+        write(&t, "//! kani a.rs -- lib.c\n");
+        write(&d.join("lib.c"), "int f(void);\n");
+        let src = std::fs::read_to_string(&t).unwrap();
+        let declared = vec!["--c-lib".to_string(), "already/lib.c".to_string()];
+        let got = augment_prose_c_lib(declared.clone(), &src, &t, &d);
+        assert_eq!(got, declared);
+    }
+
+    /// A `.c` file that does not exist is NOT invented: a stale prose line must
+    /// not silently change how the corpus is invoked.
+    #[test]
+    fn prose_c_lib_requires_the_file_to_exist() {
+        let d = tmpdir("prose-clib-missing");
+        let t = d.join("a.rs");
+        write(&t, "//! kani a.rs -- absent.c\n");
+        let src = std::fs::read_to_string(&t).unwrap();
+        assert!(augment_prose_c_lib(Vec::new(), &src, &t, &d).is_empty());
+    }
+
+    /// Ordinary prose mentioning a `.c` file is not an invocation directive.
+    #[test]
+    fn prose_c_lib_ignores_non_invocation_prose() {
+        let d = tmpdir("prose-clib-noise");
+        let t = d.join("a.rs");
+        write(&t, "//! see lib.c for the definitions -- it is vendored\n");
+        write(&d.join("lib.c"), "int f(void);\n");
+        let src = std::fs::read_to_string(&t).unwrap();
+        assert!(augment_prose_c_lib(Vec::new(), &src, &t, &d).is_empty());
+    }
 
     fn suite() -> &'static Suite {
         suites::lookup("expected").unwrap()

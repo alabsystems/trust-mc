@@ -13,9 +13,13 @@ Check 1: example.assertion.1
 ```
 
 trust-mc determines the verification result for the harness based on the
-result (i.e., `<status>`) of each individual check (also known as "properties"). If all
-checks are successful then the overall verification result of the harness is successful. Otherwise the
-verification fails, which indicates issues with the code under verification.
+result (i.e., `<status>`) of each individual check (also known as "properties"). If any
+check fails, the harness fails, which indicates issues with the code under
+verification. Checks passing is necessary but not sufficient for a
+`SUCCESSFUL` harness: trust-mc fails closed, so a harness that discharged its
+obligations vacuously, produced no obligations at all, or leaned on an encoding
+approximation gets a verdict of its own rather than a pass. See
+[Harness verdicts](#harness-verdicts) below.
 
 ## Check results
 
@@ -38,7 +42,7 @@ Check 4: success_example.assertion.4
 ```
 
 2. `FAILURE`: This indicates that the check failed (i.e., the property doesn't
-hold). In this case, please see the [concrete playback](./experimental/concrete-playback.md)
+hold). In this case, please see the [concrete playback](./reference/experimental/concrete-playback.md)
 section for more help.
 
 Example:
@@ -145,7 +149,7 @@ Check 3: cover_unreachable_example.cover.1
          - Location: src/main.rs:90:13 in function cover_unreachable_example
 ```
 
-4. `UNDETERMINED`: This is the same as the `UNDETERMINED` result for normal checks (see [check_results]).
+4. `UNDETERMINED`: This is the same as the `UNDETERMINED` result for normal checks (see [Check results](#check-results)).
 
 ## Verification summary
 
@@ -159,3 +163,23 @@ SUMMARY:
 
 VERIFICATION:- SUCCESSFUL
 ```
+
+## Harness verdicts
+
+The `VERIFICATION:-` line carries the harness's verdict. `trust-mc explain
+results` prints the same list from inside the tool:
+
+| Verdict | Meaning |
+| --- | --- |
+| `SUCCESSFUL` | every check is SUCCESS or UNREACHABLE |
+| `SUCCESSFUL (UNVALIDATED)` | proved in a logic (non-linear arithmetic, datatypes with bit-vectors) the solver cannot fully validate; exit 0 unless `--fail-on-unvalidated-success` |
+| `FAILED` | a counterexample, OR a proof demoted because it relied on an encoding approximation, OR a CHC `UNKNOWN`. The `[AY:...]` marker lines tell them apart |
+| `INCONCLUSIVE (no checks)` | the harness produced no obligations, so nothing was verified |
+| `INCONCLUSIVE (solver undecided ...)` | real obligations, but no verdict inside the budget. Try `--ay-chc` |
+| `VACUOUS (...)` | every check is UNREACHABLE and the harness itself cannot run: the assumptions are contradictory. `--allow-vacuous` turns it into a pass, loudly |
+| `INCONCLUSIVE (every check is unreachable ...)` | every check is UNREACHABLE but the harness does run — the checks sit on dead code. No assumption is blamed; `--allow-vacuous` also relaxes this |
+| `UNVALIDATED (DT+BV)` | a non-success in a logic the solver cannot validate |
+
+Exit status follows the verdicts: `0` every selected harness verified, `1` a
+harness failed or was inconclusive (or the engine errored), `2` usage error,
+`3` the engine, sysroot or solver is not installed.

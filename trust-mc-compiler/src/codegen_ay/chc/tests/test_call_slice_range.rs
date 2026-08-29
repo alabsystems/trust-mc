@@ -152,7 +152,9 @@ fn with_real_range_type_scaffold(
             else {
                 continue;
             };
-            if args.len() == 2 && ChcCtx::is_range_type_operand(&args[1], mir_body.locals()) {
+            if args.len() == 2
+                && ChcCtx::is_range_type_operand(ctx.tcx, &args[1], mir_body.locals())
+            {
                 call_site = Some((bb_idx, args, destination.clone(), *target));
                 break;
             }
@@ -293,11 +295,11 @@ fn test_is_range_type_operand_false_for_u32() {
         let place = Place { local: 1usize, projection: vec![] };
         let op = Operand::Copy(place);
         assert!(
-            !ChcCtx::is_range_type_operand(&op, mir_body.locals()),
+            !ChcCtx::is_range_type_operand(ctx.tcx, &op, mir_body.locals()),
             "u32 operand should not be detected as Range type"
         );
         assert!(
-            !ChcCtx::is_range_inclusive_operand(&op, mir_body.locals()),
+            !ChcCtx::is_range_inclusive_operand(ctx.tcx, &op, mir_body.locals()),
             "u32 operand should not be detected as RangeInclusive type"
         );
     });
@@ -321,12 +323,12 @@ fn test_is_range_type_operand_detects_range_in_mir() {
                     let place = Place { local: idx, projection: vec![] };
                     let op = Operand::Copy(place);
                     assert!(
-                        ChcCtx::is_range_type_operand(&op, mir_body.locals()),
+                        ChcCtx::is_range_type_operand(ctx.tcx, &op, mir_body.locals()),
                         "Local {} has Range type but is_range_type_operand returned false",
                         idx
                     );
                     assert!(
-                        !ChcCtx::is_range_inclusive_operand(&op, mir_body.locals()),
+                        !ChcCtx::is_range_inclusive_operand(ctx.tcx, &op, mir_body.locals()),
                         "Range (not Inclusive) local should return false for is_range_inclusive"
                     );
                     found_range = true;

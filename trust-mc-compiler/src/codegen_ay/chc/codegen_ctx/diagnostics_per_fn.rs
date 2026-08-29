@@ -357,6 +357,16 @@ impl GlobalDiagnosticCounters {
         Self::lock_map(&self.recursive_unwind_by_fn).get(fn_name).copied().unwrap_or(0)
     }
 
+    // --- Vacuous-checks per-function map (CHC lane V4) ---
+
+    pub(in crate::codegen_ay) fn record_vacuous_checks_for_fn(&self, fn_name: &str) {
+        Self::record_for_fn(&self.vacuous_checks_by_fn, fn_name, 1);
+    }
+
+    pub(in crate::codegen_ay) fn get_vacuous_checks_for_fn(&self, fn_name: &str) -> bool {
+        Self::lock_map(&self.vacuous_checks_by_fn).get(fn_name).copied().unwrap_or(0) > 0
+    }
+
     // --- Inferable summary names per-function map (Part of #4031) ---
 
     pub(in crate::codegen_ay) fn record_inferable_summary_name_for_fn(
@@ -404,7 +414,11 @@ impl GlobalDiagnosticCounters {
         *reasons.entry(reason.to_owned()).or_insert(0) += 1;
     }
 
-    #[cfg(test)]
+    /// Drain the per-function aggregate gap reasons.
+    ///
+    /// Was `#[cfg(test)]`, which is why the reasons existed only in test
+    /// builds: production recorded them at every site and could never read
+    /// them back, so the corpus counted this cluster without naming its cause.
     pub(in crate::codegen_ay) fn take_aggregate_gap_reasons_by_fn(
         &self,
     ) -> BTreeMap<String, BTreeMap<String, usize>> {

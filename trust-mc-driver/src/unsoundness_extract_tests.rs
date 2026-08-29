@@ -40,6 +40,7 @@ fn test_sound_approx_per_harness_includes_issue_3447_stmt_level_counters() {
         m.aggregate_encoding_gap = Some(AggregateEncodingGapInfo {
             count: 5,
             per_harness: BTreeMap::from([("harness_stmt".to_string(), 5)]),
+            per_harness_reasons: BTreeMap::new(),
         });
         m.stub_approximation = Some(StubApproximationInfo {
             count: 6,

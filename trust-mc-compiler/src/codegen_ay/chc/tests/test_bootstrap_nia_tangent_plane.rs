@@ -176,6 +176,9 @@ fn run_compiletest_parity_probe<'tcx>(
         instance,
         fn_name,
         ChcConfig {
+            frame_narrowing: crate::codegen_ay::chc::frame_narrowing_enabled(),
+            frame_narrowing_flattened: crate::codegen_ay::chc::frame_narrowing_flattened_enabled(),
+            nan_checks: ctx.config.nan_checks,
             track_level: ctx.config.chc_track_level,
             step_mode: ctx.config.chc_step_mode,
             int_lift: ctx.config.chc_int_lift,

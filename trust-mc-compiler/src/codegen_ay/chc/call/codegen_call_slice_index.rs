@@ -92,9 +92,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3327, #3551: Detect Range/RangeInclusive slice indexing.
         // Range<usize> / RangeInclusive<usize> args produce a subslice, not a scalar element.
         if let Some(idx_op) = index_arg
-            && Self::is_range_type_operand(idx_op, self.body.locals())
+            && Self::is_range_type_operand(self.tcx, idx_op, self.body.locals())
         {
-            let inclusive = Self::is_range_inclusive_operand(idx_op, self.body.locals());
+            let inclusive = Self::is_range_inclusive_operand(self.tcx, idx_op, self.body.locals());
             debug!(fn_name = %self.fn_name, inclusive, "CHC slice index: Range index detected; subslice path");
             return self
                 .codegen_call_slice_range_index(cx, dest_local, slice_arg, idx_op, inclusive);
@@ -102,22 +102,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Part of #3495: RangeFull indexing (`&slice[..]`) is identity.
         if let Some(idx_op) = index_arg
-            && Self::is_range_full_operand(idx_op, self.body.locals())
+            && Self::is_range_full_operand(self.tcx, idx_op, self.body.locals())
         {
             return self.codegen_call_slice_range_full_identity(cx, dest_local, slice_arg);
         }
 
         if let Some(idx_op) = index_arg
-            && Self::is_range_to_operand(idx_op, self.body.locals())
+            && Self::is_range_to_operand(self.tcx, idx_op, self.body.locals())
         {
-            let inclusive = Self::is_range_to_inclusive_operand(idx_op, self.body.locals());
+            let inclusive =
+                Self::is_range_to_inclusive_operand(self.tcx, idx_op, self.body.locals());
             return self
                 .codegen_call_slice_range_to_index(cx, dest_local, slice_arg, idx_op, inclusive);
         }
 
         // Part of #3495: RangeFrom indexing (`&slice[start..]`) is a subslice from start to end.
         if let Some(idx_op) = index_arg
-            && Self::is_range_from_operand(idx_op, self.body.locals())
+            && Self::is_range_from_operand(self.tcx, idx_op, self.body.locals())
         {
             return self.codegen_call_slice_range_from_index(cx, dest_local, slice_arg, idx_op);
         }

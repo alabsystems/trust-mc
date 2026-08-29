@@ -76,6 +76,13 @@ pub(crate) struct BodyTransformation {
     /// The passes that may change the function body according to harness configuration.
     /// The stubbing passes should be applied before so user stubs take precedence.
     stub_passes: Vec<Box<dyn ClonableTransformPass>>,
+    /// The unit's stub map, `from -> to`.
+    ///
+    /// Kept whole rather than as a bool so the obligation-free walk can RESOLVE
+    /// through it and see the same program the encoder encodes. It used to be
+    /// `has_stubs: bool` and the walk simply refused any stubbed unit, which
+    /// was sound but cost `tests/kani/Stubbing/glob_{cycle,path}.rs`.
+    stubs: crate::kani_middle::codegen_units::Stubs,
     /// The passes that may add safety checks to the function body.
     inst_passes: Vec<Box<dyn ClonableTransformPass>>,
     /// Cache transformation results.
@@ -88,6 +95,10 @@ impl BodyTransformation {
             stub_passes: vec![],
             inst_passes: vec![],
             cache: Default::default(),
+            // Recorded because the obligation-free certificate cannot resolve
+            // callees on a stubbed program: it walks raw `Instance::resolve`,
+            // which returns the ORIGINAL body. See `has_stubs`.
+            stubs: unit.stubs.clone(),
         };
         let safety_check_type = CheckType::new_safety_check_assert_assume(queries);
         let unsupported_check_type = CheckType::new_unsupported_check_assert_assume_false(queries);
@@ -139,7 +150,36 @@ impl BodyTransformation {
     /// instance without requiring full Kani hook/intrinsic discovery.
     #[cfg(test)]
     pub(crate) fn new_for_tests() -> Self {
-        Self { stub_passes: vec![], inst_passes: vec![], cache: Default::default() }
+        Self {
+            stub_passes: vec![],
+            inst_passes: vec![],
+            cache: Default::default(),
+            stubs: Default::default(),
+        }
+    }
+
+    /// Does this unit stub anything?
+    pub(crate) fn has_stubs(&self) -> bool {
+        !self.stubs.is_empty()
+    }
+
+    /// A copy of the stub map for the obligation-free walk.
+    pub(crate) fn stub_map_for_walk(&self) -> crate::kani_middle::codegen_units::Stubs {
+        self.stubs.clone()
+    }
+
+    /// The stub replacement for `fn_def`, if this unit stubs it.
+    ///
+    /// The obligation-free walk resolves callees through this so it inspects
+    /// the STUB's body, not the original's. Without it the walk answered about
+    /// a different program: `#[kani::stub(clean, panicking)]` made it see
+    /// `clean`, find nothing to prove, and CERTIFY a harness whose emitted
+    /// check FAILS.
+    pub(crate) fn stub_target(
+        &self,
+        fn_def: rustc_public::ty::FnDef,
+    ) -> Option<rustc_public::ty::FnDef> {
+        self.stubs.get(&fn_def).copied()
     }
 
     /// Clear the transformation cache to reclaim memory.
@@ -179,6 +219,48 @@ impl BodyTransformation {
         self.body_ref(tcx, instance).clone()
     }
 
+    /// Like [`body`], but DECLINES instead of panicking when the instance has
+    /// no MIR at all.
+    ///
+    /// `body_ref` unwraps `instance.body()` with an `expect`, so every caller
+    /// that reaches it with a body-less instance takes down the compiler.
+    /// `AYCtx::body_or_instance_body` advertises `Option`, and its callers
+    /// honour that — `try_inline_small_instance_call` writes
+    /// `body_or_instance_body(instance)?` and declines gracefully — but the
+    /// transformer arm wrapped this in `Some(..)`, so the `None` the contract
+    /// promises could never actually be produced. The panic was a contract
+    /// violation one frame below the code that respected it.
+    ///
+    /// The instances that hit this are `#[rustc_intrinsic]`s with no fallback
+    /// body (`float_to_int_unchecked`, `arith_offset`, `caller_location`);
+    /// measured, they are all `kind=Intrinsic, intrinsic=true, foreign=false`
+    /// from `core`.
+    ///
+    /// Keyed on `instance.body().is_none()`, NOT on `has_body()`:
+    /// `has_body() == false` does not imply `body() == None` — a shim reports
+    /// no body yet still materializes one — so testing `has_body()` here would
+    /// decline for instances that can in fact be inlined.
+    ///
+    /// Declining does NOT drop the call's obligations. The `Call` terminator
+    /// survives, dispatch falls through to `unsupported_call_successors`, and
+    /// that path calls `unsupported_with_fallback`, which bumps the
+    /// per-harness demotion counter — so a harness containing one of these can
+    /// never come back SUCCESSFUL. Anything implemented here must keep going
+    /// through that path: plain `unsupported()` records diagnostics and bumps
+    /// no counter, which would not demote, and that is the false-proof shape.
+    pub(crate) fn try_body(&mut self, tcx: TyCtxt, instance: Instance) -> Option<Body> {
+        if !self.cache.contains_key(&instance) {
+            // Resolve BEFORE touching the cache, so a decline leaves no entry
+            // behind to poison a later lookup.
+            let mut body = instance.body()?;
+            for pass in self.stub_passes.iter_mut().chain(self.inst_passes.iter_mut()) {
+                body = pass.transform(tcx, body, instance).1;
+            }
+            self.cache.insert(instance, TransformationResult(body));
+        }
+        self.cache.get(&instance).map(|result| result.0.clone())
+    }
+
     fn add_pass<P: ClonableTransformPass + 'static>(&mut self, query_db: &QueryDb, pass: P) {
         if pass.is_enabled(query_db) {
             match P::transformation_type() {
@@ -198,6 +280,7 @@ impl BodyTransformation {
             stub_passes: self.stub_passes.clone(),
             inst_passes: self.inst_passes.clone(),
             cache: Default::default(),
+            stubs: self.stubs.clone(),
         }
     }
 }

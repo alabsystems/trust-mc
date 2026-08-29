@@ -6,7 +6,6 @@
 //! Extracted from `codegen_stmt_ptr_metadata.rs` per #4130.
 
 use ay_bindings::Expr;
-use rustc_public::CrateDef;
 use rustc_public::mir::{
     AggregateKind, Operand, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
 };
@@ -30,6 +29,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut visited = HashSet::new();
         // Max 8 hops to prevent infinite loops.
         while visited.len() < 8 && visited.insert(current) {
+            // This is a whole-body, path-insensitive trace.  Selecting the
+            // first producer at a CFG join would turn one predecessor's side
+            // metadata into exact fat-pointer authority.
+            if self.local_has_multiple_whole_definitions(current) {
+                return None;
+            }
             // Scan MIR for the assignment to `current`.
             let mut source_local = None;
             let mut is_call_result = false;
@@ -81,6 +86,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // Also check terminators for Call results.
                 if let TerminatorKind::Call { destination, .. } = &block.terminator.kind
                     && destination.local == current
+                    && destination.projection.is_empty()
                 {
                     is_call_result = true;
                 }
@@ -112,6 +118,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             match source_local {
                 Some(src) => {
+                    if self.local_has_multiple_whole_definitions(src) {
+                        return None;
+                    }
                     if let Some(len) = self.ref_resolution.subslice_len.get(&src) {
                         return Some(len.clone());
                     }
@@ -131,80 +140,76 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         current_local: usize,
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
+        if self.local_has_multiple_whole_definitions(current_local) {
+            return None;
+        }
         for block in &self.body.blocks {
-            let TerminatorKind::Call { args, destination, .. } = &block.terminator.kind else {
+            let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
+            else {
                 continue;
             };
-            if destination.local != current_local {
+            if destination.local != current_local || !destination.projection.is_empty() {
                 continue;
             }
-            // Check each argument for Range/RangeInclusive type.
-            for arg in args {
-                let Ok(ty) = arg.ty(self.body.locals()) else {
-                    continue;
-                };
-                let (is_range, is_inclusive) = match ty.kind() {
-                    TyKind::RigidTy(RigidTy::Adt(def, _)) => {
-                        let name = def.trimmed_name();
-                        (name == "Range" || name == "RangeInclusive", name == "RangeInclusive")
-                    }
-                    _ => (false, false),
-                };
-                if !is_range {
-                    continue;
-                }
-                // Extract the Range local index.
-                let range_local = match arg {
-                    Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
-                        place.local
-                    }
-                    _ => continue,
-                };
-                // Get start (field 0) and end (field 1) from flattened state.
-                // Inlined from flattened_local_field_expr (call/ pub(crate)
-                // not accessible from stmt/).
-                let get_field = |field_idx: usize| -> Option<Expr> {
-                    if let Some(expr) =
-                        self.encode.flattened_field_env.get(&(range_local, field_idx))
-                    {
-                        return Some(expr.clone());
-                    }
-                    let base_idx = self.try_state_idx_for_local(range_local)?;
-                    let slot = base_idx + field_idx;
-                    let vars = if modified_locals.contains(&range_local) {
-                        &self.state_var_mgr.output_state_vars
-                    } else {
-                        &self.state_var_mgr.state_vars
-                    };
-                    vars.get(slot).map(|(name, sort)| Expr::var(&**name, sort.clone()))
-                };
-                let start = get_field(0)?;
-                let end = get_field(1)?;
-                // Coerce to pointer width bitvector.
-                let coerce = |expr: Expr| -> Option<Expr> {
-                    match expr.sort().bitvec_width() {
-                        Some(w) if w == POINTER_WIDTH => Some(expr),
-                        Some(w) if w < POINTER_WIDTH => Some(expr.zero_extend(POINTER_WIDTH - w)),
-                        Some(_) => Some(expr.extract(POINTER_WIDTH - 1, 0)),
-                        None => None,
-                    }
-                };
-                let start_bv = coerce(start)?;
-                let end_bv = coerce(end)?;
-                let len = if is_inclusive {
-                    end_bv.bvsub(start_bv).bvadd(Expr::bitvec_const(1, POINTER_WIDTH))
-                } else {
-                    end_bv.bvsub(start_bv)
-                };
-                debug!(
-                    fn_name = %self.fn_name,
-                    current_local,
-                    range_local,
-                    is_inclusive,
-                    "PtrMetadata: computed subslice_len from Call Range args (phase ordering fix)"
-                );
-                return Some(len);
+            // A Range-shaped argument is not return-length authority. Require
+            // the exact standard Index/SliceIndex method, its authenticated
+            // argument order and carrier, then inspect only its index operand.
+            let (_, _, index) = self.authenticated_core_slice_index_args(func, args)?;
+            if !Self::is_range_type_operand(self.tcx, index, self.body.locals()) {
+                return None;
             }
+            let is_inclusive =
+                Self::is_range_inclusive_operand(self.tcx, index, self.body.locals());
+            let range_local = match index {
+                Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+                    place.local
+                }
+                _ => return None,
+            };
+            if self.local_has_multiple_whole_definitions(range_local) {
+                return None;
+            }
+            // Get start (field 0) and end (field 1) from flattened state.
+            // Inlined from flattened_local_field_expr (call/ pub(crate)
+            // not accessible from stmt/).
+            let get_field = |field_idx: usize| -> Option<Expr> {
+                if let Some(expr) = self.encode.flattened_field_env.get(&(range_local, field_idx)) {
+                    return Some(expr.clone());
+                }
+                let base_idx = self.try_state_idx_for_local(range_local)?;
+                let slot = base_idx + field_idx;
+                let vars = if modified_locals.contains(&range_local) {
+                    &self.state_var_mgr.output_state_vars
+                } else {
+                    &self.state_var_mgr.state_vars
+                };
+                vars.get(slot).map(|(name, sort)| Expr::var(&**name, sort.clone()))
+            };
+            let start = get_field(0)?;
+            let end = get_field(1)?;
+            let coerce = |expr: Expr| -> Option<Expr> {
+                match expr.sort().bitvec_width() {
+                    Some(w) if w == POINTER_WIDTH => Some(expr),
+                    Some(w) if w < POINTER_WIDTH => Some(expr.zero_extend(POINTER_WIDTH - w)),
+                    Some(_) => Some(expr.extract(POINTER_WIDTH - 1, 0)),
+                    None => None,
+                }
+            };
+            let start_bv = coerce(start)?;
+            let end_bv = coerce(end)?;
+            let len = if is_inclusive {
+                end_bv.bvsub(start_bv).bvadd(Expr::bitvec_const(1, POINTER_WIDTH))
+            } else {
+                end_bv.bvsub(start_bv)
+            };
+            debug!(
+                fn_name = %self.fn_name,
+                current_local,
+                range_local,
+                is_inclusive,
+                "PtrMetadata: computed authenticated subslice_len from Index Range args"
+            );
+            return Some(len);
         }
         None
     }
@@ -215,26 +220,37 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// (e.g., `my_slice[0]` → `Index::index(my_slice, 0)`), trace back through
     /// the array/slice to find the element's subslice_len.
     fn try_resolve_subslice_len_from_index_call(&self, result_local: usize) -> Option<Expr> {
-        // Find the Call terminator for result_local.
-        let mut call_args = None;
+        if self.local_has_multiple_whole_definitions(result_local) {
+            return None;
+        }
+        // Find the authenticated Call terminator for result_local.
+        let mut authenticated = None;
         for block in &self.body.blocks {
-            if let TerminatorKind::Call { args, destination, .. } = &block.terminator.kind
+            if let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
                 && destination.local == result_local
+                && destination.projection.is_empty()
             {
-                call_args = Some(args.clone());
+                authenticated = self
+                    .authenticated_core_slice_index_args(func, args)
+                    .map(|(_, source, index)| (source.clone(), index.clone()));
                 break;
             }
         }
-        let args = call_args?;
-        if args.is_empty() {
+        let (source, index) = authenticated?;
+        // This lane recovers metadata for one selected element.  Range-shaped
+        // indices return a new slice and have independent length semantics.
+        let index_ty = index.ty(self.body.locals()).ok()?;
+        if !matches!(index_ty.kind(), TyKind::RigidTy(RigidTy::Uint(_) | RigidTy::Int(_))) {
             return None;
         }
 
-        // The first arg is typically the collection reference (&[T] or &[T; N]).
-        let collection_local = match &args[0] {
+        let collection_local = match &source {
             Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
             _ => return None,
         };
+        if self.local_has_multiple_whole_definitions(collection_local) {
+            return None;
+        }
         let array_local = self.trace_local_to_referent(collection_local)?;
         let element_locals = self.find_array_aggregate_elements(array_local);
         if element_locals.is_empty() {
@@ -252,6 +268,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut current = local;
         let mut visited = HashSet::new();
         while visited.len() < 4 && visited.insert(current) {
+            if self.local_has_multiple_whole_definitions(current) {
+                return None;
+            }
             let mut next = None;
             for block in &self.body.blocks {
                 for stmt in &block.statements {
@@ -296,6 +315,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Find element locals from an `Aggregate(Array, ...)` assignment.
     fn find_array_aggregate_elements(&self, array_local: usize) -> Vec<usize> {
+        if self.local_has_multiple_whole_definitions(array_local) {
+            return Vec::new();
+        }
         let mut elements = Vec::new();
         for block in &self.body.blocks {
             for stmt in &block.statements {
@@ -320,16 +342,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Return the uniform subslice_len shared by all elements, or None.
     fn uniform_subslice_len_from_elements(&self, elements: &[usize]) -> Option<Expr> {
+        if elements.is_empty() {
+            return None;
+        }
         let mut found_len: Option<Expr> = None;
         for &elem_local in elements {
-            if let Some(len) = self.ref_resolution.subslice_len.get(&elem_local) {
-                if let Some(ref existing) = found_len {
-                    if existing != len {
-                        return None;
-                    }
-                } else {
-                    found_len = Some(len.clone());
+            if self.local_has_multiple_whole_definitions(elem_local) {
+                return None;
+            }
+            let len = self.ref_resolution.subslice_len.get(&elem_local)?;
+            if let Some(ref existing) = found_len {
+                if existing != len {
+                    return None;
                 }
+            } else {
+                found_len = Some(len.clone());
             }
         }
         found_len
@@ -341,6 +368,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// find the array local, look up its `Aggregate(Array, ...)` construction,
     /// and return the shared subslice_len from the aggregate elements.
     fn try_resolve_subslice_len_from_index_proj(&self, dest_local: usize) -> Option<Expr> {
+        if self.local_has_multiple_whole_definitions(dest_local) {
+            return None;
+        }
         // Find the assignment to dest_local with an Index projection in the source.
         let mut array_local = None;
         let mut index_local = None;
@@ -374,7 +404,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Trace through Ref/Deref to find the actual array storage local.
         // Pattern: _ref = &_array, then (*_ref)[_idx] — resolve _ref → _array.
-        let storage_local = self.trace_ref_to_storage(array_local);
+        let storage_local = self.trace_ref_to_storage(array_local)?;
 
         // Find the Aggregate(Array, ...) that created the storage local.
         self.resolve_subslice_len_from_array_aggregate(storage_local, index_local)
@@ -384,10 +414,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Part of #4163: Also handles Cast (PtrToPtr, Unsize) to trace through
     /// unsize coercions (`&[T; N]` -> `&[T]`) that sit between the array Ref
     /// and the index projection.
-    fn trace_ref_to_storage(&self, start: usize) -> usize {
+    fn trace_ref_to_storage(&self, start: usize) -> Option<usize> {
         let mut current = start;
         let mut visited = HashSet::new();
         while visited.len() < 4 && visited.insert(current) {
+            if self.local_has_multiple_whole_definitions(current) {
+                return None;
+            }
             let mut next = None;
             for block in &self.body.blocks {
                 for stmt in &block.statements {
@@ -425,7 +458,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 None => break,
             }
         }
-        current
+        Some(current)
     }
 
     /// Given an array local, find its Aggregate construction and resolve
@@ -437,6 +470,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         array_local: usize,
         index_local: Option<usize>,
     ) -> Option<Expr> {
+        if self.local_has_multiple_whole_definitions(array_local) {
+            return None;
+        }
         let mut element_locals: Vec<usize> = Vec::new();
         for block in &self.body.blocks {
             for stmt in &block.statements {
@@ -466,20 +502,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut all_same = true;
         let mut first_len: Option<Expr> = None;
         for &elem_local in &element_locals {
-            if let Some(len) = self.ref_resolution.subslice_len.get(&elem_local) {
-                if let Some(ref first) = first_len {
-                    if first != len {
-                        all_same = false;
-                    }
-                } else {
-                    first_len = Some(len.clone());
-                }
-                element_lens.push(Some(len.clone()));
-                any_found = true;
-            } else {
-                element_lens.push(None);
-                all_same = false;
+            if self.local_has_multiple_whole_definitions(elem_local) {
+                return None;
             }
+            let Some(len) = self.ref_resolution.subslice_len.get(&elem_local) else {
+                // A partial side table cannot describe the selected element:
+                // choosing a known sibling as fallback under-approximates the
+                // missing array position.
+                return None;
+            };
+            if let Some(ref first) = first_len {
+                if first != len {
+                    all_same = false;
+                }
+            } else {
+                first_len = Some(len.clone());
+            }
+            element_lens.push(Some(len.clone()));
+            any_found = true;
         }
         if !any_found {
             return None;
@@ -498,6 +538,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Slow path: elements have different subslice_len. Build ITE chain
         // over the index variable: ite(idx == 0, len0, ite(idx == 1, len1, ...))
         let idx_local = index_local?;
+        if self.local_has_multiple_whole_definitions(idx_local) {
+            return None;
+        }
         // Resolve the index local to a AY expression using input state vars.
         let idx_expr = {
             let empty_modified = HashSet::new();

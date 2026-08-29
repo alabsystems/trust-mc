@@ -259,6 +259,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                     "CHC: Unsize dyn coercion — per-field scatter of concrete struct into dyn-tail byte view"
                                 );
                             } else {
+                                // A ZERO-SIZED source has no bytes to scatter, so
+                                // "declined" here means "there was nothing to
+                                // store" — not an approximation. Recording a
+                                // sound-fallback for it is a false drop: it
+                                // marks the harness as having lost information
+                                // when none existed, which (via the vacuity
+                                // evidence) costs parity on harnesses that are
+                                // genuinely obligation-free. `&dyn Trait` built
+                                // from a unit struct is the common shape
+                                // (tests/kani/DynTrait/upcast.rs).
+                                let src_is_zst = src_inner
+                                    .layout()
+                                    .ok()
+                                    .is_some_and(|l| l.shape().size.bytes() == 0);
+                                if src_is_zst {
+                                    debug!(
+                                        src_key = %src_pointee_key,
+                                        "CHC: Unsize dyn coercion — zero-sized source, nothing to scatter"
+                                    );
+                                } else {
                                 // Decompose declined (unknown offsets/params/
                                 // width mismatch): skip the alias store
                                 // entirely. Unconstrained target-key cells are
@@ -271,6 +291,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                     tgt_key = %tgt_pointee_key,
                                     "CHC: Unsize dyn coercion — struct decompose declined, skipping alias store (sound over-approximation)"
                                 );
+                                }
                             }
                         } else {
                             // Any other sort mismatch: skip the alias store

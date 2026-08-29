@@ -21,9 +21,39 @@ use super::codegen_expr_flattened_coroutine::FlattenedCoroutineRootProjection;
 use super::codegen_types::CodegenTypes;
 use super::{FieldProjection, UnknownProjectionPolicy, collect_field_projections};
 
-use rustc_public::mir::Place;
+use rustc_public::mir::{Place, ProjectionElem};
+use rustc_public::ty::{RigidTy, TyKind};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Drop the leading field projections that name a transparent
+    /// single-element tuple wrapper.
+    ///
+    /// `translate_ty` maps `(T,)` to `T`'s own sort (#1979), so the wrapper has
+    /// no field in the sort world and its `.0` is the identity. Every step is
+    /// checked against the MIR type, so nothing is dropped unless the type says
+    /// the wrapper really is single-element.
+    fn peel_transparent_tuple_fields(
+        &self,
+        local_idx: usize,
+        field_projections: &[FieldProjection],
+    ) -> Vec<FieldProjection> {
+        let Some(local_decl) = self.body.locals().get(local_idx) else {
+            return field_projections.to_vec();
+        };
+        let mut ty = local_decl.ty;
+        let mut consumed = 0;
+        while let Some(fp) = field_projections.get(consumed) {
+            if fp.cons_idx.is_some() || fp.field_idx != 0 {
+                break;
+            }
+            let TyKind::RigidTy(RigidTy::Tuple(elems)) = ty.kind() else { break };
+            let [sole] = elems[..] else { break };
+            ty = sole;
+            consumed += 1;
+        }
+        field_projections[consumed..].to_vec()
+    }
+
     /// Part of #3041 Category E: Reconstruct a Datatype expression from flattened state vars.
     ///
     /// For a flattened local with N scalar state vars (fld0..fldN-1), reconstructs
@@ -108,6 +138,36 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             &place.projection,
             UnknownProjectionPolicy::ReturnEmpty(&self.diagnostics),
         );
+
+        // Companion to #1979: `translate_ty` unwraps a single-element tuple to
+        // its element's sort, so the local's flattened slots describe the
+        // ELEMENT, not the wrapper. The MIR place still spells the wrapper's
+        // `.0`, and resolving that against the unwrapped sort reads the
+        // ELEMENT's own field 0 — one level too deep. For
+        // `_w: ((*mut u32, *mut u32),)` the read of `_w.0` returned the first
+        // pointer instead of the pair, so the destination's second slot was
+        // never constrained and the `modifies` footprint was built from a free
+        // pointer. Peel the transparent steps off before resolving.
+        let peeled = self.peel_transparent_tuple_fields(local_idx, &field_projections);
+        let all_field_like = place
+            .projection
+            .iter()
+            .all(|p| matches!(p, ProjectionElem::Field(_, _) | ProjectionElem::Downcast(_)));
+        if peeled.len() < field_projections.len() {
+            if peeled.is_empty() && all_field_like {
+                debug!(
+                    local_idx,
+                    "translate_place: transparent single-element tuple projection — bare read"
+                );
+                return self.reconstruct_flattened_bare_read(local_idx, modified_locals);
+            }
+            debug!(
+                local_idx,
+                peeled = field_projections.len() - peeled.len(),
+                "translate_place: peeled transparent single-element tuple projections"
+            );
+        }
+        let field_projections = peeled;
 
         // B. Single-field projection (struct/enum).
         if field_projections.len() == 1 {

@@ -12,7 +12,6 @@
 
 use std::collections::HashSet;
 
-use rustc_public::CrateDef;
 use rustc_public::mir::{AggregateKind, Operand, ProjectionElem, Rvalue, StatementKind};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
@@ -54,6 +53,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         struct_local: usize,
         field_idx: usize,
     ) -> Option<usize> {
+        if self.local_has_multiple_whole_definitions(struct_local) {
+            return None;
+        }
         // Direct Aggregate lookup on struct_local.
         if let Some(result) = self.find_aggregate_field(struct_local, field_idx) {
             return Some(result);
@@ -64,6 +66,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut current = struct_local;
         let mut visited = HashSet::new();
         while visited.len() < 6 && visited.insert(current) {
+            if self.local_has_multiple_whole_definitions(current) {
+                return None;
+            }
             let mut next = None;
             for block in &self.body.blocks {
                 for stmt in &block.statements {
@@ -107,10 +112,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Search for an Aggregate assignment on `local` and return the source local
     /// for `field_idx`. Helper for `trace_field_through_aggregate`.
     fn find_aggregate_field(&self, local: usize, field_idx: usize) -> Option<usize> {
+        if self.local_has_multiple_whole_definitions(local) {
+            return None;
+        }
         for block in &self.body.blocks {
             for stmt in &block.statements {
                 if let StatementKind::Assign(lhs, rvalue) = &stmt.kind
                     && lhs.local == local
+                    && lhs.projection.is_empty()
                     && let Rvalue::Aggregate(_, operands) = rvalue
                 {
                     if let Some(operand) = operands.get(field_idx) {
@@ -120,22 +129,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
         None
-    }
-
-    /// Check if a Call func operand is an Index::index method.
-    /// Guards the Range MIR scan against false matches on non-index calls.
-    pub(in crate::codegen_ay::chc) fn is_index_call(
-        func: &Operand,
-        locals: &[rustc_public::mir::LocalDecl],
-    ) -> bool {
-        let Ok(func_ty) = func.ty(locals) else { return false };
-        match func_ty.kind() {
-            TyKind::RigidTy(RigidTy::FnDef(def, _)) => {
-                let name = def.trimmed_name();
-                name == "index" || name.ends_with("::index")
-            }
-            _ => false,
-        }
     }
 
     /// Extract the local index from an operand, if it is a simple Copy/Move.
@@ -154,13 +147,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &self,
         start_local: usize,
     ) -> Option<(u64, u64)> {
-        let traced = self.trace_through_moves(start_local);
+        let traced = self.trace_through_moves(start_local)?;
         self.find_range_aggregate_const_fields(traced)
     }
 
     /// Follow Use(Move(_X)) / Use(Copy(_X)) chains to find the originating local.
-    fn trace_through_moves(&self, mut local_idx: usize) -> usize {
+    fn trace_through_moves(&self, mut local_idx: usize) -> Option<usize> {
         for _ in 0..5 {
+            if self.local_has_multiple_whole_definitions(local_idx) {
+                return None;
+            }
             let mut followed = false;
             for block in &self.body.blocks {
                 for stmt in &block.statements {
@@ -182,16 +178,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 break;
             }
         }
-        local_idx
+        Some(local_idx)
     }
 
     /// Find a Range Aggregate definition for the given local and extract
     /// constant start/end fields as (start, end).
     fn find_range_aggregate_const_fields(&self, local_idx: usize) -> Option<(u64, u64)> {
+        if self.local_has_multiple_whole_definitions(local_idx) {
+            return None;
+        }
         for block in &self.body.blocks {
             for stmt in &block.statements {
                 if let StatementKind::Assign(lhs, rvalue) = &stmt.kind
                     && lhs.local == local_idx
+                    && lhs.projection.is_empty()
                     && let Rvalue::Aggregate(AggregateKind::Adt(..), operands) = rvalue
                     && operands.len() == 2
                 {

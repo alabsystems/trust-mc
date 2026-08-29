@@ -13,6 +13,7 @@
 //! pass configuration or call-site selection logic.
 
 use super::remap::{monomorphize_ty, remap_block_with_ty};
+use super::variadic;
 use crate::kani_middle::transform::body::MutableBody;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::CrateDef;
@@ -21,7 +22,7 @@ use rustc_public::mir::{
     AggregateKind, BasicBlock, BasicBlockIdx, Body, Local, Mutability, Operand, Place,
     ProjectionElem, RawPtrKind, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
 };
-use rustc_public::ty::{Span, Ty};
+use rustc_public::ty::{RigidTy, Span, Ty, TyKind, UintTy};
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -29,6 +30,11 @@ use tracing::debug;
 ///
 /// Handles projected destinations (e.g., `_3.0 = foo()`) by creating a
 /// temporary return local and a post-return assignment block (#225).
+///
+/// Returns the number of actual variadic arguments when the callee was a
+/// specialized `c_variadic` function with at least one `va_arg` fetch — a
+/// construct-derived unwind bound for any loop that fetches (see
+/// [`variadic`]).
 pub(super) fn inline_function(
     tcx: TyCtxt<'_>,
     callee_instance: Instance,
@@ -39,15 +45,24 @@ pub(super) fn inline_function(
     call_dest: &Place,
     call_target: Option<BasicBlockIdx>,
     call_span: Span,
-) {
+) -> Option<usize> {
     let callee_locals = callee.locals();
     let has_projection = !call_dest.projection.is_empty();
 
     // Defensive check: callee must have at least the return local (local 0)
     if callee_locals.is_empty() {
         debug!("inline_function: callee has no locals, skipping inline");
-        return;
+        return None;
     }
+
+    // C-variadic specialization: the call site's own MIR carries the actual
+    // argument sequence, so the `...` parameter is modelled as that list plus a
+    // fetch cursor. Planned BEFORE any mutation so the actual argument types are
+    // read from the untouched caller. `None` = not modellable; fall through to
+    // the ordinary paths (which, for a genuinely variadic call, means the
+    // arity mismatch below leaves the extra arguments unbound).
+    let variadic_plan =
+        variadic::plan_variadic_inline(tcx, callee_instance, callee, caller, call_args);
 
     // Map from callee local index to caller local index
     let mut local_map: HashMap<Local, Local> = HashMap::new();
@@ -91,9 +106,93 @@ pub(super) fn inline_function(
     // Un-tuple only if: call site has 2 args, callee expects >2, AND tuple arg is a place (not constant)
     let tuple_arg_is_place =
         call_args.get(1).is_some_and(|op| matches!(op, Operand::Copy(_) | Operand::Move(_)));
-    let needs_untuple = call_args.len() == 2 && arg_count > 2 && tuple_arg_is_place;
+    // A one-parameter closure has `arg_count == 2` (self + the parameter), and
+    // the RustCall ABI still hands it a ONE-element tuple. `arg_count > 2` alone
+    // therefore never fires for it, and the tuple was bound whole to the
+    // parameter. The values line up -- a 1-tuple of `&u8` lays out like `&u8` --
+    // so nothing looked wrong, but the reference's identity did not survive:
+    // codegen tracks the pointee under the tuple's FIELD key while the body
+    // dereferences the parameter itself, finds nothing, and invents a fresh
+    // symbolic pointee. `kani::any_where(|s| *s < 10)` then constrained a value
+    // unrelated to the one it returned.
+    //
+    // Decide by type rather than arity: un-tuple when the callee's parameter is
+    // the tuple's ELEMENT, and leave it packed when the parameter really is the
+    // tuple (a closure declared `|t: (&u8,)|`, whose RustCall argument is
+    // `((&u8,),)`).
+    //
+    // The operand must genuinely BE a one-element tuple: an ordinary two-argument
+    // call also has `call_args.len() == 2` and `arg_count == 2`, and spreading
+    // its second argument would project a tuple field out of something that is
+    // not a tuple.
+    let untuple_single_param = arg_count == 2 && {
+        let tuple_ty = call_args.get(1).and_then(|op| op.ty(caller.locals()).ok());
+        let param_ty =
+            callee_locals.get(2).map(|decl| monomorphize_ty(tcx, callee_instance, decl.ty));
+        match (tuple_ty, param_ty) {
+            (Some(tuple_ty), Some(param_ty)) => {
+                matches!(
+                    tuple_ty.kind(),
+                    TyKind::RigidTy(RigidTy::Tuple(ref fields)) if fields.len() == 1
+                ) && tuple_ty != param_ty
+            }
+            _ => false,
+        }
+    };
+    let needs_untuple =
+        call_args.len() == 2 && (arg_count > 2 || untuple_single_param) && tuple_arg_is_place;
 
-    let init_stmts: Vec<Statement> = if needs_untuple {
+    // Locals materializing the `...` parameter for a specialized variadic call.
+    let mut va_actual_locals: Vec<Local> = Vec::new();
+    let mut va_cursor_local: Local = 0;
+
+    let init_stmts: Vec<Statement> = if let Some(plan) = &variadic_plan {
+        let mut stmts = Vec::new();
+
+        // Named parameters bind 1:1, exactly as in a non-variadic call.
+        for i in 0..plan.named_count {
+            let caller_arg_local = local_map[&(i + 1)];
+            stmts.push(Statement {
+                kind: StatementKind::Assign(
+                    Place::from(caller_arg_local),
+                    Rvalue::Use(call_args[i].clone()),
+                ),
+                span: call_span,
+            });
+        }
+
+        // Each actual variadic argument is COPIED at the call site: arguments
+        // are evaluated by the caller, so a later write inside the inlined body
+        // must not disturb what a fetch reads.
+        for (k, actual_ty) in plan.actual_tys.iter().enumerate() {
+            let local = caller.new_local(*actual_ty, call_span, Mutability::Mut);
+            stmts.push(Statement {
+                kind: StatementKind::Assign(
+                    Place::from(local),
+                    Rvalue::Use(call_args[plan.named_count + k].clone()),
+                ),
+                span: call_span,
+            });
+            va_actual_locals.push(local);
+        }
+
+        // The fetch cursor starts at the first actual. The trailing
+        // `VaListImpl` arg local is deliberately left unbound: nothing reads it
+        // (checked by the plan), and binding it would model an ABI the checker
+        // does not need.
+        va_cursor_local = caller.new_local(
+            Ty::from_rigid_kind(RigidTy::Uint(UintTy::Usize)),
+            call_span,
+            Mutability::Mut,
+        );
+        let zero = caller.new_uint_operand(0, UintTy::Usize, call_span);
+        stmts.push(Statement {
+            kind: StatementKind::Assign(Place::from(va_cursor_local), Rvalue::Use(zero)),
+            span: call_span,
+        });
+
+        stmts
+    } else if needs_untuple {
         debug!(
             "#1598: Un-tupling args for closure (call site has {} args, callee expects {})",
             call_args.len(),
@@ -229,6 +328,25 @@ pub(super) fn inline_function(
         new_blocks.push(new_block);
     }
 
+    // Specialized variadic fetches: `dest = actual[cursor]; cursor += 1`,
+    // guarded by the `cursor < N` UB obligation. Emitted here so the extra
+    // blocks land after every block this inline already reserved.
+    let va_extra_blocks: Vec<BasicBlock> = if let Some(plan) = &variadic_plan {
+        let first_extra_bb =
+            caller_blocks_base + callee_blocks.len() + usize::from(ret_tmp.is_some());
+        variadic::rewrite_fetch_terminators(
+            caller,
+            &mut new_blocks,
+            plan,
+            &va_actual_locals,
+            va_cursor_local,
+            first_extra_bb,
+            call_span,
+        )
+    } else {
+        Vec::new()
+    };
+
     // Replace the Call terminator with Goto to inlined entry
     let call_block = caller.block_mut(call_bb_idx);
     for stmt in init_stmts {
@@ -279,6 +397,16 @@ pub(super) fn inline_function(
         let added_locals = if callee_locals.is_empty() { 0 } else { callee_locals.len() - 1 };
         debug!("inline_function: added {} blocks, {} locals", callee_blocks.len(), added_locals,);
     }
+
+    for extra_block in va_extra_blocks {
+        caller.push_block(extra_block);
+    }
+
+    // Report the actual-argument count when a specialized fetch can run inside
+    // a loop: the (N+1)-th `va_arg` is UB and its bounds assert fails, so no
+    // non-failing execution reaches the loop body more than N times. That is a
+    // real, construct-derived unwind bound the CHC lane can use.
+    variadic_plan.filter(|plan| !plan.fetch_bbs.is_empty()).map(|plan| plan.actual_tys.len())
 }
 
 /// Resolve Drop terminators in the body. Part of #3039.

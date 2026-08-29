@@ -1,3 +1,8 @@
+// Oracle: NOT-GENUINE — this is a SAFE program, so it may fail only via a
+// DEMOTION (OverApproximation/Unknown), never with a Genuine counterexample.
+// Measured 2026-08-24: dual69_safe_twin_truncate is FAILED with
+// "0 EncodingGap, 1 OverApproximation, 0 Genuine" => within tolerance.
+//
 // Task #69 safe twin: same shrink-then-index shape as dual69_shrink_index.rs
 // but the index is IN BOUNDS after the shrink. Must NOT regress to a
 // FAILED-Genuine verdict (clean SUCCESSFUL preferred; demoted-Unknown

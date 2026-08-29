@@ -605,6 +605,7 @@ mod tests {
                     ("crate_sound::a".to_string(), 2),
                     ("crate_sound::b".to_string(), 5),
                 ]),
+                per_harness_reasons: BTreeMap::new(),
             });
             md.stub_approximation = Some(StubApproximationInfo {
                 count: 3,

@@ -1,3 +1,7 @@
+// Oracle (per harness) — CONTROL 1/CONTROL 2 below, by name:
+//   check_good   -> VERIFICATION:- SUCCESSFUL
+//   check_caught -> VERIFICATION:- FAILED
+//
 // CONTROL — trust-mc SHOULD get these right, isolating the bug to the
 // same-object / dropped-offset case.
 

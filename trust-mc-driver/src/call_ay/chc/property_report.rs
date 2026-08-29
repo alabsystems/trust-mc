@@ -25,7 +25,10 @@ use std::path::Path;
 use trust_mc_core::violation::PropertyKind;
 use trust_mc_metadata::HarnessMetadata;
 
-use crate::ay_parse::{ChcArtifactProperty, load_chc_property_table, vc_artifact_path_for_smt};
+use crate::ay_parse::{
+    ChcArtifactProperty, apply_loop_contract_naming, load_chc_property_table,
+    vc_artifact_path_for_smt,
+};
 use crate::property_model::{CheckStatus, Property, PropertyId};
 
 /// Property-id class string for a check kind (used in `fn.class.id` names).
@@ -83,11 +86,29 @@ pub(super) fn chc_success_properties(
     smt_file: &Path,
     harness: &HarnessMetadata,
 ) -> Option<Vec<Property>> {
-    let table = load_chc_property_table(&vc_artifact_path_for_smt(smt_file));
+    let artifact = vc_artifact_path_for_smt(smt_file);
+    // A harness that registered NO obligations verified nothing. Returning an
+    // empty list (rather than None) stops the caller fabricating a synthetic
+    // `Success` property and lets the V4b no-checks gate report
+    // `INCONCLUSIVE (no checks)`, which is what BMC and the README both say.
+    if crate::ay_parse::vc_artifact::artifact_registers_no_obligations(&artifact) {
+        return Some(Vec::new());
+    }
+    let table = load_chc_property_table(&artifact);
     if table.is_empty() {
         return None;
     }
-    Some(table.iter().map(|e| build_property(e, harness, CheckStatus::Success)).collect())
+    let mut properties: Vec<Property> =
+        table.iter().map(|e| build_property(e, harness, CheckStatus::Success)).collect();
+    // Same Kani-parity rename the BMC path applies (`apply_kani_property_naming`
+    // calls this first). Without it a CHC run renders the loop-contract
+    // obligations under their INTERNAL message — including the `(loop N)`
+    // suffix, which is plumbing, not something to show a user — and the
+    // two-lane vacuity guard, which greps a lane's rendered stdout, stops
+    // recognising them (Lane O runs `--ay-chc`). MEASURED: without this the
+    // guard refused merges it used to allow.
+    apply_loop_contract_naming(&mut properties);
+    Some(properties)
 }
 
 /// Per-property list for a failing CHC harness (BSEM-18).
@@ -111,17 +132,17 @@ pub(super) fn chc_failure_properties(
     if !any_identified {
         return None;
     }
-    Some(
-        table
-            .iter()
-            .map(|e| {
-                let status = if failing_relations.contains(&e.relation) {
-                    CheckStatus::Failure
-                } else {
-                    CheckStatus::Unknown
-                };
-                build_property(e, harness, status)
-            })
-            .collect(),
-    )
+    let mut properties: Vec<Property> = table
+        .iter()
+        .map(|e| {
+            let status = if failing_relations.contains(&e.relation) {
+                CheckStatus::Failure
+            } else {
+                CheckStatus::Unknown
+            };
+            build_property(e, harness, status)
+        })
+        .collect();
+    apply_loop_contract_naming(&mut properties);
+    Some(properties)
 }

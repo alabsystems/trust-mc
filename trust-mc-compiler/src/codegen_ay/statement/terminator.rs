@@ -159,8 +159,46 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
 
             TerminatorKind::Unreachable => {
-                // Unreachable code guarded by path condition
-                self.record_violation_guarded(Expr::bool_const(true), "unreachable");
+                // Two very different facts arrive as the same terminator.
+                //
+                // The loop unroller cuts the back-edge of the last unrolled copy
+                // into a synthetic `Unreachable` block: reaching it means the
+                // loop wanted an iteration past `--unwind N`, so the BOUND is
+                // wrong, not the program. Labelling that `unreachable` sends it
+                // down the driver's panic taxonomy ("Failed Checks: panic
+                // reached", `[AY:CTREX_CAT:Genuine]`, a concrete-playback test)
+                // and tells the user to go debug a bug that does not exist.
+                //
+                // `unwind_sentinel` recognizes only blocks the unroller itself
+                // built (see the six clauses documented there); everything else
+                // keeps the original `unreachable` label, so a genuine reachable
+                // unreachable still reports as the panic it is.
+                if self.unwind_assert_blocks.contains(&self.current_bb) {
+                    // Kani-identical description "unwinding assertion loop N"
+                    // (pinned by the corpus: diverging_loop, never-return). N is
+                    // this body's loop ordinal in sentinel-block order — the
+                    // unroller appends one sentinel pair per unrolled loop, so
+                    // block order is unroll order (0 for the ubiquitous
+                    // single-loop body). The class stays "unwind" and the
+                    // driver's raise-the-bound tip keys on the "unwinding
+                    // assertion loop" PREFIX, which this preserves; the flag
+                    // guidance lives in that tip and in the not-certified note,
+                    // not in the check text.
+                    let ordinal = {
+                        let mut blocks: Vec<usize> =
+                            self.unwind_assert_blocks.iter().copied().collect();
+                        blocks.sort_unstable();
+                        blocks.iter().position(|&b| b == self.current_bb).unwrap_or(0)
+                    };
+                    self.record_violation_guarded_with_message(
+                        Expr::bool_const(true),
+                        "unwind_assert",
+                        Some(format!("unwinding assertion loop {ordinal}")),
+                    );
+                } else {
+                    // Unreachable code guarded by path condition
+                    self.record_violation_guarded(Expr::bool_const(true), "unreachable");
+                }
                 vec![]
             }
 
@@ -353,16 +391,80 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     return vec![(next_bb, None)];
                 }
 
+                // A foreign call whose definition the USER SUPPLIED
+                // (`-Z c-ffi --c-lib`) gets the sound effect frame instead of
+                // the fail-closed violation below: fresh return, havoc of every
+                // pointee it could write, and the successor edge KEPT. Declines
+                // for a symbol no `--c-lib` file defines, which is what keeps
+                // `ForeignItems/missing_fn_fail.rs` failing.
+                if self.is_foreign_call(func)
+                    && let Some(next_bb) =
+                        self.try_codegen_foreign_effect_frame_bmc(func, args, destination, *target)
+                {
+                    return vec![(next_bb, None)];
+                }
+
                 // Undefined foreign function calls (Part of #3175).
                 // Foreign functions not handled by any dispatcher above are
                 // unresolved FFI calls — emit assert(false) equivalent so the
-                // verifier produces CTREX if the call is reachable.
+                // verifier produces CTREX if the call is reachable. The message
+                // is Kani's own, naming the symbol, so the corpus text matches
+                // and a user sees WHICH call is unsupported.
                 if self.ctx.config.undefined_function_checks && self.is_foreign_call(func) {
-                    self.record_violation_guarded(
+                    let name = self.callee_display_name(func);
+                    self.record_violation_guarded_with_message(
                         Expr::bool_const(true),
-                        "unsupported foreign function",
+                        "unsupported_foreign_function",
+                        Some(format!(
+                            "call to foreign \"C\" function `{name}` is not currently supported by Kani"
+                        )),
                     );
                     return vec![];
+                }
+
+                // The same obligation for a foreign callee reached through a fn
+                // POINTER. `func(x)` on an `extern "C" fn(u32)` pointer carries
+                // no FnDef operand, so `is_foreign_call` above cannot see it;
+                // the fn-ptr inliner already declined (a foreign item has no
+                // MIR). Without this branch the call fell to the generic havoc
+                // fallback and the harness failed on its own downstream assert
+                // with a raw message — the right verdict for the wrong reason,
+                // and the wrong verdict entirely for a harness whose foreign
+                // call sits on a dead path: `record_violation_guarded` conjoins
+                // the path condition, so a never-taken call discharges instead
+                // of failing the harness.
+                if self.ctx.config.undefined_function_checks
+                    && func
+                        .ty(self.body.locals())
+                        .into_option()
+                        .is_some_and(|t| matches!(t.kind(), TyKind::RigidTy(RigidTy::FnPtr(..))))
+                {
+                    // Prefer a resolved instance that turned out foreign; fall
+                    // back to a foreign reify seen in this body or a parent
+                    // scope. `Instance::resolve` fails on extern declarations,
+                    // so the instance path alone can never see them.
+                    let foreign_name = match self.resolve_bmc_fn_ptr_callee(func) {
+                        Some((instance, _)) if self.is_foreign_instance(&instance) => {
+                            let n = instance.name();
+                            Some(n.rsplit("::").next().unwrap_or(&n).to_string())
+                        }
+                        Some(_) => None,
+                        None => self
+                            .resolve_all_foreign_fn_ptr_names()
+                            .into_iter()
+                            .next()
+                            .or_else(|| self.parent_foreign_fn_ptrs.first().cloned()),
+                    };
+                    if let Some(name) = foreign_name {
+                        self.record_violation_guarded_with_message(
+                            Expr::bool_const(true),
+                            "unsupported_foreign_function",
+                            Some(format!(
+                                "call to foreign \"C\" function `{name}` is not currently supported by Kani"
+                            )),
+                        );
+                        return vec![];
+                    }
                 }
 
                 self.unsupported_call_successors(func, *target, term)
@@ -389,7 +491,47 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                                 "codegen_terminator_overflow",
                             )
                         });
-                        self.emit_overflow_check(*op, &lhs_expr, &rhs_expr, is_signed);
+                        // A shift overflows on its DISTANCE, not its value, and
+                        // `overflow_check` has no case for it -- its fallthrough
+                        // reads "Shift, comparison, and bitwise operations don't
+                        // overflow", which is true of the other two and false of
+                        // this one. rustc emits `Assert { msg: Overflow(Shl, ..) }`
+                        // exactly because `a << s` panics when `s >= bit width`,
+                        // and returning None here dropped that obligation on the
+                        // floor:
+                        //
+                        //     let r = a << s;   // s unconstrained
+                        //     assert!(r >= 0);
+                        //     VERIFICATION:- SUCCESSFUL
+                        //
+                        // for a program that panics at run time. `let _ = a << s`
+                        // alone was caught only because it left the harness with
+                        // no obligations at all, which the no-checks gate reports
+                        // -- the right verdict for the wrong reason, and no help
+                        // the moment the harness asserts anything else.
+                        if matches!(
+                            op,
+                            BinOp::Shl | BinOp::ShlUnchecked | BinOp::Shr | BinOp::ShrUnchecked
+                        ) {
+                            let distance_signed = self.operand_signedness(rhs);
+                            // Kani-identical wording: this IS the MIR assert
+                            // `Overflow(Shl|Shr)`, whose rustc description the
+                            // corpus pins (binop, test2). Both sub-checks are
+                            // conjuncts of that one obligation.
+                            let message = if matches!(op, BinOp::Shl | BinOp::ShlUnchecked) {
+                                "attempt to shift left with overflow"
+                            } else {
+                                "attempt to shift right with overflow"
+                            };
+                            self.emit_shift_distance_check_with_message(
+                                &lhs_expr,
+                                &rhs_expr,
+                                distance_signed,
+                                Some(message),
+                            );
+                        } else {
+                            self.emit_overflow_check(*op, &lhs_expr, &rhs_expr, is_signed);
+                        }
                     } else {
                         let location = format!("{:?}", term.span);
                         self.ctx.unsupported_with_fallback("Overflow assert operands", location);

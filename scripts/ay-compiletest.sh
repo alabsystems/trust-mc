@@ -17,6 +17,8 @@
 # derived from the verifier's `[AY:...]` stdout markers, which trust-mc emits
 # specifically for this script (see trust-mc-driver/src/harness_runner.rs,
 # verification_result.rs, wall_clock_watchdog.rs).
+# The replacement-public mode is separate: it runs each checked inventory
+# harness directly so one verifier result maps to one schema-v2 report row.
 #
 # Usage:
 #   scripts/ay-compiletest.sh [OPTIONS] [SUITE]
@@ -43,6 +45,11 @@
 #       --dry-run         List discovered harnesses, do not verify.
 #       --skip-build      Reuse existing build artifacts; skip cargo builds.
 #       --fail-fast       Stop at first failing harness (default: --no-fail-fast).
+#       --replacement-public
+#                         Run the checked, source-bound 818-row public corpus.
+#       --replacement-plan
+#                         Validate/print that plan without running the driver.
+#       --self-test       Run focused evidence-tool regression tests.
 #   -h, --help            Show this help and exit.
 #
 # Environment:
@@ -71,8 +78,8 @@ usage_error() { printf 'ay-compiletest: %s\n' "$*" >&2; printf 'Try --help for u
 log() { printf 'ay-compiletest: %s\n' "$*" >&2; }
 
 print_help() {
-    # Emit the leading comment block (lines 7..53) verbatim as help text.
-    sed -n '7,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # Emit the leading comment block verbatim as help text.
+    sed -n '7,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --------------------------------------------------------------------------
@@ -96,6 +103,9 @@ DRY_RUN=0
 SKIP_BUILD=0
 FAIL_FAST=0
 FORCE_RERUN=0
+REPLACEMENT_PUBLIC=0
+REPLACEMENT_PLAN=0
+SELF_TEST=0
 REPORT_DIR="${REPO_ROOT}/reports"
 declare -a AY_FLAGS=()
 declare -a FILTERS=()
@@ -121,12 +131,70 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=1; shift ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         --fail-fast) FAIL_FAST=1; shift ;;
+        --replacement-public) REPLACEMENT_PUBLIC=1; shift ;;
+        --replacement-plan) REPLACEMENT_PLAN=1; shift ;;
+        --self-test) SELF_TEST=1; shift ;;
         --) shift; break ;;
         -*) usage_error "unknown option: $1" ;;
         *) [[ -z "$SUITE" ]] || usage_error "unexpected extra argument: $1"; SUITE="$1"; shift ;;
     esac
 done
 [[ $# -gt 0 && -z "$SUITE" ]] && SUITE="$1"
+
+if [[ "$SELF_TEST" -eq 1 ]]; then
+    [[ -z "$SUITE" && "$REPLACEMENT_PUBLIC" -eq 0 && "$REPLACEMENT_PLAN" -eq 0 \
+        && -z "$MODE" && "${#FILTERS[@]}" -eq 0 && "${#AY_FLAGS[@]}" -eq 0 \
+        && "$USE_CHC" -eq 0 && "$DRY_RUN" -eq 0 && "$FAIL_FAST" -eq 0 \
+        && "$FORCE_RERUN" -eq 0 && "$SKIP_BUILD" -eq 0 ]] \
+        || usage_error "--self-test does not accept a suite or replacement mode"
+    # shellcheck source=scripts/ay_python.sh
+    source "$SCRIPT_DIR/ay_python.sh"
+    cd "$REPO_ROOT"
+    exec "$AY_PYTHON_BIN" -m unittest scripts/test_replacement_evidence_tools.py
+fi
+
+if [[ "$REPLACEMENT_PUBLIC" -eq 1 || "$REPLACEMENT_PLAN" -eq 1 ]]; then
+    [[ $((REPLACEMENT_PUBLIC + REPLACEMENT_PLAN)) -eq 1 ]] \
+        || usage_error "choose exactly one replacement mode"
+    [[ -z "$SUITE" ]] || usage_error "replacement mode does not accept a suite"
+    [[ -z "$MODE" && "${#FILTERS[@]}" -eq 0 && "${#AY_FLAGS[@]}" -eq 0 \
+        && "$USE_CHC" -eq 0 && "$DRY_RUN" -eq 0 && "$FAIL_FAST" -eq 0 \
+        && "$FORCE_RERUN" -eq 0 ]] \
+        || usage_error "replacement mode does not accept compiletest-only options"
+    [[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
+        || usage_error "--timeout must be a positive integer in replacement mode"
+    # shellcheck source=scripts/ay_python.sh
+    source "$SCRIPT_DIR/ay_python.sh"
+
+    if [[ "$REPLACEMENT_PLAN" -eq 1 ]]; then
+        exec "$AY_PYTHON_BIN" "$SCRIPT_DIR/replacement_public_runner.py" --plan-only
+    fi
+
+    TRUST_MC_CARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" cargo)"
+    REPLACEMENT_DRIVER="${TRUST_MC_TEST_BIN:-${KANI_TEST_BIN:-}}"
+    if [[ "$SKIP_BUILD" -eq 0 ]]; then
+        log "building trust-mc (cargo build-dev) ..."
+        ( cd "$REPO_ROOT" && "$TRUST_MC_CARGO" build-dev ) \
+            || die "cargo build-dev failed"
+    fi
+    if [[ -z "$REPLACEMENT_DRIVER" ]]; then
+        for candidate in \
+            "${REPO_ROOT}/target/trust-mc/bin/trust-mc-driver" \
+            "${REPO_ROOT}/target/debug/trust-mc-driver"; do
+            if [[ -x "$candidate" ]]; then
+                REPLACEMENT_DRIVER="$candidate"
+                break
+            fi
+        done
+    fi
+    [[ -n "$REPLACEMENT_DRIVER" && -x "$REPLACEMENT_DRIVER" ]] \
+        || die "replacement mode requires an executable trust-mc-driver; build it or set TRUST_MC_TEST_BIN"
+    exec "$AY_PYTHON_BIN" "$SCRIPT_DIR/replacement_public_runner.py" \
+        --driver "$REPLACEMENT_DRIVER" \
+        --solver "${AY_SOLVER:-ay}" \
+        --timeout "$TIMEOUT" \
+        --report-dir "$REPORT_DIR"
+fi
 
 # Default suite: the canonical Kani verification suite (tests/expected).
 SUITE="${SUITE:-expected}"
@@ -136,7 +204,7 @@ SUITE="${SUITE:-expected}"
 # --------------------------------------------------------------------------
 # Prerequisite checks — fail clearly rather than silently proceeding.
 # --------------------------------------------------------------------------
-command -v cargo >/dev/null 2>&1 || die "cargo not found on PATH"
+TRUST_MC_CARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" cargo)"
 
 COMPILETEST_DIR="${REPO_ROOT}/tools/compiletest"
 [[ -f "${COMPILETEST_DIR}/Cargo.toml" ]] \
@@ -167,7 +235,8 @@ TRUST_MC_BIN="${TRUST_MC_TEST_BIN:-${KANI_TEST_BIN:-}}"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
     log "building trust-mc (cargo build-dev) ..."
-    ( cd "$REPO_ROOT" && cargo build-dev ) || die "cargo build-dev failed"
+    ( cd "$REPO_ROOT" && "$TRUST_MC_CARGO" build-dev ) \
+        || die "cargo build-dev failed"
 fi
 
 # If the caller did not pin a verifier binary, prefer the build-dev-installed
@@ -206,18 +275,29 @@ declare -a CT_ARGS=(
     --mode "$MODE"
     --src-base "$SRC_BASE"
     --build-base "$BUILD_BASE"
-    --timeout "$TIMEOUT"
+    --timeout "$(( TIMEOUT * 5 ))"
 )
 [[ "$FAIL_FAST" -eq 0 ]] && CT_ARGS+=( --no-fail-fast )
 [[ "$FORCE_RERUN" -eq 1 ]] && CT_ARGS+=( --force-rerun )
 
-# CHC backend: forward --ay-chc and inject the per-harness timeout; the outer
-# watchdog budget is 5x the per-harness timeout (matches the verifier's
-# wall_clock_watchdog 5x multiplier).
+# The per-harness budget goes to the DRIVER (`--harness-timeout`), and the
+# compiletest process cap sits at 5x above it, in BOTH lanes.
+#
+# These used to be the same number in BMC — worse, only the process cap was
+# set, so the driver ran with its internal 120s solver budget UNDER a 60s
+# process cap. The outer timer always won: the driver was SIGKILLed before it
+# could reach its own budget and report, turning a would-be INCONCLUSIVE into
+# a mute "Process timed out". Measured in one run: 49 tests killed by the cap
+# while 2 completed within 4s of it — every load spike flipped those, and each
+# flip cost a by-hand isolation to disprove as a regression. The driver
+# bounding its own solve is also what lets the cooperative solver deadline
+# fire; a SIGKILLed driver leaves its process-grouped solver orphaned.
+#
+# --harness-timeout is unstable; it is rejected without -Z unstable-options.
+AY_FLAGS+=( "-Z" "unstable-options" "--harness-timeout=${TIMEOUT}" )
 WATCHDOG_TIMEOUT=0
 if [[ "$USE_CHC" -eq 1 ]]; then
-    # --harness-timeout is unstable; it is rejected without -Z unstable-options.
-    AY_FLAGS+=( "--ay-chc" "-Z" "unstable-options" "--harness-timeout=${TIMEOUT}" )
+    AY_FLAGS+=( "--ay-chc" )
     WATCHDOG_TIMEOUT=$(( TIMEOUT * 5 ))
 fi
 
@@ -236,7 +316,7 @@ done
 run_compiletest() {
     # $1: extra flag (e.g. --dry-run) or empty.
     local extra="$1"
-    local -a cmd=( cargo run --quiet -p compiletest -- "${CT_ARGS[@]}" )
+    local -a cmd=( "$TRUST_MC_CARGO" run --quiet -p compiletest -- "${CT_ARGS[@]}" )
     [[ -n "$extra" ]] && cmd+=( "$extra" )
     if [[ "$USE_CHC" -eq 1 && -z "$extra" && "$WATCHDOG_TIMEOUT" -gt 0 ]] \
         && command -v timeout >/dev/null 2>&1; then

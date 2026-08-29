@@ -408,6 +408,24 @@ pub struct NativeTypedChcObligationMetadata {
     /// refutation arms still carry their own havoc-freedom demotion).
     #[serde(default)]
     pub fail_closed_lowering_site_count: u32,
+    /// The DISTINCT typed reasons behind `fail_closed_lowering_site_count`, as
+    /// stable construct labels (`"Cast"`, `"IndirectCall"`, `"HeapAllocation"`,
+    /// …) sorted and deduplicated by the producer.
+    ///
+    /// PURE DIAGNOSTIC, strictly weaker than the count it annotates. The count
+    /// alone already says "N unsupported trust_ir construct(s)" and leaves no
+    /// way to know WHICH — this makes the demotion message actionable without
+    /// parsing SMT-LIB or re-running the translator. Read by exactly one
+    /// consumer: the demotion-reason text formatter.
+    ///
+    /// Forgeable and DEMOTE-ONLY, on the same terms as the count: it is never
+    /// compared, thresholded or matched, and NO verdict, gate or acceptance
+    /// check reads it. Absent metadata reads as EMPTY (the message then renders
+    /// exactly as before); an arbitrary or adversarial value can only alter
+    /// human-readable text on a verdict that the count has ALREADY demoted to
+    /// Unknown, so it can neither mint nor strengthen proof authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fail_closed_lowering_reasons: Vec<String>,
 }
 
 impl NativeTypedChcObligationMetadata {
@@ -448,6 +466,7 @@ impl NativeTypedChcObligationMetadata {
             // translator (`native_chc_metadata`) may certify this true.
             structural_reachability_complete: false,
             fail_closed_lowering_site_count: 0,
+            fail_closed_lowering_reasons: Vec::new(),
         }
     }
 
@@ -467,6 +486,26 @@ impl NativeTypedChcObligationMetadata {
     #[must_use]
     pub fn with_fail_closed_lowering_site_count(mut self, count: u32) -> Self {
         self.fail_closed_lowering_site_count = count;
+        self
+    }
+
+    /// Record the DISTINCT construct labels behind the fail-closed lowering
+    /// count. Sorted + deduplicated here so the value is canonical regardless of
+    /// the order the translator emitted its diagnostics in (the metadata is
+    /// serialized into artifact bytes, so a non-canonical order would make an
+    /// otherwise-identical obligation hash differently).
+    ///
+    /// Pure diagnostic; see the field documentation. Nothing reads it but the
+    /// demotion-reason text formatter.
+    #[must_use]
+    pub fn with_fail_closed_lowering_reasons(
+        mut self,
+        reasons: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut reasons: Vec<String> = reasons.into_iter().collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        self.fail_closed_lowering_reasons = reasons;
         self
     }
 

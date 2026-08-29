@@ -49,8 +49,39 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // The target allocation contains the actual pointee value
                     return self.codegen_scalar_from_alloc(&target_alloc, pointee_ty);
                 }
+                // A reference constant into a STATIC (`static X: i32 = 12;`
+                // read through `fn foo() -> i32 { X }`). Without this arm the
+                // rvalue codegen returned None, the LHS stayed unconstrained
+                // (`[AY:CTREX_CAT:EncodingGap:unconstrained_assignment]`) and
+                // every check that reads the static reported FAILURE on values
+                // the program cannot produce — `expected/static/main.rs` failed
+                // BOTH of its assertions instead of only the first.
+                //
+                // SOUNDNESS: folding the initializer is exact only while the
+                // object cannot change. `immutable_static_initializer` refuses
+                // `static mut` (an earlier store is the live value, not the
+                // initializer), interior-mutable (non-`Freeze`) types, generic
+                // shapes, and foreign statics with no initializer body at all;
+                // every refusal returns None, which is the previous behaviour —
+                // unconstrained, i.e. any value.
+                GlobalAlloc::Static(static_def) => {
+                    // The pointer's own bytes hold the offset INTO the target
+                    // allocation; only offset 0 names the whole object, which is
+                    // what `codegen_scalar_from_alloc` reads.
+                    if Self::const_ptr_offset_is_zero(&alloc) != Some(true) {
+                        return None;
+                    }
+                    let target_alloc = self.immutable_static_initializer(static_def)?;
+                    if let TyKind::RigidTy(RigidTy::Ref(_, nested_pointee, _)) = pointee_ty.kind()
+                        && matches!(nested_pointee.kind(), TyKind::RigidTy(RigidTy::Str))
+                    {
+                        return self.codegen_const_str_slice_from_fat_ptr_alloc(&target_alloc);
+                    }
+                    debug!(?pointee_ty, "const ref into an immutable static: folded initializer");
+                    return self.codegen_scalar_from_alloc(&target_alloc, pointee_ty);
+                }
                 _ => {
-                    // external enum: GlobalAlloc — Function, Static, VTable not handled yet
+                    // external enum: GlobalAlloc — Function, VTable not handled yet
                     return None;
                 }
             }
@@ -58,6 +89,65 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Fallback: try direct extraction (for cases without provenance)
         self.codegen_scalar_from_alloc(&alloc, pointee_ty)
+    }
+
+    /// Whether the pointer stored in `alloc` addresses its target at offset 0.
+    ///
+    /// Returns `None` when any of the pointer's bytes is uninitialized (the
+    /// caller must then decline rather than guess an offset).
+    fn const_ptr_offset_is_zero(alloc: &Allocation) -> Option<bool> {
+        let ptr_bytes = POINTER_WIDTH as usize / 8;
+        let bytes = alloc.bytes.get(..ptr_bytes)?;
+        let mut offset: u128 = 0;
+        for (i, byte) in bytes.iter().enumerate() {
+            let b = (*byte)?;
+            offset |= u128::from(b) << (i * 8);
+        }
+        Some(offset == 0)
+    }
+
+    /// The initializer allocation of a static whose value is FIXED for the whole
+    /// program run, or `None` when the static may hold something else.
+    ///
+    /// Declines (in order):
+    /// - a foreign (`extern "C" { static X: T; }`) static: it has no MIR
+    ///   initializer body and `eval_initializer()` raises a rustc `span_bug`,
+    ///   which is an abort `.ok()` cannot catch;
+    /// - `static mut`: a store executed earlier in the harness is the live
+    ///   value, so the initializer is not what a later read observes;
+    /// - a non-`Freeze` type (`UnsafeCell`, and so `Cell`/`RefCell`/atomics):
+    ///   an `&`-reference to it can still be written through;
+    /// - a still-generic type, which cannot be evaluated at all.
+    ///
+    /// Every decline is `None`, and `None` is exactly the pre-existing
+    /// behaviour (the referent is left unconstrained — any value), so the
+    /// fail direction never pins state that could have changed.
+    fn immutable_static_initializer(
+        &self,
+        static_def: rustc_public::mir::mono::StaticDef,
+    ) -> Option<Allocation> {
+        use rustc_middle::ty::TypeVisitableExt;
+        use rustc_public::CrateDef;
+
+        let tcx = self.ctx.tcx;
+        let def_id = rustc_public::rustc_internal::internal(tcx, static_def.def_id());
+        if tcx.is_foreign_item(def_id) {
+            debug!("immutable_static_initializer: foreign static, left unconstrained");
+            return None;
+        }
+        if tcx.is_mutable_static(def_id) {
+            debug!("immutable_static_initializer: `static mut`, left unconstrained");
+            return None;
+        }
+        let internal_ty = rustc_public::rustc_internal::internal(tcx, static_def.ty());
+        if internal_ty.has_param() {
+            return None;
+        }
+        if !internal_ty.is_freeze(tcx, rustc_middle::ty::TypingEnv::fully_monomorphized()) {
+            debug!("immutable_static_initializer: interior-mutable, left unconstrained");
+            return None;
+        }
+        static_def.eval_initializer().ok()
     }
 
     fn const_allocation(mir_const: &MirConst) -> Option<Allocation> {

@@ -157,6 +157,23 @@ pub(crate) struct VerificationArgs {
     #[arg(long, hide_short_help = true)]
     pub no_codegen: bool,
 
+    /// Rust edition to compile the input with, forwarded to `rustc --edition`.
+    ///
+    /// Unset means rustc's own default (2015), which is what Kani's compiletest
+    /// also uses when neither a `// compile-flags: --edition ...` header nor its
+    /// `--edition` option supplies one — so leaving this unset keeps trust-mc
+    /// compiling the same program Kani does. Defaulting it to 2021 was measured
+    /// at -4 parity and +9 compile errors on the corpus, because edition
+    /// controls closure capture granularity, array `IntoIterator`, and `panic!`
+    /// macro semantics.
+    ///
+    /// Without this flag there was NO way to select an edition on the command
+    /// line: `--edition 2021` was rejected as an unexpected argument, so a file
+    /// using edition-gated syntax (e.g. `c"..."` C-string literals, edition
+    /// >= 2021) could not be verified at all.
+    #[arg(long, value_name = "EDITION")]
+    pub edition: Option<String>,
+
     /// Internal mode used by `cargo trust-mc list`/`trust-mc list`: run the compiler
     /// backend far enough to emit metadata, but skip per-harness verification
     /// condition generation.
@@ -557,6 +574,28 @@ impl VerificationArgs {
     ///
     /// Part of #4308, #4309, #4310, #4311, #4312.
     pub(crate) fn validate_cbmc_only_flags(&self) -> Result<(), Error> {
+        // POSITIVE RECEIPT for --c-lib. A path that does not resolve used to be
+        // accepted silently, so the C front-end ingested an EMPTY translation
+        // unit and every extern call fell back to "undefined foreign function".
+        // The verdict then looked like an ordinary encoder result, and a corpus
+        // row could not distinguish "the C-body lane is inert" from "the C-body
+        // lane was never reached" — a measurement that cannot fail is not
+        // evidence. Fail loudly instead, naming the cwd, because these paths are
+        // conventionally written RELATIVE to the crate/test root.
+        for lib in &self.c_lib {
+            if !lib.exists() {
+                let cwd = std::env::current_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|_| "<unknown>".to_string());
+                return Err(Error::raw(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!(
+                        "--c-lib path does not exist: {}\n                                  resolved relative to cwd: {cwd}\n                                  (a missing C library would otherwise be ingested as empty,                          silently turning every extern call into an undefined-function error)\n",
+                        lib.display()
+                    ),
+                ));
+            }
+        }
         if !self.cbmc_args.is_empty() {
             warning(
                 "--cbmc-args is CBMC-only and has been discarded by trust-mc.\n         \

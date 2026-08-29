@@ -6,7 +6,9 @@
 //!
 //! Extracted from `place.rs` as part of #2246 decomposition.
 
-use super::{Expr, IndexedVal, Place, ProjectionElem, Sort, StatementCodegen};
+use super::{
+    Expr, IndexedVal, Place, ProjectionElem, Sort, StatementCodegen, constant_index_offset,
+};
 use crate::codegen_ay::provenance::is_transparent_pointer_wrapper_repr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH};
 use tracing::debug;
@@ -262,10 +264,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             return DerefProjectionResult::Unsupported;
                         }
                     }
-                    // Part of #3186: parity with CHC ConstantIndex from_end handling.
-                    // from_end means count from end: actual_index = min_length - offset.
-                    let actual_offset =
-                        if *from_end { min_length.saturating_sub(*offset) } else { *offset };
+                    let Some(actual_offset) =
+                        constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        if fallthrough_on_failure {
+                            return DerefProjectionResult::Fallthrough;
+                        }
+                        self.ctx.unsupported(
+                            context_label,
+                            format!(
+                                "ConstantIndex from_end requires runtime slice length: \
+                                 offset={offset}, min_length={min_length}"
+                            ),
+                        );
+                        return DerefProjectionResult::Unsupported;
+                    };
                     let idx_expr = Expr::bitvec_const(actual_offset as i128, POINTER_WIDTH);
                     expr = expr.select(idx_expr);
                     debug!("apply_post_deref: ConstantIndex at offset {}", offset);
@@ -285,8 +298,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             return DerefProjectionResult::Unsupported;
                         }
                     }
-                    // Identity case: from=0, to=0 extracts the full array.
-                    if *from == 0 && *to == 0 {
+                    // Identity only for `[0..len-0]`. For `from_end=false`,
+                    // `[0..0]` is empty and must not alias the full source.
+                    if *from == 0 && *to == 0 && *from_end {
                         debug!("apply_post_deref: identity Subslice (full array)");
                     } else if let Some(arr_sort) = expr.sort().array_sort() {
                         // General case: build result[i] = src[from + i].
@@ -312,7 +326,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             return DerefProjectionResult::Unsupported;
                         }
                         let end = *to as usize;
-                        let result_len = end.saturating_sub(start);
+                        let Some(result_len) = end.checked_sub(start) else {
+                            if fallthrough_on_failure {
+                                return DerefProjectionResult::Fallthrough;
+                            }
+                            self.ctx.unsupported(
+                                context_label,
+                                format!("Subslice end {end} precedes start {start}"),
+                            );
+                            return DerefProjectionResult::Unsupported;
+                        };
                         let mut result = Expr::var(&name, expr.sort().clone());
                         for i in 0..result_len {
                             let src_idx = Expr::bitvec_const((start + i) as u128, POINTER_WIDTH);

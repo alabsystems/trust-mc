@@ -10,7 +10,9 @@
 //!
 //! Extracted from `datatype.rs` — Part of #4206.
 
-use super::{AYCtx, Expr, Place, ProjectionElem, SortInner, StatementCodegen};
+use super::{
+    AYCtx, Expr, Place, ProjectionElem, SortInner, StatementCodegen, constant_index_offset,
+};
 use tracing::debug;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
@@ -261,10 +263,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         match projections.first() {
             Some(ProjectionElem::ConstantIndex { offset, min_length, from_end }) => {
                 // ConstantIndex: arr[N] where N is compile-time constant
-                // Part of #3186: parity with CHC ConstantIndex from_end handling.
-                // from_end means count from end: actual_index = min_length - offset.
-                let actual_offset =
-                    if *from_end { min_length.saturating_sub(*offset) } else { *offset };
+                let Some(actual_offset) = constant_index_offset(*offset, *min_length, *from_end)
+                else {
+                    self.ctx.unsupported(
+                        "ConstantIndex from_end requires runtime slice length",
+                        format!("offset={offset}, min_length={min_length}"),
+                    );
+                    return ArrayIndexPrefix::Unsupported;
+                };
                 // Verify array is in env before returning
                 if let Some(arr_expr) = self.env_lookup(base_name) {
                     let idx_expr = match arr_expr.sort().array_sort() {

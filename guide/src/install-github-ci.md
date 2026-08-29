@@ -25,20 +25,20 @@ jobs:
         run: |
           git clone https://github.com/alabsystems/trust-mc.git /tmp/trust-mc
 
-      - name: 'Install Rust nightly from trust-mc toolchain'
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain-file: /tmp/trust-mc/rust-toolchain.toml
-
       - name: 'Build and install trust-mc from source'
         run: |
           cd /tmp/trust-mc
-          cargo build-dev -- --release
-          echo "/tmp/trust-mc/scripts" >> $GITHUB_PATH
+          cargo run --release -p build-trust-mc -- build-dev --release
+          cargo install --path .   # trust-mc, cargo-trust-mc, targo-trust-mc
 
       - name: 'Run trust-mc on your code.'
-        run: targo trust-mc
+        run: cargo trust-mc
 ```
+
+> **NOTE**: `rust-toolchain.toml` pins `channel = "trust"`, a locally linked
+> custom toolchain that rustup cannot fetch, so `setup-rust-toolchain` with
+> `toolchain-file:` will not resolve it. A runner has to provide that toolchain
+> before the build step above will work.
 
 This builds trust-mc from source and runs verification on your crate.
 

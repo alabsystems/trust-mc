@@ -118,6 +118,86 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         result
     }
 
+    /// Resolve `(*_p).…` through a pointer that PROVABLY holds `&_L`.
+    ///
+    /// `deref_load_referent_local` answers "does `_p` hold the address of local
+    /// `_L`'s own slot, with no projections?" using a single-assignment
+    /// backward walk over the whole body, so it sees reference flow that the
+    /// per-block `ref_targets` map does not — a `&result` handed to a contract
+    /// closure arrives through a capture field, and no `_p = &_L` statement
+    /// remains for `ref_targets` to record.
+    ///
+    /// Without this, `(*_p)` falls through to a type-indexed memory select.
+    /// For a local whose value lives in REGISTERS — a BV-flattened multi-ctor
+    /// enum, say — nothing was ever stored at that address, so the select is a
+    /// free variable: `matches!(*result, Foo::B(c) if c == inner)` is then
+    /// refutable and reports a counterexample against a correct contract.
+    ///
+    /// Reading `_L`'s register is exact, not an approximation: the walk proved
+    /// `*_p` IS `_L` on every path. The restriction to reference-typed bases
+    /// mirrors `try_resolve_deref_via_ref_targets` — raw pointers keep the
+    /// explicit memory path at Mem level so loads stay symmetric with
+    /// `build_memory_store`.
+    fn try_resolve_deref_via_referent_local(
+        &mut self,
+        place: &Place,
+        local_idx: usize,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        // Only a leading Deref: projections BEFORE the Deref apply to `_p`'s own
+        // value, which `deref_load_referent_local` says nothing about.
+        if !matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
+            return None;
+        }
+        let base_local_ty = self.body.locals()[local_idx].ty;
+        let TyKind::RigidTy(RigidTy::Ref(_, pointee_ty, _)) = base_local_ty.kind() else {
+            return None;
+        };
+        let remaining = &place.projection[1..];
+        // A further Deref would need the referent's own pointer value resolved;
+        // leave those to the memory path.
+        let all_value_projs = remaining.iter().all(|p| {
+            matches!(
+                p,
+                ProjectionElem::Field(_, _)
+                    | ProjectionElem::Downcast(_)
+                    | ProjectionElem::Index(_)
+                    | ProjectionElem::ConstantIndex { .. }
+                    | ProjectionElem::Subslice { .. }
+            )
+        });
+        if !all_value_projs {
+            return None;
+        }
+        let referent = self.deref_load_referent_local(local_idx)?;
+        if referent == local_idx {
+            return None;
+        }
+        // A dead local is dropped from the CHC relation, so its state var reads
+        // as a free variable — exactly the failure this is fixing.
+        if self.liveness.dead_locals.contains(&referent) {
+            return None;
+        }
+        // The referent must actually carry the pointee's value.
+        if self.body.locals()[referent].ty != pointee_ty {
+            return None;
+        }
+        if self.try_state_idx_for_local(referent).is_none() {
+            return None;
+        }
+        let resolved_place = Place { local: referent, projection: remaining.to_vec() };
+        let result = self.translate_place_with_deref(&resolved_place, modified_locals);
+        if result.is_some() {
+            debug!(
+                ptr_local = local_idx,
+                referent,
+                remaining = remaining.len(),
+                "CHC: resolved deref through a pointer that provably addresses a local's slot"
+            );
+        }
+        result
+    }
+
     /// Run the deref-resolution cascade for a place that contains Deref projections.
     ///
     /// Tries, in order:
@@ -151,6 +231,38 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if let Some(resolved) =
             self.try_resolve_deref_via_ref_targets(place, local_idx, modified_locals)
         {
+            return DerefCascadeResult::Resolved(resolved);
+        }
+
+        // `ref_targets` only records an unprojected `_p = &_L` in this block's
+        // dataflow. A reference that reaches here through a capture field, a
+        // call argument, or another block carries no entry — yet the
+        // address-provenance walk can still PROVE it holds `&_L`. Reuse that
+        // proof so the read keeps concrete value flow instead of selecting a
+        // memory cell no rule ever wrote (see below).
+        if let Some(resolved) =
+            self.try_resolve_deref_via_referent_local(place, local_idx, modified_locals)
+        {
+            return DerefCascadeResult::Resolved(resolved);
+        }
+
+        // A deref of a reference INTO a collection element resolves in the
+        // COLLECTION's value lane, not through memory. `_e = Index::index(&v,i)`
+        // is a CALL destination, so it has neither a `ref_target` nor a provable
+        // referent local and both lanes above decline; the Mem path then selects
+        // from a type-indexed array (`_main_mem_u64`) that `Vec::push` never
+        // wrote — push stores into the Vec datatype's `fld_data`. The value read
+        // was a free variable, which refuted `v[0].base == GuestAddress(0)` on a
+        // one-element Vec.
+        if matches!(place.projection.first(), Some(ProjectionElem::Deref))
+            && let Some(extra_fields) = Self::collection_elem_trailing_fields(place)
+            && let Some(resolved) = self.resolve_collection_elem_field_ref_value(
+                local_idx,
+                &extra_fields,
+                modified_locals,
+            )
+        {
+            debug!(local_idx, ?place, "CHC: resolved deref through collection element value lane");
             return DerefCascadeResult::Resolved(resolved);
         }
 

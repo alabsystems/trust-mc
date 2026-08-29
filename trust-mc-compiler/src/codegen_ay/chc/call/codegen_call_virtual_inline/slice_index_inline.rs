@@ -265,23 +265,25 @@ fn try_inline_range_full_identity<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
     walk_ctx: &InlineWalkCtx<'_>,
     state: &mut InlineExecutionState,
+    func: &Operand,
     args: &[Operand],
     destination: &rustc_public::mir::Place,
     target_bb: usize,
     callee_name: &str,
     callee_path: &str,
 ) -> Option<TerminatorStep> {
-    // Identify the RangeFull argument. RangeFull is a ZST struct — check arg types.
-    let range_full_idx = args.iter().position(|arg| {
-        let Ok(ty) = arg.ty(walk_ctx.locals) else { return false };
-        matches!(
-            ty.kind(),
-            TyKind::RigidTy(RigidTy::Adt(def, _)) if def.trimmed_name() == "RangeFull"
-        )
-    })?;
-    // The other arg is the receiver (the slice/str being indexed).
-    let receiver_idx = if range_full_idx == 0 { 1 } else { 0 };
-    let receiver_arg = args.get(receiver_idx)?;
+    // A callee path and a RangeFull-shaped name are routing hints, not identity
+    // authority. Require the exact core SliceIndex trait method, its real
+    // `(index, source)` order, an exact core RangeFull, and a slice-like source.
+    let (receiver_arg, index_arg) = ctx.authenticated_core_slice_index_method_args(
+        func,
+        args,
+        walk_ctx.locals,
+        &["index", "index_mut", "get", "get_mut", "get_unchecked", "get_unchecked_mut"],
+    )?;
+    if !ChcCtx::is_range_full_operand(ctx.tcx, index_arg, walk_ctx.locals) {
+        return None;
+    }
 
     // Translate the receiver expression.
     let receiver_expr = inline_operand_to_expr(
@@ -351,6 +353,7 @@ pub(super) fn try_execute_inline_slice_index_call<'tcx, 'body>(
         ctx,
         walk_ctx,
         state,
+        func,
         args,
         destination,
         target_bb,

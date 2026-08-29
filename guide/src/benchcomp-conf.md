@@ -45,10 +45,7 @@ Filter scripts can emit either YAML (which might be more readable while developi
 
 ## Built-in visualizations
 
-The following visualizations are available; these can be added to the `visualize` list of `benchcomp.yaml`.
-
-{{#include ../gen_src/visualization_list.txt}}
-
-Detailed documentation for these visualizations follows.
-
-{{#include ../gen_src/visualization_docs.txt}}
+Visualizations are added to the `visualize` list of `benchcomp.yaml`. The
+generated list and per-visualization documentation are produced by the
+`benchcomp` tool, which is not checked into this repository (see
+[Performance comparisons](./performance-comparisons.md)).

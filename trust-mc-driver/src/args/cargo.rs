@@ -35,6 +35,10 @@ pub(crate) struct CargoCommonArgs {
     #[arg(long, name = "PATH")]
     pub manifest_path: Option<PathBuf>,
 
+    /// Require Cargo.lock to be up to date
+    #[arg(long)]
+    pub locked: bool,
+
     /// Do not activate the `default` feature
     #[arg(long)]
     pub no_default_features: bool,
@@ -83,6 +87,9 @@ impl CargoCommonArgs {
         if let Some(path) = &self.manifest_path {
             cargo_args.push("--manifest-path".into());
             cargo_args.push(path.into());
+        }
+        if self.locked {
+            cargo_args.push("--locked".into());
         }
         if self.workspace {
             cargo_args.push("--workspace".into())
@@ -282,6 +289,13 @@ mod tests {
         assert_eq!(target.test, ["integ"]);
         assert_eq!(target.bench, ["speed"]);
         assert!(target.benches);
+    }
+
+    #[test]
+    fn parses_locked_dependency_authority() {
+        let args = CargoKaniArgs::try_parse_from(["cargo-trust-mc", "--locked"]).unwrap();
+
+        assert!(args.verify_opts.cargo.locked);
     }
 
     #[test]

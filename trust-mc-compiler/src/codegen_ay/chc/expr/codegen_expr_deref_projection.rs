@@ -86,7 +86,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     active_variant = None;
                 }
                 ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    let actual_offset = constant_index_offset(*offset, *min_length, *from_end);
+                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                    let Some(actual_offset) =
+                        constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        return None;
+                    };
                     let index_expr = Expr::bitvec_const(actual_offset as u128, POINTER_WIDTH);
                     if !current.sort().is_array() {
                         return None;
@@ -480,7 +485,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     active_variant = None; // Reset: Index breaks Downcast-Field pairing
                 }
                 ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    let actual_offset = constant_index_offset(*offset, *min_length, *from_end);
+                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                    let Some(actual_offset) =
+                        constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        return None;
+                    };
                     let index_expr = Expr::bitvec_const(actual_offset as u128, POINTER_WIDTH);
                     let projection_kind = ArrayProjectionKind::ConstantIndex {
                         local_idx,

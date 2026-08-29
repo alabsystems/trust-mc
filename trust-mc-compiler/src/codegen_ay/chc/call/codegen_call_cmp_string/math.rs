@@ -25,8 +25,10 @@ use tracing::debug;
 
 use super::super::ChcCtx;
 use super::super::chc_call_context::DispatchCallContext;
-use super::super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto};
-use super::super::codegen_call_fallback_emit::emit_math_axiom_goto_extra;
+use super::super::codegen_call_coerce::CallCoerce;
+use super::super::codegen_call_fallback_emit::{
+    emit_math_axiom_goto_extra, emit_sound_fallback_goto_extra,
+};
 use super::super::codegen_rules::CodegenRules;
 use super::math_axioms;
 use super::math_const::{
@@ -273,14 +275,25 @@ pub(in crate::codegen_ay::chc) fn codegen_math_intrinsic(
         }
     }
 
+    // CONGRUENCE (Part of #4270 / TL18). Every tier below leaves the result a
+    // fresh havoc, so the encoder could not prove `sin(x) == sin(x)` — the two
+    // sites got independent values. Bind the destination to a select over the
+    // frozen, never-constrained `call_uf_tbl` instead: still universally
+    // quantified (for a fixed key the ∀-table ranges over every value, so no
+    // behaviour is removed), but now EQUAL at equal arguments, which is what
+    // the real function does. Purity is established by the intrinsic's
+    // specification — see `call_uf_table::math_uf_summary_term`.
+    let uf_congruence: Option<Expr> = math_uf_congruence(ctx, dcx, callee_path, dest_local);
+
     // Tier 2: Sound range axioms for transcendental intrinsics (Part of #3609).
     // Constrains symbolic results to valid ranges (e.g. sin in [-1,1], sqrt >= 0).
     if let Some(input_expr) = ctx.translate_operand_with_modified(&dcx.args[0], modified_locals)
         && let Some((_, dest_var)) = ctx.resolve_destination(dest_local)
     {
-        let axioms =
+        let mut axioms =
             math_range_axioms::emit_range_axioms(callee_path, &input_expr, &dest_var, width);
         if !axioms.is_empty() {
+            axioms.extend(uf_congruence.clone());
             emit_math_axiom_goto_extra(
                 ctx,
                 from_app,
@@ -323,9 +336,10 @@ pub(in crate::codegen_ay::chc) fn codegen_math_intrinsic(
                 ctx.translate_operand_with_modified(&dcx.args[0], modified_locals)
                 && let Some((_, dest_var)) = ctx.resolve_destination(dest_local)
             {
-                let axioms =
+                let mut axioms =
                     math_range_axioms::emit_power_nonneg_axiom(&input_expr, &dest_var, width);
                 if !axioms.is_empty() {
+                    axioms.extend(uf_congruence.clone());
                     emit_math_axiom_goto_extra(
                         ctx,
                         from_app,
@@ -345,17 +359,48 @@ pub(in crate::codegen_ay::chc) fn codegen_math_intrinsic(
         }
     }
 
-    // Tier 3: Fully unconstrained fallback.
+    // Tier 3: no range axiom for this intrinsic (log, tan, powf with a symbolic
+    // exponent, …). The destination stays unconstrained apart from congruence,
+    // and the pre-existing fail-closed `call_dispatch_fallback` reason is
+    // recorded unchanged — this tier is a precision refinement only.
     debug!(
         callee = callee_path,
-        is_f32, "math intrinsic fallback to unconstrained (bb{}->bb{})", bb_idx, target
+        is_f32,
+        congruent = uf_congruence.is_some(),
+        "math intrinsic fallback to unconstrained (bb{}->bb{})",
+        bb_idx,
+        target
     );
-    emit_sound_fallback_goto(
+    emit_sound_fallback_goto_extra(
         ctx,
         from_app,
         target,
         modified_locals,
         &[dest_local],
         stmt_constraints,
+        uf_congruence,
     );
+}
+
+/// `dest == select(call_uf_tbl, tag(f) ++ args)` for a pure math intrinsic, or
+/// `None` when the table was not declared for this harness, an argument does
+/// not translate, or the key/value widths do not fit (never truncated — a
+/// colliding key would assert an equality that need not hold).
+fn math_uf_congruence(
+    ctx: &mut ChcCtx<'_, '_>,
+    dcx: &DispatchCallContext<'_>,
+    callee_path: &str,
+    dest_local: usize,
+) -> Option<Expr> {
+    if !ctx.call_uf_table_declared() {
+        return None;
+    }
+    let mut arg_exprs: Vec<Expr> = Vec::with_capacity(dcx.args.len());
+    for arg in dcx.args {
+        arg_exprs.push(ctx.translate_operand_with_modified(arg, dcx.modified_locals)?);
+    }
+    let (_, dest_var) = ctx.resolve_destination(dest_local)?;
+    let out_sort = dest_var.sort().clone();
+    let term = ctx.math_uf_summary_term(callee_path, &arg_exprs, &out_sort)?;
+    Some(dest_var.eq(term))
 }

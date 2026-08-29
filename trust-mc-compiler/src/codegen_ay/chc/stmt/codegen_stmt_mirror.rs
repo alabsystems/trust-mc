@@ -167,6 +167,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // mem_<adt_name> when reconstructing promoted constants, so we need
         // per-element stores there too — not just in mem_<elem_ty>.
         let is_simd_adt = matches!(array_ty.kind(), TyKind::RigidTy(RigidTy::Adt(..)));
+        // A `#[repr(simd)] struct V([T; N])` is layout-compatible with `[T; N]`,
+        // and a pointer cast to that inner array is the ONLY way to read it
+        // (field projection into a SIMD type is banned by MCP#838). Such a load
+        // reads `mem_<[T; N]>`, a third partition distinct from both `mem_<T>`
+        // and `mem_<V>` written below — so without this bridge the punned read
+        // is unconstrained and the solver invents a counterexample.
+        let simd_inner_array_ty =
+            if is_simd_adt { self.simd_inner_array_ty(array_ty) } else { None };
 
         for i in 0..array_len {
             let index_expr = Expr::bitvec_const(i as u128, POINTER_WIDTH);
@@ -194,6 +202,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Part of #4086: Store element to the SIMD ADT's own typed heap.
             // elem_value is BV64 and mem_i64x2 element sort is BV64, so sorts match.
             if is_simd_adt {
+                // Bridge the pointer-cast view onto the inner `[T; N]` first;
+                // `elem_addr`/`elem_value` are consumed by the ADT store below.
+                if let Some(inner_ty) = simd_inner_array_ty
+                    && let Some(inner_store) = self.build_memory_store_untyped(
+                        elem_addr.clone(),
+                        elem_value.clone(),
+                        inner_ty,
+                    )
+                {
+                    constraints.push(inner_store);
+                }
                 if let Some(adt_store) =
                     self.build_memory_store_untyped(elem_addr, elem_value, array_ty)
                 {

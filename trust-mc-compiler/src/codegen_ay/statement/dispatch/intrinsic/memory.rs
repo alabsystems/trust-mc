@@ -111,6 +111,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             || (method == "read_volatile" && fn_name.contains("core::ptr::"))
         {
             debug!("AY codegen: handling {} (memory read)", method);
+            // `volatile_load` requires `src` aligned (UB otherwise); the
+            // `unaligned_volatile_load` variant is exempt by definition.
+            // Without this obligation a misaligned load verified SUCCESSFUL
+            // (tests/expected/intrinsics/volatile_load/unaligned).
+            if method != "unaligned_volatile_load"
+                && let Some(ptr) = args.first()
+            {
+                self.emit_intrinsic_alignment_check(ptr, "src");
+            }
             return CallDispatchOutcome::from_handled_target(self.codegen_atomic_load(
                 args,
                 destination,
@@ -122,6 +131,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             || (method == "write_volatile" && fn_name.contains("core::ptr::"))
         {
             debug!("AY codegen: handling volatile_store (memory write)");
+            // Symmetric with the load: `dst` must be properly aligned.
+            if let Some(ptr) = args.first() {
+                self.emit_intrinsic_alignment_check(ptr, "dst");
+            }
             return CallDispatchOutcome::from_handled_target(
                 self.codegen_atomic_store(args, target),
             );
@@ -192,6 +205,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 target,
                 false,
             ));
+        }
+        if method == "arith_offset" {
+            debug!("AY codegen: handling arith_offset (wrapping)");
+            return CallDispatchOutcome::from_handled_target(
+                self.codegen_arith_offset_intrinsic(args, destination, target),
+            );
         }
         if method == "offset" {
             debug!("AY codegen: handling pointer offset");

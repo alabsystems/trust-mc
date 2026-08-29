@@ -1,8 +1,22 @@
 // Audit repro: transmute / pointer-provenance / type-punning false-Safe probe.
 //
-// Build/run is OWNED BY A GATE — this file is source-analysis evidence only.
-// Run (opt-in validity feature, matching Kani):
-//   trust-mc --harness <name> -Z valid-value-checks
+// Oracle: MIXED — score PER HARNESS, not per file:
+//   bool_invalid_transmute_FALSE_SAFE     MUST FAIL (invalid bool byte 2)
+//   char_invalid_transmute_CONTROL_caught MUST FAIL (lone surrogate)
+//   provenance_roundtrip_CONTROL_failclosed  MAY VERIFY — see below
+// kani-flags: -Z valid-value-checks
+//
+// STATUS 2026-08-24: the FINDING BELOW IS FIXED — this file is now a REGRESSION
+// GUARD, not an open defect. Re-measured with `-Z valid-value-checks`:
+// `bool_invalid_transmute_FALSE_SAFE` reports
+//   Check 1: "Undefined Behavior: Invalid value of type `bool`" -> FAILED
+// i.e. the invalid byte 2 IS caught. The narrative below describes the ORIGINAL
+// defect and is kept for provenance; do not read it as current behaviour.
+//
+// The requirement used to be stated in PROSE only ("Run: ... -Z
+// valid-value-checks"), so the dual wall ran this file with NO flags, no checks
+// were emitted at all, and it scored as a bogus P0 for years. It now declares
+// `kani-flags:` above.
 //
 // FINDING (primary, HARNESS `bool_invalid_transmute_FALSE_SAFE`):
 //   trust-mc's BV->Bool transmute lowering is VALUE-NORMALIZING, not
@@ -48,6 +62,14 @@ fn char_invalid_transmute_CONTROL_caught() {
 //   conservative for legit round-trips). OOB via preserved-obj_id arithmetic
 //   is separately caught by the offset<size bounds check in heap_access_checks.
 //   Included to show candidate 2 is NOT a false-Safe in the default config.
+//
+//   STATUS 2026-08-24: this harness now VERIFIES, and that is CORRECT, not a
+//   missed bug. The program is SAFE — a legitimate expose-then-reconstruct
+//   round-trip where `y == 42` — and the comment above already concedes the
+//   old CTREX was "over-conservative for legit round-trips". The fail-closed
+//   over-approximation has since been tightened, so the expectation recorded
+//   here (FAILED) is STALE. Kept as a precision guard: if it ever flips back to
+//   FAILED, the over-approximation returned.
 #[kani::proof]
 fn provenance_roundtrip_CONTROL_failclosed() {
     let x: u32 = 42;

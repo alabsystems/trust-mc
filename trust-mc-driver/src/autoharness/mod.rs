@@ -31,7 +31,10 @@ pub(crate) fn autoharness_cargo(args: CargoAutoharnessArgs, identity: CliIdentit
     setup_session(&mut session, &args.common_autoharness_args);
 
     if !session.args.common_args.quiet {
-        print_kani_version(InvocationType::CargoKani { args: vec![], identity });
+        print_kani_version(
+            InvocationType::CargoKani { args: vec![], identity },
+            session.args.common_args.verbose,
+        );
     }
     let project = project::cargo_project(&mut session, false)?;
     postprocess_project(project, session, args.common_autoharness_args, identity)
@@ -45,7 +48,10 @@ pub(crate) fn autoharness_standalone(
     setup_session(&mut session, &args.common_autoharness_args);
 
     if !session.args.common_args.quiet {
-        print_kani_version(InvocationType::Standalone { identity });
+        print_kani_version(
+            InvocationType::Standalone { identity },
+            session.args.common_args.verbose,
+        );
     }
 
     let project = if args.std {

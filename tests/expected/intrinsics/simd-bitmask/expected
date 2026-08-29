@@ -1,0 +1,6 @@
+Checking harness check_simd_bitmask_model...
+
+Status: SUCCESS\
+Description: "assertion failed: mask == 0"
+
+VERIFICATION:- SUCCESSFUL

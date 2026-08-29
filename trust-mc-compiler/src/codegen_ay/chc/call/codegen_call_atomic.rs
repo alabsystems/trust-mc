@@ -33,7 +33,7 @@ use crate::codegen_ay::ptr_repr::PtrSlot;
 
 /// Classification of atomic intrinsic operations.
 #[derive(Debug)]
-pub(in crate::codegen_ay::chc) enum AtomicKind {
+pub(in crate::codegen_ay) enum AtomicKind {
     Load,
     Store,
     Exchange,
@@ -80,7 +80,7 @@ pub(in crate::codegen_ay::chc) fn strip_generic_args(path: &str) -> &str {
 ///
 /// Matches raw intrinsic names and stable `std::sync::atomic` method names.
 /// Part of #3452, #3741, #3776.
-pub(in crate::codegen_ay::chc) fn detect_atomic_intrinsic(path: &str) -> Option<AtomicKind> {
+pub(in crate::codegen_ay) fn detect_atomic_intrinsic(path: &str) -> Option<AtomicKind> {
     if !path.contains("atomic") {
         return None;
     }

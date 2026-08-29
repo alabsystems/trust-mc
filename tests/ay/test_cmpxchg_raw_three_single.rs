@@ -1,0 +1,53 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Licensed under the Apache License, Version 2.0
+
+// 3 different pointers, 1 CAS each — isolate multi-pointer vs multi-round.
+//
+// kani-expect: PROOF
+// NOTE: check_three_ptrs_one_round nondeterministic (ay#8578/Spacer) — flips PROOF↔UNKNOWN across runs.
+
+#![feature(core_intrinsics)]
+use std::intrinsics::{AtomicOrdering, atomic_cxchg};
+
+#[kani::proof]
+fn check_three_ptrs_one_round() {
+    let mut a1 = 0u8;
+    let mut a2 = 0u8;
+    let mut a3 = 0u8;
+
+    let p1: *mut u8 = &mut a1;
+    let p2: *mut u8 = &mut a2;
+    let p3: *mut u8 = &mut a3;
+
+    unsafe {
+        let x1 = atomic_cxchg::<_, { AtomicOrdering::SeqCst }, { AtomicOrdering::SeqCst }>(p1, 0, 1);
+        let x2 = atomic_cxchg::<_, { AtomicOrdering::AcqRel }, { AtomicOrdering::Acquire }>(p2, 0, 1);
+        let x3 = atomic_cxchg::<_, { AtomicOrdering::Acquire }, { AtomicOrdering::Relaxed }>(p3, 0, 1);
+
+        assert!(x1 == (0, true));
+        assert!(x2 == (0, true));
+        assert!(x3 == (0, true));
+    }
+}
+
+#[kani::proof]
+fn check_two_ptrs_two_rounds() {
+    let mut a1 = 0u8;
+    let mut a2 = 0u8;
+
+    let p1: *mut u8 = &mut a1;
+    let p2: *mut u8 = &mut a2;
+
+    unsafe {
+        let x1 = atomic_cxchg::<_, { AtomicOrdering::SeqCst }, { AtomicOrdering::SeqCst }>(p1, 0, 1);
+        let x2 = atomic_cxchg::<_, { AtomicOrdering::AcqRel }, { AtomicOrdering::Acquire }>(p2, 0, 1);
+        assert!(x1 == (0, true));
+        assert!(x2 == (0, true));
+
+        let y1 = atomic_cxchg::<_, { AtomicOrdering::SeqCst }, { AtomicOrdering::SeqCst }>(p1, 1, 1);
+        let y2 = atomic_cxchg::<_, { AtomicOrdering::AcqRel }, { AtomicOrdering::Acquire }>(p2, 1, 1);
+        assert!(y1 == (1, true));
+        assert!(y2 == (1, true));
+    }
+}

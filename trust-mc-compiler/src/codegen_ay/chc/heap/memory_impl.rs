@@ -26,6 +26,17 @@ use crate::codegen_ay::chc::call::codegen_call_kani_model_dst::is_zst_ty;
 use crate::codegen_ay::provenance::{Loc, Val};
 use crate::codegen_ay::shared::ty_signedness_shallow;
 
+/// How a store-to-load-forwarded value lines up with the load's width.
+#[derive(Debug)]
+enum ForwardedWidth {
+    /// Same width (or a sort with no width) — forward it as-is.
+    Exact,
+    /// Narrower, but the consecutive byte entries covered the load exactly.
+    Reassembled(Expr),
+    /// Narrower and not reassemblable — do NOT forward.
+    TooNarrow,
+}
+
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     // =========================================================================
     // Phase 3: Memory load/store operations (Part of #892)
@@ -77,6 +88,51 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> Option<Val> {
         #[allow(deprecated)]
         self.load_from_memory_untyped(loc.into_expr(), pointee_ty).map(Val::of_value)
+    }
+
+    /// Match a forwarded store value against the width this load needs.
+    ///
+    /// See the call site in `load_from_memory_untyped` for why a narrower
+    /// forwarded value must never be handed back as-is.
+    fn widen_forwarded_bytes(
+        store_forward_map: &std::collections::HashMap<u64, (usize, Expr, std::sync::Arc<str>)>,
+        current_bb: usize,
+        obj_id: u32,
+        offset: u32,
+        forwarded: &Expr,
+        pointee_sort: Option<&Sort>,
+    ) -> ForwardedWidth {
+        let (Some(have), Some(want)) =
+            (forwarded.sort().bitvec_width(), pointee_sort.and_then(Sort::bitvec_width))
+        else {
+            return ForwardedWidth::Exact;
+        };
+        if have >= want {
+            return ForwardedWidth::Exact;
+        }
+        // Only whole-byte chunks tile an address range.
+        if have % 8 != 0 || want % have != 0 {
+            return ForwardedWidth::TooNarrow;
+        }
+        let chunk_bytes = have / 8;
+        let chunks = want / have;
+        // Little-endian: the byte at the LOWEST address is the LEAST
+        // significant, so concatenation runs from the highest chunk down.
+        let mut assembled = forwarded.clone();
+        for i in 1..chunks {
+            let Some(chunk_offset) = offset.checked_add(i * chunk_bytes) else {
+                return ForwardedWidth::TooNarrow;
+            };
+            let key = ((obj_id as u64) << 32) | (chunk_offset as u64);
+            let Some((chunk_bb, chunk_value, _)) = store_forward_map.get(&key) else {
+                return ForwardedWidth::TooNarrow;
+            };
+            if *chunk_bb != current_bb || chunk_value.sort().bitvec_width() != Some(have) {
+                return ForwardedWidth::TooNarrow;
+            }
+            assembled = chunk_value.clone().concat(assembled);
+        }
+        ForwardedWidth::Reassembled(assembled)
     }
 
     /// Loads a value from memory at the given address.
@@ -160,10 +216,52 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     offset = fwd_offset,
                     "CHC: load_from_memory - store-to-load forwarding (#3608)"
                 );
-                return Some(Self::coerce_loaded_value_for_pointee(
-                    forwarded_value,
+                // A NARROWER forwarded value is not this load's value. It shows
+                // up when a byte array (`[u8; N]`) was mirrored element-wise and
+                // a wider scalar is then read through the same address — e.g.
+                // `addr_of!([u8::MAX; 4]) as *const char`, where forwarding used
+                // to hand a single BV8 `0xFF` to the char-validity predicate,
+                // which read it as the valid scalar value 255 and answered
+                // "dereferenceable" (ValidValues/unaligned.rs).
+                //
+                // Reassemble the wider value from the consecutive byte entries
+                // when they are ALL present (little-endian, the target's byte
+                // order); otherwise fail closed and fall through to the real
+                // memory arrays rather than return a value of the wrong width.
+                match Self::widen_forwarded_bytes(
+                    &self.heap_state.store_forward_map,
+                    self.current_encode_bb,
+                    fwd_obj_id,
+                    fwd_offset,
+                    &forwarded_value,
                     pointee_sort.as_ref(),
-                ));
+                ) {
+                    ForwardedWidth::Exact => {
+                        return Some(Self::coerce_loaded_value_for_pointee(
+                            forwarded_value,
+                            pointee_sort.as_ref(),
+                        ));
+                    }
+                    ForwardedWidth::Reassembled(value) => {
+                        debug!(
+                            obj_id = fwd_obj_id,
+                            offset = fwd_offset,
+                            "CHC: load_from_memory - forwarded bytes reassembled into scalar"
+                        );
+                        return Some(Self::coerce_loaded_value_for_pointee(
+                            value,
+                            pointee_sort.as_ref(),
+                        ));
+                    }
+                    ForwardedWidth::TooNarrow => {
+                        debug!(
+                            obj_id = fwd_obj_id,
+                            offset = fwd_offset,
+                            "CHC: load_from_memory - forwarded value narrower than the load and \
+                             not byte-reassemblable; falling through to memory"
+                        );
+                    }
+                }
             }
         }
 
@@ -476,6 +574,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 self.get_array_element_ty(pointee_ty).and_then(|et| self.get_type_size(et))
             && elem_size > 0
         {
+            // The per-element cells above live under the ARRAY's type key
+            // (`mem_slice_u8` for `[u8; 4]`), but a read through a `*const u8`
+            // resolves its key from the POINTEE type and selects `mem_u8`.
+            // Nothing bridged the two, so `arr[0]` and `*arr.as_ptr().add(0)`
+            // denoted unrelated symbolic values and a `kani::assume` written
+            // through the pointer never reached the indexed read
+            // (`Quantifiers/array.rs`). Mirror each element under the ELEMENT
+            // key too, but ONLY for an object nothing can write through a
+            // pointer — see `array_elem_mirror_key_if_write_free`.
+            let elem_type_key = self
+                .array_elem_mirror_key_if_write_free(&addr, pointee_ty)
+                .filter(|k| **k != *type_key);
             for i in 0..array_len {
                 let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
                 let elem_val = value.clone().select(idx);
@@ -485,6 +595,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     addr.clone().bvadd(Expr::bitvec_const((i * elem_size) as u128, POINTER_WIDTH))
                 };
                 self.try_store_to_region(&elem_addr, &elem_val, &elem_sort, signed);
+                if let Some(ref ek) = elem_type_key {
+                    self.store_to_type_array(
+                        elem_addr.clone(),
+                        elem_val.clone(),
+                        ek,
+                        elem_sort.clone(),
+                        signed,
+                    );
+                }
                 self.store_to_type_array(elem_addr, elem_val, &type_key, elem_sort.clone(), signed);
             }
             debug!(
@@ -504,6 +623,78 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Type-indexed array store with coercion, forwarding, and alias mirroring.
+    /// Element type key to ALSO mirror a `[T; N]` store under, or `None` when
+    /// that mirror could go stale.
+    ///
+    /// The mirror publishes the array local's REGISTER value into the
+    /// element-typed memory array. That is only safe while memory cannot hold a
+    /// newer value than the register: a `*mut T` write lands in `mem_T` alone,
+    /// and the next whole-array mirror would then republish the stale register
+    /// contents OVER it — answering `*p.add(1)` with the pre-write byte. That is
+    /// a fabricated proof, not a spurious counterexample, so this fails closed.
+    ///
+    /// Two conditions must hold, and both are decided from the MIR, not guessed:
+    ///   * the object is a stack local that is never mutably borrowed
+    ///     (`&mut _L` / `&raw mut _L`) — in safe Rust no `*mut` into it can
+    ///     exist, so no caller or callee holds a writer; and
+    ///   * this body performs no store through a `Deref` place at all — a
+    ///     second net covering pointers this walk did not attribute to `_L`.
+    /// Anything else keeps the array-key-only behaviour that shipped before.
+    fn array_elem_mirror_key_if_write_free(
+        &mut self,
+        addr: &Expr,
+        array_ty: rustc_public::ty::Ty,
+    ) -> Option<Cow<'static, str>> {
+        let (obj_id, _) = Self::try_extract_constant_addr(addr)?;
+        let owner = self.heap_state.local_idx_for_obj_id(obj_id)?;
+        if self.local_is_mutably_borrowed(owner) || self.body_stores_through_deref() {
+            return None;
+        }
+        let elem_ty = self.get_array_element_ty(array_ty)?;
+        Some(self.type_key_for_body_ty(elem_ty))
+    }
+
+    /// `true` if any statement or call in this body writes through a `Deref`
+    /// place — i.e. the typed memory array can hold a value the owning local's
+    /// state var does not.
+    fn body_stores_through_deref(&self) -> bool {
+        use rustc_public::mir::{Place, StatementKind, TerminatorKind};
+        let place_has_deref = |p: &Place| {
+            p.projection.iter().any(|e| matches!(e, rustc_public::mir::ProjectionElem::Deref))
+        };
+        self.body.blocks.iter().any(|block| {
+            block.statements.iter().any(|stmt| match &stmt.kind {
+                StatementKind::Assign(lhs, _) => place_has_deref(lhs),
+                _ => false,
+            }) || matches!(
+                &block.terminator.kind,
+                TerminatorKind::Call { destination, .. } if place_has_deref(destination)
+            )
+        })
+    }
+
+    /// `true` if `local` is the base of a mutable borrow (`&mut _L`) or a
+    /// mutable raw-address expression (`&raw mut _L`) anywhere in this body.
+    fn local_is_mutably_borrowed(&self, local: usize) -> bool {
+        use rustc_public::mir::{BorrowKind, Mutability, Rvalue, StatementKind};
+        self.body.blocks.iter().any(|block| {
+            block.statements.iter().any(|stmt| {
+                let StatementKind::Assign(_, rvalue) = &stmt.kind else {
+                    return false;
+                };
+                match rvalue {
+                    Rvalue::Ref(_, kind, place) => {
+                        place.local == local && !matches!(kind, BorrowKind::Shared)
+                    }
+                    Rvalue::AddressOf(kind, place) => {
+                        place.local == local && kind.to_mutable_lossy() == Mutability::Mut
+                    }
+                    _ => false,
+                }
+            })
+        })
+    }
+
     pub(in crate::codegen_ay::chc) fn store_to_type_array(
         &mut self,
         addr: Expr,
@@ -647,5 +838,90 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
 
         (arr_name_arc, out_arc)
+    }
+}
+
+#[cfg(test)]
+mod forwarded_width_tests {
+    use super::{ChcCtx, ForwardedWidth};
+    use ay_bindings::{Expr, Sort};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Store-to-load forwarding must never hand a NARROWER value back to a
+    /// wider load: `addr_of!([u8::MAX; 4]) as *const char` forwarded a single
+    /// `0xFF` byte, which the char-validity predicate then read as the
+    /// perfectly valid scalar 255 and answered "dereferenceable"
+    /// (`ValidValues/unaligned.rs`). Consecutive byte cells reassemble
+    /// little-endian; anything else falls through to the real memory arrays.
+    #[test]
+    fn test_widen_forwarded_bytes_reassembles_little_endian() {
+        const OBJ_ID: u32 = 7;
+        const BB: usize = 3;
+        let byte = |v: u64| Expr::bitvec_const(v, 8);
+        let key = |off: u32| ((OBJ_ID as u64) << 32) | (off as u64);
+        let u8_key: Arc<str> = Arc::from("u8");
+        let want = Sort::bitvec(32);
+
+        let mut map: HashMap<u64, (usize, Expr, Arc<str>)> = HashMap::new();
+        for off in 0..4u32 {
+            map.insert(key(off), (BB, byte(0xF0 + u64::from(off)), Arc::clone(&u8_key)));
+        }
+
+        // Four 8-bit cells covering a 32-bit load: assembled MSB-first from the
+        // HIGHEST address, i.e. byte3 ++ byte2 ++ byte1 ++ byte0.
+        let ForwardedWidth::Reassembled(assembled) =
+            ChcCtx::widen_forwarded_bytes(&map, BB, OBJ_ID, 0, &byte(0xF0), Some(&want))
+        else {
+            panic!("four consecutive byte cells must reassemble");
+        };
+        assert_eq!(assembled.sort().bitvec_width(), Some(32));
+        assert_eq!(
+            assembled,
+            byte(0xF3).concat(byte(0xF2).concat(byte(0xF1).concat(byte(0xF0)))),
+            "lowest address must be the LEAST significant byte"
+        );
+
+        // A same-width forward is untouched — the pre-existing fast path.
+        assert!(matches!(
+            ChcCtx::widen_forwarded_bytes(
+                &map,
+                BB,
+                OBJ_ID,
+                0,
+                &Expr::bitvec_const(1u64, 32),
+                Some(&want)
+            ),
+            ForwardedWidth::Exact
+        ));
+
+        // A missing tail byte must NOT forward a short value.
+        map.remove(&key(3));
+        assert!(matches!(
+            ChcCtx::widen_forwarded_bytes(&map, BB, OBJ_ID, 0, &byte(0xF0), Some(&want)),
+            ForwardedWidth::TooNarrow
+        ));
+
+        // Neither may a cell written in a DIFFERENT block: forwarding is
+        // same-block only, exactly as the caller's `store_bb` guard requires.
+        map.insert(key(3), (BB + 1, byte(0xF3), Arc::clone(&u8_key)));
+        assert!(matches!(
+            ChcCtx::widen_forwarded_bytes(&map, BB, OBJ_ID, 0, &byte(0xF0), Some(&want)),
+            ForwardedWidth::TooNarrow
+        ));
+
+        // A width that does not tile the load (24-bit cell into 32 bits) is
+        // refused rather than padded.
+        assert!(matches!(
+            ChcCtx::widen_forwarded_bytes(
+                &map,
+                BB,
+                OBJ_ID,
+                0,
+                &Expr::bitvec_const(0u64, 24),
+                Some(&want)
+            ),
+            ForwardedWidth::TooNarrow
+        ));
     }
 }

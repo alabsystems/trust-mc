@@ -19,6 +19,7 @@ use super::super::chc_call_context::ChcCallContext;
 use super::super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto};
 use super::super::codegen_rules::CodegenRules;
 use super::super::stubs_option_helpers::OptionHelpers;
+use crate::codegen_ay::ptr_repr::PtrRepr;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Semantic Layout construction for LayoutNew/LayoutForValueRaw/LayoutArray/LayoutFromSizeAlign{,Unchecked}.
@@ -103,7 +104,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let ptr_resolved = args
                         .first()
                         .and_then(|arg| self.translate_operand_with_modified(arg, modified_locals))
-                        .and_then(|ptr| self.split_pointer(&ptr));
+                        .and_then(|ptr| {
+                            // `split_pointer` only accepts a bv64 address, but the argument
+                            // to `Layout::for_value_raw` on an unsized pointee is a FAT
+                            // pointer: bv128 laid out `[metadata : upper | data : lower]`.
+                            // Without taking the data half first, split_pointer returned
+                            // None for every `Box<[T]>` / `Box<str>`, the dynamic size was
+                            // never bound, and the destination fell through to the
+                            // unconstrained fallback below -- so the dealloc size-match
+                            // obligation was refutable and dropping a `Box<[u8]>` produced
+                            // a false counterexample.
+                            //
+                            // Taking the low half is correct for a widened THIN pointer
+                            // too: there the upper half is fabricated zero and the address
+                            // still occupies the low 64 bits.
+                            let addr = PtrRepr::classify(&ptr)
+                                .map_or(ptr, |repr| repr.into_data().into_expr());
+                            self.split_pointer(&addr)
+                        });
                     if let Some((obj_id_expr, _offset)) = ptr_resolved {
                         let obj_size_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(32));
                         let obj_size_in = Expr::var("obj_size", obj_size_sort);

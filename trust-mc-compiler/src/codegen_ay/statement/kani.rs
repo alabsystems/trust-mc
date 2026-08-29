@@ -187,6 +187,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let fresh = self.create_constrained_symbolic(pointee_ty, "ay_write_any");
         let pointer = self.resolve_concrete_expr(&self.coerce_to_ptr_width(pointer_expr));
         self.ctx.store_memory_bytes(pointer.clone(), fresh.clone());
+        // Register lane: prefer the tracked pointee NAME. The addr-symbol
+        // structural match below fails whenever the pointer term is an SSA
+        // var rather than the literal address symbol — e.g. a stub_verified
+        // replace closure reached through nested captures — and then the
+        // havoc updated only byte memory while every register read of the
+        // target stayed STALE, so the assumed ensures contradicted the
+        // un-havocked value (corpus: function-contract/as-assertions/
+        // precedence.rs, modifies/field_replace_pass.rs went
+        // [AY:VACUOUS:unsat-assumption]). This is the same name-tracked
+        // store lane every ordinary `*p = v` uses (ref_pointees).
+        if let Operand::Copy(place) | Operand::Move(place) = pointer_arg {
+            let ref_base = self.ssa_base_name(place);
+            if let Some(pointee) = self.ref_pointees.get(ref_base.as_str()).cloned() {
+                // The tracked pointee may be a `_deref` alias one family
+                // away from the root local (the alias-vs-root split the
+                // typed_swap resolver already handles); refresh EVERY name
+                // on the chain so no reader sees a stale register value.
+                let targets = self.resolve_deref_pointee_chain(pointee.as_ref());
+                debug!(?targets, "write_any_slim: havoc via tracked pointee names");
+                for base in targets {
+                    let ssa_name = self.ssa_name_from_base(&base, true);
+                    let ssa_var = self.ctx.declare_var(&ssa_name, fresh.sort().clone());
+                    self.assert_ssa_def(ssa_var.clone(), fresh.clone(), &base);
+                    let base_arc: Arc<str> = Arc::from(base.as_str());
+                    self.env_update(Arc::clone(&base_arc), ssa_var);
+                    self.heap_pointees.insert(base_arc, fresh.clone());
+                }
+                return true;
+            }
+        }
         self.update_addressed_local_after_write_any(&pointer, fresh);
         true
     }
@@ -297,18 +327,41 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
-    /// Codegen kani::assume - asserts the condition as a path assumption.
+    /// Codegen kani::assume - folds the condition into the ordered assumption
+    /// context (CBMC/Kani suffix semantics).
+    ///
+    /// CBMC semantics: an `assume` constrains only the program SUFFIX — checks
+    /// recorded after it in codegen order. The previous encoding asserted the
+    /// condition globally (`assert_guarded`), which had two Kani-divergent
+    /// consequences, one of them a soundness hole:
+    /// - it retroactively masked violations recorded BEFORE the assume
+    ///   (`assert!(x == 0); kani::assume(x == 0);` proved SAFE — a false proof;
+    ///   CBMC reports the assert FAILURE because its VC only includes assumes
+    ///   that precede it), and
+    /// - a mid-harness contradictory assume made the whole-harness feasibility
+    ///   probe unsat, flipping checks BEFORE the assume to UNREACHABLE and the
+    ///   verdict to VACUOUS where Kani reports SUCCESS for the prefix and
+    ///   UNREACHABLE only for the suffix (corpus:
+    ///   safety-constraint-attribute/check-invariant).
+    /// The ordered context gives every later check/cover/reach flag exactly the
+    /// assumes that dominate it. The whole-trace assumption conjunction is
+    /// still handed to the driver's vacuity probe via the `ay_assume_final`
+    /// flag emitted at finalize, so `kani::assume(false)` keeps failing closed
+    /// as `[AY:VACUOUS:unsat-assumption]`.
     pub(super) fn codegen_kani_assume(&mut self, args: &[Operand]) {
         if args.is_empty() {
             return;
         }
-        // assume(cond) -> assert(cond) in SMT (constrains the path)
         // Part of #3211: Track dropped assume conditions via demotion counter.
         // Dropping an assume is sound over-approximation (more states explored),
         // but should be visible to the demotion pipeline.
         if let Some(cond_expr) = self.codegen_operand(&args[0]) {
             if let Some(bool_cond) = Self::coerce_to_bool(cond_expr) {
-                self.assert_guarded(bool_cond);
+                let constraint = match &self.current_path_condition {
+                    None => bool_cond,
+                    Some(pc) => pc.clone().implies(bool_cond),
+                };
+                self.ctx.add_ordered_assumption(constraint);
             } else {
                 warn!("codegen_kani_assume: coerce_to_bool returned None, assume dropped");
                 self.ctx.unsupported_with_fallback(
@@ -322,6 +375,64 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 "kani_assume_condition_drop",
                 "codegen_operand returned None",
             );
+        }
+    }
+
+    /// Codegen `kani::internal::untracked_deref(ptr: &T) -> T`: read the
+    /// POINTEE of `ptr`.
+    ///
+    /// This hook is NOT the identity. The previous behavior copied the
+    /// operand's expression into the destination, which for a `&place`
+    /// operand encoded as a synthesized address handed the caller the
+    /// ADDRESS one level up instead of the pointee value. The contract
+    /// replace-closure's modifies havoc reads its target pointer exactly
+    /// this way (`write_any(Pointer::assignable(untracked_deref(&ptr)))`),
+    /// so the havoc write landed on a fabricated pointee, the caller's
+    /// storage never changed, and the assumed ensures contradicted the
+    /// un-havocked state (corpus: function-contract/modifies
+    /// stub_verified harnesses reported [AY:VACUOUS:unsat-assumption]).
+    ///
+    /// Resolution order:
+    /// 1. `ref_pointees` on the operand's base name — the tracked pointee
+    ///    NAME. Its env entry is the pointee value, and chaining one more
+    ///    `ref_pointees` level onto the DESTINATION lets a later deref-store
+    ///    through the result reach the original storage.
+    /// 2. Fallback: the old operand-identity behavior (some operand shapes
+    ///    already encode the pointee value directly, e.g. a capture read
+    ///    through a projection).
+    pub(super) fn codegen_untracked_deref(&mut self, args: &[Operand], destination: &Place) {
+        if args.is_empty() {
+            return;
+        }
+        let dest_base = self.ssa_base_name(destination);
+        if let Operand::Copy(p) | Operand::Move(p) = &args[0] {
+            let ref_base = self.ssa_base_name(p);
+            if let Some(pointee) = self.ref_pointees.get(ref_base.as_str()).cloned() {
+                // Chain the pointee NAME one more level: the result IS the
+                // pointer stored at `pointee`, so a deref of the result
+                // lands wherever that pointer's own pointee is.
+                if let Some(next) = self.ref_pointees.get(pointee.as_ref()).cloned() {
+                    debug!(
+                        "untracked_deref: chaining ref_pointees {} -> {}",
+                        dest_base, next
+                    );
+                    self.ref_pointees.insert(Arc::from(dest_base.as_str()), next);
+                }
+                if let Some(val) = self.env_lookup(pointee.as_ref()).cloned() {
+                    debug!(
+                        "untracked_deref: {} := env[{}] (sort={:?})",
+                        dest_base,
+                        pointee,
+                        val.sort()
+                    );
+                    self.env_update(dest_base, val);
+                    return;
+                }
+            }
+        }
+        // Fallback: previous identity behavior.
+        if let Some(val) = self.codegen_operand(&args[0]) {
+            self.env_update(dest_base, val);
         }
     }
 
@@ -420,12 +531,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             _ => return, // non-enum: Option<Expr>
         };
 
-        // Guard the cover condition by the current path condition
-        // Cover is satisfied if: path_condition ∧ cover_condition is SAT
-        let guarded_cond = match &self.current_path_condition {
-            Some(pc) => pc.clone().and(cond_expr),
-            None => cond_expr,
-        };
+        // The cover is satisfied if `path_condition ∧ cover_condition` is SAT.
+        // The path condition is passed SEPARATELY rather than pre-conjoined:
+        // the recorder needs it on its own to emit the `ay_reach_cover_<n>`
+        // companion that distinguishes UNSATISFIABLE (site reachable, condition
+        // never true) from UNREACHABLE (the cover statement is dead code) —
+        // Kani reports those as different statuses. The cover flag itself is
+        // the same conjunction it always was.
+        let guard = self.current_path_condition.clone();
 
         // #1164: Pass source location for property location tracking
         let location = self.current_source_location();
@@ -434,7 +547,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let message = args.get(1).and_then(|msg_op| self.try_extract_str_constant(msg_op));
 
         let cover_id =
-            self.ctx.record_cover_property_with_location(guarded_cond, location, message);
+            self.ctx.record_cover_property_with_guard(cond_expr, guard, location, message);
         debug!("codegen_kani_cover: recorded cover property ay_cover_{}", cover_id);
     }
 

@@ -90,6 +90,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if !self.int_lift {
             self.collect_float_binop_table_state_vars();
         }
+
+        // 6. Frozen congruent call-summary table for ESTABLISHED-pure scalar
+        // callees the precise inline lane refused by size (see
+        // call_uf_table.rs). Read-only and unconstrained, and declared only
+        // when the pre-scan finds such a call, so ordinary harnesses keep
+        // their relation arity. Skipped under int-lift for the same reason as
+        // the float tables above: Array sorts block PDR there, and the call
+        // lane then keeps its pre-existing sound havoc.
+        if !self.int_lift {
+            self.collect_call_uf_table_state_vars();
+        }
     }
 
     /// Classify a Datatype sort name as a collection/iterator projection kind.

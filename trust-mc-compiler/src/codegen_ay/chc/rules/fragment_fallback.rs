@@ -29,6 +29,44 @@ use super::fragment_gen::{
 };
 use trust_mc_core::chc::{RelationDecl, VarDecl};
 
+/// Predecessors of every block, counted over the blocks reachable from the
+/// body entry only.
+///
+/// Chain composition fuses a block into its predecessor's rule and gives it NO
+/// relation of its own, so an edge that enters the block from anywhere else has
+/// nowhere to land: `try_emit_unreachable_error` cannot tell "absorbed into a
+/// chain" from "error-only block" and routes that edge to `error()`. Fusing is
+/// therefore only sound for a block whose sole way in is the chain edge, and
+/// answering that question needs the real predecessor relation.
+///
+/// Unreachable-from-entry blocks are skipped: `FunctionWithContractPass` and
+/// the CHC inliner strand whole copies of a body (see `reachable_blocks` in
+/// `codegen_function.rs`), and counting those stranded copies' edges would
+/// split chains that really do have a single live predecessor.
+fn reachable_predecessors(ctx: &ChcCtx<'_, '_>) -> Vec<HashSet<usize>> {
+    let n = ctx.body.blocks.len();
+    let mut preds: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+    if n == 0 {
+        return preds;
+    }
+    let mut seen = vec![false; n];
+    seen[0] = true;
+    let mut worklist = vec![0usize];
+    while let Some(bb) = worklist.pop() {
+        for succ in ctx.body.blocks[bb].terminator.successors() {
+            if succ >= n {
+                continue;
+            }
+            preds[succ].insert(bb);
+            if !seen[succ] {
+                seen[succ] = true;
+                worklist.push(succ);
+            }
+        }
+    }
+    preds
+}
+
 /// Fallback: try sub-fragment splitting at Call boundaries, else per-block.
 ///
 /// For non-composable fragments (internal branching/calls), builds composable
@@ -113,6 +151,9 @@ pub(super) fn generate_fallback_fragment_rules(ctx: &mut ChcCtx<'_, '_>, blocks:
     let topo_position: std::collections::HashMap<usize, usize> =
         blocks.iter().enumerate().map(|(pos, &bb)| (bb, pos)).collect();
 
+    // Join points may not be absorbed into a chain — see [`reachable_predecessors`].
+    let preds = reachable_predecessors(ctx);
+
     for &call_bb in &call_blocks {
         let landing_pad = match &ctx.body.blocks[call_bb].terminator.kind {
             TerminatorKind::Call { target: Some(t), .. } => *t,
@@ -167,6 +208,14 @@ pub(super) fn generate_fallback_fragment_rules(ctx: &mut ChcCtx<'_, '_>, blocks:
                         && !chain_set.contains(&s)
                         && !assigned.contains(&s)
                         && (s == landing_pad || s != entry_bb)
+                        // A join point keeps its own relation: absorbing it
+                        // would strand every edge that reaches it from off the
+                        // chain, and those edges are then emitted as `error()`
+                        // (a `slice[i] == 0` if/else re-join proved a false
+                        // counterexample this way).
+                        && preds
+                            .get(s)
+                            .is_none_or(|p| p.iter().all(|&pred| pred == current))
                 })
                 .collect();
 

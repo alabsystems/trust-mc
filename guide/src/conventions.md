@@ -2,8 +2,8 @@
 
 ## Formatting
 
-We automate most of our formatting preferences. Our CI will run format checkers for PRs and pushes.
-These checks are required for merging any PR.
+We automate most of our formatting preferences. This repository has no CI, so run
+the format checkers locally before submitting a change.
 
 For Rust, we use [rustfmt](https://github.com/rust-lang/rustfmt)
 which is configured via the [rustfmt.toml](https://github.com/alabsystems/trust-mc/blob/main/rustfmt.toml) file.
@@ -13,8 +13,7 @@ Because of that, we still have a couple of lints disabled (see [.cargo/config](h
 We also have a bit of C and Python code in our repository.
 For C we use `clang-format` and for Python scripts we use `autopep8`.
 See [.clang-format](https://github.com/alabsystems/trust-mc/blob/main/.clang-format)
-and [pyproject.toml](https://github.com/alabsystems/trust-mc/blob/main/scripts/pyproject.toml)
-for their configuration.
+for the C configuration.
 
 
 ### Exceptions
@@ -45,11 +44,6 @@ When modifying a file from another project, please keep their headers as is and 
 Note: The comment escape characters will depend on the type of file you are working with. E.g.: For rust start the
 header with `//`, but for python start with `#`.
 
-We also have automated checks for the copyright notice.
-There are a few file types where this rule doesn't apply.
-You can see that list in the [copyright-exclude](
-https://github.com/alabsystems/trust-mc/blob/main/scripts/ci/copyright-exclude) file.
-
 
 ## Code for soundness
 
@@ -68,8 +62,8 @@ Here are a few ways how we do that.
 ### Compilation errors
 
 Make sure to add user-friendly errors for constructs that we can't handle.
-For example, trust-mc cannot handle the panic unwind strategy, and it will fail compilation if the crate uses this
-configuration.
+For example, trust-mc errors out on crates containing `global_asm!` unless
+`-Z unstable-options --ignore-global-asm` is passed.
 
 In general, it's preferred that error messages follow [these guidelines](https://rustc-dev-guide.rust-lang.org/diagnostics.html#diagnostic-output-style-guide) used for `rustc` development.
 If the errors are being emitted from `trust-mc-compiler`, you should use the compiler error message utilities (e.g., the `Session::span_err` method). However, if the

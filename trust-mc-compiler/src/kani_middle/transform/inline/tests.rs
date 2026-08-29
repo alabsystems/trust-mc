@@ -26,6 +26,7 @@ use tempfile::TempDir;
 use trust_mc_codegen_stubs::{StubKind, StubRegistry};
 
 mod handler_boundaries_tests;
+mod variadic_tests;
 
 fn dummy_span() -> Span {
     Span::to_val(0)

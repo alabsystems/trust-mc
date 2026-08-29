@@ -177,8 +177,7 @@ fn print_msg(diagnostic: &Diagnostic, use_rendered: bool) -> Result<()> {
 ///
 /// Ships alongside `guide/src/usage.md`. Kept as a constant so the diagnostic and
 /// the documentation never drift.
-const DEV_DEPS_DOC_URL: &str =
-    "https://model-checking.github.io/kani/usage.html#using-dev-dependencies-in-library-proofs";
+const DEV_DEPS_DOC_URL: &str = "https://github.com/alabsystems/trust-mc/blob/main/guide/src/usage.md#using-dev-dependencies-in-library-proofs";
 
 /// If `diagnostic` is an `unresolved import` error (E0432) whose crate name matches a
 /// `[dev-dependencies]` entry of the package that emitted it, print a hint pointing users

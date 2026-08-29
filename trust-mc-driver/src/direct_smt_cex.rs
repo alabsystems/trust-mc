@@ -19,11 +19,12 @@
 //! bit-vector overflow obligations refute with a concrete witness rather than
 //! stalling at Unknown.
 
+mod relevance_slicing;
 mod wide_nonlinear_abstraction;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ay_chc::{
     ChcExpr, ChcProblem, ClauseHead, HornClause, PredicateId, SmtContext, SmtResult, SmtValue,
@@ -43,6 +44,29 @@ use self::wide_nonlinear_abstraction::abstract_wide_nonlinear;
 /// through to the full PDR/BMC solve (which proves it), so tightening only trims
 /// waste — it never fabricates a proof or drops a counterexample (gate stays GREEN).
 const SMT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Total wall-clock the relevance-slicing pre-phase may spend before it gives up
+/// and lets the caller run the full body query unchanged. Bounds the ADDED cost
+/// of slicing on bodies it cannot decide; the phase is a pure optimisation, so
+/// abandoning it is always allowed.
+fn slice_phase_budget() -> Duration {
+    SMT_QUERY_TIMEOUT
+}
+
+/// Per-slice budget. Slices are, by construction, much smaller than the body; if
+/// one needs more than a fraction of the full-body budget it is not the cheap win
+/// this phase exists to harvest, so move on rather than starve the phase.
+fn slice_probe_timeout() -> Duration {
+    (SMT_QUERY_TIMEOUT / 4).max(Duration::from_millis(20)).min(SMT_QUERY_TIMEOUT)
+}
+
+/// Kill switch for the relevance-slicing pre-phase (any non-empty value disables
+/// it). Measurement lever only: with slicing off the lane behaves exactly as it
+/// did before the phase existed, because the phase can only convert an
+/// `Undecided` into a definitively-justified `Unsat`.
+fn slicing_disabled() -> bool {
+    std::env::var_os("TRUST_SMT_SLICE_DISABLE").is_some_and(|v| !v.is_empty())
+}
 
 // These are the exact private limits used by the pinned ay-chc
 // `ChcExpr::substitute` implementation. Keep this guard in lockstep with every
@@ -807,7 +831,69 @@ fn classify_smt_result(result: &SmtResult) -> SolveOutcomeTag {
     }
 }
 
+/// SOUND relevance-slicing pre-phase: try to prove the body UNSATISFIABLE from a
+/// strict SUBSET of its top-level conjuncts. Returns `true` only on a definitive
+/// subset-UNSAT.
+///
+/// # Why this exists
+///
+/// The TrustIr lowering fuses a whole function's panic-freedom obligation into
+/// one clause body. Large bit-vector components can make that fused query
+/// undecidable even when a small, variable-disjoint component is contradictory.
+/// Slicing exposes those small contradictions without weakening the proof bar.
+///
+/// # Soundness derivation
+///
+/// Let flattening split ONLY top-level conjunctions, equivalence-preservingly, so
+/// `PHI = C1 ∧ … ∧ Cn`. For any subset `S`, `PHI ⟹ AND(i∈S, Ci)`, hence
+/// `UNSAT(AND(i∈S, Ci)) ⟹ UNSAT(PHI)`. The caller may therefore prune the
+/// body only when a probed strict subset receives the same definitive-UNSAT tag
+/// used by the full query.
+///
+/// Three details are load-bearing and test-pinned: slices index original
+/// conjuncts without rewriting them; only [`SolveOutcomeTag::Unsat`] is consumed;
+/// and slice models never enter the refutation lane.
+fn slicing_proves_unsat(smt: &mut SmtContext, constraints: &[ChcExpr]) -> bool {
+    if slicing_disabled() {
+        return false;
+    }
+    let conjuncts = relevance_slicing::flat_conjuncts(constraints);
+    let slices = relevance_slicing::relevance_slices(&conjuncts);
+    if slices.is_empty() {
+        return false;
+    }
+
+    let started = Instant::now();
+    let phase_budget = slice_phase_budget();
+    let probe_timeout = slice_probe_timeout();
+    for slice in slices {
+        if started.elapsed() >= phase_budget {
+            return false;
+        }
+        // A genuine SUBSET: each element is a clone of an original conjunct,
+        // selected by index. Never a rewrite.
+        let subset: Vec<ChcExpr> = slice.iter().map(|&index| conjuncts[index].clone()).collect();
+        debug_assert!(subset.len() < conjuncts.len(), "relevance_slices must emit strict subsets");
+        let formula = ChcExpr::and_all(subset);
+        smt.reset();
+        let result = smt.check_sat_with_timeout(&formula, probe_timeout);
+        // A SAT or undecided slice says nothing about the full conjunction.
+        if classify_smt_result(&result) == SolveOutcomeTag::Unsat {
+            return true;
+        }
+    }
+    false
+}
+
 fn solve_constraints(smt: &mut SmtContext, constraints: &[ChcExpr]) -> SolveOutcome {
+    // Run before the fused query because the target bodies can consume the whole
+    // caller budget there. This can only turn a would-be `Undecided` into a
+    // subset-justified `Unsat`; it cannot divert a satisfiable body or produce a
+    // witness.
+    if slicing_proves_unsat(smt, constraints) {
+        return SolveOutcome::Unsat;
+    }
+
     let formula = ChcExpr::and_all(constraints.iter().cloned());
 
     smt.reset();
@@ -1373,5 +1459,192 @@ mod tests {
             "FALSE-PROOF REGRESSION: SMT `Unknown` classified as prunable `Unsat` — \
              an undecided edge would be silently pruned, promoting a may-panic body to SAFE"
         );
+    }
+
+    // ==================================================================
+    // Relevance slicing (`relevance_slicing`, `slicing_proves_unsat`)
+    // ==================================================================
+
+    /// A BV term wider than ay's per-term bit-blast budget. Ay refuses to blast
+    /// such a query and returns `Unknown` for the whole conjunction, fail-closed.
+    fn arbitrary_precision_bv_noise() -> Vec<ChcExpr> {
+        let wide = ChcExpr::var(ChcVar::new("bignum", ChcSort::BitVec(20_000)));
+        let other = ChcExpr::var(ChcVar::new("bignum_hi", ChcSort::BitVec(20_000)));
+        vec![ChcExpr::bv_ule(wide.clone(), other.clone()), ChcExpr::bv_ule(other, wide)]
+    }
+
+    /// `shift ≥ 32 ∧ shift < 32` plus surrounding range facts: two conjuncts
+    /// contradict and the rest share the same variable, so they stay in one
+    /// connected component.
+    fn shift_contradiction() -> Vec<ChcExpr> {
+        let shift = || ChcExpr::var(ChcVar::new("shift", ChcSort::Int));
+        vec![
+            ChcExpr::ge(shift(), ChcExpr::int(0)),
+            ChcExpr::le(ChcExpr::int(0), shift()),
+            ChcExpr::le(shift(), ChcExpr::int(4_294_967_295_i64)),
+            ChcExpr::ge(shift(), ChcExpr::int(32)),
+            ChcExpr::lt(shift(), ChcExpr::int(32)),
+        ]
+    }
+
+    /// Satisfiable filler over pairwise-disjoint variables, matching the
+    /// discriminant-range facts that dominate real fused bodies.
+    fn discriminant_range_filler(count: usize) -> Vec<ChcExpr> {
+        (0..count)
+            .map(|i| {
+                let v = ChcExpr::var(ChcVar::new(format!("__trust_mir__discr__{i}"), ChcSort::Int));
+                ChcExpr::or_vec(vec![
+                    ChcExpr::eq(ChcExpr::int(0), v.clone()),
+                    ChcExpr::eq(ChcExpr::int(1), v),
+                ])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bitblast_refused_body_with_disjoint_contradiction_decides_unsat() {
+        let mut constraints = arbitrary_precision_bv_noise();
+        constraints.extend(discriminant_range_filler(6));
+        constraints.extend(shift_contradiction());
+
+        // Precondition: the fused query really is undecidable without slicing.
+        let mut smt = SmtContext::new();
+        let fused = ChcExpr::and_all(constraints.iter().cloned());
+        smt.reset();
+        let fused_result = smt.check_sat_with_timeout(&fused, SMT_QUERY_TIMEOUT);
+        assert_eq!(
+            classify_smt_result(&fused_result),
+            SolveOutcomeTag::Undecided,
+            "test precondition broke: fused body is no longer undecidable ({fused_result:?})"
+        );
+
+        let mut smt = SmtContext::new();
+        assert!(
+            matches!(solve_constraints(&mut smt, &constraints), SolveOutcome::Unsat),
+            "slicing must prove the fused body UNSAT from its disjoint contradiction"
+        );
+    }
+
+    #[test]
+    fn bitblast_refused_unreachable_error_decides_safe() {
+        let mut constraints = arbitrary_precision_bv_noise();
+        constraints.extend(discriminant_range_filler(6));
+        constraints.extend(shift_contradiction());
+        let mut problem = ChcProblem::new();
+        problem.add_clause(HornClause::new(
+            ClauseBody::constraint(ChcExpr::and_all(constraints)),
+            ClauseHead::False,
+        ));
+        match acyclic_direct_smt_decision(&problem) {
+            AcyclicDecision::Safe => {}
+            AcyclicDecision::Unsafe(_) => panic!("UNSOUND: an UNSAT error body was refuted"),
+            AcyclicDecision::Inconclusive => {
+                panic!("slicing must decide the disjoint contradiction")
+            }
+        }
+    }
+
+    /// Every subset of a satisfiable conjunction is satisfiable. This goes red if
+    /// slicing rewrites a conjunct or consumes anything except definitive UNSAT.
+    #[test]
+    fn slicing_never_prunes_a_satisfiable_body() {
+        let mut constraints = discriminant_range_filler(12);
+        let a = ChcExpr::var(ChcVar::new("a", ChcSort::Int));
+        let b = ChcExpr::var(ChcVar::new("b", ChcSort::Int));
+        constraints.push(ChcExpr::lt(a.clone(), b.clone()));
+        constraints.push(ChcExpr::ge(a.clone(), ChcExpr::int(0)));
+        constraints.push(ChcExpr::le(b, ChcExpr::int(100)));
+        constraints.push(ChcExpr::le(a, ChcExpr::int(50)));
+
+        let mut smt = SmtContext::new();
+        assert!(
+            !slicing_proves_unsat(&mut smt, &constraints),
+            "FALSE PROOF: slicing claimed UNSAT on a satisfiable body"
+        );
+        let mut smt = SmtContext::new();
+        assert!(
+            matches!(solve_constraints(&mut smt, &constraints), SolveOutcome::Sat(_)),
+            "the satisfiable body must still produce its SAT model"
+        );
+    }
+
+    #[test]
+    fn slicing_cannot_divert_a_real_counterexample() {
+        let mut constraints = discriminant_range_filler(10);
+        let d = ChcExpr::var(ChcVar::new("_4", ChcSort::Int));
+        constraints.push(ChcExpr::eq(d.clone(), ChcExpr::int(0)));
+        constraints.push(ChcExpr::lt(d, ChcExpr::int(7)));
+        let mut problem = ChcProblem::new();
+        problem.add_clause(HornClause::new(
+            ClauseBody::constraint(ChcExpr::and_all(constraints)),
+            ClauseHead::False,
+        ));
+        assert!(
+            matches!(acyclic_direct_smt_decision(&problem), AcyclicDecision::Unsafe(_)),
+            "a satisfiable error body must still refute with a witness"
+        );
+    }
+
+    #[test]
+    fn non_conjunctive_top_level_is_never_sliced() {
+        let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+        let mut arms = vec![ChcExpr::and_vec(vec![
+            ChcExpr::ge(x.clone(), ChcExpr::int(32)),
+            ChcExpr::lt(x, ChcExpr::int(32)),
+        ])];
+        arms.extend((0..12).map(|i| {
+            ChcExpr::ge(ChcExpr::var(ChcVar::new(format!("y{i}"), ChcSort::Int)), ChcExpr::int(0))
+        }));
+        let constraints = vec![ChcExpr::or_vec(arms)];
+        assert!(
+            relevance_slicing::relevance_slices(&relevance_slicing::flat_conjuncts(&constraints))
+                .is_empty(),
+            "an Or-headed body must not be sliced"
+        );
+        let mut smt = SmtContext::new();
+        assert!(
+            !slicing_proves_unsat(&mut smt, &constraints),
+            "FALSE PROOF: slicing entered a disjunction"
+        );
+    }
+
+    /// Pin exact top-level conjunction flattening and prove every materialized
+    /// slice is a sub-multiset of the independently re-derived body conjuncts.
+    #[test]
+    fn every_probed_slice_is_a_submultiset_of_the_body_conjuncts() {
+        use std::collections::BTreeMap;
+
+        let mut constraints = arbitrary_precision_bv_noise();
+        constraints.extend(discriminant_range_filler(20));
+        constraints.extend(shift_contradiction());
+
+        let conjuncts = relevance_slicing::flat_conjuncts(&constraints);
+        assert_eq!(
+            ChcExpr::and_all(conjuncts.iter().cloned()),
+            ChcExpr::and_all(constraints.iter().cloned()),
+            "flattening must preserve the conjunction exactly"
+        );
+
+        let folded = ChcExpr::and_all(constraints.iter().cloned());
+        let mut available: BTreeMap<ChcExpr, usize> = BTreeMap::new();
+        for conjunct in folded.conjuncts() {
+            *available.entry(conjunct.clone()).or_default() += 1;
+        }
+
+        let slices = relevance_slicing::relevance_slices(&conjuncts);
+        assert!(!slices.is_empty(), "this body must slice, or the test proves nothing");
+        for slice in slices {
+            let subset: Vec<ChcExpr> =
+                slice.iter().map(|&index| conjuncts[index].clone()).collect();
+            let mut used: BTreeMap<ChcExpr, usize> = BTreeMap::new();
+            for element in &subset {
+                *used.entry(element.clone()).or_default() += 1;
+            }
+            for (element, count) in &used {
+                let have = available.get(element).copied().unwrap_or(0);
+                assert!(*count <= have, "slice duplicated an unavailable conjunct");
+                assert!(available.contains_key(element), "slice rewrote a conjunct: {element:?}");
+            }
+        }
     }
 }

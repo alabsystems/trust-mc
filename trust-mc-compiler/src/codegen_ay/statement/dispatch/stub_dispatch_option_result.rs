@@ -32,8 +32,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target: Option<BasicBlockIdx>,
     ) -> CallDispatchOutcome {
         if matches!(stub_kind, StubKind::OptionUnwrapUnchecked) {
+            // `unwrap_unchecked` has no panic branch (reaching it on None is UB,
+            // not a panic), so use the variant that skips the None-panic check.
             debug!("codegen_stubbed_call: Option::unwrap_unchecked - delegating to option unwrap");
-            return Self::outcome_or_fallthrough(self.codegen_option_unwrap(
+            return Self::outcome_or_fallthrough(self.codegen_option_unwrap_unchecked(
                 args,
                 destination,
                 target,

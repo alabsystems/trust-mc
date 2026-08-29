@@ -172,12 +172,13 @@ fn translate_virtual_body_inline_impl<'tcx, 'body>(
     );
 
     let resolver = PlaceResolver::FieldMap(&self_field_map);
-    let walk_ctx = InlineWalkCtx::new_with_loop_fuel_override(
+    let walk_ctx = InlineWalkCtx::new_with_loop_policy(
         body,
         resolver,
         effective_blocks,
         bb_idx,
         current_spawn_scheduler_run_loop_fuel(ctx),
+        ctx.recursive_unwind_depth as usize,
     );
     let state = InlineExecutionState::new(local_exprs, inline_vtable_ids, HashSet::new());
     let result = walk_blocks_to_return(ctx, &walk_ctx, 0, state, 0, inline_depth);
@@ -204,12 +205,13 @@ pub(in crate::codegen_ay::chc) fn translate_body_with_resolver<'tcx, 'body>(
         let ((), effective_blocks) =
             prepare_inline_walk(ctx, body, bb_idx, inline_depth, MAX_INLINE_DEPTH)?;
 
-        let walk_ctx = InlineWalkCtx::new_with_loop_fuel_override(
+        let walk_ctx = InlineWalkCtx::new_with_loop_policy(
             body,
             resolver,
             effective_blocks,
             bb_idx,
             current_spawn_scheduler_run_loop_fuel(ctx),
+            ctx.recursive_unwind_depth as usize,
         );
         let state = InlineExecutionState::new(local_exprs, caller_vtable_ids, HashSet::new());
         walk_blocks_to_return(ctx, &walk_ctx, 0, state, 0, inline_depth)

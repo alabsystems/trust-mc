@@ -45,6 +45,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             "codegen_assign: reference deref whole struct, ref={}, pointee={}",
             ref_base, pointee_base
         );
+        // FC-06 (BMC): a ref-deref store to pre-existing storage inside a
+        // modifies frame with an empty declared footprint is an assigns
+        // violation (see `statement::modifies_frame`).
+        self.bmc_modifies_check_ref_store(lhs, &pointee_base);
         let Some(rhs_expr) = self.codegen_rvalue(rhs) else {
             return false;
         };
@@ -77,7 +81,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// When pointee is an indexed element (e.g., `fn::local_1_idx_by_3`),
     /// update the array itself using store operation so subsequent reads
     /// via `arr[i]` see the updated value (#1210).
-    fn try_propagate_indexed_ref_write_to_array(
+    pub(in crate::codegen_ay::statement) fn try_propagate_indexed_ref_write_to_array(
         &mut self,
         fn_name: &str,
         pointee_base: &str,

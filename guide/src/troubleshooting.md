@@ -7,8 +7,8 @@ next line (`[AY:UNKNOWN-CATEGORY] ...`) so you can triage without reading SMT.
 
 | Category tag | Meaning | Remediation |
 |---|---|---|
-| `≥2 Array-sorted state parameters` | A predicate has ≥2 `Array` sorts in its argument list, hitting the ay-chc Array-param invariant-synthesis limit. | Track or contribute to #4259 (heap-to-scalar promotion). Consider promoting small fixed-size arrays to scalar state vars. |
-| `PDR invariant synthesis timeout` | All portfolio engines ran out of budget without producing a result. | Increase `--harness-timeout`, simplify loop invariants, or add a loop-hint via `--ay-chc-loop-hints`. |
+| `≥2 Array-sorted state parameters` | A predicate has ≥2 `Array` sorts in its argument list. The tag is DESCRIPTIVE, not causal: measured 2026-08-02, ay proves real and synthetic multi-array VCs, so there is no array-parameter ceiling; the responsible factor is unisolated (array count and predicate count vary together). | Track or contribute to #4259 (heap-to-scalar promotion). Consider promoting small fixed-size arrays to scalar state vars. |
+| `PDR invariant synthesis timeout` | All portfolio engines ran out of budget without producing a result. | Increase `--harness-timeout`, simplify loop invariants, or try `--ay-chc-auto-invariants=range`. |
 | `solver error (engine=X)` | No engine completed and none timed out — all returned `NotApplicable` / `Disabled` / `Unknown`. | Engine misconfiguration or unsupported problem class. File a bug with the SMT artifact. |
 | `no error rule encoded` | VC had `(query error)` but no rule derives it (see #4284). Degenerate / vacuous. | Confirm your harness has a reachable assertion. |
 | `uncategorized` | None of the above matched. | Re-run with `--verbose` and inspect the per-engine budget report. |
@@ -63,8 +63,8 @@ Symptom:
   `[AY:UNKNOWN-CATEGORY] ≥2 Array-sorted state parameters ...`.
 
 Diagnosis:
-- The CHC predicate shape currently exceeds the native array-parameter
-  invariant-synthesis limit.
+- The VC carries ≥2 Array-sorted predicate parameters. That is a structural
+  marker, not a proven cause.
 - This is the tracked heap-to-scalar promotion gap in
   [#4259](https://github.com/alabsystems/trust-mc/issues/4259).
 
@@ -197,11 +197,10 @@ Diagnosis:
   portfolio, or a trust-mc integration mismatch against the new AY revision.
 
 Fix:
-- Run the AY bump guardrails first: `scripts/check-ay-pin.sh`, then
-  `cargo check -p trust-mc-driver --all-targets --features "ay,ay-chc-native"`,
-  then the corpus suites (`scripts/ay-compiletest.sh`,
-  `scripts/ay-soundness-gate.sh`). The single `ay-bump-canary.sh` wrapper for
-  this ceremony is planned but NOT yet implemented (roadmap item 6.1).
+- Run the AY bump guardrails first: `scripts/check-ay-pin.sh`, the complete
+  `scripts/ay-bump-canary.sh`, and `scripts/ay-soundness-gate.sh`. The bump
+  canary includes the native API/workspace checks, a fresh dev-sysroot build,
+  and the version-sensitive corpus slices.
 - If the failure reproduces on the corpus suites, keep the reduced artifact and
   file a AY issue with the same reproducer.
 - If it only reproduces in trust-mc and not in the corpus flow, file it in trust-mc as

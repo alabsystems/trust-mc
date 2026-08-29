@@ -70,6 +70,7 @@ mod comparison_eq;
 mod datatype;
 mod datatype_deref_write;
 mod dispatch;
+mod foreign_frame;
 // NOTE: INTERNAL_WORKAROUND_COUNT is available via dispatch module for telemetry
 // within this crate. Not re-exported to avoid unused import warnings.
 mod collections;
@@ -79,6 +80,7 @@ mod iter;
 mod kani;
 mod kani_float;
 mod kani_shadow_mem;
+mod modifies_frame;
 mod operand;
 mod operand_ref;
 mod operand_scalar;
@@ -106,12 +108,13 @@ mod sort_inference;
 mod sort_inference_adt;
 mod ssa;
 mod terminator;
+mod unwind_sentinel;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 mod tests;
 
 // Re-export StatementCodegen from codegen_prelude for crate-level access.
 pub(in crate::codegen_ay) use codegen_prelude::StatementCodegen;
-pub(in crate::codegen_ay) use codegen_prelude::{AdapterStage, AdapterStageKind};
+pub(in crate::codegen_ay) use codegen_prelude::{AdapterStage, AdapterStageKind, BmcModifiesFrame};
 
 // Re-export iterator unsoundness counter accessor (#1929)
 pub(in crate::codegen_ay) use collections::get_bmc_iterator_unsound_skip_count;
@@ -163,6 +166,34 @@ pub(super) use crate::kani_middle::tuple_usage::TupleUsageAnalysis;
 // Re-export for submodule access via `super::IntoOption`.
 pub(super) use crate::codegen_ay::shared::IntoOption;
 use crate::codegen_ay::shared::take_into_option_dropped_count;
+
+/// Return a statically authenticated `ConstantIndex` offset.
+///
+/// MIR's `min_length` is only the pattern's minimum length. For a
+/// `from_end` slice projection the real index is `runtime_length - offset`, so
+/// BMC lanes without that metadata must fail closed instead of selecting
+/// `min_length - offset`. Arrays always lower with `from_end = false`.
+#[inline]
+pub(super) fn constant_index_offset(offset: u64, _min_length: u64, from_end: bool) -> Option<u64> {
+    if from_end { None } else { Some(offset) }
+}
+
+#[cfg(test)]
+mod constant_index_offset_tests {
+    use super::constant_index_offset;
+
+    #[test]
+    fn direct_array_index_is_exact() {
+        assert_eq!(constant_index_offset(3, 4, false), Some(3));
+    }
+
+    #[test]
+    fn from_end_slice_index_never_uses_pattern_minimum() {
+        assert_eq!(constant_index_offset(1, 1, true), None);
+        assert_eq!(constant_index_offset(1, 8, true), None);
+        assert_eq!(constant_index_offset(9, 2, true), None);
+    }
+}
 
 /// Result of codegen for a terminator that may have multiple successors.
 /// Each entry is (target_block, path_condition) where path_condition is Some

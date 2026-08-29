@@ -20,3 +20,4 @@ mod io_write_all_buf;
 mod io_write_buf;
 mod io_write_int;
 mod support;
+mod sync_mpsc;

@@ -30,10 +30,59 @@ use super::ChcCtx;
 /// half-second proof into a hang.
 ///
 /// Same idiom as `TRUST_MC_NO_STRAIGHTLINE_DISCHARGE` (chc/straightline_proof.rs).
-fn frame_narrowing_enabled() -> bool {
+///
+/// Read ONCE, at `ChcConfig` construction, into [`ChcConfig::frame_narrowing`].
+/// It must not be consulted again further down: the free-variable retry in
+/// `mir_to_chc_internal` disables narrowing by rebuilding the config with
+/// `frame_narrowing: false`, and a second env read below that point would
+/// re-enable it and re-drop the very columns the retry exists to restore.
+/// `TRUST_MC_FRAME_STATS=1`: print total declared frame columns per encoded
+/// function, before and after narrowing. Measurement only — it changes no
+/// verdict, and it reports the width AFTER the repair passes, which is the width
+/// the relation declarations actually get.
+fn frame_stats_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("TRUST_MC_FRAME_NARROWING").map(|v| v == "1").unwrap_or(false)
+    *ENABLED
+        .get_or_init(|| std::env::var("TRUST_MC_FRAME_STATS").map(|v| v == "1").unwrap_or(false))
+}
+
+pub(in crate::codegen_ay) fn frame_narrowing_enabled() -> bool {
+    frame_narrowing_level() >= 1
+}
+
+/// `TRUST_MC_FRAME_NARROWING=2` additionally narrows FLATTENED aggregate groups.
+///
+/// Level 1 keeps every flattened local's field slots unconditionally. That is the
+/// safe default but it is also where the columns are: the corpus's widest frame
+/// (`kani/Str/utf8.rs`, ~50 k columns) is almost entirely `_N_fldK` slots, so
+/// level 1 cannot shrink the frames that actually drive solver latency.
+///
+/// Level 2 drops such a group ATOMICALLY — every field slot of a flattened local
+/// keys to the same base local in `state_idx_to_local`, so one `retain` decision
+/// covers the whole group and a half-dropped aggregate (the slot-misalignment
+/// shape that fabricates proofs) cannot be constructed here. It is separated from
+/// level 1 because a flattened group is read through channels MIR liveness cannot
+/// see far more often than a scalar is, so it leans harder on the free-variable
+/// validator and its full-frame re-encode.
+pub(in crate::codegen_ay) fn frame_narrowing_flattened_enabled() -> bool {
+    frame_narrowing_level() >= 2
+}
+
+fn frame_narrowing_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        // DEFAULT 1 (level-1 scalar narrowing ON). Measured same-tree, same-pin:
+        // expected 307 -> 315 (+8), kani 458 -> 457 (-1, inside the +-3 noise
+        // band) = +7 combined, missed_bug 0 / unsound_pass 0 in both arms.
+        // Safe to default ON only because narrowing is now SPECULATIVE: the full
+        // frame is encoded first and a narrowed VC is kept only when the full one
+        // was not straight-line discharged (G1), which is what used to turn a
+        // 0.002s syntactic proof into a 38s `unknown`.
+        // Level 2 (flattened aggregate groups) stays opt-in.
+        std::env::var("TRUST_MC_FRAME_NARROWING")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(1)
     })
 }
 
@@ -446,11 +495,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// flattened field groups and pointer-mediated pointees. Only columns that map
     /// to a MIR local are eligible; ambient state (heap metadata, shadow memory,
     /// vtables, mutable statics, memory arrays) is never touched.
+    ///
+    /// FAIL-CLOSED in three places, because a wrongly dropped column is a havoc:
+    /// the fixpoint BAILS WITHOUT RESTRICTING if its iteration bound is hit
+    /// rather than restrict from half-computed sets; a column with no MIR local
+    /// is kept; and `ambient_protected` columns are kept even when the local they
+    /// were aliased onto is dead. Flattened groups are kept entirely at level 1
+    /// and dropped only as whole groups at level 2 (`TRUST_MC_FRAME_NARROWING=2`).
+    ///
+    /// None of that makes the result trustworthy on its own — MIR liveness is not
+    /// a model of what the CHC encoder reads. The decision is validated on the
+    /// EMITTED VC by `constraint_vars_outside_relation_frames`, and a VC that
+    /// fails it is discarded in favour of the full-frame encode
+    /// (`stmt/codegen_stmt_output.rs::narrow_or_reencode`).
     fn restrict_to_backward_live_locals(
         &self,
         result: &mut [Vec<usize>],
         state_idx_to_local: &HashMap<usize, usize>,
     ) {
+        let narrow_flattened = self.frame_narrowing_flattened;
         let block_count = self.body.blocks.len();
         if block_count == 0 || result.len() != block_count {
             return;
@@ -544,16 +607,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 let keep = match state_idx_to_local.get(idx) {
                     // A FLATTENED aggregate's field slots are all keyed to the base
-                    // local, so a single `retain` kills the whole group — and
-                    // `enforce_atomic_flattened_liveness` iterates the SURVIVING set,
-                    // so it cannot restore a group that was wholly removed. Worse,
-                    // `used` cannot see field reads at all: `collect_place_index_locals`
-                    // records only `ProjectionElem::Index`, so `L.field` never marks `L`
-                    // used. Both together make MIR liveness structurally wrong for
-                    // these locals — observed as `_check_utf8_1_fld2__out` surviving in
-                    // the encoding of the corpus's widest frame (kani/Str/utf8.rs,
-                    // ~49,805 columns) after its group had been dropped.
-                    Some(local) if self.flatten.flattened_tuple_locals.contains(local) => true,
+                    // local, so a single `retain` decides the whole group at once —
+                    // atomic by construction, which is what keeps the level-2 drop
+                    // out of the slot-misalignment shape. What it does NOT get is a
+                    // second chance: `enforce_atomic_flattened_liveness` iterates the
+                    // SURVIVING set, so it cannot restore a group that was wholly
+                    // removed. The recovery path for a wrongly dropped group is the
+                    // free-variable validator's full-frame re-encode, which is why
+                    // this is level 2 and scalars are level 1.
+                    //
+                    // (The base local IS marked used by a field read:
+                    // `collect_operand_local` inserts `place.local` for every
+                    // Copy/Move regardless of projection. `collect_place_index_locals`
+                    // adds only the extra locals named by `ProjectionElem::Index`.)
+                    Some(local)
+                        if !narrow_flattened
+                            && self.flatten.flattened_tuple_locals.contains(local) =>
+                    {
+                        true
+                    }
                     Some(local) => live.contains(local),
                     None => true, // ambient state var: never restricted here
                 };
@@ -597,11 +669,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let state_idx_to_local = self.build_state_idx_to_local_map();
         let mut result = self.compute_forward_per_block_liveness(&state_idx_to_local);
         self.propagate_backward_liveness(&mut result, &state_idx_to_local, retained_blocks);
-        if self.frame_narrowing || frame_narrowing_enabled() {
+        let columns_before: usize = result.iter().map(Vec::len).sum();
+        // Config only. `ChcConfig::frame_narrowing` already carries the env
+        // opt-in (resolved at construction), and it is the flag the
+        // free-variable retry clears — OR-ing the env var back in here made the
+        // retry a no-op and the validator dead code.
+        if self.frame_narrowing {
             self.restrict_to_backward_live_locals(&mut result, &state_idx_to_local);
         }
         self.enforce_atomic_flattened_liveness(&mut result, &state_idx_to_local);
         self.propagate_ref_target_liveness(&mut result, &state_idx_to_local);
+        if frame_stats_enabled() {
+            let columns_after: usize = result.iter().map(Vec::len).sum();
+            eprintln!(
+                "FRAME_STATS fn={} blocks={block_count} state_vars={state_count} \
+                 columns_before={columns_before} columns_after={columns_after}",
+                self.fn_name
+            );
+        }
 
         trace!(block_count, state_count, "computed per-block live state indices");
         self.state_var_mgr.live_state_indices = result;

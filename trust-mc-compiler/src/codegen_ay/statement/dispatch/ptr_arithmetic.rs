@@ -9,7 +9,7 @@
 use ay_bindings::Expr;
 use rustc_public::mir::{BasicBlockIdx, Operand, Place};
 use rustc_public::ty::{RigidTy, TyKind};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::statement::StatementCodegen;
@@ -18,12 +18,57 @@ use crate::kani_middle::abi::LayoutOf;
 
 use super::super::IntoOption;
 
+/// Whether a pointer offset carries the out-of-bounds UB obligations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OffsetUb {
+    /// `ptr::offset` — leaving the object is UB.
+    Checked,
+    /// `arith_offset` — wrapping; leaving the object is permitted.
+    Wrapping,
+}
+
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     pub(in crate::codegen_ay::statement) fn codegen_ptr_offset_intrinsic(
         &mut self,
         args: &[Operand],
         destination: &Place,
         target: Option<BasicBlockIdx>,
+    ) -> Option<BasicBlockIdx> {
+        self.codegen_ptr_offset_common(args, destination, target, OffsetUb::Checked)
+    }
+
+    /// `arith_offset` — the WRAPPING pointer offset.
+    ///
+    /// Computing an out-of-bounds address is NOT UB here: `arith_offset` is
+    /// `wrapping_offset`, and only a later dereference of the result is
+    /// undefined. The corpus states exactly that — `arith-offset-overflow`
+    /// calls `arith_offset(ptr, isize::MAX)` with no dereference and expects
+    /// VERIFICATION:- SUCCESSFUL. So this shares the offset arithmetic and
+    /// emits none of the `offset_*` obligations; the deref-site object-bounds
+    /// check carries the obligation for any later read or write.
+    ///
+    /// Shipping this required two prior pieces, in order, and both attempts
+    /// without them produced FALSE PROOFS (fail-closed demotions traded for
+    /// clean SUCCESSFULs on UB): first the deref-site bounds check itself, and
+    /// then real `fld_len` metadata for fat-pointer views — `&str` fat pointers
+    /// were synthesized with an UNCONSTRAINED length, so the bounds check could
+    /// never fire through `str::as_ptr` and `arith-offset-u8-fail` verified
+    /// clean.
+    pub(in crate::codegen_ay::statement) fn codegen_arith_offset_intrinsic(
+        &mut self,
+        args: &[Operand],
+        destination: &Place,
+        target: Option<BasicBlockIdx>,
+    ) -> Option<BasicBlockIdx> {
+        self.codegen_ptr_offset_common(args, destination, target, OffsetUb::Wrapping)
+    }
+
+    fn codegen_ptr_offset_common(
+        &mut self,
+        args: &[Operand],
+        destination: &Place,
+        target: Option<BasicBlockIdx>,
+        ub: OffsetUb,
     ) -> Option<BasicBlockIdx> {
         if args.len() < 2 {
             return None;
@@ -80,7 +125,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // that would launder a value (or a `FALLBACK_PTR` literal) into an
         // address. args[1] is the element count, a value by role.
         let count = Val::of_value(count_expr.clone());
-        if let Some(base) = Self::establish_pointer_base_address(&ptr_operand_expr) {
+        if matches!(ub, OffsetUb::Wrapping) {
+            // Wrapping offset: the address may legally leave the object, so
+            // there is no obligation here. The deref site carries it.
+        } else if let Some(base) = Self::establish_pointer_base_address(&ptr_operand_expr) {
             self.emit_offset_overflow_check(&base, &count, pointee_size);
         } else {
             // No address exists here, so `pointer_invalid` cannot be asked and
@@ -152,9 +200,62 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             1
         };
 
-        let diff_bytes = lhs_ptr.bvsub(rhs_ptr);
+        let diff_bytes = lhs_ptr.clone().bvsub(rhs_ptr.clone());
         let elem_size = if pointee_size == 0 { 1 } else { pointee_size };
         let size_expr = Expr::bitvec_const(elem_size as u128, ptr_width);
+
+        // Obligations from Kani's ptr_offset_from model
+        // (library/kani_core/src/models.rs), which this handler replaces:
+        // for ptr1 != ptr2 the pointers must point into the SAME allocation,
+        // the byte distance must be a multiple of size_of::<T>, and the
+        // unsigned variant additionally demands a non-negative distance.
+        // None of these were emitted — the handler lowered straight to
+        // (ptr1 - ptr2) / size, so the corpus test whose whole purpose is
+        // the out-of-bounds failure reported [AY:VACUOUS:dead-checks]
+        // (tests/expected/offset-bounds-check/offset_from_unsigned.rs) and
+        // a genuinely UB offset_from proved SAFE. Each check follows Kani's
+        // assert-then-assume lowering (code after a failed check is
+        // path-constrained).
+        let differs = lhs_ptr.clone().eq(rhs_ptr.clone()).not();
+        let same_alloc = self
+            .ctx
+            .heap_pointer_object(lhs_ptr.clone())
+            .eq(self.ctx.heap_pointer_object(rhs_ptr.clone()));
+        self.record_violation_guarded_with_message(
+            differs.clone().and(same_alloc.clone().not()),
+            "ptr_offset_from_same_alloc",
+            Some("Offset result and original pointer should point to the same allocation".to_string()),
+        );
+        let mut no_ub = differs.clone().not().or(same_alloc);
+        if elem_size > 1 {
+            let zero = Expr::bitvec_const(0u128, ptr_width);
+            let rem_zero = diff_bytes.clone().bvsrem(size_expr.clone()).eq(zero);
+            self.record_violation_guarded_with_message(
+                differs.clone().and(rem_zero.clone().not()),
+                "ptr_offset_from_exact_multiple",
+                Some(
+                    "Expected the distance between the pointers, in bytes, to be a multiple of the size of `T`"
+                        .to_string(),
+                ),
+            );
+            no_ub = no_ub.and(differs.clone().not().or(rem_zero));
+        }
+        if unsigned {
+            let zero = Expr::bitvec_const(0u128, ptr_width);
+            let non_negative = diff_bytes.clone().bvslt(zero).not();
+            self.record_violation_guarded_with_message(
+                differs.clone().and(non_negative.clone().not()),
+                "ptr_offset_from_non_negative",
+                Some("Expected non-negative distance between pointers".to_string()),
+            );
+            no_ub = no_ub.and(differs.not().or(non_negative));
+        }
+        let constraint = match &self.current_path_condition {
+            None => no_ub,
+            Some(pc) => pc.clone().implies(no_ub),
+        };
+        self.ctx.add_ordered_assumption(constraint);
+
         let offset =
             if unsigned { diff_bytes.bvudiv(size_expr) } else { diff_bytes.bvsdiv(size_expr) };
 
@@ -245,7 +346,56 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         );
 
         self.assign_value_to_place(destination, result);
+
+        // PROVENANCE: carry the array identity across pointer arithmetic, and
+        // record WHICH element the advanced pointer addresses.
+        //
+        // Without this, `a.as_mut_ptr().add(2)` produced an address with no
+        // relationship to `a`, so a store through it was dropped and
+        // `assert!(a[2] == 0)` was PROVED after writing 9. The element index is
+        // encoded in the pointee NAME using the existing `_idx_by_<local>`
+        // convention that `try_propagate_indexed_ref_write_to_array` already
+        // understands, so the write-back reuses the machinery the `&mut a[i]`
+        // path uses rather than inventing a second one.
+        self.record_offset_ptr_provenance(args, destination);
         target
+    }
+
+    /// Propagate `ref_pointees` across `ptr.add(count)` / `ptr.offset(count)`,
+    /// naming the element the result points at.
+    ///
+    /// Declines unless the base pointer has array provenance AND the count is a
+    /// plain local: an unresolvable count would otherwise be silently recorded
+    /// as element 0, which is a wrong answer rather than a missing one.
+    fn record_offset_ptr_provenance(&mut self, args: &[Operand], destination: &Place) {
+        let (Some(ptr_arg), Some(count_arg)) = (args.first(), args.get(1)) else {
+            return;
+        };
+        let ptr_place = match ptr_arg {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Constant(_) => return,
+        };
+        let ptr_base = self.root_ssa_base_name(ptr_place);
+        let Some(array_base) = self.ref_pointees.get(ptr_base.as_str()).cloned() else {
+            return;
+        };
+        // Already element-qualified (a second `.add` on an advanced pointer):
+        // the indices would have to be summed, which this does not model.
+        if array_base.contains("_idx_by_") {
+            return;
+        }
+        let count_place = match count_arg {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Constant(_) => return,
+        };
+        if !count_place.projection.is_empty() {
+            return;
+        }
+        let dest_base: std::sync::Arc<str> =
+            std::sync::Arc::from(self.root_ssa_base_name(destination));
+        let qualified = format!("{}_idx_by_{}", array_base, count_place.local);
+        debug!("Model(Offset): provenance {} -> {}", dest_base, qualified);
+        self.ref_pointees.insert(dest_base, std::sync::Arc::from(qualified.as_str()));
     }
 
     /// Try to codegen `offset_from_unsigned::runtime_ptr_ge(self, origin) -> bool`.

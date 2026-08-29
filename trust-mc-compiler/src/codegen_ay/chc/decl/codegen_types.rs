@@ -84,9 +84,17 @@ impl<'tcx, 'body> CodegenTypes<'tcx, 'body> for ChcCtx<'tcx, 'body> {
     /// datatype constructor applications that fail AY's parser.
     fn deref_ref_ty_sized_only(ty: rustc_public::ty::Ty) -> (rustc_public::ty::Ty, bool) {
         match ty.kind() {
-            TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _))
-                if Self::ref_pointee_is_fat_bv128(inner) =>
-            {
+            // RAW pointers keep POINTER semantics. A `*mut T` local is already a
+            // BV64 ADDRESS, so stripping the payload of `Option<*mut T>` to `T`
+            // declares a pointee-width slot and forces the aggregate store to
+            // TRUNCATE the address into it (`extract 31 0` of a 64-bit pointer,
+            // then sign-extend back) — the object-id lane is destroyed and the
+            // pointer that comes back out is a different pointer. Observed on
+            // `AtomicPtr::fetch_update`, whose CAS stores `Some(new)`'s payload.
+            // References stay value-modeled: that is a deliberate model, and
+            // `&T` payload reads are routed through the deref machinery.
+            TyKind::RigidTy(RigidTy::RawPtr(..)) => (ty, false),
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _)) if Self::ref_pointee_is_fat_bv128(inner) => {
                 (ty, false)
             }
             _ => Self::deref_ref_ty(ty),

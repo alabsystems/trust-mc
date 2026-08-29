@@ -317,6 +317,33 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                 return;
             }
             ExprValue::BoolConst(false) => {
+                // A guard that folds to FALSE is a PROOF that this edge is
+                // infeasible. When the target is an `Unreachable` block, that
+                // proof IS the harness's obligation — "control never reaches
+                // the unreachable" — discharged at encode time.
+                //
+                // It used to leave no trace, so a harness whose ONLY obligation
+                // was an unreachable arm emitted ZERO properties and the
+                // driver's V4 gate reported a PROVED harness as vacuous. `?` on
+                // a `Result`, an uninhabited `!` arm and a niche-optimised enum
+                // match all produce exactly that shape.
+                //
+                // Register the property and emit NO rule: nothing can derive
+                // `error_p{id}`, so the solver reports it discharged. The
+                // obligation becomes visible as the SUCCESS it already was,
+                // instead of being inferred from an absence.
+                if target < self.body.blocks.len()
+                    && matches!(
+                        self.body.blocks[target].terminator.kind,
+                        rustc_public::mir::TerminatorKind::Unreachable
+                    )
+                {
+                    let _ = self.register_error_head(
+                        trust_mc_core::violation::PropertyKind::Unreachable,
+                        target,
+                        Some("unreachable code reached".to_string()),
+                    );
+                }
                 debug!(?target, "skipping guarded transition rule (guard=false)");
                 return;
             }
@@ -373,6 +400,33 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                 return;
             }
             ExprValue::BoolConst(false) => {
+                // A guard that folds to FALSE is a PROOF that this edge is
+                // infeasible. When the target is an `Unreachable` block, that
+                // proof IS the harness's obligation — "control never reaches
+                // the unreachable" — discharged at encode time.
+                //
+                // It used to leave no trace, so a harness whose ONLY obligation
+                // was an unreachable arm emitted ZERO properties and the
+                // driver's V4 gate reported a PROVED harness as vacuous. `?` on
+                // a `Result`, an uninhabited `!` arm and a niche-optimised enum
+                // match all produce exactly that shape.
+                //
+                // Register the property and emit NO rule: nothing can derive
+                // `error_p{id}`, so the solver reports it discharged. The
+                // obligation becomes visible as the SUCCESS it already was,
+                // instead of being inferred from an absence.
+                if target < self.body.blocks.len()
+                    && matches!(
+                        self.body.blocks[target].terminator.kind,
+                        rustc_public::mir::TerminatorKind::Unreachable
+                    )
+                {
+                    let _ = self.register_error_head(
+                        trust_mc_core::violation::PropertyKind::Unreachable,
+                        target,
+                        Some("unreachable code reached".to_string()),
+                    );
+                }
                 debug!(?target, "skipping guarded transition rule (guard=false)");
                 return;
             }

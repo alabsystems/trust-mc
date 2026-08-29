@@ -14,13 +14,18 @@ use rustc_public::mir::{
     AggregateKind, Body, LocalDecl, Operand, Rvalue, StatementKind, TerminatorKind,
 };
 use rustc_public::ty::{AdtKind, ClosureKind, RigidTy, TyKind};
+use tracing::debug;
 
 use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::bool_sort;
 use crate::rustc_public_bridge::IndexedVal;
 
 use super::super::ChcCtx;
+use super::super::inline_body::translate_closure_inline_body;
 use super::super::stubs_option_helpers::{OptionHelpers, option_value_sort};
+use crate::codegen_ay::chc::quantifier_encoding::{
+    ClosureBodyResult, translate_closure_body_with_params,
+};
 
 fn closure_returns_option_like_success(body: &Body) -> bool {
     let mut block_idx = 0;
@@ -165,6 +170,65 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Some((self.make_some_expr_for_option(payload, out_sort), None))
     }
 
+    /// Fold FOR REAL: replay the user closure once per element.
+    ///
+    /// Returns `Some((acc, fully_covered))` when the element sequence is
+    /// addressable AND the closure body could be replayed for every step.
+    /// The caller keeps its previous over-approximation on the
+    /// `!fully_covered` side, so this lane can only add precision.
+    fn try_precise_fold(
+        &mut self,
+        args: &[Operand],
+        modified_locals: &HashSet<usize>,
+        init_expr: &Expr,
+        acc_sort: &Sort,
+    ) -> Option<(Expr, Expr, Vec<Expr>)> {
+        let closure_body =
+            resolve_try_fold_closure_body_for_operand(args.get(2)?, self.body.locals())?;
+        let reduction = self.precise_reduce_chain(
+            args,
+            modified_locals,
+            init_expr,
+            acc_sort,
+            |ctx, acc, elem| {
+                // Closure locals: 0 = return, 1 = environment, 2 = accumulator,
+                // 3 = item. An empty capture list fails CLOSED — a capturing
+                // closure leaves its local unresolved and the walk returns None,
+                // abandoning the whole chain rather than folding a wrong value.
+                let params = [acc.clone(), elem.clone()];
+                translate_closure_inline_body(ctx, &closure_body, &params, &[], 0, 0).or_else(
+                    || {
+                        translate_closure_body_with_params(ctx, &closure_body, &params, &[], 0)
+                            .map(|ClosureBodyResult { pred, .. }| pred)
+                    },
+                )
+            },
+        )?;
+        debug!("iter fold: precise per-element replay emitted (fold folds)");
+        Some((reduction.acc, reduction.fully_covered, reduction.constraints))
+    }
+
+    /// Sum FOR REAL: `acc + elem` per element, same coverage contract as
+    /// [`Self::try_precise_fold`].
+    fn try_precise_sum(
+        &mut self,
+        args: &[Operand],
+        modified_locals: &HashSet<usize>,
+        zero: &Expr,
+        acc_sort: &Sort,
+    ) -> Option<(Expr, Expr, Vec<Expr>)> {
+        if acc_sort.bitvec_width().is_none() {
+            return None;
+        }
+        let reduction =
+            self.precise_reduce_chain(args, modified_locals, zero, acc_sort, |ctx, acc, elem| {
+                let elem = ctx.coerce_value_to_sort(elem.clone(), acc.sort(), true)?;
+                Some(acc.clone().bvadd(elem))
+            })?;
+        debug!("iter sum: precise per-element replay emitted (sum sums)");
+        Some((reduction.acc, reduction.fully_covered, reduction.constraints))
+    }
+
     /// Handle IterFold and IterSum reduction arms.
     pub(in crate::codegen_ay::chc) fn codegen_reduce_arm(
         &mut self,
@@ -173,6 +237,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         modified_locals: &HashSet<usize>,
         dest_local: usize,
         dest_vec_idx: usize,
+        extra_constraints: &mut Vec<Expr>,
     ) -> (Option<Expr>, Option<Vec<Option<Expr>>>) {
         match stub {
             StubKind::IterFold => {
@@ -222,8 +287,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         (Some(symbolic_result), None)
                     } else {
                         let symbolic_result =
-                            self.fresh_adapter_symbol("iter_fold_value", init_sort);
-                        (Some(Expr::ite(has_remaining, symbolic_result, init_expr)), None)
+                            self.fresh_adapter_symbol("iter_fold_value", init_sort.clone());
+                        let overapprox =
+                            Expr::ite(has_remaining, symbolic_result, init_expr.clone());
+                        let folded = self
+                            .try_precise_fold(args, modified_locals, &init_expr, &init_sort)
+                            .map_or(overapprox.clone(), |(acc, covered, chain)| {
+                                extra_constraints.extend(chain);
+                                Expr::ite(covered, acc, overapprox)
+                            });
+                        (Some(folded), None)
                     }
                 } else {
                     (None, None)
@@ -242,8 +315,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         // is fully symbolic, making sum result nondeterministic.
                         "iter_sum_advance_failed",
                     );
-                    let symbolic_result = self.fresh_adapter_symbol("iter_sum_value", out_sort);
-                    (Some(Expr::ite(has_remaining, symbolic_result, zero)), None)
+                    let symbolic_result =
+                        self.fresh_adapter_symbol("iter_sum_value", out_sort.clone());
+                    let overapprox = Expr::ite(has_remaining, symbolic_result, zero.clone());
+                    let summed = self
+                        .try_precise_sum(args, modified_locals, &zero, &out_sort)
+                        .map_or(overapprox.clone(), |(acc, covered, chain)| {
+                            extra_constraints.extend(chain);
+                            Expr::ite(covered, acc, overapprox)
+                        });
+                    (Some(summed), None)
                 } else {
                     (None, None)
                 }

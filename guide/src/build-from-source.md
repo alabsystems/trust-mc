@@ -17,10 +17,11 @@ In general, the following dependencies are required to build trust-mc from sourc
 > (`--backend` accepts `auto` and `ay`). CBMC content in this repository is
 > retained as historical upstream reference, not as an active runtime backend.
 
-> **NOTE**: The setup scripts below install additional solvers for regression
-> and benchmark workflows (cvc5, kissat) plus optional CBMC. They do **not**
-> install the AY solver. Install AY separately and ensure the `ay` binary is in
-> your PATH.
+> **NOTE**: the `scripts/setup/` dependency installers referenced below are
+> inherited from upstream Kani and are **not present** in this repository.
+> Install rustup from <https://rustup.rs/>, link the toolchain named in
+> `rust-toolchain.toml`, and build the AY solver separately (see
+> [Installation](./install-guide.md)) so the `ay` binary is on your PATH.
 
 trust-mc has been tested in [Ubuntu](#install-dependencies-on-ubuntu) and [macOS](#install-dependencies-on-macos) platforms.
 
@@ -45,27 +46,22 @@ To use a local AY checkout for rapid co-development:
    ```bash
    git clone https://github.com/alabsystems/ay.git
    ```
-2. Uncomment the `[patch]` section in `.cargo/config.toml` to override
-   git deps with your local AY checkout, then use `cargo build-dev`.
-   To update pinned revisions, follow the bump procedure documented above
-   the `[workspace.dependencies]` pin block in `Cargo.toml`
-   (`scripts/check-ay-pin.sh`, then `cargo update -p ay-chc`), and run
-   `cargo check -p trust-mc-driver --all-targets --features "ay,ay-chc-native"`
-   before trusting the new pin so `ay-chc` API visibility drift is caught
-   early. A single `scripts/ay-bump-canary.sh` wrapper for this ceremony is
-   planned but NOT yet implemented (roadmap item 6.1 in
-   `docs/roadmap-100-parity-2026-07-06.md`).
+2. The committed `[patch."https://github.com/alabsystems/ay.git"]` table in
+   `Cargo.toml` already redirects the audited AY packages to that sibling.
+   Check out the desired pushed commit there, keep it clean, and update the
+   uniform manifest authority with
+   `scripts/bump-ay-pin.py <40-char-rev> <version>`. Then run
+   `scripts/check-ay-pin.sh` and the complete
+   `scripts/ay-bump-canary.sh`; the latter performs the native API checks,
+   rebuilds the dev sysroot once, and executes the version-sensitive corpus
+   canaries against that build.
 
 > **NOTE**: When reporting verification metrics or benchmarks, always record the
 > AY commit hash used. Path dependencies are not reproducible across clones.
 
-`scripts/ay-compiletest.sh` normally preserves its historical developer
-convenience of auto-pulling a sibling `../ay` checkout before running. For
-reproducible or self-contained runs, set `AY_SELF_CONTAINED=1`; Trust
-full-verify/release environments enable this behavior automatically. In that
-mode the script will not fetch or pull the sibling AY checkout unless
-`AY_ALLOW_PULL=1` is set explicitly. `AY_NO_PULL=1` remains the force-off switch
-and takes precedence.
+The measurement runners never fetch, pull, or check out the sibling AY tree.
+Align it explicitly before a run; `scripts/check-ay-pin.sh` fails if its clean
+HEAD is not the declared authority.
 
 See `Cargo.toml` comments for full rationale.
 
@@ -113,16 +109,13 @@ cargo build-dev
 ```
 to compile in debug/development mode.
 
-Then, optionally, run the regression tests:
+There is no monolithic regression wrapper. Run the Rust units and the
+fail-closed AY corpus gates explicitly:
 
 ```
-./scripts/trust-mc-regression.sh
-```
-
-This script has a lot of noisy output, but on a successful run you'll see at the end of the execution:
-
-```
-All trust-mc regression tests completed successfully.
+cargo test --workspace --no-fail-fast
+./scripts/ay-compiletest.sh expected
+./scripts/ay-soundness-gate.sh
 ```
 
 ## Adding trust-mc to your path

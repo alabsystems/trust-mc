@@ -164,7 +164,48 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             self.coerce_to_ptr_width(arg_expr)
         };
         self.assign_value_to_place(destination, ptr);
+
+        // PROVENANCE: remember which array this pointer addresses.
+        //
+        // `a.as_mut_ptr()` returns an address, and nothing recorded that it
+        // belongs to `a`. A later `*p = v` therefore had nothing to write back
+        // to, so the store was dropped and `assert!(a[0] == old)` was PROVED —
+        // see docs/findings/2026-08-22-raw-pointer-stores-are-dropped.md. The
+        // pointer starts at element 0; `codegen_model_offset` refines it when
+        // the pointer is advanced.
+        if let Some(arg) = args.first() {
+            self.record_slice_ptr_provenance(arg, destination);
+        }
         target
+    }
+
+    /// Record `ref_pointees[dest] = <array base>` for a slice/array data
+    /// pointer, following the argument's own reference chain first (the
+    /// argument is typically `&a` or `&mut a`, not `a`).
+    fn record_slice_ptr_provenance(&mut self, arg: &Operand, destination: &Place) {
+        let arg_place = match arg {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Constant(_) => return,
+        };
+        let mut base: std::sync::Arc<str> =
+            std::sync::Arc::from(self.root_ssa_base_name(arg_place));
+        // `&a` records ref_pointees[ref] = a; resolve through it so the
+        // provenance names the ARRAY, not the reference to it.
+        for _ in 0..4 {
+            let Some(next) = self.ref_pointees.get(base.as_ref()).cloned() else {
+                break;
+            };
+            base = next;
+        }
+        // Only claim provenance we can actually use: the base must name a
+        // local whose value is an SMT array.
+        if !self.env_lookup(base.as_ref()).is_some_and(|e| e.sort().is_array()) {
+            return;
+        }
+        let dest_base: std::sync::Arc<str> =
+            std::sync::Arc::from(self.root_ssa_base_name(destination));
+        debug!("slice::as_ptr: provenance {} -> {}", dest_base, base);
+        self.ref_pointees.insert(dest_base, base);
     }
 
     fn codegen_box_into_raw_with_allocator_stub(

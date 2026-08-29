@@ -59,12 +59,53 @@ fn main() {
 
     // Only rebuild when HEAD changes (new commit), not on every staging operation.
     // Previously included `.git/index` which triggered rebuilds on every `git add`.
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    //
+    // The paths MUST be resolved through `git rev-parse --git-path`, never
+    // spelled as a literal `.git/HEAD`: build scripts run with cwd = this
+    // package dir (trust-mc-driver/), where no `.git` exists at all — the
+    // repository's git dir is one level up, and when trust-mc is consumed as a
+    // git submodule (trust's first-party/trust-mc) it is a gitlink FILE whose
+    // real dir lives under the superproject's `.git/modules/...`. Cargo treats
+    // a `rerun-if-changed` path that does not exist as ALWAYS DIRTY, so the
+    // literal spelling re-ran this script on every cargo invocation and
+    // recompiled trust-mc-driver -> trust-bmc -> trust-router -> targo-trust
+    // and rustc_mir_transform -> rustc_driver each time. Measured in trust's
+    // `x.py build --stage 2` (2026-08-22, aarch64-apple-darwin, seed
+    // 1.99.0-trust): every re-invocation relinked the stage1 trustc (53s) and
+    // rebuilt stage1 std (49s), and the fresher stage1 trustc mtime made
+    // bootstrap's clear_if_dirty wipe the stage2 tool target dirs, so stage2
+    // cargo (3m21s) and stage2 targo-trust (~600 crates) restarted from zero
+    // on every run — the build could never converge under a 10-minute
+    // per-invocation budget. A path that cannot be resolved or does not exist
+    // is simply not registered (the GIT_* values then refresh only when some
+    // other input changes), which is the documented fallback for tarball /
+    // non-git installs anyway.
+    let git_path = |rel: &str| -> Option<String> {
+        let out = Command::new("git")
+            .args(["rev-parse", "--git-path", rel])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!path.is_empty() && std::path::Path::new(&path).is_file()).then_some(path)
+    };
+    if let Some(head) = git_path("HEAD") {
+        println!("cargo:rerun-if-changed={head}");
+    }
     // Track the ref file that HEAD points to (e.g., refs/heads/main) so we
-    // detect new commits on the current branch.
-    if let Ok(head_content) = std::fs::read_to_string(".git/HEAD")
-        && let Some(ref_path) = head_content.trim().strip_prefix("ref: ")
+    // detect new commits on the current branch. `symbolic-ref -q` fails on a
+    // detached HEAD (the normal submodule state), and a packed ref has no
+    // loose file — both cases fall through to HEAD alone, which still changes
+    // on every checkout/commit in those states.
+    if let Some(ref_path) = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|r| !r.is_empty())
+        && let Some(ref_file) = git_path(&ref_path)
     {
-        println!("cargo:rerun-if-changed=.git/{ref_path}");
+        println!("cargo:rerun-if-changed={ref_file}");
     }
 }

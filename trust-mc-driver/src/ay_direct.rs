@@ -117,11 +117,30 @@ pub(crate) fn run_ay_direct_with_timeout(
 
     // Cancellation token: set to true when timeout fires so the solver
     // thread can exit promptly instead of running indefinitely.
+    //
+    // The between-commands check below cannot do that on its own: it only runs
+    // in the gap BETWEEN commands, and the command that overruns is invariably
+    // the single `(check-sat)`. Installing the same flag as ay's own interrupt
+    // makes it effective *inside* that call — ay documents `set_interrupt` as
+    // "checked during every check-sat", returning Unknown/Interrupted. Without
+    // it the flag was set on timeout and then never observed, so the thread ran
+    // to natural completion at full speed while the driver moved on to the next
+    // harness; under `--jobs N` those orphans compete with live work.
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_clone = Arc::clone(&cancelled);
+    let executor_interrupt = Arc::clone(&cancelled);
+
+    // Also hand ay the budget itself. Previously `timeout` was used ONLY for
+    // the driver-side `recv_timeout`, so the solver was never told how long it
+    // had and could not bail on its own. The deadline is set equal to the
+    // driver's wait, so no answer that used to be delivered is lost: anything
+    // ay produces after that instant was already being discarded.
+    let solve_deadline = Instant::now() + timeout;
 
     std::thread::spawn(move || {
         let mut executor = ay_dpll::Executor::new();
+        executor.set_interrupt(executor_interrupt);
+        executor.set_deadline(Some(solve_deadline));
         let mut check_sat_result: Option<&'static str> = None;
         let mut failed_assert_count: u32 = 0;
         let mut failed_other_count: u32 = 0;

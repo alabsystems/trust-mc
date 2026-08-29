@@ -140,6 +140,12 @@ pub(in crate::codegen_ay) struct GlobalDiagnosticCounters {
     /// Records how many recursive-inline exhaustion events occurred per harness,
     /// so the compiler can emit `; RECURSIVE_UNWIND_ASSERTION:` SMT markers.
     pub(in crate::codegen_ay) recursive_unwind_by_fn: OnceLock<Mutex<BTreeMap<String, usize>>>,
+    /// Per-function "the straight-line discharge proved the checks UNREACHABLE,
+    /// not SAFE" flags. Lets the compiler emit a
+    /// `; VACUOUS_ALL_CHECKS_UNREACHABLE:` SMT marker, which is the only way
+    /// the distinction survives a discharge that replaces the system with
+    /// `false => error`.
+    pub(in crate::codegen_ay) vacuous_checks_by_fn: OnceLock<Mutex<BTreeMap<String, usize>>>,
 }
 
 /// Single process-global instance of all diagnostic counters (Part of #2906).
@@ -196,6 +202,7 @@ pub(in crate::codegen_ay) static GLOBAL_COUNTERS: GlobalDiagnosticCounters =
         inferable_summary_names_by_fn: OnceLock::new(),
         aggregate_gap_reasons_by_fn: OnceLock::new(),
         recursive_unwind_by_fn: OnceLock::new(),
+        vacuous_checks_by_fn: OnceLock::new(),
     };
 
 impl GlobalDiagnosticCounters {
@@ -349,6 +356,11 @@ impl GlobalDiagnosticCounters {
             guard.clear();
         }
         if let Some(map) = self.recursive_unwind_by_fn.get()
+            && let Ok(mut guard) = map.lock()
+        {
+            guard.clear();
+        }
+        if let Some(map) = self.vacuous_checks_by_fn.get()
             && let Ok(mut guard) = map.lock()
         {
             guard.clear();

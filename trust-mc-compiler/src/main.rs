@@ -48,6 +48,9 @@ extern crate rustc_target;
 extern crate tempfile;
 
 mod args;
+/// Restricted C front-end for `--c-lib` translation units (`-Z c-ffi`).
+#[cfg(feature = "ay")]
+mod c_ffi;
 #[cfg(feature = "ay")]
 mod codegen_ay;
 mod intrinsics;

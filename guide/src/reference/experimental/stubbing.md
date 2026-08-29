@@ -112,10 +112,9 @@ In the following, we describe all the limitations of the stubbing feature.
 
 ### Usage restrictions
 
-The usage of stubbing is limited to the verification of a single harness.
-Therefore, users are **required to pass the `--harness` option** when using the stubbing feature.
-
-In addition, this feature **isn't compatible with [concrete playback](./concrete-playback.md)**.
+Harnesses are grouped into codegen units by their stub configuration, so a run
+may cover many harnesses at once; `--harness` is not required. This feature can
+be combined with [concrete playback](./concrete-playback.md).
 
 ### Support
 

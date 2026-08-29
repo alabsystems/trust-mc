@@ -163,7 +163,43 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
 
         // Reachability flag: assumption_context ∧ guard. A missing flag means
         // "trivially reachable" to the driver, so skip the trivial `true` case.
+        //
+        // TWO independent reasons to withhold the reachability COMPANION flag.
+        // The companion is what lets the driver reclassify a discharged check as
+        // UNREACHABLE, so withholding it makes the check report the solver's own
+        // verdict instead.
+        //
+        // 1. `unwind_assert` — Kani parity. The unwinding assertion is a
+        //    CBMC-side check and CBMC's reachability instrumentation covers only
+        //    Kani-codegen'd assertions, so Kani reports it SUCCESS or FAILURE,
+        //    never UNREACHABLE (corpus: never-return pins `Status: SUCCESS` for
+        //    "unwinding assertion loop 0" on a loop that exits within the bound).
+        //    The FAILURE direction is untouched — an insufficient bound still
+        //    fires via the violation flag in the main query.
+        //
+        // 2. `--no-assertion-reach-checks` — the user asked for the companion
+        //    instrumentation not to be computed at all. Kani attaches a companion
+        //    to every assert it codegens (user assertions AND the MIR `Assert`
+        //    terminators for bounds / overflow / divide-by-zero, which is why
+        //    `expected/reach/*/unreachable` pin UNREACHABLE for those classes
+        //    with the checks ON); with them off, a check in dead code reports
+        //    SUCCESS, which is what `expected/reach/turned-off` and
+        //    `expected/assert-location/debug-assert` pin.
+        //
+        // SOUNDNESS, for both: the `ay_violation_*` obligation above is emitted
+        // either way, so no check leaves the query. This suppresses an ANNOTATION
+        // of an already-discharged check, never a check, and only non-FAILURE
+        // checks are ever annotated. The V4 vacuity gate keeps the half that
+        // matters — a proof discharged under contradictory assumptions is caught
+        // by `probe_harness_reachable`, which probes the program constraints and
+        // does not read these per-check flags. Under (2) the DEAD-CHECK half does
+        // go (its trigger is "every non-cover check is UNREACHABLE"), so the
+        // driver prints a note on stderr whenever the flag is passed — see
+        // `call_single_file::kani_compiler_local_flags`. That is the user's
+        // explicit trade, not a silent one.
+        let suppress_reach_flag = !self.config.assertion_reach_checks || label == "unwind_assert";
         let reach_expr = match (&self.assumption_context, guard) {
+            _ if suppress_reach_flag => None,
             (None, None) => None,
             (Some(assum_ctx), None) => Some(assum_ctx.clone()),
             (None, Some(g)) => Some(g),
@@ -243,8 +279,11 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
                 PropertyKind::ArithmeticOverflow
             }
             l if l.starts_with("overflow_check_") => PropertyKind::ArithmeticOverflow,
-            "null_pointer_check" => PropertyKind::NullPointer,
-            "alignment_check" => PropertyKind::MemorySafety,
+            "null_pointer_check" | "raw_ptr_deref_null" => PropertyKind::NullPointer,
+            "alignment_check" | "raw_ptr_deref_misaligned" | "pointer_bounds_check" => {
+                PropertyKind::MemorySafety
+            }
+            "unsupported_foreign_function" => PropertyKind::UndefinedBehavior,
             "pointer_invalid" | "dead_object" => PropertyKind::MemorySafety,
             "use_after_free_check"
             | "double_free_check"
@@ -264,6 +303,23 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         }
     }
 
+    /// Publish the whole-trace assumption conjunction as the UNASSERTED flag
+    /// `ay_assume_final` (defined `= final_context`, never asserted here).
+    ///
+    /// Since `kani::assume` joined the ordered assumption context (instead of
+    /// being asserted globally), the program constraints alone no longer say
+    /// whether the harness's assumptions can all hold — which is exactly the
+    /// question the driver's vacuity probe (`probe_harness_reachable`) must
+    /// answer to tell `[AY:VACUOUS:unsat-assumption]` from dead checks. The
+    /// probe asserts this flag on top of the constraints; the main query and
+    /// every per-check flag are untouched by an unasserted definition.
+    pub(in crate::codegen_ay) fn emit_assume_final_flag(&mut self) {
+        if let Some(ctx) = self.assumption_context.clone() {
+            let pred = self.declare_var("ay_assume_final", bool_sort());
+            self.assert(pred.eq(ctx));
+        }
+    }
+
     /// Finalize the harness counterexample query.
     ///
     /// Adds a single assertion `(or viol_0 ... viol_n)` so SAT corresponds to a reachable
@@ -272,6 +328,8 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// Also upgrades the logic to ALL if datatypes were declared (since QF_AUFBV etc.
     /// don't support algebraic datatypes).
     pub(in crate::codegen_ay) fn finalize_counterexample_query(&mut self) {
+        // The vacuity probe needs the whole-trace assumption conjunction.
+        self.emit_assume_final_flag();
         // Upgrade logic if datatypes are present (QF_AUFBV doesn't support datatypes)
         self.program.upgrade_logic_for_datatypes();
 
@@ -315,11 +373,65 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         location: Option<SourceLocation>,
         message: Option<String>,
     ) -> u64 {
+        self.record_cover_property_with_guard(condition, None, location, message)
+    }
+
+    /// Record a cover property together with the SITE GUARD it sits under.
+    ///
+    /// `guard` is the path condition at the `kani::cover!` statement, kept
+    /// SEPARATE from the cover condition itself. The cover flag is still
+    /// `assumption_context ∧ guard ∧ condition` — unchanged — but keeping the
+    /// two apart lets this function also emit the reachability companion
+    /// `ay_reach_cover_<n>` defined as `assumption_context ∧ guard`.
+    ///
+    /// # Why the companion exists (Kani parity)
+    ///
+    /// Kani distinguishes two ways a cover can fail to hold, and pins both:
+    ///
+    /// * **UNSATISFIABLE** — the cover STATEMENT is reachable, but the
+    ///   condition is never true there.
+    /// * **UNREACHABLE** — the cover statement itself sits on dead code, so the
+    ///   condition was never even asked (`expected/cover/cover-unreachable`
+    ///   pins `Status: UNREACHABLE` for `kani::cover!(x == 2)` under
+    ///   `if x > 10 { if x < 5 { … } }`, and the tally
+    ///   `** 1 of 3 cover properties satisfied (2 unreachable)`).
+    ///
+    /// A single flag conflates them: `guard ∧ condition` is unsat in both
+    /// cases, so the driver had no way to tell them apart and reported every
+    /// dead cover as UNSATISFIABLE. The companion answers exactly the missing
+    /// question — "is the cover SITE reachable at all" — and the driver
+    /// reclassifies to UNREACHABLE only when the solver proves it is not.
+    ///
+    /// Gated on `config.assertion_reach_checks` for the same reason the
+    /// violation companion is (see `record_property_violation_with_guard`):
+    /// Kani attaches the reachability companion to every assert it codegens,
+    /// `kani::cover!` included, and `--no-assertion-reach-checks` removes them
+    /// all — under that flag Kani reports a dead cover UNSATISFIABLE, which is
+    /// this function's behaviour with the companion withheld.
+    ///
+    /// SOUNDNESS: the companion adds a definition, never removes an obligation,
+    /// and the reclassification it enables moves between two NEGATIVE cover
+    /// outcomes (neither counts toward "N of M cover properties satisfied", and
+    /// `has_unsatisfiable_cover` treats them identically). No cover can become
+    /// SATISFIED through this path, and no verification verdict can flip.
+    pub(in crate::codegen_ay) fn record_cover_property_with_guard(
+        &mut self,
+        condition: Expr,
+        guard: Option<Expr>,
+        location: Option<SourceLocation>,
+        message: Option<String>,
+    ) -> u64 {
         // Kani assert-assume ordering: a cover after a failed assert (or after
         // an assume) is only satisfiable on paths consistent with the
         // assumption context recorded before it.
-        let condition = match &self.assumption_context {
-            Some(assum_ctx) => assum_ctx.clone().and(condition),
+        let site_guard = match (&self.assumption_context, guard) {
+            (None, None) => None,
+            (Some(assum_ctx), None) => Some(assum_ctx.clone()),
+            (None, Some(g)) => Some(g),
+            (Some(assum_ctx), Some(g)) => Some(assum_ctx.clone().and(g)),
+        };
+        let condition = match &site_guard {
+            Some(g) => g.clone().and(condition),
             None => condition,
         };
         // Create a named predicate for the cover condition
@@ -338,6 +450,24 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         self.bmc_vc.add_constraint(pred_eq_condition);
         self.bmc_vc.add_model_query(pred);
 
+        // Reachability companion. A missing flag means "trivially reachable" to
+        // the driver, so the trivial `true` guard is skipped, exactly as on the
+        // violation path.
+        let reach_name = match site_guard {
+            _ if !self.config.assertion_reach_checks => None,
+            None => None,
+            Some(expr) => {
+                let mut rname = String::with_capacity("ay_reach_cover_".len() + 20);
+                rname.push_str("ay_reach_cover_");
+                let _ = write!(&mut rname, "{cover_id}");
+                // declare_var + assert dual-write to program and bmc_vc, so both
+                // the legacy and emit_bmc payloads carry the flag definition.
+                let rpred = self.declare_var(&rname, bool_sort());
+                self.assert(rpred.eq(expr));
+                Some(rname)
+            }
+        };
+
         // #1164: Store cover metadata for VC artifact emission
         let property_id = PropertyId::new(self.property_counter);
         self.property_counter += 1;
@@ -348,6 +478,9 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         }
         if let Some(msg) = message {
             metadata = metadata.with_message(msg);
+        }
+        if let Some(rname) = reach_name {
+            metadata = metadata.with_reach_var(rname);
         }
         self.cover_metadata.push(metadata);
 

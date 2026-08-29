@@ -10,7 +10,7 @@ In this tutorial, we will show how to use `kani::any()` to create symbolic value
 ## Safe nondeterministic variables
 
 Let's say you're developing an inventory management tool, and you would like to start verifying properties about your API.
-Here is a simple example (available [here](https://github.com/model-checking/kani/blob/main/docs/src/tutorial/arbitrary-variables/src/inventory.rs)):
+Here is a simple example (available [here](https://github.com/alabsystems/trust-mc/blob/main/guide/src/tutorial/arbitrary-variables/src/inventory.rs)):
 
 ```rust
 {{#include tutorial/arbitrary-variables/src/inventory.rs:inventory_lib}}
@@ -119,7 +119,7 @@ A proof harness like `safe_update` above, but starting with `any_inventory(2)` w
 A hint for this exercise: you might choose two different behaviors, "size of exactly `bound`" or "size up to `bound`".
 Try both!
 
-A solution can be found in [`exercise_solution.rs`](https://github.com/model-checking/kani/blob/main/docs/src/tutorial/arbitrary-variables/src/exercise_solution.rs).
+A solution can be found in [`exercise_solution.rs`](https://github.com/alabsystems/trust-mc/blob/main/guide/src/tutorial/arbitrary-variables/src/exercise_solution.rs).
 
 ## Summary
 

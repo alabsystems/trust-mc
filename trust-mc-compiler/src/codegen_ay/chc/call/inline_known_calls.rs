@@ -40,6 +40,61 @@ use crate::codegen_ay::types::{
     POINTER_WIDTH, SignExtension, coerce_bitvec_width, unflatten_bitvec_to_datatype,
 };
 
+/// Element-scaled pointer arithmetic for the pure-expression inline path.
+///
+/// `<*const T>::wrapping_add(count)` / `wrapping_sub(count)` step by
+/// `count * size_of::<T>()` BYTES. The statement path already scales
+/// (`emit_ptr_wrapping_element_transition`); this is the same encoding for
+/// call sites that must produce an expression — notably quantifier predicate
+/// bodies, where an unscaled step reads the wrong element and refutes a true
+/// `forall`.
+///
+/// FAIL-CLOSED: without a resolved receiver type or a known pointee size this
+/// returns `None` (no inline) rather than falling back to a byte-sized step.
+fn inline_wrapping_ptr_arith_expr<'tcx, 'body>(
+    ctx: &ChcCtx<'tcx, 'body>,
+    callee_path: &str,
+    args: &[Expr],
+    first_arg: Option<&Operand>,
+    caller_locals: &[LocalDecl],
+) -> Option<Expr> {
+    let method = callee_path.rsplit("::").next()?;
+    let is_sub = match method {
+        "wrapping_add" => false,
+        "wrapping_sub" => true,
+        _ => return None,
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let receiver = first_arg?;
+    // Only a DIRECT raw-pointer receiver: for `&*const T` the translated
+    // operand is the reference, not the pointer, so stepping it would move the
+    // wrong address.
+    let receiver_ty = receiver.ty(caller_locals).ok()?;
+    let TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) = receiver_ty.kind() else {
+        return None;
+    };
+    let elem_size = ctx.get_type_size(pointee)?;
+    let ptr = args[0].clone();
+    if ptr.sort().bitvec_width() != Some(POINTER_WIDTH) {
+        return None;
+    }
+    let count = args.get(1)?.clone();
+    if !count.sort().is_bitvec() {
+        return None;
+    }
+    let count = coerce_bitvec_width(count, POINTER_WIDTH, SignExtension::ZeroExtend);
+    let offset_bytes = count.bvmul(Expr::bitvec_const(elem_size as u128, POINTER_WIDTH));
+    let step = if is_sub {
+        step_split_pointer_sub(ptr, offset_bytes)
+    } else {
+        step_split_pointer(ptr, offset_bytes)
+    };
+    debug!(elem_size, is_sub, "CHC: inline wrapping pointer arith - ptr +/- count * sizeof(T)");
+    Some(step.result)
+}
+
 /// Inline pure call patterns that do not expose a simple MIR body.
 pub(in crate::codegen_ay) fn inline_known_call_expr<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
@@ -82,7 +137,14 @@ pub(in crate::codegen_ay) fn inline_known_call_expr_for_callee_path<'tcx, 'body>
     if let Some(expr) = inline_exact_math_call(callee_path, translated_args) {
         return Some(expr);
     }
-    if let Some(expr) = inline_wrapping_arith_expr(callee_path, translated_args) {
+    if let Some(expr) =
+        inline_wrapping_ptr_arith_expr(ctx, callee_path, translated_args, first_arg, caller_locals)
+    {
+        return Some(expr);
+    }
+    if let Some(expr) =
+        inline_wrapping_arith_expr(callee_path, translated_args, first_arg, caller_locals)
+    {
         return Some(expr);
     }
     if let Some(expr) =
@@ -1343,6 +1405,8 @@ mod tests {
         let result = inline_wrapping_arith_expr(
             "core::num::<impl i64>::wrapping_add",
             &[a.clone(), b.clone()],
+            None,
+            &[],
         )
         .expect("wrapping_add should inline");
         assert_eq!(result, a.bvadd(b));
@@ -1375,6 +1439,8 @@ mod tests {
         let result = inline_wrapping_arith_expr(
             "core::num::<impl i64>::wrapping_neg",
             std::slice::from_ref(&a),
+            None,
+            &[],
         )
         .expect("wrapping_neg should inline");
         assert_eq!(result, a.bvneg());
@@ -1383,8 +1449,9 @@ mod tests {
     #[test]
     fn test_inline_wrapping_arith_expr_unsigned_abs() {
         let a = Expr::bitvec_const(0u64, 64);
-        let result = inline_wrapping_arith_expr("core::num::<impl i64>::unsigned_abs", &[a])
-            .expect("unsigned_abs should inline");
+        let result =
+            inline_wrapping_arith_expr("core::num::<impl i64>::unsigned_abs", &[a], None, &[])
+                .expect("unsigned_abs should inline");
         // Result is an ite expression — just check it produced something
         assert!(result.sort().is_bitvec());
     }

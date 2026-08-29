@@ -19,8 +19,10 @@ cargo build-dev
 ### Test
 
 ```bash
-# Full regression suite
-./scripts/trust-mc-regression.sh
+# Rust units and fail-closed AY corpus gates
+cargo test --workspace --no-fail-fast
+./scripts/ay-compiletest.sh expected
+./scripts/ay-soundness-gate.sh
 ```
 
 ```bash
@@ -87,14 +89,17 @@ TRUST_MC_REACH_DEBUG="${TARGET_ITEM}" trust-mc ${INPUT}.rs
 
 > **Historical note**: Current trust-mc releases support `--backend=auto|ay` only.
 > `--backend=cbmc` is rejected by the CLI.
-> `--cbmc-args`, `--solver`, and `--synthesize-loop-contracts` are accepted
-> only as warned compatibility no-ops and do not affect AY verification.
+> The standalone `trust-mc` front door REJECTS `--cbmc-args`, a CBMC `--solver`
+> name and `--synthesize-loop-contracts` by name (usage error, exit 2) and
+> prints the AY alternative; the engine keeps them as warned no-ops for
+> `cargo trust-mc` drop-in scripts, where they do not affect AY verification.
 > The commands below are standalone CBMC tool examples from upstream workflows.
 
 Current trust-mc policy for legacy Kani/CBMC flags:
 
 ```bash
-# Accepted for migration compatibility, warned, and ignored:
+# Rejected by name by the `trust-mc` front door, with the AY alternative
+# (still accepted as warned no-ops by the engine under `cargo trust-mc`):
 trust-mc file.rs --cbmc-args --object-bits 8
 trust-mc file.rs --solver kissat
 trust-mc file.rs --synthesize-loop-contracts

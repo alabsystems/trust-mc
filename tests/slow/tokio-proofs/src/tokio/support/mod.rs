@@ -2,3 +2,4 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 pub mod leaked_buffers;
+pub(crate) mod mpsc_stream;

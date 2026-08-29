@@ -170,6 +170,31 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     if is_mutable_static {
                         self.ref_resolution.mutable_static_state_idxs.insert(vec_idx);
                     }
+                    // A linked C definition can reach an EXPORTED static by
+                    // symbol without Rust ever passing it a pointer, so the
+                    // foreign-call effect frame has to havoc these. Interior
+                    // mutability (`!Freeze`) makes an *immutable* static
+                    // writable too, hence the wider predicate.
+                    if is_mutable_static
+                        || (crate::codegen_ay::foreign_defs::any_c_definitions()
+                            && self.ty_has_interior_mut(static_ty))
+                    {
+                        self.ref_resolution.c_writable_static_state_idxs.insert(vec_idx);
+                    }
+                    // A `--c-lib` translation unit names an exported object by
+                    // LINKER SYMBOL. Record it so the C front-end can resolve
+                    // `S` to this slot without matching on the Rust path,
+                    // which `#[link_name]` is free to differ from.
+                    let foreign_symbol = self.tcx.is_foreign_item(static_def_id).then(|| {
+                        self.tcx
+                            .codegen_fn_attrs(static_def_id)
+                            .symbol_name
+                            .unwrap_or_else(|| self.tcx.item_name(static_def_id))
+                            .to_string()
+                    });
+                    if let Some(symbol) = foreign_symbol.clone() {
+                        self.ref_resolution.c_symbol_static_state_idx.insert(symbol, vec_idx);
+                    }
 
                     // P2-S1: in a `#[kani::proof_for_contract]` CHECK harness
                     // the contract must hold for ARBITRARY ambient static
@@ -228,6 +253,39 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let mut init_expr_opt = init_alloc_opt
                         .as_ref()
                         .and_then(|alloc| self.static_init_from_alloc(alloc, &sort, static_ty));
+
+                    // A foreign static has no MIR initializer — but a
+                    // `--c-lib` translation unit may DEFINE the object
+                    // (`uint32_t S = 12;`), and that definition IS the initial
+                    // value. This is the same dropped input the effect frame
+                    // exists for, and pinning it is what `assert!(S == 12)`
+                    // needs. Guarded like a call: the C declaration's type must
+                    // match the Rust one, and a C global whose initializer did
+                    // not fold to a constant pins NOTHING — the static stays
+                    // nondet rather than being given a convenient zero.
+                    if init_expr_opt.is_none()
+                        && let Some(ref symbol) = foreign_symbol
+                        && let Some(cglobal) = crate::c_ffi::global(symbol)
+                        && let Some(value) = cglobal.init
+                        && crate::codegen_ay::c_ffi_check::scalar_ty_matches(
+                            &cglobal.ty,
+                            static_ty,
+                            crate::c_ffi::target(),
+                        )
+                        && let Some(width) = sort.bitvec_width()
+                    {
+                        let wrapped =
+                            if width >= 128 { value } else { value.rem_euclid(1i128 << width) };
+                        debug!(
+                            vec_idx,
+                            static_name = %static_name,
+                            symbol = %symbol,
+                            value,
+                            "CHC: foreign static pinned to its --c-lib initializer"
+                        );
+                        init_expr_opt =
+                            Some(Val::of_value(ay_bindings::Expr::bitvec_const(wrapped, width)));
+                    }
                     let mut seed_metadata = if is_mutable_static || contract_havoc {
                         None
                     } else {

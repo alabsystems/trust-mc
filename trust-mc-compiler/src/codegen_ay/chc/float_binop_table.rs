@@ -110,6 +110,110 @@ pub(in crate::codegen_ay::chc) fn float_binop_congruent_key(
     Some(Expr::bitvec_const(tag, FLOAT_BINOP_TAG_WIDTH).concat(lhs).concat(rhs))
 }
 
+/// IEEE 754 NaN-propagation refinement.
+///
+/// Every IEEE 754 arithmetic operation with a NaN operand produces a NaN. The
+/// free table value carries no such guarantee, so the solver was free to pick
+/// `tbl[Div, x, 2.0]` = NaN (making `a == b / 2.0` false by unordered
+/// comparison) while simultaneously picking `tbl[Mul, NaN, 0.0]` = +0.0 — a
+/// combination no real FPU can produce. That inconsistency fabricated the
+/// `Pointers_OtherTypes/main.rs` counterexample.
+///
+/// The refinement forces the result INTO NaN space WITHOUT pinning a bit
+/// pattern: `v | (exp_all_ones << mant_bits | quiet_bit)` leaves the sign bit
+/// and the low payload bits free while making the exponent all-ones and the
+/// mantissa non-zero (a NaN, never an infinity).
+///
+/// SOUNDNESS (for proofs): every NaN an IEEE operation may return is still
+/// reachable — Rust guarantees an arithmetic NaN result is *quiet*, so for any
+/// real result `r` the table interpretation `v := r` yields `nanify(r) == r`
+/// (`r` already has exponent all-ones and the quiet bit set). The refined term
+/// therefore still over-approximates the real operation; only the physically
+/// impossible "NaN in, number out" interpretations are removed. Sign and
+/// payload stay free, so no specific NaN bit pattern is ever fabricated, and
+/// nothing is asserted about ops whose operands are *not* NaN (`0.0 / 0.0` and
+/// `Inf - Inf` keep their free — possibly NaN — table value).
+///
+/// Like the Sub-reflexive refinement this is a term REFINEMENT — a pure
+/// function of `(lhs, rhs, tbl_term)` — so congruence by construction is
+/// preserved.
+fn refine_nan_propagation(lhs: &Expr, rhs: &Expr, width: u32, tbl_term: Expr) -> Expr {
+    // Fail closed on any width whose IEEE layout we cannot name: keep the
+    // unrefined (weaker, still sound) table value rather than guess a mask.
+    let Some(nan_mask) = quiet_nan_forcing_mask(width) else {
+        return tbl_term;
+    };
+    let nanify = |v: Expr| v.bvor(Expr::bitvec_const(nan_mask, width));
+    // Concrete operands decide the guard at compile time, so the common
+    // `x op <literal>` shape costs one `is_nan` term instead of two — this is
+    // the hot path of every symbolic float binop.
+    let mut cond: Option<Expr> = None;
+    for operand in [lhs, rhs] {
+        match operand_nan_guard(operand, width) {
+            // Provably NaN: no branch needed, the result is always a NaN.
+            OperandNan::Always => return nanify(tbl_term),
+            OperandNan::Never => {}
+            OperandNan::Maybe(g) => {
+                cond = Some(match cond {
+                    Some(prev) => prev.or(g),
+                    None => g,
+                })
+            }
+        }
+    }
+    // Neither operand can be NaN: the "NaN in ⇒ NaN out" implication is
+    // vacuous, so the table value stays entirely free.
+    let Some(cond) = cond else { return tbl_term };
+    Expr::ite(cond, nanify(tbl_term.clone()), tbl_term)
+}
+
+/// Whether one operand of a float binop can be NaN.
+enum OperandNan {
+    Always,
+    Never,
+    Maybe(Expr),
+}
+
+/// `Some(mask)` such that `v | mask` is always a quiet NaN of this width:
+/// exponent all ones, mantissa MSB (the quiet bit) set. `None` for a width
+/// with no known IEEE layout.
+fn quiet_nan_forcing_mask(width: u32) -> Option<u128> {
+    let (exp_field, mant_mask) = ieee754_bit_fields(width)?;
+    Some(exp_field | ((mant_mask >> 1) + 1))
+}
+
+/// `(exponent field mask, mantissa field mask)` for a float width.
+fn ieee754_bit_fields(width: u32) -> Option<(u128, u128)> {
+    use super::call::codegen_call_cmp_string::float_predicates::ieee754_params;
+    let (exp_hi, exp_lo, mant_bits, _) = ieee754_params(width)?;
+    let exp_all_ones: u128 = (1u128 << (exp_hi - exp_lo + 1)) - 1;
+    Some((exp_all_ones << mant_bits, (1u128 << mant_bits) - 1))
+}
+
+/// NaN guard for one operand, folded when the operand is a concrete literal.
+fn operand_nan_guard(v: &Expr, width: u32) -> OperandNan {
+    use super::call::codegen_call_cmp_string::float_predicates::{
+        FloatPredicateKind, build_float_predicate_expr,
+    };
+    if let ay_bindings::ExprValue::BitVecConst { value, width: const_width } = v.value()
+        && *const_width == width
+        && let Some((exp_field, mant_mask)) = ieee754_bit_fields(width)
+    {
+        // NaN iff exponent all ones AND mantissa non-zero.
+        let exp_field = num_bigint::BigInt::from(exp_field);
+        let mant_mask = num_bigint::BigInt::from(mant_mask);
+        let is_nan =
+            (value & &exp_field) == exp_field && (value & &mant_mask) != num_bigint::BigInt::ZERO;
+        return if is_nan { OperandNan::Always } else { OperandNan::Never };
+    }
+    match build_float_predicate_expr(v, FloatPredicateKind::Nan) {
+        Some(g) => OperandNan::Maybe(g),
+        // Sort we cannot read: no guard can be built, so the implication is
+        // simply dropped — the table value stays free (weaker, still sound).
+        None => OperandNan::Never,
+    }
+}
+
 /// P4-4: exact reflexive-subtraction boundary refinement.
 ///
 /// When the operands are BITWISE equal and FINITE, IEEE 754 subtraction
@@ -177,6 +281,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let key = float_binop_congruent_key(op, lhs.clone(), rhs.clone(), width)?;
         let tbl_term = tbl.select(key);
 
+        // The two refinements compose: the NaN-propagation guard (an operand
+        // is NaN) and the Sub-reflexive guard (operands bitwise equal AND
+        // finite) are mutually exclusive, so layering Sub on top of NaN never
+        // loses either exact case.
+        let tbl_term = refine_nan_propagation(&lhs, &rhs, width, tbl_term);
         Some(refine_sub_reflexive_boundary(op, &lhs, &rhs, width, tbl_term))
     }
 

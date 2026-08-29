@@ -56,35 +56,6 @@ fn default_kani_dir() -> Result<PathBuf> {
     Ok(kani_dir)
 }
 
-/// Fast check to see if we look setup already
-pub(crate) fn appears_setup() -> bool {
-    kani_dir().expect("couldn't find trust-mc directory").exists()
-}
-
-// Ensure that the tar file does not exist, essentially using its presence
-// to detect setup completion as if it were a lock file.
-pub(crate) fn appears_incomplete() -> Option<PathBuf> {
-    let kani_dir = kani_dir().expect("couldn't find trust-mc directory");
-    // kani_dir is always `<home>/.kani/kani-<VERSION>`, so parent always exists
-    #[expect(
-        clippy::unwrap_used,
-        reason = "kani_dir is constructed with subdirectory, always has parent"
-    )]
-    let kani_dir_parent = kani_dir.parent().unwrap();
-
-    for entry in std::fs::read_dir(kani_dir_parent).ok()?.flatten() {
-        // Don't collapse if as let_chains have only been stabilized in 1.88, which the target host
-        // installing Kani need not have just yet.
-        #[allow(clippy::collapsible_if)]
-        if let Some(file_name) = entry.file_name().to_str() {
-            if file_name.ends_with(".tar.gz") {
-                return Some(kani_dir_parent.join(file_name));
-            }
-        }
-    }
-    None
-}
-
 /// Sets up Kani by unpacking/installing to `~/.kani/kani-VERSION`
 pub(crate) fn setup(
     use_local_bundle: Option<OsString>,

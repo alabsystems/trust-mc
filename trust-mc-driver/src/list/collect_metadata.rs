@@ -137,10 +137,11 @@ pub(crate) fn list_cargo_with_format(
     identity: CliIdentity,
 ) -> Result<()> {
     let quiet = verify_opts.common_args.quiet;
+    let verbose = verify_opts.common_args.verbose;
     prepare_verify_opts_for_listing(&mut verify_opts);
     let mut session = KaniSession::new_for_listing(verify_opts)?;
     if !quiet {
-        print_kani_version(InvocationType::CargoKani { args: vec![], identity });
+        print_kani_version(InvocationType::CargoKani { args: vec![], identity }, verbose);
     }
 
     let outputs = session.cargo_build(false)?;
@@ -173,10 +174,11 @@ pub(crate) fn list_standalone_with_format(
     identity: CliIdentity,
 ) -> Result<()> {
     let quiet = verify_opts.common_args.quiet;
+    let verbose = verify_opts.common_args.verbose;
     prepare_verify_opts_for_listing(&mut verify_opts);
     let session = KaniSession::new_for_listing(verify_opts)?;
     if !quiet {
-        print_kani_version(InvocationType::Standalone { identity });
+        print_kani_version(InvocationType::Standalone { identity }, verbose);
     }
 
     let project: Project = if std {

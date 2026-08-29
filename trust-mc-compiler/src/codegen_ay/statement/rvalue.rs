@@ -53,6 +53,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return Some(Expr::bitvec_const(0, POINTER_WIDTH));
         }
 
+        // A `&[T]` local written by `assign_reference_to_place` is DECLARED with
+        // the fat-pointer sort but never constrained — only its pointee is — so
+        // `fld_len` selected straight off it is a fresh symbol. Read the length
+        // off the referent first; that returns None (and we fall through to the
+        // pointer's own field, e.g. the fat pointer an unsize cast built in
+        // place) whenever the referent carries no length.
+        if let Some(len) = self.slice_len_through_ref(operand) {
+            return Some(len);
+        }
+
         // Prefer extracting metadata from a fat pointer datatype (slice/str).
         if let Some(expr) = self.codegen_operand(operand)
             && let Some(meta) = extract_fat_ptr_metadata(&expr)
@@ -70,6 +80,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
+    /// True when the operand is a pointer/reference whose pointee is a trait
+    /// object (`*const dyn T`, `&dyn T`, ...) — a fat pointer carrying VTABLE
+    /// metadata. Comparing those is what Kani calls "unstable vtable
+    /// comparison". Deliberately does NOT match structs with a dyn tail:
+    /// those still take the (fail-closed) generic fallback.
+    fn operand_is_dyn_ptr(&self, operand: &Operand) -> bool {
+        operand.ty(self.body.locals()).into_option().is_some_and(|ty| match ty.kind() {
+            TyKind::RigidTy(RigidTy::RawPtr(pointee, _))
+            | TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => {
+                matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Dynamic(..)))
+            }
+            _ => false,
+        })
+    }
+
     /// Translate an MIR Rvalue into a AY expression.
     /// REQUIRES: operands referenced by the rvalue are codegen-compatible.
     /// ENSURES: on Some, result sort matches inferred MIR type when available.
@@ -78,6 +103,52 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             Rvalue::Use(operand) => self.codegen_operand(operand),
 
             Rvalue::BinaryOp(bin_op, lhs, rhs) => {
+                // Comparison of DYN fat pointers (vtable metadata) — Kani's
+                // exact behavior (kani-compiler rvalue.rs
+                // `codegen_comparison_fat_ptr`, issue kani#327): vtable
+                // pointer comparison is not well defined (vtables may be
+                // duplicated or deduplicated at the compiler's whim, for Eq
+                // as much as for Lt), so reaching one is itself the failure.
+                // Emit Kani's named check and hand back a fresh unconstrained
+                // result so downstream codegen stays well-sorted.
+                //
+                // Before this intercept the operands (a 64-bit thin part vs a
+                // fat-pointer datatype) reached `codegen_binop_typed`, which
+                // PANICKED ("bvult requires same BitVec sorts") into the
+                // catch-all, demoting the harness to INCONCLUSIVE instead of
+                // failing it on the named obligation.
+                //
+                // `record_violation_guarded_with_message` conjoins the path
+                // condition, so a comparison on a dead path discharges
+                // instead of failing the harness — same shape as the foreign
+                // call obligation in terminator.rs.
+                if matches!(
+                    bin_op,
+                    BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge
+                        | BinOp::Cmp
+                ) && self.operand_is_dyn_ptr(lhs)
+                {
+                    self.record_violation_guarded_with_message(
+                        Expr::bool_const(true),
+                        "unstable_vtable_comparison",
+                        Some(format!("Reached unstable vtable comparison '{bin_op:?}'")),
+                    );
+                    let name = self.ctx.fresh_name("vtable_cmp");
+                    let sort = if matches!(bin_op, BinOp::Cmp) {
+                        // Ordering is encoded as a 32-bit unit-enum bitvec
+                        // (see sort_inference / codegen_binop_typed BinOp::Cmp).
+                        Sort::bitvec(32)
+                    } else {
+                        Sort::bool()
+                    };
+                    return Some(self.ctx.declare_var(&name, sort));
+                }
+
                 let operand_ty =
                     rvalue.ty(self.body.locals()).into_option().and_then(|result_ty| {
                         match Self::infer_sort_from_ty(result_ty) {
@@ -359,6 +430,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 {
                     debug!("Rvalue::Len on array: compile-time length = {}", len);
                     return Some(Expr::bitvec_const(len as u128, POINTER_WIDTH));
+                }
+
+                // Same hazard as `codegen_ptr_metadata`: the fat-pointer VARIABLE
+                // for a `&[T]` place is declared unconstrained (its pointee holds
+                // the constrained slice value), so prefer the referent's length
+                // and fall through untouched when it has none.
+                if let Some(ty) = &ty
+                    && matches!(
+                        ty.kind(),
+                        TyKind::RigidTy(RigidTy::Ref(..)) | TyKind::RigidTy(RigidTy::RawPtr(..))
+                    )
+                    && let Some(len) = self.slice_len_through_ref(&Operand::Copy(place.clone()))
+                {
+                    debug!("Rvalue::Len on &[T]/&str: length recovered from the referent");
+                    return Some(len);
                 }
 
                 // Check for slice type - extract from fat pointer metadata

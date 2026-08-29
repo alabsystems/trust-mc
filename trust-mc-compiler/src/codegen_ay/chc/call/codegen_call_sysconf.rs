@@ -13,6 +13,13 @@ use super::super::chc_call_context::DispatchCallContext;
 use super::super::codegen_call_coerce::CallCoerce;
 use super::super::codegen_rules::CodegenRules;
 
+/// The path this module models. Shared with the obligation-free walk so the
+/// two cannot drift: the walk may only clear a body-less callee that the
+/// ENCODER actually models as obligation-free.
+pub(in crate::codegen_ay) fn is_modeled_sysconf_path(path: &str) -> bool {
+    path == "libc::sysconf"
+}
+
 pub(in crate::codegen_ay::chc) trait CallDispatchSysconf {
     fn try_dispatch_call_sysconf(&mut self, dcx: &DispatchCallContext<'_>) -> bool;
 }
@@ -23,7 +30,7 @@ impl<'tcx, 'body> CallDispatchSysconf for ChcCtx<'tcx, 'body> {
             return false;
         };
         let callee_path = dcx.callee_path.clone().or_else(|| self.resolve_callee_path(dcx.func));
-        if callee_path.as_deref() != Some("libc::sysconf") || dcx.args.len() != 1 {
+        if !callee_path.as_deref().is_some_and(is_modeled_sysconf_path) || dcx.args.len() != 1 {
             return false;
         }
 

@@ -62,9 +62,12 @@ pub const MAX_TRACKED_OBJECTS: usize = 1024;
 )]
 pub const MAX_TRACKED_BYTES_PER_OBJECT: usize = 64;
 
-const MAX_NUM_OBJECTS_ASSERT_MSG: &str = "The number of objects exceeds the maximum number supported by trust_mc's shadow memory model (1024)";
+// Kani-identical wording: the corpus expected files (shadow/unsupported_*)
+// pin "Kani's shadow memory model" — the earlier rename scrub over-reached
+// into check text that must match Kani verbatim.
+const MAX_NUM_OBJECTS_ASSERT_MSG: &str = "The number of objects exceeds the maximum number supported by Kani's shadow memory model (1024)";
 const MAX_OBJECT_SIZE_ASSERT_MSG: &str =
-    "The object size exceeds the maximum size supported by trust_mc's shadow memory model (64)";
+    "The object size exceeds the maximum size supported by Kani's shadow memory model (64)";
 
 /// A shadow memory data structure that contains a two-dimensional array of a
 /// generic type `T`.

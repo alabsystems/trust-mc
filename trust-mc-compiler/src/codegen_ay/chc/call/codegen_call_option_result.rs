@@ -28,6 +28,7 @@ pub(in crate::codegen_ay::chc) trait CallOptionResult {
     fn codegen_call_result_predicate(&mut self, cx: &ChcCallContext<'_>);
     fn codegen_call_unwrap_or(&mut self, cx: &ChcCallContext<'_>);
     fn codegen_call_unwrap_expect(&mut self, cx: &ChcCallContext<'_>);
+    fn emit_option_unwrap_none_panic(&mut self, cx: &ChcCallContext<'_>);
     fn codegen_call_unwrap_or_else(&mut self, cx: &ChcCallContext<'_>);
     fn codegen_call_option_copied(&mut self, cx: &ChcCallContext<'_>);
     fn codegen_call_combinator(&mut self, cx: &ChcCallContext<'_>);
@@ -71,6 +72,7 @@ impl<'tcx, 'body> CallOptionResult for ChcCtx<'tcx, 'body> {
     /// Handle Option::unwrap / Option::expect / Result::unwrap / Result::expect stubs (Part of #1836).
     fn codegen_call_unwrap_expect(&mut self, cx: &ChcCallContext<'_>) {
         debug!("unwrap_expect stub={:?} dest={}", cx.stub, cx.destination.local);
+        self.emit_option_unwrap_none_panic(cx);
         let result = self.translate_unwrap_expect_call(cx.stub, cx.args, cx.modified_locals);
         // Part of #3866: Propagate layout size cache unconditionally for Result
         // unwrap/expect, regardless of whether translation succeeded. Layout
@@ -93,6 +95,61 @@ impl<'tcx, 'body> CallOptionResult for ChcCtx<'tcx, 'body> {
         let vtable_constraint =
             propagate_unwrapped_vtable_from_operand(self, &cx.args[0], cx.destination.local);
         self.emit_stub_call_result_with_extra(result, cx, vtable_constraint.into_iter().collect());
+    }
+
+    /// PROTOTYPE: emit the None-panic obligation for Option::unwrap/expect.
+    fn emit_option_unwrap_none_panic(&mut self, cx: &ChcCallContext<'_>) {
+        use crate::codegen_ay::stubs::StubKind;
+        use trust_mc_core::chc::{Rule, RuleBody};
+        use trust_mc_core::violation::PropertyKind;
+        if !matches!(cx.stub, StubKind::OptionUnwrap | StubKind::OptionExpect) {
+            return;
+        }
+        if cx.args.is_empty() {
+            return;
+        }
+        let is_none: Option<Expr> = if let Some(discr) =
+            self.resolve_flattened_enum_discr_by_value(&cx.args[0], cx.modified_locals)
+        {
+            if discr.sort().is_bool() {
+                Some(discr.not())
+            } else {
+                discr
+                    .sort()
+                    .bitvec_width()
+                    .map(|w| discr.eq(Expr::bitvec_const(0u64, w)))
+            }
+        } else if let Some(self_expr) =
+            self.translate_operand_with_modified(&cx.args[0], cx.modified_locals)
+        {
+            let sort = self_expr.sort().clone();
+            match sort.datatype_name() {
+                Some(dt_name) => {
+                    let none_ctor =
+                        crate::codegen_ay::names::option_none_constructor_name(dt_name);
+                    if sort.datatype_has_constructor(&none_ctor) {
+                        self.declare_datatype_sort_if_needed(self_expr.sort());
+                        Some(self_expr.is_constructor(dt_name, none_ctor))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let Some(is_none) = is_none else {
+            return;
+        };
+        let error_app = self.register_error_head(
+            PropertyKind::Panic,
+            cx.target,
+            Some("Option::unwrap on a None value".to_string()),
+        );
+        let body =
+            RuleBody::from_base_and_extra(Some(cx.from_app.clone()), cx.stmt_constraints, [is_none]);
+        self.vc.add_rule(Rule::new(body, error_app));
     }
 
     /// Handle Option::unwrap_or_else / Result::unwrap_or_else stubs (Part of #1836).

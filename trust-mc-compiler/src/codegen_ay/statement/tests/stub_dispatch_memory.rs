@@ -179,9 +179,11 @@ fn test_nonnull_dangling_extra_checks_invalidates_provenance() {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
+        // The liveness range is `(_ BitVec 1)`, so freed is `#b0` — see
+        // `AYCtx::heap_valid_bit` for why it is not `Bool`.
         assert!(
-            rendered_constraints.contains("false"),
-            "extra-pointer-checks NonNull::dangling should store false into obj_valid: {rendered_constraints}"
+            rendered_constraints.contains("#b0"),
+            "extra-pointer-checks NonNull::dangling should store the freed bit into obj_valid: {rendered_constraints}"
         );
     });
 }
@@ -278,9 +280,11 @@ fn test_rawvec_new_in_extra_checks_invalidates_provenance() {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
+        // The liveness range is `(_ BitVec 1)`, so freed is `#b0` — see
+        // `AYCtx::heap_valid_bit` for why it is not `Bool`.
         assert!(
-            rendered_constraints.contains("false"),
-            "extra-pointer-checks RawVec::new_in should store false into obj_valid: {rendered_constraints}"
+            rendered_constraints.contains("#b0"),
+            "extra-pointer-checks RawVec::new_in should store the freed bit into obj_valid: {rendered_constraints}"
         );
     });
 }

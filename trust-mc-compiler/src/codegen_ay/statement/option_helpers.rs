@@ -114,6 +114,42 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
+    /// Build the "this `Option` is `None`" predicate for an already-resolved
+    /// Option base name.
+    ///
+    /// `codegen_option_is_none` works from a `&Option<T>` operand; this works
+    /// from the base name that `get_option_base_direct` resolved for a
+    /// by-value receiver (`unwrap(self)` / `expect(self, _)`), so the two
+    /// representations stay in sync without duplicating the operand handling.
+    ///
+    /// Representation handling mirrors `codegen_option_is_none`:
+    /// - flattened: `{base}.0` discriminant == 0
+    /// - native datatype: `is-None` constructor test
+    ///
+    /// ENSURES: Returns `None` when the representation exposes no discriminant
+    /// (a flattened Some payload stored bare under the base key). Callers must
+    /// treat that as "cannot decide" and skip the check rather than assume Some.
+    pub(super) fn option_none_predicate(&self, option_base: &str) -> Option<ay_bindings::Expr> {
+        let discrim_name = crate::codegen_ay::names::discrim_name(option_base);
+        if let Some(discrim_expr) = self.env_lookup(&discrim_name) {
+            let zero = self.make_zero_for_discrim(discrim_expr)?;
+            return Some(discrim_expr.clone().eq(zero));
+        }
+
+        let option_expr = self.env_lookup(option_base)?;
+        let sort = option_expr.sort();
+        let dt_name = sort.datatype_name()?;
+        let none_ctor = crate::codegen_ay::names::option_none_constructor_name(dt_name);
+        if !sort.datatype_has_constructor(&none_ctor) {
+            debug!(
+                "option_none_predicate: datatype '{}' missing constructor '{}' for {}",
+                dt_name, none_ctor, option_base
+            );
+            return None;
+        }
+        Some(option_expr.clone().is_constructor(dt_name, none_ctor))
+    }
+
     /// Helper to create zero constant matching discriminant expression sort.
     ///
     /// Returns None if the discriminant sort is unsupported.

@@ -123,7 +123,7 @@ crate-type = ["lib"]
         let mut cmd = setup_cargo_command()?;
         cmd.pass_cargo_args(&cargo_args)
             .current_dir(krate_path)
-            .env("RUSTC", &self.kani_compiler)
+            .env("RUSTC", self.kani_compiler()?)
             .pass_rustc_args(&rustc_args, PassTo::AllCrates)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("__CARGO_TESTS_ONLY_SRC_ROOT", full_path.as_os_str());
@@ -149,6 +149,9 @@ crate-type = ["lib"]
         if let Some(path) = &self.args.cargo.manifest_path {
             cargo_args.push("--manifest-path".into());
             cargo_args.push(path.into());
+        }
+        if self.args.cargo.locked {
+            cargo_args.push("--locked".into());
         }
         if self.args.cargo.all_features {
             cargo_args.push("--all-features".into());
@@ -221,7 +224,7 @@ crate-type = ["lib"]
 
                 cmd.args(verification_target.to_args())
                     .arg("--")
-                    .env("RUSTC", &self.kani_compiler)
+                    .env("RUSTC", self.kani_compiler()?)
                     .pass_rustc_args(&rustc_args, PassTo::AllCrates)
                     .pass_rustc_arg(encode_as_rustc_arg(&kani_pkg_args), PassTo::OnlyLocalCrate)
                     .env("RUSTC_BOOTSTRAP", "1")
@@ -265,7 +268,11 @@ crate-type = ["lib"]
         // restrict metadata command to host platform. References:
         // https://github.com/rust-lang/rust-analyzer/issues/6908
         // https://github.com/rust-lang/rust-analyzer/pull/6912
-        cmd.other_options(vec![String::from("--filter-platform"), build_target.to_owned()]);
+        let mut metadata_options = vec![String::from("--filter-platform"), build_target.to_owned()];
+        if self.args.cargo.locked {
+            metadata_options.push(String::from("--locked"));
+        }
+        cmd.other_options(metadata_options);
 
         // Set a --manifest-path if we're given one
         if let Some(path) = &self.args.cargo.manifest_path {

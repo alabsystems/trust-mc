@@ -12,7 +12,7 @@
 //! The Expr-producing PtrMetadata resolution stack remains in
 //! `codegen_stmt_arithmetic_ops.rs` for now (Phase 2).
 //!
-//! Utility helpers (operand_bare_local, is_index_call, trace_through_moves,
+//! Utility helpers (operand_bare_local, trace_through_moves,
 //! extract_constant_range_fields, extract_str_len_from_const_operand,
 //! extract_array_len_from_ref, trace_use_field_projection,
 //! trace_field_through_aggregate, find_aggregate_field) extracted to
@@ -22,6 +22,7 @@ use std::collections::HashSet;
 
 use rustc_public::CrateDef;
 use rustc_public::mir::{Operand, Rvalue, StatementKind, TerminatorKind};
+use rustc_public::rustc_internal;
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
@@ -39,6 +40,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut current = local_idx;
         let mut visited = HashSet::new();
         while visited.insert(current) {
+            if self.local_has_multiple_whole_definitions(current) {
+                return None;
+            }
             let mut traced_local = None;
             for block in &self.body.blocks {
                 for stmt in &block.statements {
@@ -133,16 +137,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Single-local helper for resolve_metadata_from_str_producing_call.
     fn resolve_str_producing_call_single(&self, local_idx: usize) -> Option<u64> {
+        if self.local_has_multiple_whole_definitions(local_idx) {
+            return None;
+        }
         for block in &self.body.blocks {
             let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
             else {
                 continue;
             };
-            if destination.local != local_idx {
+            if destination.local != local_idx || !destination.projection.is_empty() {
                 continue;
             }
             let Ok(func_ty) = func.ty(self.body.locals()) else { continue };
             let TyKind::RigidTy(RigidTy::FnDef(def, _)) = func_ty.kind() else { continue };
+            let direct_def_id = rustc_internal::internal(self.tcx, def.def_id());
+            if !matches!(
+                self.tcx.crate_name(direct_def_id.krate).as_str(),
+                "core" | "alloc" | "std"
+            ) {
+                continue;
+            }
             let name = def.trimmed_name();
             let is_str_producing = name == "as_str"
                 || name.ends_with("::as_str")
@@ -154,11 +168,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 continue;
             }
             let string_local = args.first().and_then(Self::operand_bare_local)?;
+            if self.local_has_multiple_whole_definitions(string_local) {
+                return None;
+            }
             let string_local = self
                 .ref_resolution
                 .ref_targets
                 .get(&string_local)
                 .map_or(string_local, |rt| rt.local);
+            if self.local_has_multiple_whole_definitions(string_local) {
+                return None;
+            }
             // Find the String::from call that produced this String local.
             if let Some(len) = self.resolve_string_from_source_len(string_local) {
                 return Some(len);
@@ -169,16 +189,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Find the const &str source length for a String local produced by String::from.
     fn resolve_string_from_source_len(&self, string_local: usize) -> Option<u64> {
+        if self.local_has_multiple_whole_definitions(string_local) {
+            return None;
+        }
         for block in &self.body.blocks {
             let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
             else {
                 continue;
             };
-            if destination.local != string_local {
+            if destination.local != string_local || !destination.projection.is_empty() {
                 continue;
             }
             let Ok(func_ty) = func.ty(self.body.locals()) else { continue };
             let TyKind::RigidTy(RigidTy::FnDef(def, _)) = func_ty.kind() else { continue };
+            let direct_def_id = rustc_internal::internal(self.tcx, def.def_id());
+            if !matches!(
+                self.tcx.crate_name(direct_def_id.krate).as_str(),
+                "core" | "alloc" | "std"
+            ) {
+                continue;
+            }
             let name = def.trimmed_name();
             if !(name == "from" || name.ends_with("::from") || name.contains("From")) {
                 continue;
@@ -205,6 +235,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut current = local_idx;
         let mut visited = HashSet::new();
         while visited.insert(current) {
+            if self.local_has_multiple_whole_definitions(current) {
+                return None;
+            }
             let mut next_local = None;
             for block in &self.body.blocks {
                 for stmt in &block.statements {
@@ -241,21 +274,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         for block in &self.body.blocks {
             if let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
                 && destination.local == local_idx
-                && Self::is_index_call(func, self.body.locals())
+                && destination.projection.is_empty()
+                && !self.local_has_multiple_whole_definitions(local_idx)
             {
-                for arg in args {
-                    let Ok(arg_ty) = arg.ty(self.body.locals()) else { continue };
-                    if let TyKind::RigidTy(RigidTy::Adt(def, _)) = arg_ty.kind()
-                        && def.trimmed_name() == "Range"
-                        && let Some(range_local) = Self::operand_bare_local(arg)
-                        && let Some((start, end)) = self.extract_constant_range_fields(range_local)
-                    {
-                        debug!(
-                            local_idx,
-                            start, end, "PtrMetadata: resolved Range subslice len from MIR"
-                        );
-                        return Some(end.saturating_sub(start));
-                    }
+                let Some((_, _, index)) = self.authenticated_core_slice_index_args(func, args)
+                else {
+                    continue;
+                };
+                if Self::is_range_type_operand(self.tcx, index, self.body.locals())
+                    && !Self::is_range_inclusive_operand(self.tcx, index, self.body.locals())
+                    && let Some(range_local) = Self::operand_bare_local(index)
+                    && let Some((start, end)) = self.extract_constant_range_fields(range_local)
+                {
+                    debug!(
+                        local_idx,
+                        start, end, "PtrMetadata: resolved Range subslice len from MIR"
+                    );
+                    return Some(end.saturating_sub(start));
                 }
             }
         }
@@ -268,22 +303,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         for block in &self.body.blocks {
             if let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
                 && destination.local == local_idx
-                && Self::is_index_call(func, self.body.locals())
+                && destination.projection.is_empty()
+                && !self.local_has_multiple_whole_definitions(local_idx)
             {
-                // Find the first argument that is a slice reference — its metadata
-                // is the length we need.
-                for arg in args {
-                    if let Some(arg_local) = Self::operand_bare_local(arg) {
-                        if let Some(len) = self.resolve_slice_metadata_from_mir(arg_local) {
-                            debug!(
-                                local_idx,
-                                arg_local,
-                                len,
-                                "PtrMetadata: resolved slice len from Index call argument"
-                            );
-                            return Some(len);
-                        }
-                    }
+                let Some(source) = self.authenticated_core_range_full_source(func, args) else {
+                    continue;
+                };
+                if let Some(arg_local) = Self::operand_bare_local(source)
+                    && !self.local_has_multiple_whole_definitions(arg_local)
+                    && let Some(len) = self.resolve_slice_metadata_from_mir(arg_local)
+                {
+                    debug!(
+                        local_idx,
+                        arg_local, len, "PtrMetadata: resolved slice len from Index call argument"
+                    );
+                    return Some(len);
                 }
             }
         }

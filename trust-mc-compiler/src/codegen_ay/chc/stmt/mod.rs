@@ -70,6 +70,7 @@ pub(super) mod codegen_stmt_mirror;
 pub(super) mod codegen_stmt_output;
 pub(super) mod codegen_stmt_projection;
 pub(super) mod codegen_stmt_store;
+pub(in crate::codegen_ay::chc) use codegen_stmt_store::deref_mem::ProvDef;
 pub(super) mod codegen_stmt_store_ref;
 pub(super) mod stmt_accumulator;
 

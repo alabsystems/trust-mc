@@ -5,7 +5,7 @@ trust-mc is unlike the testing tools you may already be familiar with.
 Much of testing is concerned with thinking of new corner cases that need to be covered.
 With trust-mc, all the corner cases are covered from the start, and the new concern is narrowing down the scope to something manageable for the verifier.
 
-Consider this first program (which can be found under [`first-steps-v1`](https://github.com/model-checking/kani/tree/main/docs/src/tutorial/first-steps-v1/)):
+Consider this first program (which can be found under [`first-steps-v1`](https://github.com/alabsystems/trust-mc/tree/main/guide/src/tutorial/first-steps-v1/)):
 
 ```rust
 {{#include tutorial/first-steps-v1/src/lib.rs:code}}
@@ -128,7 +128,7 @@ VERIFICATION:- FAILED
 
 It seems a bit odd that our example function is tested against billions of possible inputs, when it really only seems to be designed to handle a few thousand.
 Let's encode this fact about our function by asserting some reasonable upper bound on our input, after we've fixed our bug.
-(New code available under [`first-steps-v2`](https://github.com/model-checking/kani/tree/main/docs/src/tutorial/first-steps-v2/)):
+(New code available under [`first-steps-v2`](https://github.com/alabsystems/trust-mc/tree/main/guide/src/tutorial/first-steps-v2/)):
 
 ```rust
 {{#include tutorial/first-steps-v2/src/lib.rs:code}}

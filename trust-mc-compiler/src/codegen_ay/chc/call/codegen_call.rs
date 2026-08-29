@@ -14,6 +14,10 @@
 //! Extracted from include!() to proper module via extension trait pattern.
 //! Part of #2306: include!() to proper module migration.
 
+#[path = "codegen_call_c_body.rs"]
+mod codegen_call_c_body;
+#[path = "codegen_call_foreign.rs"]
+mod codegen_call_foreign;
 #[path = "codegen_call_libc_mem.rs"]
 mod codegen_call_libc_mem;
 #[path = "codegen_call_posix_memalign.rs"]
@@ -21,8 +25,10 @@ mod codegen_call_posix_memalign;
 #[path = "codegen_call_struct_map_accessor.rs"]
 mod codegen_call_struct_map_accessor;
 #[path = "codegen_call_sysconf.rs"]
-mod codegen_call_sysconf;
+pub(in crate::codegen_ay) mod codegen_call_sysconf;
 
+use self::codegen_call_c_body::CallDispatchCBody;
+use self::codegen_call_foreign::CallDispatchForeign;
 use self::codegen_call_libc_mem::CallDispatchLibcMem;
 use self::codegen_call_posix_memalign::CallDispatchPosixMemalign;
 use self::codegen_call_struct_map_accessor::CallDispatchStructMapAccessor;
@@ -309,6 +315,18 @@ impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
         if self.try_dispatch_call_slice_contains_pre_inline(dcx) {
             return true;
         }
+        // `Range`/`RangeInclusive::contains` value lowering before fn_inline.
+        // The MIR inline pass preserves these calls as a handler boundary
+        // (`is_handler_backed_range_contains`), but the CHC `range_contains`
+        // handler only ran from the tail catch-all — AFTER fn_inline had already
+        // claimed the call and bound its result to a fresh symbolic bool when the
+        // `RangeBounds::contains` body exceeded the inline block budget. Running
+        // it here makes the preserved boundary reach its handler; the handler
+        // returns false (falling through unchanged) when it cannot resolve the
+        // range bounds.
+        if self.try_dispatch_call_range_contains_pre_inline(dcx) {
+            return true;
+        }
         // Part of #4050: ArraySolver shadow SMT array dispatch (before fn_inline).
         if self.try_dispatch_call_array_solver_shadow(dcx) {
             return true;
@@ -379,6 +397,19 @@ impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
         // When the func operand is FnPtr (indirect call through fn pointer),
         // scan the caller's MIR for ClosureFnPointer/ReifyFnPointer casts
         // to resolve the concrete callee and inline its body.
+        // An INDIRECT call through a function pointer that reifies a FOREIGN
+        // item is still a call to that C function — and `Instance::body()` is
+        // `None` for a foreign item, so the inline path below cannot touch it.
+        // When the user supplied its definition, encode it exactly as the
+        // direct call is encoded; `ForeignItems/extern_fn_ptr.rs` asserts the
+        // two agree, which is unprovable while one of them is unconstrained.
+        if let Some(symbol) = self.fn_ptr_foreign_link_symbol(dcx)
+            && crate::codegen_ay::foreign_defs::c_lib_defines(&symbol)
+            && self.try_dispatch_call_c_body(dcx, &symbol)
+        {
+            return true;
+        }
+
         if self.try_dispatch_call_fn_ptr(dcx) {
             return true;
         }
@@ -436,6 +467,18 @@ impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
             {
                 return true;
             }
+        }
+
+        // A foreign call whose definition the USER SUPPLIED (`-Z c-ffi
+        // --c-lib`) is not an unknown-callee error: it is a call to some
+        // concrete C function with this prototype. Model it with a sound effect
+        // frame — fresh return, havoc of every location the callee could write
+        // — instead of collapsing the harness at the call site. Declines (and
+        // leaves the fail-closed error() below standing) for a symbol no
+        // `--c-lib` file defines, which is what keeps
+        // `ForeignItems/missing_fn_fail.rs` failing.
+        if self.try_dispatch_call_foreign_model(dcx) {
+            return true;
         }
 
         // Undefined foreign function calls (Part of #3175).

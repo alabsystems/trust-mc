@@ -182,6 +182,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if let Operand::Copy(place) | Operand::Move(place) = arg
             && place.projection.is_empty()
         {
+            if self.local_has_multiple_whole_definitions(place.local) {
+                return None;
+            }
             let resolved = self.resolve_provenance_local(place.local);
             if let Some(backing) =
                 self.resolve_slice_backing_local(place.local, modified_locals, arg)
@@ -346,6 +349,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         };
 
+        if !self.path_insensitive_metadata_copy_is_unique(src_local, dest_local) {
+            self.clear_slice_as_ptr_metadata(dest_local);
+            return;
+        }
+
         self.clear_slice_as_ptr_metadata(dest_local);
         let has_nonzero_offset = self
             .ref_resolution
@@ -436,6 +444,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         modified_locals: &HashSet<usize>,
         arg: &Operand,
     ) -> Option<ResolvedSliceBacking> {
+        if self.local_has_multiple_whole_definitions(local) {
+            return None;
+        }
         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
         // Part of #4179: After unsized coercion (`&[T; N]` -> `&[T]`), the operand
         // type is `&[T]` so static_slice_len_from_operand returns None.
@@ -466,6 +477,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         modified_locals: &HashSet<usize>,
         arg: &Operand,
     ) -> Option<ResolvedSliceBacking> {
+        if self.local_has_multiple_whole_definitions(data_local)
+            || self.local_has_multiple_whole_definitions(metadata_local)
+        {
+            return None;
+        }
         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
         let len_hint = self
             .ref_resolution
@@ -505,6 +521,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if !visited.insert(local) {
             return None;
         }
+        if self.local_has_multiple_whole_definitions(local) {
+            return None;
+        }
         if let Some(slice_view) = self.ref_resolution.const_ref_slice_views.get(&local).cloned() {
             return Some(slice_view);
         }
@@ -530,6 +549,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         local: usize,
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
+        if self.local_has_multiple_whole_definitions(local) {
+            return None;
+        }
         // Box-backed range receivers often appear as `_slice = &(*_raw_ptr)`.
         // When ref_targets metadata is unavailable on the reference local, recover
         // the backing by translating the borrowed place directly.
@@ -581,23 +603,30 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     fn resolve_slice_backing_source_local(&self, dest_local: usize) -> Option<usize> {
-        self.body.blocks.iter().flat_map(|bb_data| bb_data.statements.iter()).find_map(|stmt| {
-            let StatementKind::Assign(lhs, rhs) = &stmt.kind else {
-                return None;
-            };
-            if lhs.local != dest_local || !lhs.projection.is_empty() {
-                return None;
-            }
-            match rhs {
-                Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
-                | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
-                    if src.projection.is_empty() =>
-                {
-                    Some(src.local)
-                }
-                _ => None,
-            }
-        })
+        if self.local_has_multiple_whole_definitions(dest_local) {
+            return None;
+        }
+        let source =
+            self.body.blocks.iter().flat_map(|bb_data| bb_data.statements.iter()).find_map(
+                |stmt| {
+                    let StatementKind::Assign(lhs, rhs) = &stmt.kind else {
+                        return None;
+                    };
+                    if lhs.local != dest_local || !lhs.projection.is_empty() {
+                        return None;
+                    }
+                    match rhs {
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                        | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
+                            if src.projection.is_empty() =>
+                        {
+                            Some(src.local)
+                        }
+                        _ => None,
+                    }
+                },
+            )?;
+        (!self.local_has_multiple_whole_definitions(source)).then_some(source)
     }
 
     fn slice_backing_from_expr(
@@ -752,6 +781,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if !seen.insert(current) {
                 break;
             }
+            if self.local_has_multiple_whole_definitions(current) {
+                return None;
+            }
             if current < self.body.locals().len() {
                 let ty = self.resolve_body_ty(self.body.locals()[current].ty);
                 let inner_ty = match ty.kind() {
@@ -821,6 +853,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         for _ in 0..8 {
             if !seen.insert(current) {
                 break;
+            }
+            if self.local_has_multiple_whole_definitions(current) {
+                return None;
             }
             // Check the type of the current local for a static array length.
             if current < self.body.locals().len() {

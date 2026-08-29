@@ -15,6 +15,7 @@
 //! loop reasoning.
 
 mod cfg;
+mod const_trip;
 mod dominators;
 mod unroll;
 
@@ -24,6 +25,7 @@ mod tests;
 // Re-export CFG infrastructure for large-step CHC encoding (#112).
 pub(in crate::codegen_ay) use cfg::Cfg;
 pub(in crate::codegen_ay) use cfg::topo_sort;
+pub(in crate::codegen_ay) use const_trip::derive_const_trip_unroll_depth;
 pub(in crate::codegen_ay) use dominators::find_loop_headers;
 use rustc_public::mir::Body;
 use tracing::{debug, warn};

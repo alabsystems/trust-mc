@@ -58,6 +58,7 @@ mod deadline;
 mod demotion;
 mod harness_runner;
 mod list;
+mod loop_two_lane;
 mod metadata;
 mod project;
 mod proof_summary;
@@ -99,6 +100,11 @@ fn main() -> ExitCode {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
+
+    // Terminate the solver subtree if whatever launched us dies. Signal
+    // forwarding from the front door handles the catchable signals; this is
+    // the backstop for SIGKILL and for crashes, which cannot forward anything.
+    crate::subprocess_tracker::watch_parent_death();
 
     // Activate ay's process-wide RSS memory guard. Without this, the in-process
     // CHC solver (AdaptivePortfolio with 12 parallel engines) has no memory bound
@@ -186,7 +192,10 @@ fn cargokani_main(input_args: Vec<OsString>, identity: CliIdentity) -> Result<()
     };
 
     if !session.args.common_args.quiet {
-        print_kani_version(InvocationType::CargoKani { args: input_args, identity });
+        print_kani_version(
+            InvocationType::CargoKani { args: input_args, identity },
+            session.args.common_args.verbose,
+        );
     }
 
     if let Some(bundle_path) = session.args.trust_vc_bundle.clone() {
@@ -236,7 +245,10 @@ fn standalone_main(identity: CliIdentity) -> Result<()> {
         Some(StandaloneSubcommand::VerifyStd(args)) => {
             let session = KaniSession::new(args.verify_opts)?;
             if !session.args.common_args.quiet {
-                print_kani_version(InvocationType::Standalone { identity });
+                print_kani_version(
+                    InvocationType::Standalone { identity },
+                    session.args.common_args.verbose,
+                );
             }
 
             let project = project::std_project(&args.std_path, &session)?;
@@ -245,7 +257,10 @@ fn standalone_main(identity: CliIdentity) -> Result<()> {
         None => {
             let session = KaniSession::new(args.verify_opts)?;
             if !session.args.common_args.quiet {
-                print_kani_version(InvocationType::Standalone { identity });
+                print_kani_version(
+                    InvocationType::Standalone { identity },
+                    session.args.common_args.verbose,
+                );
             }
 
             if let Some(bundle_path) = session.args.trust_vc_bundle.clone() {
@@ -572,6 +587,19 @@ fn report_chc_translation_drop_warnings(project: &Project) {
                 }
             }
         }
+        // Emit the aggregate-gap reasons, which for the nested-call lane name
+        // the CALLEE that was over-approximated
+        // (`inline_nested_call_fallback_symbolic@<callee_path>`). The walker has
+        // always recorded these; nothing drained them outside unit tests, so a
+        // corpus run could count 62 non-parity rows in this cluster without
+        // being able to say which calls caused them.
+        if let Some(ref info) = metadata.aggregate_encoding_gap {
+            for (fn_name, reasons) in &info.per_harness_reasons {
+                for (reason, count) in reasons {
+                    println!("[AY:AGGREGATE_GAP_REASON:{fn_name}:{reason}={count}]");
+                }
+            }
+        }
     }
 }
 
@@ -702,13 +730,22 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
     // metadata, never from an empty result set, so a harness-discovery bug
     // can never become a silent false-pass channel.
     let metadata_harness_count = project.get_all_harnesses().len();
+    // Captured before `--harness` filtering: these are the names a failed
+    // filter should be measured against.
+    let available_harnesses: Vec<String> =
+        project.get_all_harnesses().iter().map(|h| h.pretty_name.clone()).collect();
     let harnesses = session.determine_targets(project.get_all_harnesses())?;
     debug!(n = harnesses.len(), ?harnesses, "verify_project");
 
     // Residual-775 Wall-0: codegen is complete at this point (the project was
     // built above); stamp a machine-readable marker so DriverTimeout
     // adjudication can split compile-time from solve-time without rerunning.
-    println!("[AY:CODEGEN_COMPLETE:harnesses={}]", harnesses.len());
+    // ...but honor --quiet, which promises "nothing but the exit code and
+    // requested artifacts". This was the one line that broke that promise on a
+    // successful run; the adjudication tooling never runs with --quiet.
+    if !session.args.common_args.quiet {
+        println!("[AY:CODEGEN_COMPLETE:harnesses={}]", harnesses.len());
+    }
 
     // The driver budgets --harness-timeout per harness, so the process
     // budget carries one extra harness-timeout per extra harness (mirrors
@@ -748,7 +785,7 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
 
     session.write_sarif(&results)?;
     session.write_proof_summary_json(&results)?;
-    session.print_final_summary(&results, metadata_harness_count)
+    session.print_final_summary(&results, metadata_harness_count, &available_harnesses)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -428,6 +428,42 @@ fn execute_inline_call<'tcx, 'body>(
             }
         }
 
+        // Layout intrinsics are COMPILE-TIME CONSTANTS — never havoc them.
+        //
+        // `mem::size_of`, `align_of`, `size_of_val`, `vtable_size`/`vtable_align`
+        // already have a correct translator (`translate_mem_intrinsic_call`,
+        // reached from the statement-level path via `codegen_call_mem_intrinsic`).
+        // The inline walker never consulted it, so inside an inlined body a
+        // `size_of::<T>()` became a fresh unconstrained symbol and the solver
+        // was free to pick any value for it — which manufactures counterexamples
+        // against correct code.
+        //
+        // Measured 2026-08-23 over the 42 `oracle=success, observed=fail` rows
+        // in this cluster: `size_of` 7 rows, `align_of` 3, `size_of_val` 3,
+        // `vtable_size` 3, `vtable_align` 2 — the largest single family.
+        //
+        // Not new modelling, just reusing the existing model on the path that
+        // skipped it. `translate_mem_intrinsic_call` returns None for every
+        // non-layout stub (`_ => return None`) and fails closed on unknown
+        // types, so this can only ever REPLACE a havoc with a known constant.
+        // The sort guard keeps it conservative: if the translated constant does
+        // not match the destination sort we fall through to the old fallback
+        // rather than force a coercion the walker cannot verify.
+        if let Some(stub) = ctx.detect_stub(func)
+            && let Some(result) = ctx.translate_mem_intrinsic_call(stub, func)
+            && result.sort() == &dest_sort
+        {
+            debug!(
+                current_bb,
+                ?callee_path,
+                ?stub,
+                "walker: layout intrinsic folded to a constant instead of havoc"
+            );
+            if apply_inline_writeback(ctx, walk_ctx, state, destination, result) {
+                return TerminatorStep::ContinueAt(target_bb);
+            }
+        }
+
         // Part of #3903: sound over-approximation — unconstrained result.
         debug!(
             current_bb,
@@ -485,6 +521,100 @@ fn execute_inline_call<'tcx, 'body>(
             callee_path.as_deref(),
         )
         .unwrap_or_else(|| build_nested_call_fallback_expr(effective_sort, is_pointer_dest));
+
+        // TAINT (Task #78): this call could not be inlined — missing stdlib MIR,
+        // an unhandled stub — so its result is a fresh, unconstrained symbol.
+        // Only the depth-exhaustion branch above recorded anything, which left
+        // the ordinary case invisible: the harness carried no approximation at
+        // all, `classify_ctrex` fell through to its `Genuine` default, and a
+        // counterexample built on an invented return value was reported as a
+        // real bug in correct code. Live instance:
+        // `bounded_any::<String, 4>().len() <= 4` — the function's own contract
+        // — FAILED with `[AY:CTREX_CAT:Genuine]`. (A failing `HashMap::get` is
+        // mislabelled the same way but does NOT come through here: the CHC lane
+        // models hashbrown as raw memory rather than stubbing it, so there is no
+        // over-approximated CALL result to tag. See the findings note.)
+        //
+        // Recorded as a SOUND approximation, not a demoting fallback: the var
+        // is a fresh `declare-var`, universally quantified over its rule, so it
+        // admits every value the real call could return and cannot mint a false
+        // proof. That keeps clean proofs clean while making a counterexample
+        // that depends on the invented value `OverApproximation` — i.e.
+        // `[AY:CTREX_NOT_CERTIFIED]`, which is exactly what this case is.
+        if let Some(freed) =
+            super::nested_call_fallback::nested_call_fallback_freed_var(&fallback_var)
+        {
+            // Name the callee we gave up on. `record_sound_fallback_reason_identified`
+            // records the freed VAR (`__nested_call_overapprox_N`), which says a
+            // call was over-approximated but not WHICH — and this is the largest
+            // non-parity cluster in the corpus, so "somewhere" is not a triage
+            // key. `note_gap_reason` touches no counter, so classification is
+            // unaffected; the string surfaces as
+            // `[AY:AGGREGATE_GAP_REASON:<fn>:nested_call_overapprox@<callee>=N]`.
+            // Recorded UNCONDITIONALLY. An earlier cut only recorded when
+            // `callee_path` resolved, and on the rows actually in this cluster
+            // it does not — so every record was dropped and the marker never
+            // appeared. "The callee could not be resolved" is itself the
+            // finding: it separates "we know which call and have not modelled
+            // it" from "we cannot even name the call", and those need different
+            // fixes.
+            let callee_label = callee_path.as_deref().unwrap_or("<unresolved-callee>");
+            ctx.note_gap_reason(&format!("nested_call_overapprox@{callee_label}"));
+            // FAIL-CLOSED when the callee we gave up on VISIBLY carries an
+            // obligation.
+            //
+            // The `nested_call_overapprox` blessing argues that a fresh
+            // universally-quantified destination "can only add behaviours,
+            // never remove one, so no proof this admits is a false proof".
+            // That is true of the RETURN VALUE and says nothing about the
+            // callee's OBLIGATIONS — and dropping one removes exactly one
+            // behaviour: the failing one. Measured: an `assert!(a == 43)`
+            // inside `kani::block_on` never reaches the check list, and the
+            // harness reports `[AY:PROOF_QUALIFIERS:clean] SUCCESSFUL`. The
+            // same harness with `a == 42` reports identically, so it is a
+            // DROP, not a proof. Only the vacuity gate caught it, and only
+            // while the harness had no other check.
+            //
+            // POSITIVE sighting only. `Unknown` — an unresolvable callee, an
+            // absent body, the budget — keeps the blessing, because treating
+            // "could not tell" as "has an obligation" would demote nearly
+            // every harness touching an un-inlinable stdlib call, which is the
+            // cost the blessing exists to avoid. So this is a strict increase
+            // in what is caught, not a change of policy; the unresolvable case
+            // remains open and is called out in the module docs.
+            if callee_instance_has_visible_obligation(ctx, func, walk_ctx.locals) {
+                ctx.record_sound_fallback_reason("nested_call_dropped_obligation");
+            }
+            // Say it on stderr too, once per distinct callee.
+            //
+            // The recorded reason above is the durable channel, but it rides
+            // `aggregate_encoding_gap`, which is currently never serialized into
+            // kani-metadata (a pre-existing gap), so nothing downstream can read
+            // it yet. This mirrors `first_report_of_missing_stdlib_mir` in the
+            // inline pass and makes the cluster triagable from a plain run in
+            // the meantime. Once-per-callee because the walker reaches the same
+            // call from every harness and every pass.
+            if first_report_of_overapproximated_callee(callee_label) {
+                tracing::warn!(
+                    "Nested call over-approximated (result is a fresh unconstrained \
+                     symbol): {callee_label} — a counterexample that depends on it is \
+                     not a real bug"
+                );
+            }
+            ctx.record_sound_fallback_reason_identified("nested_call_overapprox", Some(&freed));
+        } else {
+            // No `__nested_call_overapprox` var in the expression: this is the
+            // constrained collection-backing fallback, which DOES produce a
+            // live value (a Vec with a fresh object id) whose identity this
+            // site does not know. Passing `None` would ASSERT the approximation
+            // freed nothing readable — the driver would then be free to certify
+            // a counterexample that depends on it as Genuine, which is the
+            // exact bug this change exists to close. Record it unaccounted
+            // instead, so identity-completeness fails and certification is
+            // refused (fail-closed).
+            ctx.record_sound_fallback_reason("nested_call_overapprox");
+        }
+
         if apply_inline_writeback(ctx, walk_ctx, state, destination, fallback_var) {
             return TerminatorStep::ContinueAt(target_bb);
         }
@@ -908,4 +1038,43 @@ fn call_is_check_machinery(ctx: &ChcCtx<'_, '_>, func: &Operand, locals: &[Local
     let path = ctx.tcx.def_path_str(internal_def_id);
     let tail = path.rsplit("::").next().unwrap_or(&path);
     path.contains("kani::") && matches!(tail, "assert" | "check")
+}
+
+/// Has this over-approximated callee already been reported in this run?
+///
+/// Returns true exactly once per distinct callee path. The walker reaches the
+/// same call from every harness and on every pass, so without this a single
+/// `Vec::push` would print once per visit and bury the list it exists to
+/// produce. Process-global for the same reason as the inline pass's twin
+/// (`first_report_of_missing_stdlib_mir`): the compiler runs once per crate and
+/// this site has no single owner to hang the set on.
+fn first_report_of_overapproximated_callee(callee: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static REPORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    REPORTED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_or(true, |mut seen| seen.insert(callee.to_owned()))
+}
+
+/// Did the callee this site gave up on VISIBLY carry an obligation?
+///
+/// Resolves the callee the same way [`resolve_inline_callee_path`] does, then
+/// asks the obligation walk for a POSITIVE sighting. `false` for both "provably
+/// none" and "could not tell".
+fn callee_instance_has_visible_obligation(
+    ctx: &ChcCtx<'_, '_>,
+    func: &Operand,
+    locals: &[LocalDecl],
+) -> bool {
+    let Ok(func_ty) = func.ty(locals) else { return false };
+    let TyKind::RigidTy(RigidTy::FnDef(fn_def, fn_args)) = func_ty.kind() else {
+        return false;
+    };
+    let Some(instance) = Instance::resolve(fn_def, &fn_args).ok() else {
+        return false;
+    };
+    crate::codegen_ay::obligation_free_walk::body_has_visible_obligation(ctx.tcx, instance)
 }

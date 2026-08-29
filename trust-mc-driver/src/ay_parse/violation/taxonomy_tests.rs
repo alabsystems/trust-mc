@@ -111,13 +111,27 @@ fn emitted_violation_labels() -> BTreeSet<String> {
 fn test_classify_violation_expanded_families() {
     assert_maps("panic", "assertion", "panic reached");
     assert_maps("panic_stub", "assertion", "panic reached");
-    assert_maps("unreachable", "assertion", "panic reached");
+    // Kani-identical: TerminatorKind::Unreachable reports as its own class,
+    // which `determine_failed_from_properties` still counts as a panic.
+    assert_maps("unreachable", "unreachable", "unreachable code");
+
+    // The BMC unwinding assertion must NOT land in the panic family: its class
+    // gates concrete playback and the should_panic accounting, and its
+    // description carries the "unwinding assertion loop" prefix that
+    // `has_unwinding_assertion_failures` looks for.
+    let (unwind_class, unwind_desc) = classify_violation("unwind_assert");
+    assert_eq!(unwind_class, "unwind", "unwind_assert must not be classified as a panic");
+    assert!(
+        unwind_desc.starts_with("unwinding assertion loop"),
+        "the raise-the-bound tip keys off this prefix: {unwind_desc}"
+    );
+    assert!(unwind_desc.contains("--unwind"), "the description must name the flag to raise");
 
     assert_maps("bigint_div_by_zero", "division-by-zero", "division by zero");
     assert_maps("bigint_mod_by_zero", "division-by-zero", "division by zero");
 
-    assert_maps("simd_extract", "array_bounds", "SIMD index out of bounds");
-    assert_maps("simd_insert", "array_bounds", "SIMD index out of bounds");
+    assert_maps("simd_extract", "array_bounds", "simd_extract: SIMD index out of bounds");
+    assert_maps("simd_insert", "array_bounds", "simd_insert: SIMD index out of bounds");
 
     assert_maps("offset_value_overflow", "pointer-overflow", "pointer arithmetic overflow");
     assert_maps("offset_bytes_overflow", "pointer-overflow", "pointer arithmetic overflow");
@@ -137,11 +151,28 @@ fn test_classify_violation_expanded_families() {
         "pointer_dereference",
         "dereference failure: use after free",
     );
-    // Part of #2740: Heap deallocation safety labels.
+    // Part of #2740: Heap deallocation safety labels. The base-pointer check
+    // renders CBMC's wording, which the corpus pins (dealloc/stack).
     assert_maps(
         "dealloc_base_pointer_check",
         "pointer_dereference",
-        "dereference failure: dealloc base pointer mismatch",
+        "free argument must be dynamic object",
+    );
+
+    // Kani-identical raw-pointer deref texts (zst, issue-3571, ptr_to_ref_cast).
+    assert_maps("raw_ptr_deref_null", "safety_check", "null pointer dereference occurred");
+    assert_maps(
+        "raw_ptr_deref_misaligned",
+        "safety_check",
+        "misaligned pointer dereference: address must be a multiple of its type's alignment",
+    );
+
+    // Kani-identical INT_MIN / -1 overflow wordings for `/` and `%`.
+    assert_maps("overflow_check_div", "overflow", "attempt to divide with overflow");
+    assert_maps(
+        "overflow_check_rem",
+        "overflow",
+        "attempt to calculate the remainder with overflow",
     );
     assert_maps(
         "dealloc_size_mismatch",

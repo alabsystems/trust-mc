@@ -34,7 +34,7 @@ use tracing::debug;
 /// exactly one concrete implementation exists (single-impl devirtualization).
 ///
 /// Part of #3159: DynTrait category recovery.
-pub(super) fn try_devirtualize(
+pub(crate) fn try_devirtualize(
     tcx: TyCtxt<'_>,
     fn_def: FnDef,
     fn_args: &rustc_public::ty::GenericArgs,

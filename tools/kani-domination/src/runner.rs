@@ -160,6 +160,11 @@ fn run_one(env: &Env, test: &Discovered, cfg: &RunConfig) -> TestResult {
         proof_marker: false,
         native_proof_accepted: false,
         ctrex_category: None,
+        ctrex_categories_raw: Vec::new(),
+        translation_drops: Vec::new(),
+        no_harnesses: false,
+        vacuous: false,
+        aggregate_gap_reasons: Vec::new(),
         unknown_reason: None,
         unknown_category: None,
         unknown_category_detail: None,
@@ -241,7 +246,16 @@ fn run_one(env: &Env, test: &Discovered, cfg: &RunConfig) -> TestResult {
     let mut cmd = Command::new(&env.verifier);
     let outer_timeout = match &test.kind {
         EntryKind::SingleFile { harness_count } => {
-            cmd.arg(&run_abs).args(&flags);
+            // Run from the Kani checkout root, mirroring Kani's own harness.
+            // Test headers declare paths RELATIVE to that root, e.g.
+            // `// kani-flags: -Z c-ffi --c-lib tests/kani/ForeignItems/lib.c`.
+            // Without this the child inherits the runner's cwd
+            // (tools/kani-domination), the path resolves to nothing, and the
+            // driver silently ingests an EMPTY C library — so the row cannot
+            // distinguish "the C-body lane is inert" from "the C-body lane is
+            // never reached". A corpus that cannot fail is not evidence.
+            // Only the CargoPackage arm set a cwd before; this arm did not.
+            cmd.arg(&run_abs).args(&flags).current_dir(env.kani_dir());
             cfg.outer_timeout(*harness_count)
         }
         EntryKind::CargoPackage { manifest_dir, harness, harness_count } => {
@@ -474,6 +488,11 @@ fn parse_markers(s: &str, r: &mut TestResult) {
     r.native_proof_accepted = s.contains("[AY:NATIVE_PROOF_GRADE:accepted");
     r.sound_fallback = sum_marker(s, "[AY:SOUND_FALLBACK:");
     r.ctrex_category = marker_value(s, "[AY:CTREX_CAT:");
+    r.ctrex_categories_raw = marker_all_values(s, "[AY:CTREX_CAT:");
+    r.translation_drops = marker_all_values(s, "[AY:TRANSLATION_DROP_REASON:");
+    r.no_harnesses = s.contains("[AY:NO_HARNESSES]");
+    r.vacuous = s.contains("[AY:VACUOUS");
+    r.aggregate_gap_reasons = marker_all_values(s, "[AY:AGGREGATE_GAP_REASON:");
     r.unknown_reason = marker_value(s, "[AY:UNKNOWN_REASON:");
     let (category, detail) = parse_unknown_category(s);
     r.unknown_category = category;
@@ -533,6 +552,31 @@ fn marker_value(s: &str, prefix: &str) -> Option<String> {
     // The value may itself be `Cat:detail`; keep only the leading token.
     let v = &rest[..end];
     Some(v.split([':', ' ']).next().unwrap_or(v).to_string())
+}
+
+/// Every `prefix<value>]` occurrence, WHOLE value, de-duplicated, first-seen
+/// order.
+///
+/// [`marker_value`]'s truncation at `:` is right for the classification key and
+/// wrong for diagnosis: it turns `OverApproximation:chc_translation_drop=4`
+/// into `OverApproximation`, keeping the symptom and dropping the cause.
+///
+/// Unlike [`marker_csv_values`] the value is taken whole rather than split on
+/// commas, because these markers embed `:` and `=` rather than listing items.
+/// A multi-harness file prints one per harness, so a single scan is not enough.
+fn marker_all_values(s: &str, prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = s;
+    while let Some(idx) = rest.find(prefix) {
+        let after = &rest[idx + prefix.len()..];
+        let end = after.find(']').unwrap_or(after.len());
+        let v = after[..end].trim();
+        if !v.is_empty() && !out.iter().any(|e| e == v) {
+            out.push(v.to_string());
+        }
+        rest = &after[end..];
+    }
+    out
 }
 
 /// Collect the comma-separated values of EVERY `prefix<a,b,c>]` occurrence,
@@ -767,6 +811,31 @@ fn coherent_multi_harness_outcomes(combined: &str) -> Option<Vec<HarnessOutcome>
 
 /// Adjudicate a multi-harness FAILED run per harness. `None` = fall back to
 /// the run-level path unchanged.
+/// Does trust-mc's output satisfy KANI'S OWN pass/fail rule for this test?
+///
+/// Kani's `expected` suite is decided by `contains_lines` over the output —
+/// `run_expected_test` (kani compiletest `runtest.rs`) never inspects the exit
+/// status. So when every line of the expected file is present in trust-mc's
+/// output, this is a test Kani considers PASSING and trust-mc reproduced it;
+/// calling that a divergence-from-Kani would be wrong.
+///
+/// Used ONLY as a tiebreaker on the false-positive arms (see the call sites),
+/// never as the scoring rule. Measured on 98 real runs, replacing the verdict
+/// rule with `contains_lines` wholesale demotes 53 of 94 scorable rows —
+/// trust-mc does not emit CBMC's per-check report text — and forgives verdict
+/// errors on 111 of 470 rows, 17 of them missed-bug slots. Confined to the
+/// false-positive arm it can only ever correct a wrong FP; it cannot demote a
+/// passing row, and it cannot launder a real FP whose output is missing the
+/// expected verdict line outright.
+fn kani_criterion_satisfied(ctx: &ClassifyCtx<'_>, combined: &str) -> bool {
+    // Triage lever: A/B the tiebreaker across the corpus without editing code.
+    // Every flip it causes must be auditable, so keep a way to measure the set.
+    if std::env::var("TRUST_MC_NO_KANI_TIEBREAK").map(|v| v == "1").unwrap_or(false) {
+        return false;
+    }
+    matches!(ctx.expected, Some(exp) if matches_expected(combined, exp))
+}
+
 fn classify_multi_harness_fail(oracle: Verdict, combined: &str) -> Option<Classification> {
     let outcomes = coherent_multi_harness_outcomes(combined)?;
     let failing: Vec<&HarnessOutcome> =
@@ -987,6 +1056,17 @@ fn classify(ctx: &ClassifyCtx<'_>, r: &TestResult, combined: &str) -> Classifica
         let has_unknown_verdict = combined.contains("[AY:UNKNOWN_QUALITY:")
             || combined.contains("VERIFICATION:- UNDETERMINED")
             || combined.contains("UNREACHABLE");
+        // An honest vacuity refusal is not breakage. The driver emits
+        // `[AY:VACUOUS:no-checks]` + `VERIFICATION:- INCONCLUSIVE (no checks)`
+        // and exits 1, which `looks_like_error` reads as a failure to run.
+        // Before this arm those rows landed in `Error` alongside genuine
+        // compile failures: a 2026-08-22 run reported `error=46`, of which 33
+        // were vacuity and 3 were real compile breakage. Same non-parity
+        // outcome, but the headline said "crash wave" when it meant "we
+        // generated no checks".
+        if r.vacuous {
+            return Classification::Vacuous;
+        }
         return if looks_like_error && !has_unknown_verdict {
             Classification::Error
         } else {
@@ -1022,6 +1102,19 @@ fn classify(ctx: &ClassifyCtx<'_>, r: &TestResult, combined: &str) -> Classifica
         //     sibling. Engages only on a coherent per-harness split;
         //     otherwise the run-level path below is unchanged.
         if let Some(class) = classify_multi_harness_fail(oracle, combined) {
+            // A multi-harness file whose expected content pins only SOME of its
+            // harnesses can land here as a false positive while trust-mc is in
+            // fact correct — e.g. `modifies/field_replace_pass` and
+            // `modifies/check_only_verification` each pair a user harness with a
+            // `proof_for_contract` harness whose contract is GENUINELY violated
+            // (field_replace: `requires(*s.target < 100)` admits target=5 with
+            // prior=7, so the body yields 6 while `ensures` claims prior+1 = 8;
+            // check_only: `requires(*ptr < 100)` admits old=5, so the returned
+            // `*ptr` is 6, not the 100 the `ensures` asserts). Kani's own rule
+            // passes those files, so trust-mc has not diverged.
+            if class == Classification::FalsePositive && kani_criterion_satisfied(ctx, combined) {
+                return Classification::Parity;
+            }
             return class;
         }
         // 2b. Ill-sorted / unparseable CHC, or non-genuine CTREX that trust-mc
@@ -1038,7 +1131,41 @@ fn classify(ctx: &ClassifyCtx<'_>, r: &TestResult, combined: &str) -> Classifica
             Classification::Parity
         } else {
             // oracle == Success but trust-mc found a (claimed-genuine) CEX.
-            Classification::FalsePositive
+            //
+            // Before calling that a false positive, ask the question the label
+            // actually claims: does trust-mc DIVERGE FROM KANI here? Kani's own
+            // pass/fail rule for the `expected` suite is `contains_lines` over
+            // the output — `run_expected_test` (kani compiletest runtest.rs)
+            // never inspects the exit status. So an expected file whose lines
+            // are all present in trust-mc's output is a test KANI CONSIDERS
+            // PASSING, and trust-mc reproduced it.
+            //
+            // This matters for multi-harness files whose expected content only
+            // pins one harness. `function-contract/modifies/field_replace_pass`
+            // and `.../check_only_verification` each pair a user harness with a
+            // `proof_for_contract` harness whose contract is GENUINELY violated
+            // (field_replace: `requires(*s.target < 100)` admits target=5 with
+            // prior=7, so the body yields 6 while `ensures` claims prior+1=8;
+            // check_only: `requires(*ptr < 100)` admits old=5, so the returned
+            // `*ptr` is 6, not the 100 the `ensures` asserts). trust-mc is
+            // RIGHT to fail those, and scoring it a false positive punishes a
+            // correct answer.
+            //
+            // Deliberately NOT a wholesale oracle swap. Measured on 98 real
+            // runs, replacing the verdict rule with contains_lines demotes 53
+            // of 94 scorable rows (trust-mc does not emit CBMC's per-check
+            // report text) and forgives verdict errors on 111 of 470 rows, 17
+            // of them missed-bug slots. So contains_lines is used ONLY here, as
+            // a tiebreaker on the false-positive arm, where it can reclassify a
+            // wrong FP but can never demote a passing row. It also cannot
+            // launder a real one: `loop-contract/decreases_binary_search` is a
+            // single-harness file, its output lacks `VERIFICATION:- SUCCESSFUL`
+            // entirely, contains_lines FAILS, and it stays a false positive.
+            if kani_criterion_satisfied(ctx, combined) {
+                Classification::Parity
+            } else {
+                Classification::FalsePositive
+            }
         };
     }
 
@@ -1185,6 +1312,67 @@ mod tests {
     use super::*;
     use crate::model::{Classification as C, Verdict as V};
 
+    /// A multi-harness file whose expected content pins only the harness that
+    /// PASSES must not be branded a false positive when trust-mc is right.
+    ///
+    /// This is the `function-contract/modifies/field_replace_pass` /
+    /// `check_only_verification` shape: a user harness verifies, a sibling
+    /// `proof_for_contract` harness correctly REFUTES a contract that really is
+    /// violated, and the expected file mentions only the former. Kani's own
+    /// rule (`contains_lines`, exit status ignored) passes such a file, so
+    /// trust-mc has not diverged.
+    #[test]
+    fn fp_is_downgraded_when_output_satisfies_kanis_own_criterion() {
+        let combined = "\
+Checking harness good...
+VERIFICATION:- SUCCESSFUL
+Checking harness contract_harness...
+[AY:CTREX_CAT:Genuine]
+Failed Checks: |result| bogus
+VERIFICATION:- FAILED
+";
+        let expected = "VERIFICATION:- SUCCESSFUL\n";
+        assert_eq!(
+            classify_full(V::Success, combined, false, Some(1), false, Some(expected)),
+            C::Parity,
+            "expected lines are all present, so Kani itself passes this file"
+        );
+    }
+
+    /// ...but the tiebreaker must NOT launder a real false positive. This is
+    /// the `loop-contract/decreases_binary_search` shape: a single harness that
+    /// fails, whose output never contains the expected success line at all.
+    #[test]
+    fn fp_survives_when_output_misses_the_expected_verdict() {
+        let combined = "\
+Checking harness only...
+[AY:CTREX_CAT:Genuine]
+Failed Checks: assertion failed: result == Some(2)
+VERIFICATION:- FAILED
+";
+        let expected = "VERIFICATION:- SUCCESSFUL\n";
+        assert_eq!(
+            classify_full(V::Success, combined, false, Some(1), false, Some(expected)),
+            C::FalsePositive,
+            "the expected success line is absent, so Kani fails this file too"
+        );
+    }
+
+    /// With no expected file there is no Kani criterion to consult, so the
+    /// verdict rule stands unchanged.
+    #[test]
+    fn fp_survives_without_an_expected_file() {
+        let combined = "\
+Checking harness only...
+[AY:CTREX_CAT:Genuine]
+VERIFICATION:- FAILED
+";
+        assert_eq!(
+            classify_full(V::Success, combined, false, Some(1), false, None),
+            C::FalsePositive
+        );
+    }
+
     /// End-to-end: parse a raw verifier transcript and classify it against an
     /// oracle, exactly as `run_one` does.
     fn classify_full(
@@ -1212,6 +1400,8 @@ mod tests {
             suite: "t".into(), file: "f.rs".into(), oracle, observed: None,
             classification: None, sound_fallback: 0, effective_success: false,
             proof_marker: false, native_proof_accepted: false, ctrex_category: None,
+            ctrex_categories_raw: vec![], translation_drops: vec![], no_harnesses: false,
+            vacuous: false, aggregate_gap_reasons: vec![],
             unknown_reason: None, unknown_category: None, unknown_category_detail: None,
             demotion_reasons: vec![], self_reported_unsound: false,
             duration_ms: 0,
@@ -1246,6 +1436,8 @@ mod tests {
             suite: "".into(), file: "".into(), oracle: V::Success, observed: None,
             classification: None, sound_fallback: 0, effective_success: false,
             proof_marker: false, native_proof_accepted: false, ctrex_category: None,
+            ctrex_categories_raw: vec![], translation_drops: vec![], no_harnesses: false,
+            vacuous: false, aggregate_gap_reasons: vec![],
             unknown_reason: None, unknown_category: None, unknown_category_detail: None,
             demotion_reasons: vec![], self_reported_unsound: false,
             duration_ms: 0,
@@ -1314,6 +1506,8 @@ mod tests {
             suite: "".into(), file: "".into(), oracle: V::Fail, observed: None,
             classification: None, sound_fallback: 0, effective_success: false,
             proof_marker: false, native_proof_accepted: false, ctrex_category: None,
+            ctrex_categories_raw: vec![], translation_drops: vec![], no_harnesses: false,
+            vacuous: false, aggregate_gap_reasons: vec![],
             unknown_reason: None, unknown_category: None, unknown_category_detail: None,
             demotion_reasons: vec![], self_reported_unsound: false,
             duration_ms: 0,
@@ -1784,6 +1978,8 @@ mod tests {
             suite: "t".into(), file: "f.rs".into(), oracle: V::Success, observed: None,
             classification: None, sound_fallback: 0, effective_success: false,
             proof_marker: false, native_proof_accepted: false, ctrex_category: None,
+            ctrex_categories_raw: vec![], translation_drops: vec![], no_harnesses: false,
+            vacuous: false, aggregate_gap_reasons: vec![],
             unknown_reason: None, unknown_category: None, unknown_category_detail: None,
             demotion_reasons: vec![], self_reported_unsound: false,
             duration_ms: 0,

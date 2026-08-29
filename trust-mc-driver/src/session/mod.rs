@@ -57,14 +57,47 @@ pub(crate) struct KaniSession {
     /// Invariant: this field is_some() iff the autoharness subcommand is enabled.
     pub autoharness_compiler_flags: Option<Vec<String>>,
 
-    /// The location we found the 'kani_rustc' command
-    pub kani_compiler: PathBuf,
+    /// Where trust-mc was detected. The Kani-compatibility compiler binary is
+    /// resolved from this ON DEMAND -- see [`KaniSession::kani_compiler`].
+    ///
+    /// It used to be an eagerly-resolved `PathBuf`, which coupled the two lanes
+    /// this driver serves. `trust-mc-compiler` is the RUST-SOURCE frontend (the
+    /// Kani-compatibility path: Rust -> rustc internals -> AY). The TRUST-native
+    /// path does not use it at all -- `--trust-vc-bundle` goes straight to
+    /// `trust_mc_trust_vc_ingest` -- yet resolving it in the constructor made
+    /// EVERY invocation fail closed when it was absent, including that one.
+    /// Trust's own bootstrap builds this driver and never builds that compiler,
+    /// so the Trust engine lane could not run without the Kani lane installed.
+    pub install: InstallType,
 
     /// The temporary files we littered that need to be cleaned up at the end of execution
     pub temporaries: Mutex<Vec<PathBuf>>,
 }
 
 impl KaniSession {
+    /// Resolve the Kani-compatibility compiler binary, checking the sysroot first.
+    ///
+    /// Both checks were previously done eagerly in the constructor; the messages
+    /// are preserved verbatim so anything that genuinely needs the Rust-source
+    /// lane still fails closed exactly as before.
+    pub fn kani_compiler(&self) -> Result<PathBuf> {
+        // Pre-flight check: verify sysroot exists (#903)
+        // The sysroot contains pre-compiled standard libraries needed for compilation.
+        // Without it, users get confusing "can't find crate for `core`" errors.
+        let sysroot_lib = lib_folder()?;
+        if !sysroot_lib.exists() {
+            bail!(
+                "trust_mc sysroot not found at {}\n\n\
+                 The trust-mc sysroot contains pre-compiled standard libraries required for verification.\n\n\
+                 To build the sysroot, run:\n\
+                 \n  cargo build-dev\n\n\
+                 This only needs to be done once after cloning the repository or updating the toolchain.",
+                sysroot_lib.display()
+            );
+        }
+        self.install.kani_compiler()
+    }
+
     fn run_mode(
         &self,
         cmd: Command,
@@ -96,27 +129,17 @@ impl KaniSession {
 
         let install = InstallType::new()?;
 
-        // Pre-flight check: verify sysroot exists (#903)
-        // The sysroot contains pre-compiled standard libraries needed for compilation.
-        // Without it, users get confusing "can't find crate for `core`" errors.
-        let sysroot_lib = lib_folder()?;
-        if !sysroot_lib.exists() {
-            bail!(
-                "trust_mc sysroot not found at {}\n\n\
-                 The trust-mc sysroot contains pre-compiled standard libraries required for verification.\n\n\
-                 To build the sysroot, run:\n\
-                 \n  cargo build-dev\n\n\
-                 This only needs to be done once after cloning the repository or updating the toolchain.",
-                sysroot_lib.display()
-            );
-        }
-
+        // The sysroot and compiler-binary checks that used to live here are now in
+        // `kani_compiler()`, at the point of use. Both are RUST-SOURCE lane
+        // requirements; running them in the constructor made them requirements of
+        // every lane. They still fail closed, with the same messages, for anything
+        // that actually needs them.
         resolve_backend_for_session(&mut args, require_solver)?;
 
         Ok(KaniSession {
             args,
             autoharness_compiler_flags: None,
-            kani_compiler: install.kani_compiler()?,
+            install,
             temporaries: Mutex::new(vec![]),
         })
     }

@@ -79,9 +79,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             })
                         }
                         ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                            let actual =
-                                super::constant_index_offset(*offset, *min_length, *from_end);
-                            Some(Expr::bitvec_const(actual as u128, POINTER_WIDTH))
+                            // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                            super::constant_index_offset(*offset, *min_length, *from_end)
+                                .map(|i| Expr::bitvec_const(i as u128, POINTER_WIDTH))
                         }
                         _ => None,
                     };

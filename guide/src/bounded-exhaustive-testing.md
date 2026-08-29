@@ -9,6 +9,10 @@ high confidence in the MIR-to-SMT translation for a well-defined Rust subset.
 The harness lives in `scripts/bounded_exhaustive.py`. It defines a small
 grammar and configurable bounds to keep the search finite.
 
+> **NOTE**: that script is not currently checked into this repository, so the
+> commands and options below describe the harness as designed rather than as
+> something you can run from a fresh clone.
+
 ## Grammar
 
 ### Types

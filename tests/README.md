@@ -1,5 +1,4 @@
-# Kani Test Suites
+# trust-mc Test Suites
 
-You can see more details about each test suite in this folder in the
-[Kani testing suites](https://model-checking.github.io/kani/regression-testing.html#kani-testing-suites).
-
+You can see more details about each test suite in this folder in
+[trust-mc testing suites](../guide/src/regression-testing.md#trust-mc-testing-suites).

@@ -277,7 +277,17 @@ pub fn run_tests(config: Config) {
     }
 
     if config.dry_run {
-        let tests = test::filter_tests(&opts, tests);
+        // libtest now takes a `TestList` (tests + a sortedness tag) rather than a
+        // bare Vec: `filter_tests` uses binary search for `--exact` when the list
+        // is known sorted. These tests come from `make_tests` above, not from
+        // rustc's `--test` harness, so their order is NOT guaranteed and
+        // `Unsorted` is the only sound tag -- claiming `Sorted` would let the
+        // binary search miss tests. `filter_tests` still RETURNS a Vec, so the
+        // uses below are unchanged.
+        let tests = test::filter_tests(
+            &opts,
+            test::TestList::new(tests, test::TestListOrder::Unsorted),
+        );
         print_msg(&config, format!("Number of Tests: {}", tests.len()));
         for test in tests {
             print_msg(&config, format!(" - {} ...", test.desc.name.as_slice()));
@@ -285,7 +295,10 @@ pub fn run_tests(config: Config) {
         return;
     }
 
-    let res = test::run_tests_console(&opts, tests);
+    let res = test::run_tests_console(
+        &opts,
+        test::TestList::new(tests, test::TestListOrder::Unsorted),
+    );
     match res {
         Ok(true) => {}
         Ok(false) => {

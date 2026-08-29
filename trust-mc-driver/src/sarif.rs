@@ -14,8 +14,10 @@
 
 use crate::demotion::is_effective_manual_success;
 use crate::harness_runner::HarnessResult;
+use crate::proof_summary::{HarnessVerdict, classify_harness_verdict};
 use crate::property_model::{CheckStatus, Property, RawSourceLocation, TraceItem};
 use crate::session::KaniSession;
+use crate::verification_result::VerificationStatus;
 use anyhow::{Context, Result};
 use pathdiff::diff_paths;
 use serde::Serialize;
@@ -111,6 +113,17 @@ struct SarifResult {
 struct ResultProperties {
     harness: String,
     property_name: Option<String>,
+    /// The HARNESS-level verdict this finding belongs to.
+    ///
+    /// `level` is per-finding severity and says nothing about why the harness
+    /// as a whole did not succeed: a check reported under a harness the solver
+    /// never decided, and one under a harness whose assertion is genuinely
+    /// refutable, both arrived as `"level": "error"`. Code scanning that reads
+    /// only SARIF could not tell "raise the budget" from "your code is wrong".
+    /// Carried in `properties` (SARIF's own extension point) so no consumer
+    /// that ignores it can break, and named with the same tokens
+    /// `--proof-summary-json` uses.
+    verdict: &'static str,
 }
 
 #[derive(Serialize)]
@@ -156,6 +169,9 @@ impl SarifLog {
                 continue;
             }
 
+            let verdict = classify_harness_verdict(result, harness.attributes.should_panic);
+            let results_before = sarif_results.len();
+
             for prop in &result.results {
                 // Skip cover and code_coverage properties -- they are not verification findings.
                 if prop.is_cover_property() || prop.property_class() == "code_coverage" {
@@ -195,6 +211,55 @@ impl SarifLog {
                     properties: ResultProperties {
                         harness: harness.pretty_name.clone(),
                         property_name: Some(prop.property_name()),
+                        verdict: verdict.label(),
+                    },
+                });
+            }
+
+            // A harness can fail as a WHOLE while no single property failed, and
+            // the loop above -- which only ever reports properties -- then emits
+            // nothing at all for it. Both vacuity gates in `harness_runner` land
+            // here: `[AY:VACUOUS:unsat-assumption]` and its dead-check sibling
+            // `[AY:VACUOUS:dead-checks]` leave every check
+            // UNREACHABLE (never `Failure`), and `[AY:VACUOUS:no-checks]` leaves
+            // `results` empty outright. The run printed a red verdict and exited
+            // 1, but the machine-readable channel that CI actually gates on said
+            // zero findings:
+            //
+            //     $ trust-mc --sarif out.sarif vacuous.rs   # exit 1
+            //     $ jq '.runs[0].results | length' out.sarif
+            //     0
+            //
+            // For code scanning that reads as a clean file. A failing harness has
+            // to leave a finding behind, so synthesize one against the harness
+            // itself when its properties produced none.
+            if sarif_results.len() == results_before
+                && result.status == VerificationStatus::Failure
+            {
+                let (rule_id, text) = harness_level_finding(verdict);
+                rules.entry(rule_id.to_string()).or_insert_with(|| ReportingDescriptor {
+                    id: rule_id.to_string(),
+                    short_description: Message { text: harness_rule_description(rule_id) },
+                });
+                sarif_results.push(SarifResult {
+                    rule_id: rule_id.to_string(),
+                    level: "error",
+                    message: Message { text: format!("[{}] {text}", harness.pretty_name) },
+                    locations: vec![Location {
+                        physical_location: PhysicalLocation {
+                            artifact_location: ArtifactLocation {
+                                uri: relativize_path(&harness.original_file),
+                            },
+                            region: Region {
+                                start_line: harness.original_start_line as u32,
+                                start_column: None,
+                            },
+                        },
+                    }],
+                    properties: ResultProperties {
+                        harness: harness.pretty_name.clone(),
+                        property_name: None,
+                        verdict: verdict.label(),
                     },
                 });
             }
@@ -216,6 +281,52 @@ impl SarifLog {
             }],
         }
     }
+}
+
+/// Rule id and message for a harness that failed without any failing property.
+///
+/// The distinction matters to whoever reads the report: "you assumed something
+/// contradictory" and "you compiled to zero obligations" have different fixes,
+/// and neither is the ordinary "this assertion can fail".
+///
+/// The split itself now comes from [`classify_harness_verdict`], which is the
+/// console channel's own verdict chain — this used to be a second, hand-rolled
+/// copy of it (`results.is_empty()` where the console counts NON-COVER checks,
+/// and a vacuity test with no `should_panic` guard), and two copies of a rule
+/// are two rules. The RULE IDS are deliberately unchanged: they are what CI
+/// gates on, so the finer verdicts ride along in `properties.verdict` instead
+/// of splitting an existing id into new ones.
+fn harness_level_finding(verdict: HarnessVerdict) -> (&'static str, &'static str) {
+    match verdict {
+        HarnessVerdict::InconclusiveUndecided => {
+            ("trust_mc.harness.undecided", verdict.description())
+        }
+        HarnessVerdict::InconclusiveNoChecks => {
+            ("trust_mc.harness.no_checks", verdict.description())
+        }
+        // Both all-checks-unreachable shapes keep the ONE id they have always
+        // had. The id is what CI gates on and the two are the same news to a
+        // gate ("this harness established nothing"); which of them it was rides
+        // along in `properties.verdict` and in the message, exactly as the
+        // paragraph above says the finer verdicts should.
+        HarnessVerdict::Vacuous | HarnessVerdict::InconclusiveDeadChecks => {
+            ("trust_mc.harness.vacuous", verdict.description())
+        }
+        // Everything else keeps the one id that existed before, including the
+        // uncertified-counterexample case: it is a failure with findings of its
+        // own in the normal path, so it only reaches here in odd shapes.
+        _ => ("trust_mc.harness.failed", "verification did not succeed for this harness"),
+    }
+}
+
+fn harness_rule_description(rule_id: &str) -> String {
+    match rule_id {
+        "trust_mc.harness.no_checks" => "Harness produced no verification conditions",
+        "trust_mc.harness.undecided" => "Harness could not be decided by the solver",
+        "trust_mc.harness.vacuous" => "Harness proof is vacuous",
+        _ => "Harness verification did not succeed",
+    }
+    .to_string()
 }
 
 fn sarif_level(status: &CheckStatus) -> Option<&'static str> {
@@ -396,5 +507,71 @@ mod tests {
         let r = &v["runs"][0]["results"][0];
         // Should fall back to harness original_start_line
         assert_eq!(r["locations"][0]["physicalLocation"]["region"]["startLine"], 42);
+    }
+
+    /// Every finding says which VERDICT its harness got.
+    ///
+    /// `level` is per-finding severity: a check under a harness the solver
+    /// never decided and a check under a genuinely refuted one both came back
+    /// `"error"`, so code scanning could not tell "raise the budget" from
+    /// "your code is wrong".
+    #[test]
+    fn test_sarif_results_carry_the_harness_verdict() {
+        let harness = test_harness("my_harness", "test_crate");
+        let mut result = test_result(VerificationStatus::Failure, FailedProperties::PanicsOnly);
+        result.results = vec![failure_property()];
+        let log = SarifLog::from_harness_results(&[HarnessResult { harness: &harness, result }]);
+        let v = serde_json::to_value(&log).unwrap();
+        assert_eq!(v["runs"][0]["results"][0]["properties"]["verdict"], "failed");
+        // ...and the fields that were already there are untouched.
+        assert_eq!(v["runs"][0]["results"][0]["properties"]["harness"], "my_harness");
+        assert_eq!(v["runs"][0]["results"][0]["level"], "error");
+
+        // A harness the solver could not decide is a different verdict on the
+        // synthesized harness-level finding.
+        let mut undecided = test_result(VerificationStatus::Failure, FailedProperties::Other);
+        undecided.solver_unknown_reason =
+            Some(crate::verification_provenance::SolverUnknownReason::UndecidedModel);
+        let log = SarifLog::from_harness_results(&[HarnessResult {
+            harness: &harness,
+            result: undecided,
+        }]);
+        let v = serde_json::to_value(&log).unwrap();
+        assert_eq!(v["runs"][0]["results"][0]["ruleId"], "trust_mc.harness.undecided");
+        assert_eq!(v["runs"][0]["results"][0]["properties"]["verdict"], "inconclusive_undecided");
+    }
+
+    /// The rule ids are what CI gates on: the finer verdicts ride in
+    /// `properties`, and these four ids keep their exact meaning.
+    #[test]
+    fn test_sarif_harness_rule_ids_are_stable() {
+        assert_eq!(harness_level_finding(HarnessVerdict::Vacuous).0, "trust_mc.harness.vacuous");
+        assert_eq!(
+            harness_level_finding(HarnessVerdict::InconclusiveNoChecks).0,
+            "trust_mc.harness.no_checks"
+        );
+        assert_eq!(
+            harness_level_finding(HarnessVerdict::InconclusiveUndecided).0,
+            "trust_mc.harness.undecided"
+        );
+        assert_eq!(harness_level_finding(HarnessVerdict::Failed).0, "trust_mc.harness.failed");
+        assert_eq!(
+            harness_level_finding(HarnessVerdict::UncertifiedCounterexample).0,
+            "trust_mc.harness.failed",
+            "a NEW rule id would break every consumer that enumerates them"
+        );
+        for verdict in [
+            HarnessVerdict::Vacuous,
+            HarnessVerdict::InconclusiveNoChecks,
+            HarnessVerdict::InconclusiveUndecided,
+            HarnessVerdict::Failed,
+        ] {
+            let (id, _) = harness_level_finding(verdict);
+            assert_ne!(
+                harness_rule_description(id),
+                String::new(),
+                "every rule id needs a description"
+            );
+        }
     }
 }

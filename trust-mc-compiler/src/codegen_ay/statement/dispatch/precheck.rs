@@ -183,6 +183,39 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     /// Pre-check for Cow<str>::to_string() calls (Part of #1738).
     /// Examines generic args because the def_path_str doesn't contain "Cow".
+    /// `<String as BoundedArbitrary>::bounded_any::<N>()` — a symbolic String
+    /// of at most N bytes. Reaches codegen because the inline pass declines it
+    /// (see `should_inline_mutable`); without that this call is expanded into
+    /// `utf8_chunks()` internals that abstract to unconstrained symbolics, and
+    /// the bound is lost.
+    pub(in crate::codegen_ay::statement) fn try_codegen_bounded_string_precheck(
+        &mut self,
+        func: &Operand,
+        callee_path: &str,
+        destination: &Place,
+        target: Option<BasicBlockIdx>,
+    ) -> Option<Option<BasicBlockIdx>> {
+        if !callee_path.ends_with("::bounded_any") || !callee_path.contains("String") {
+            return None;
+        }
+
+        let func_ty = func.ty(self.body.locals()).into_option()?;
+        let fn_args = match func_ty.kind() {
+            TyKind::RigidTy(RigidTy::FnDef(_, args)) => args,
+            _ => return None, // external enum: TyKind
+        };
+        // No resolvable const bound means there is no bound to state; decline
+        // and let the existing fallback handle it.
+        let bound = fn_args.0.iter().find_map(|arg| match arg {
+            GenericArgKind::Const(c) => c.eval_target_usize().into_option(),
+            _ => None,
+        })?;
+
+        debug!(bound, "bounded_any::<String, N>: modelling a String of at most N bytes");
+        self.codegen_bounded_string_value(bound, destination);
+        Some(target)
+    }
+
     pub(in crate::codegen_ay::statement) fn try_codegen_cow_tostring_precheck(
         &mut self,
         func: &Operand,

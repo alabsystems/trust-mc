@@ -176,14 +176,53 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
-    /// Codegen `std::alloc::dealloc` / `__rust_dealloc`.
+    /// Whether `arg`'s MIR type is `std::alloc::Layout`.
     ///
-    /// Handles two calling conventions:
-    /// - __rust_dealloc: `fn(ptr: *mut u8, size: usize, align: usize)` (3 args)
-    /// - std::alloc::dealloc: `fn(ptr: *mut u8, layout: Layout)` (2 args)
+    /// Used to tell the `(…, ptr, layout)` deallocation conventions apart from
+    /// `__rust_dealloc(ptr, size, align)`, whose trailing operand is a `usize`.
+    /// Answers on the MIR type rather than the codegen'd expression so the
+    /// probe costs no extra `codegen_operand` (which mints fresh symbols).
+    /// Fail-safe direction: an operand whose type cannot be read answers
+    /// `false`, which keeps the pre-existing positional reading.
+    fn operand_is_layout(&self, arg: &Operand) -> bool {
+        use rustc_public::CrateDef;
+        use rustc_public::ty::{RigidTy, TyKind};
+        use trust_mc_codegen_shared::IntoOption;
+
+        let Some(ty) = arg.ty(self.body.locals()).into_option() else {
+            return false;
+        };
+        matches!(
+            ty.kind(),
+            TyKind::RigidTy(RigidTy::Adt(def, _)) if def.name() == "std::alloc::Layout"
+        )
+    }
+
+    /// Codegen `std::alloc::dealloc` / `__rust_dealloc` / `Allocator::deallocate`.
+    ///
+    /// Handles three calling conventions:
+    /// - `__rust_dealloc`: `fn(ptr: *mut u8, size: usize, align: usize)` (3 args)
+    /// - `std::alloc::dealloc`: `fn(ptr: *mut u8, layout: Layout)` (2 args)
+    /// - `<A as Allocator>::deallocate`: `fn(&self, ptr: NonNull<u8>, layout: Layout)`
+    ///   (3 args, `args[0]` is the ALLOCATOR RECEIVER)
+    ///
+    /// The receiver in the third shape is why the pointer cannot be read
+    /// positionally from `args[0]`: `Box`'s drop glue lowers to
+    /// `<Global as Allocator>::deallocate(&self, ptr, layout)`, so a positional
+    /// read deallocated the borrowed `Global` — an unconstrained address —
+    /// while passing the REAL pointer as the size and the `Layout` datatype as
+    /// the alignment. That invalidates an arbitrary heap block and leaves the
+    /// actual allocation live (a use-after-free the model can no longer see),
+    /// and it makes the dealloc size/base-pointer obligations fail against
+    /// garbage. In every `Layout`-carrying shape the pointer is the operand
+    /// IMMEDIATELY BEFORE the layout, so that is what is read.
+    ///
+    /// The CHC twin already refuses the positional read for the same reason
+    /// (`allocator_pointer_arg_idx`, #3184 — "`&Global` is a 64-bit
+    /// pointer-width bitvec too, so the allocator reference was freed instead
+    /// of the allocation"); only the BMC lane still had it.
     ///
     /// REQUIRES: args.len() >= 1 (at least ptr)
-    /// REQUIRES: args[0] is a valid allocated pointer
     /// ENSURES: ctx.heap marks the allocation as invalid
     pub(super) fn codegen_rust_dealloc(
         &mut self,
@@ -195,7 +234,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return None;
         }
 
-        let ptr = if let Some(p) = self.codegen_operand(&args[0]) {
+        // A trailing `Layout` operand identifies the `(…, ptr, layout)` shapes,
+        // in which the pointer sits one slot before the layout. `__rust_dealloc`
+        // ends in a `usize` align, so it keeps `args[0]`.
+        let layout_tail = args.len() >= 2 && self.operand_is_layout(&args[args.len() - 1]);
+        let ptr_idx = if layout_tail { args.len() - 2 } else { 0 };
+
+        let ptr = if let Some(p) = self.codegen_operand(&args[ptr_idx]) {
             p
         } else {
             // If ptr codegen fails, we can't safely deallocate.
@@ -206,7 +251,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
 
         // Extract size and align based on calling convention
-        let (size, align) = if args.len() >= 3 {
+        let (size, align) = if layout_tail {
+            // `dealloc(ptr, layout)` / `deallocate(&self, ptr, layout)`
+            self.extract_dealloc_layout_args(&args[args.len() - 1])
+        } else if args.len() >= 3 {
             // __rust_dealloc(ptr, size, align) form
             let size = self.codegen_operand(&args[1]).unwrap_or_else(|| {
                 let name = self.ctx.fresh_name("dealloc_size");

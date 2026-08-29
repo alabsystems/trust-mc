@@ -52,6 +52,32 @@ pub(crate) fn codegen_function_with_body(
     body: rustc_public::mir::Body,
     name: &str,
 ) {
+    // Positive evidence that zero checks means "nothing to prove", not "we
+    // dropped it": no obligation SITE is reachable from this body.
+    //
+    // This used to require no `Call` terminator AT ALL, which refused every
+    // harness that called anything — `bar();`, `Path::new(..)`, `println!(..)`
+    // are all calls, and all of them were left VACUOUS. The walk asks the same
+    // question of every body it can reach instead, and is fail-closed on
+    // anything it cannot see (indirect/virtual callee, absent body, inline
+    // asm, budget). `Option::unwrap` still fails it: its body asserts.
+    // Callees are resolved THROUGH the unit's stub map, so the walk inspects
+    // the same program the encoder encodes. A stub can ADD an obligation the
+    // original lacks — `#[kani::stub(clean, panicking)]` once made the walk see
+    // `clean`, find nothing to prove, and CERTIFY a harness whose emitted check
+    // FAILS — and walking the original is exactly how that happened.
+    //
+    // This replaces a blunt "refuse any stubbed unit" gate, which was sound but
+    // cost `tests/kani/Stubbing/glob_{cycle,path}.rs`. No transformer (a test
+    // context) still fails closed: an empty map cannot resolve a stub, so the
+    // certificate is refused wherever a stub would have mattered.
+    let stubs = ay_ctx.transformer_stub_map();
+    let obligation_free =
+        crate::codegen_ay::obligation_free_walk::body_is_transitively_obligation_free(
+            ay_ctx.tcx, instance, &body, &stubs,
+        );
+    ay_ctx.obligation_free_body_by_fn.insert(name.to_string(), obligation_free);
+    tracing::debug!(name, certified = obligation_free, "obligation-free walk");
     // Contract-heavy functions can require more than the default inline depth
     // to fully inline `kani_register_contract`/closure-call shims.
     // If we stop early, BMC falls back to symbolic closure results and can
@@ -139,6 +165,53 @@ pub(crate) fn codegen_function_with_body(
         debug!("AY codegen: inlined function calls in {}", name);
     }
 
+    // Construct-derived unwind bound from a specialized C-variadic call.
+    // `va_arg` past the end of the actual list is UB and its bounds obligation
+    // fails there, so no non-failing execution runs a fetching loop body more
+    // than `n` times; `n + 2` covers those iterations plus the exit test.
+    // Unrolling itself stays fail-closed regardless of the bound: the exhausted
+    // back-edge becomes an unwinding-assertion error edge, so a bound that is
+    // too small FAILS loudly instead of proving anything vacuously.
+    const VARIADIC_UNROLL_DEPTH_CAP: usize = 16;
+    let variadic_unroll_depth: Option<u32> = inline_pass
+        .variadic_actual_bound()
+        .map(|n| n + 2)
+        .filter(|d| *d <= VARIADIC_UNROLL_DEPTH_CAP)
+        .map(|d| d as u32);
+
+    // Construct-derived unwind bound from a CONSTANT-TRIP-COUNT loop.
+    //
+    // With no user bound the depth is 1, so `unroll_cfg_loops` cuts a loop's
+    // last back-edge into the unwinding-assertion sentinel and everything after
+    // the loop becomes reachable only through paths that truncation removed —
+    // post-loop checks come back UNREACHABLE instead of getting a verdict.
+    // Kani's default is CBMC *complete* unwinding, so a loop with a statically
+    // computable trip count is fully unrolled there. This derives that trip
+    // count per body (see `loop_unroll::const_trip`) rather than raising the
+    // default for everyone: memory is already bounded, but a deeper unroll is a
+    // strictly bigger solver query, so the bound has to be earned per loop.
+    //
+    // Two gates, both fail-open to today's behaviour:
+    //   * `has_explicit_unwind` — a user bound (`--unwind`, `--default-unwind`,
+    //     `#[kani::unwind(N)]`) must keep today's behaviour EXACTLY, including
+    //     the tests that pin `unwinding assertion loop N: FAILURE`.
+    //   * `unwinding_assertions` — the derived bound is only safe BECAUSE an
+    //     exhausted back-edge is still an error edge. With unwinding assertions
+    //     off a mis-derived bound would truncate silently, so we derive nothing.
+    // CHC is deliberately left alone: it expresses loops as recursive predicates
+    // and needs no bound, so unrolling there would only enlarge the query.
+    let const_trip_unroll_depth: Option<u32> = if ay_ctx.config.use_chc
+        || ay_ctx.config.has_explicit_unwind
+        || !ay_ctx.config.unwinding_assertions
+    {
+        None
+    } else {
+        loop_unroll::derive_const_trip_unroll_depth(&body)
+    };
+    if let Some(depth) = const_trip_unroll_depth {
+        debug!(name, depth, "derived a constant-trip-count unwind bound");
+    }
+
     // Unsupported captures deliberately leave the original role-0 register
     // call in place. Scan after inlining so a contracted loop in a helper
     // cannot evade the harness-level fail-closed gate; the register function
@@ -184,19 +257,24 @@ pub(crate) fn codegen_function_with_body(
         // the unwinding-assertion error edge for a loop that cannot terminate
         // within the bound (SOUNDNESS: a non-terminating `loop {}` under unwind(1)
         // must FAIL, not be vacuously proved safe).
-        if ay_ctx.config.chc_bounded_unroll
+        // A user unwind hint wins when present; otherwise a specialized variadic
+        // call supplies its own bound (with unwinding assertions forced ON —
+        // this bound is derived by the encoder, not requested by the user, so it
+        // must never be allowed to silently truncate an execution).
+        let unroll_request: Option<(u32, bool)> =
+            if ay_ctx.config.chc_bounded_unroll && ay_ctx.config.has_explicit_unwind {
+                Some((ay_ctx.config.unwind_depth, ay_ctx.config.unwinding_assertions))
+            } else {
+                variadic_unroll_depth.map(|depth| (depth, true))
+            };
+        if let Some((unroll_depth, unroll_assertions)) = unroll_request
             && !cfg.is_acyclic()
-            && ay_ctx.config.has_explicit_unwind
         {
             debug!(
                 "AY codegen CHC: body has loops, applying bounded unrolling (depth={}) before CHC encoding for {}",
-                ay_ctx.config.unwind_depth, name
+                unroll_depth, name
             );
-            match loop_unroll::unroll_cfg_loops(
-                body.clone(),
-                ay_ctx.config.unwind_depth,
-                ay_ctx.config.unwinding_assertions,
-            ) {
+            match loop_unroll::unroll_cfg_loops(body.clone(), unroll_depth, unroll_assertions) {
                 Ok(unrolled) => {
                     body = unrolled;
                     debug!(
@@ -225,13 +303,21 @@ pub(crate) fn codegen_function_with_body(
     let (mut topo_order, mut reachable_count) = compute_topo(&body);
 
     if topo_order.len() != reachable_count {
+        // A specialized variadic call bounds its own fetching loop; take the
+        // deeper of the two so the BMC twin does not truncate a fetch sequence
+        // the model can already discharge.
+        let bmc_unwind_depth = ay_ctx
+            .config
+            .unwind_depth
+            .max(variadic_unroll_depth.unwrap_or(0))
+            .max(const_trip_unroll_depth.unwrap_or(0));
         debug!(
             "AY codegen: CFG cycle detected in {}, attempting bounded unrolling (depth={})",
-            name, ay_ctx.config.unwind_depth
+            name, bmc_unwind_depth
         );
         match loop_unroll::unroll_cfg_loops(
             body,
-            ay_ctx.config.unwind_depth,
+            bmc_unwind_depth,
             ay_ctx.config.unwinding_assertions,
         ) {
             Ok(unrolled) => {
@@ -525,6 +611,17 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
         ay_ctx.queries.args().unstable_features.iter().any(|f| f == "loop-contracts");
     if loop_contracts_enabled && body_has_loop_decreases_call(body) {
         debug!(name, "CHC: loop `decreases` ranking not proven — attributed failing VC");
+        // Say so out loud, once per body. Reaching here means
+        // `instrument_loop_decreases` did NOT encode this measure (the register
+        // call survived the pass), so the clause really is unhandled and the
+        // failing VC below is a conservative stand-in rather than a discharged
+        // ranking obligation. The failing VC stays exactly as it was — this
+        // line only states the limitation the verdict already encodes, which is
+        // what `tests/expected/loop-contract/loop_decreases_unsupported` reads.
+        ay_ctx.tcx.dcx().warn(
+            "`#[kani::loop_decreases]` is parsed but termination checking for loop \
+             variants is not supported by trust-mc yet",
+        );
         // Attributed failing VC: a registered `loop_decreases` PROPERTY whose
         // error_p1 relation is a reachable fact, bridged into the aggregate
         // `error` query. The harness reports a named failing check
@@ -564,7 +661,8 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
     // mutable borrow on ay_ctx is not held across the unwind boundary.
     let tcx = ay_ctx.tcx;
     let chc_cfg = ChcConfig {
-        frame_narrowing: false,
+        frame_narrowing: crate::codegen_ay::chc::frame_narrowing_enabled(),
+        frame_narrowing_flattened: crate::codegen_ay::chc::frame_narrowing_flattened_enabled(),
         track_level: ay_ctx.config.chc_track_level,
         step_mode: ay_ctx.config.chc_step_mode,
         int_lift: ay_ctx.config.chc_int_lift,
@@ -770,7 +868,11 @@ mod integration_bmc_tests;
 #[cfg(test)]
 mod integration_chc_kani_hook_tests;
 #[cfg(test)]
+mod integration_chc_dyn_vtable_tests;
+#[cfg(test)]
 mod integration_chc_tests;
+#[cfg(test)]
+mod integration_obligation_free_walk_tests;
 #[cfg(test)]
 mod integration_verdict_baseline_tests;
 #[cfg(test)]

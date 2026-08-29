@@ -12,6 +12,13 @@ use csv::WriterBuilder;
 use graph_cycles::Cycles;
 use petgraph::graph::Graph;
 use rustc_middle::ty::TyCtxt;
+// `FieldDef::ty()` is provided by the `CrateDefType` TRAIT, not inherently, so
+// the trait must be in scope at the call site (analysis.rs:360). call_graph.rs
+// already imports it for the same reason. Without it rustc reports
+// "no method named `ty` found for struct `rustc_public::ty::FieldDef`" and then
+// points at crate_def.rs where the method IS available -- a missing import, not
+// a removed API.
+use rustc_public::CrateDefType;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::visit::{Location, PlaceContext, PlaceRef};
 use rustc_public::mir::{

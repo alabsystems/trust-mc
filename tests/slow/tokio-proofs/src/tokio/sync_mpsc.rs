@@ -8,7 +8,10 @@
 
 #![allow(clippy::redundant_clone)]
 #![warn(rust_2018_idioms)]
-#![cfg(feature = "sync")]
+// This crate exposes the Tokio test corpus through its `full` feature.  The
+// upstream test's `sync` feature name is not a feature of this proof crate and
+// silently removed every harness in this file from the crate graph.
+#![cfg(feature = "full")]
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -25,9 +28,7 @@ use tokio_test::*;
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
-mod support {
-    pub(crate) mod mpsc_stream;
-}
+use super::support;
 
 trait AssertSend: Send {}
 impl AssertSend for mpsc::Sender<i32> {}
@@ -466,7 +467,7 @@ fn unconsumed_messages_are_dropped() {
     assert_eq!(1, Arc::strong_count(&msg));
 }
 
-#[maybe_tokio_test]
+#[test]
 #[cfg(feature = "full")]
 fn blocking_recv() {
     let (tx, mut rx) = mpsc::channel::<u8>(1);

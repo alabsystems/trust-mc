@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
-use anyhow::Result;
+use std::process::ExitCode;
 
-fn main() -> Result<()> {
-    trust_mc::proxy("cargo-trust-mc")
+fn main() -> ExitCode {
+    trust_mc::cargo_proxy("cargo-trust-mc")
 }

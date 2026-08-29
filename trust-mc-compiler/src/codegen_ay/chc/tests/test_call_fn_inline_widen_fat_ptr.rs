@@ -282,7 +282,7 @@ fn test_alloc_id_extraction_handles_bvconcat_from_widening() {
 
         let ptr_expr = extracted.unwrap();
         // try_extract_constant_addr expects BV64 with obj_id in upper 32 bits.
-        let addr = ChcCtx::try_extract_constant_addr(&ptr_expr);
+        let addr = ChcCtx::try_extract_constant_addr(ptr_expr.as_expr());
         if let Some((obj_id, offset)) = addr {
             assert_eq!(obj_id, 5, "obj_id should be 5");
             assert_eq!(offset, 0, "offset should be 0");

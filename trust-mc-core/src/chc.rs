@@ -131,6 +131,19 @@ pub struct ChcVc {
     /// distinguishes "proved then cleared" from "silently discarded".
     pub trivially_safe_discharged: bool,
 
+    /// Set when a trivially-safe discharge proved the obligations UNREACHABLE
+    /// rather than SAFE — i.e. no check site was reachable at all, because
+    /// every path into it was pruned as infeasible (`kani::assume(false)`, two
+    /// assumptions that cannot both hold, an unreachable body).
+    ///
+    /// The discharge replaces the whole system with `false => error`, and at
+    /// that point a genuine proof and a vacuous one are byte-identical — the
+    /// BMC lane's reachability probe has nothing left to read. This flag is
+    /// the channel that carries the distinction across the discharge, so the
+    /// driver can hand the run to the same V4 vacuity gate BMC uses instead of
+    /// reporting a clean proof of nothing.
+    pub vacuous_all_checks_unreachable: bool,
+
     /// Task #78: SMT-var identities freed by RECORDED sound-approximation sites.
     ///
     /// Each entry is the base SMT variable name whose defining constraint a
@@ -209,6 +222,7 @@ impl ChcVc {
             cover_assertions: Vec::new(),
             properties: Vec::new(),
             trivially_safe_discharged: false,
+            vacuous_all_checks_unreachable: false,
             approximated_vars: Vec::new(),
             accounted_approximations: 0,
             approximation_identity_complete: false,
@@ -502,9 +516,11 @@ impl ChcVc {
                 }
             });
             let pruned = before - self.rules.len();
-            if pruned > 0 {
-                eprintln!("[ORPHAN_PRUNE] removed {pruned} rules, {} remaining", self.rules.len());
-            }
+            // (An `eprintln!` of the pruned/remaining rule counts lived here.
+            // It fired on ordinary --ay-chc runs, so every user saw internal
+            // rule counts on stderr. trust-mc-core has no logging dependency
+            // and this was its only print, so it is removed rather than gated:
+            // the counts are reconstructible from --keep-temps.)
             if pruned == 0 {
                 break;
             }

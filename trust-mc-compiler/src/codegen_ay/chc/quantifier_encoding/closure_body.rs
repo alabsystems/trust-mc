@@ -89,16 +89,21 @@ fn inline_simple_fn_call<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
     func_operand: &Operand,
     call_args: Vec<Expr>,
+    arg_operands: &[Operand],
     caller_locals: &[rustc_public::mir::LocalDecl],
     bb_idx: usize,
 ) -> Option<Expr> {
+    // The receiver OPERAND carries the type the known-call fast paths need to
+    // tell a pointer receiver from an integer one (element- vs byte-sized
+    // `wrapping_add`); passing `None` silently drops `size_of::<T>()` scaling.
+    let first_arg = arg_operands.first();
     if let Some(callee_path) = resolve_closure_body_callee_path(ctx, func_operand, caller_locals)
         && let Some(expr) = inline_known_call_expr_for_callee_path(
             ctx,
             func_operand,
             &callee_path,
             &call_args,
-            None,
+            first_arg,
             caller_locals,
         )
     {
@@ -109,7 +114,9 @@ fn inline_simple_fn_call<'tcx, 'body>(
         return Some(expr);
     }
 
-    if let Some(expr) = inline_known_call_expr(ctx, func_operand, &call_args, None, caller_locals) {
+    if let Some(expr) =
+        inline_known_call_expr(ctx, func_operand, &call_args, first_arg, caller_locals)
+    {
         // Part of #4053: declare DT sorts for known-call arg/result accessors.
         for arg in &call_args {
             ctx.declare_datatype_sort_if_needed(arg.sort());
@@ -199,6 +206,26 @@ pub(in crate::codegen_ay) fn translate_closure_body_as_expr<'tcx, 'body>(
     captures: &[Expr],
     bb_idx: usize,
 ) -> Option<ClosureBodyResult> {
+    translate_closure_body_with_params(ctx, body, std::slice::from_ref(qvar), captures, bb_idx)
+}
+
+/// Multi-parameter form of [`translate_closure_body_as_expr`].
+///
+/// `params[i]` is bound to closure local `i + 2` (local 0 = return value,
+/// local 1 = the closure environment reference). The single-parameter
+/// quantifier form is the `params.len() == 1` case.
+///
+/// Part of the `fold` reduction model: a `|acc, x|` closure needs BOTH the
+/// accumulator and the element bound before its body can be replayed, and a
+/// reduction that cannot bind its element has no choice but to mint a free
+/// value in a value position — the fabrication class this replaces.
+pub(in crate::codegen_ay) fn translate_closure_body_with_params<'tcx, 'body>(
+    ctx: &mut ChcCtx<'tcx, 'body>,
+    body: &rustc_public::mir::Body,
+    params: &[Expr],
+    captures: &[Expr],
+    bb_idx: usize,
+) -> Option<ClosureBodyResult> {
     // For simple 1-block closures, process directly.
     // For 2-block closures with a Call terminator, delegate to the call handler.
     // For multi-block closures with Assert terminators (from CheckedBinaryOp),
@@ -206,7 +233,7 @@ pub(in crate::codegen_ay) fn translate_closure_body_as_expr<'tcx, 'body>(
     if body.blocks.len() == 2 {
         // Check if bb0 ends with Call -> bb1 (the original 2-block pattern)
         if matches!(body.blocks[0].terminator.kind, TerminatorKind::Call { target: Some(1), .. }) {
-            return translate_closure_body_with_call(ctx, body, qvar, captures, bb_idx);
+            return translate_closure_body_with_call(ctx, body, params, captures, bb_idx);
         }
     }
 
@@ -216,7 +243,9 @@ pub(in crate::codegen_ay) fn translate_closure_body_as_expr<'tcx, 'body>(
     // local 2 = quantified parameter (mapped to qvar)
     // locals 3+ = temporaries
     let mut local_exprs: HashMap<usize, Expr> = HashMap::new();
-    local_exprs.insert(2, qvar.clone());
+    for (i, param) in params.iter().enumerate() {
+        local_exprs.insert(i + 2, param.clone());
+    }
 
     let locals = body.locals();
 
@@ -326,8 +355,9 @@ pub(in crate::codegen_ay) fn translate_closure_body_as_expr<'tcx, 'body>(
                     return None;
                 }
                 // Part of #3454: fall back to array-indexing pattern if simple inline fails.
-                let result = inline_simple_fn_call(ctx, func, call_args.clone(), &locals, bb_idx)
-                    .or_else(|| try_inline_array_index_call(func, &call_args, &locals));
+                let result =
+                    inline_simple_fn_call(ctx, func, call_args.clone(), args, &locals, bb_idx)
+                        .or_else(|| try_inline_array_index_call(func, &call_args, &locals));
                 if let Some(result) = result {
                     local_exprs.insert(destination.local, result);
                 }
@@ -350,7 +380,7 @@ pub(in crate::codegen_ay) fn translate_closure_body_as_expr<'tcx, 'body>(
 fn translate_closure_body_with_call<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
     body: &rustc_public::mir::Body,
-    qvar: &Expr,
+    params: &[Expr],
     captures: &[Expr],
     bb_idx: usize,
 ) -> Option<ClosureBodyResult> {
@@ -377,7 +407,9 @@ fn translate_closure_body_with_call<'tcx, 'body>(
 
     // Build local_exprs for bb0's statements (same as single-block case)
     let mut local_exprs: HashMap<usize, Expr> = HashMap::new();
-    local_exprs.insert(2, qvar.clone());
+    for (i, param) in params.iter().enumerate() {
+        local_exprs.insert(i + 2, param.clone());
+    }
 
     let locals = body.locals();
     let resolver = PlaceResolver::Captures(captures);
@@ -418,7 +450,7 @@ fn translate_closure_body_with_call<'tcx, 'body>(
     // Part of #2943: uses shared inline_simple_fn_call helper.
     // Part of #3454: fall back to array-indexing pattern if simple inline fails.
     let call_result =
-        inline_simple_fn_call(ctx, call_func, translated_args.clone(), &locals, bb_idx)
+        inline_simple_fn_call(ctx, call_func, translated_args.clone(), call_args, &locals, bb_idx)
             .or_else(|| try_inline_array_index_call(call_func, &translated_args, &locals))?;
 
     // Assign result to call destination local

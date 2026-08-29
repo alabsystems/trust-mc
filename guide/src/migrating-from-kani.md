@@ -107,19 +107,19 @@ remediation table.
 ## Known Gaps Where trust-mc Does Not Yet Match Kani
 
 Compiletest regression triage is tracked under
-[#4265](https://github.com/alabsystems/trust-mc/issues/4265). The best
-checked-in per-harness snapshot lives in
-[`reports/compiletest-per-harness-latest-trust-mc.json`](../../reports/compiletest-per-harness-latest-trust-mc.json).
-It was generated on `2026-04-20` from a merged TL71 packet and predates the
-current AY dependency revision in `Cargo.toml`, so use it as a stale baseline
-until a fresh replacement-proof authority-tuple run replaces it. That tuple
-must name the trust-mc commit, current `Cargo.toml` AY pin, report tree
-fingerprint, harness count, proof inventory SHA, and non-proof closure SHA.
+[#4265](https://github.com/alabsystems/trust-mc/issues/4265). There is no
+per-harness snapshot checked into this repository: `reports/` is gitignored,
+and the old `compiletest-per-harness-latest-trust-mc.json` baseline (generated
+`2026-04-20` from a merged TL71 packet, and predating the current AY revision
+in `Cargo.toml`) is no longer tracked. Generate a fresh one with a
+replacement-proof authority-tuple run; that tuple must name the trust-mc
+commit, current `Cargo.toml` AY pin, report tree fingerprint, harness count,
+proof inventory SHA, and non-proof closure SHA.
 
 - Snapshot counts are intentionally not duplicated here (they go stale); read
-  them from the JSON snapshot above, which is the source of truth for that run.
-- The remaining parity gaps are concentrated in exactly the areas surfaced by
-  that report: unsupported constructs, `UNKNOWN` solver buckets, and
+  them from the run you generate, which is the source of truth for that run.
+- The remaining parity gaps are concentrated in exactly the areas that report
+  surfaces: unsupported constructs, `UNKNOWN` solver buckets, and
   compile/codegen `ERROR` cases.
 
 ## Migrating A Project Step-By-Step

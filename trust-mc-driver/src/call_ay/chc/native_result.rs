@@ -18,15 +18,27 @@ use crate::session::KaniSession;
 use crate::verification_result::{FailedProperties, ProofCrosscheck, VerificationStatus};
 
 use super::smt_analysis::smt_has_recursive_unwind_assertion;
+use super::smt_analysis::smt_has_vacuous_checks_marker;
 use super::verdict_policy::{ChcOutcomeKind, apply_recursion_unwind_verdict, classify_chc_outcome};
 use super::{ChcSolverResult, TRIVIAL_SAFE_NO_ERROR_RULE_QUALIFIER};
 
 macro_rules! solver_stdout {
     ($($arg:tt)*) => {{
-        use std::io::Write;
-        let stdout = std::io::stdout();
-        let mut handle = stdout.lock();
-        let _ = writeln!(handle, $($arg)*);
+        // Honor `--quiet` ("no output, just an exit code and requested
+        // artifacts"): this macro used to write straight to stdout, so a quiet
+        // run still printed `[AY:PROOF] CHC verification: ...` and the other
+        // solver markers. The gate lives in the macro rather than at the ~70
+        // call sites because several of them are free functions with no
+        // `&KaniSession` in reach. Only the WRITE is skipped — the verdict and
+        // the exit code are untouched — and with `--quiet` absent the bytes
+        // are identical to before, which is what `scripts/ay-compiletest.sh`
+        // parses.
+        if !crate::args::common::quiet_output() {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            let _ = writeln!(handle, $($arg)*);
+        }
     }};
 }
 
@@ -83,6 +95,7 @@ impl KaniSession {
             properties.extend(cover_properties);
         }
 
+        Self::apply_vacuous_checks_marker(smt_content, &mut properties);
         let outcome = classify_chc_outcome(false, status, failed_props);
         let (status, failed_props, properties, _) = apply_recursion_unwind_verdict(
             has_recursive_unwind,
@@ -104,6 +117,29 @@ impl KaniSession {
             proof_transcript_metadata: None,
             native_full_verification_verdict: None,
         })
+    }
+
+    /// Re-status a would-be CHC proof whose obligations the compiler proved
+    /// UNREACHABLE rather than SAFE.
+    ///
+    /// Marking the checks `Unreachable` hands the run to the SAME V4 vacuity
+    /// gate the BMC lane uses (`is_unsat_assumption_vacuous` in
+    /// `harness_runner`), so both modes print one verdict, honour
+    /// `--allow-vacuous` identically, and cannot drift apart. Without this the
+    /// CHC lane reported `SUCCESSFUL` with `PROOF_QUALIFIERS:clean` for
+    /// `assume(x > 10); assume(x < 5)`.
+    fn apply_vacuous_checks_marker(smt_content: &str, properties: &mut [Property]) {
+        if !smt_has_vacuous_checks_marker(smt_content) {
+            return;
+        }
+        for property in properties.iter_mut() {
+            // Covers carry their own vocabulary (Satisfied / Unsatisfiable /
+            // Undetermined) and V4 skips them; re-statusing one here would
+            // mislabel a cover without changing the verdict.
+            if !property.is_cover_property() && property.status == CheckStatus::Success {
+                property.status = CheckStatus::Unreachable;
+            }
+        }
     }
 
     /// Interpret a compiler-discharged CHC system that preserves an explicit
@@ -153,6 +189,7 @@ impl KaniSession {
             properties.extend(cover_properties);
         }
 
+        Self::apply_vacuous_checks_marker(smt_content, &mut properties);
         let outcome = classify_chc_outcome(false, status, failed_props);
         let (status, failed_props, properties, _) = apply_recursion_unwind_verdict(
             has_recursive_unwind,
@@ -252,6 +289,7 @@ impl KaniSession {
             }
         }
 
+        Self::apply_vacuous_checks_marker(smt_content, &mut properties);
         let outcome = classify_chc_outcome(false, status, failed_props);
         let (status, failed_props, properties, outcome) = apply_recursion_unwind_verdict(
             has_recursive_unwind,
@@ -388,5 +426,95 @@ impl KaniSession {
             proof_transcript_metadata,
             native_full_verification_verdict,
         })
+    }
+}
+
+impl KaniSession {
+    /// V5-CHC (mandatory witness, fail-CLOSED): decide what an UNDECIDED
+    /// `cover(...)` means for a `--ay-chc` run.
+    ///
+    /// # Why this lane cannot decide covers
+    ///
+    /// A cover asks a REACHABILITY question — "is there a feasible run that
+    /// reaches this point with this condition true". The BMC lane answers it
+    /// exactly: its query already carries every assumption as a top-level
+    /// assertion, so `cover_cond ∧ program_constraints` is decidable. The Horn
+    /// encoding cannot: the compiler records a cover as a bare
+    /// `(assert (= ay_cover_N <cond>))` emitted AFTER `(query error)`, with no
+    /// relation application naming the block it sits in and no copy of the path
+    /// constraints that reach it (`hook_cover` in the compiler has both
+    /// `from_app` and `stmt_constraints` in hand and attaches neither). The
+    /// assumptions that bound the cover live inside `(rule ...)` bodies keyed to
+    /// a program point this file does not record, and the entry relation is
+    /// total — `(rule (=> true (bb0 …)))` — so even "reachable in SOME block"
+    /// is satisfied by every satisfiable condition. There is no sound way, from
+    /// the CHC artifact alone, to turn a `sat` into a witness.
+    ///
+    /// `check_cover_satisfiability_for_chc` therefore reports UNDETERMINED for
+    /// anything it cannot prove unsatisfiable. That is honest, but on its own it
+    /// is fail-OPEN for `--strict-vacuity`: V5 in `harness_runner` only fires on
+    /// a cover PROVED `Unsatisfiable`/`Unreachable`, so a harness whose witness
+    /// obligation was never adjudicated would exit 0 and be counted verified —
+    /// the gate asked for could never fire.
+    ///
+    /// # What this does
+    ///
+    /// Under `--strict-vacuity` an unadjudicated cover is a hard failure: the
+    /// flag's contract is "a declared cover must be shown to hold", and "we did
+    /// not check" is not "it holds". Mirrors V5's shape — `failed_properties` is
+    /// only overwritten when it is `None`, so a `should_panic` harness that
+    /// panicked as expected keeps `PanicsOnly` and stays an effective manual
+    /// success, exactly as it does under `harness_runner`'s V5.
+    ///
+    /// Without `--strict-vacuity` the verdict is untouched (V5 is warning-only
+    /// by default and covers are optional for plain harnesses); a conformance
+    /// harness is already hard-failed by `harness_runner`, so all this adds
+    /// there is the explanation of WHY no cover could be satisfied.
+    ///
+    /// ENSURES: never relaxes a verdict — status only moves to `Failure`
+    /// ENSURES: a run with no cover, or with every cover adjudicated, is untouched
+    pub(in crate::call_ay) fn apply_chc_cover_witness_fail_close(
+        &self,
+        harness: &HarnessMetadata,
+        result: &mut ChcSolverResult,
+    ) {
+        let undetermined = result
+            .properties
+            .iter()
+            .filter(|p| p.is_cover_property() && p.status == CheckStatus::Undetermined)
+            .count();
+        if undetermined == 0 {
+            return;
+        }
+
+        let is_conformance =
+            self.args.conformance_harnesses.iter().any(|h| h == &harness.pretty_name);
+        if !self.args.strict_vacuity && !is_conformance {
+            return;
+        }
+
+        if self.args.strict_vacuity {
+            solver_stdout!(
+                "[AY:VACUOUS:cover-undetermined] {}: {undetermined} declared cover(...) \
+                 could not be adjudicated in the unbounded (--ay-chc) lane — the Horn \
+                 encoding records a cover's condition without the program point that \
+                 guards it, so neither SATISFIED nor UNSATISFIABLE can be established \
+                 soundly. --strict-vacuity treats an unchecked witness as a failure. \
+                 Run the harness in the default (bounded) lane to adjudicate its covers.",
+                harness.pretty_name
+            );
+            result.status = VerificationStatus::Failure;
+            if matches!(result.failed_properties, FailedProperties::None) {
+                result.failed_properties = FailedProperties::Other;
+            }
+        } else {
+            solver_stdout!(
+                "[AY:VACUOUS:cover-undetermined] {}: {undetermined} declared cover(...) \
+                 could not be adjudicated in the unbounded (--ay-chc) lane, so this \
+                 conformance harness cannot produce the SATISFIED cover it must \
+                 demonstrate. Run it in the default (bounded) lane.",
+                harness.pretty_name
+            );
+        }
     }
 }

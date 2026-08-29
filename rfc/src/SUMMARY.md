@@ -1,10 +1,10 @@
-# Kani Rust Verifier - RFCs
+# trust-mc RFCs
 
 [Introduction](./intro.md)
 
 [RFC Template](./template.md)
 
-# Kani RFCs
+# RFCs (0001-0013 inherited from upstream Kani)
 
 - [0001-mir-linker](rfcs/0001-mir-linker.md)
 - [0002-function-stubbing](rfcs/0002-function-stubbing.md)
@@ -19,3 +19,4 @@
 - [0011-source-coverage](rfcs/0011-source-coverage.md)
 - [0012-loop-contracts](rfcs/0012-loop-contracts.md)
 - [0013-list](rfcs/0013-list.md)
+- [0014-harness-partition](rfcs/0014-harness-partition.md)

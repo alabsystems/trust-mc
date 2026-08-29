@@ -47,6 +47,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let ptr_name = self.ctx.fresh_name("vec_fe_ptr");
         let ptr = self.ctx.declare_var(&ptr_name, ptr_sort());
+        // A Vec's buffer pointer comes from the allocator, so it is non-null and
+        // aligned to the element's alignment. Minting it as a BARE symbol left
+        // both facts unstated, and the solver is free to pick an odd address:
+        // any obligation that reasons about this pointer's low bits is then
+        // trivially violable. That is not hypothetical — it makes textbook
+        // `let mut v = vec![0u32; 4]; write_bytes(v.as_mut_ptr(), 0xfe, 4)`
+        // report a misalignment that cannot occur in a real execution.
+        //
+        // These are FACTS about the program, not assumptions that weaken it:
+        // stating them models reality more precisely rather than less.
+        constrain_allocator_pointer(self.ctx, &ptr, &elem_sort);
 
         // Build data array: const_array where every index maps to elem value.
         let data = if let Some(elem) = args.first().and_then(|a| self.codegen_operand(a)) {
@@ -167,7 +178,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let elem_sort = flatten_dt_array_element(elem_sort);
         let array_sort = Sort::array(ptr_sort(), elem_sort.clone());
         let vec_sort_name = names::vec_sort_name(&names::sort_short_name(&elem_sort));
-        let vec_sort = struct_sort(vec_sort_name.clone(), names::vec_fields(array_sort));
+        let vec_sort = struct_sort(vec_sort_name.clone(), names::vec_fields(array_sort.clone()));
 
         let ptr_name = self.ctx.fresh_name("vec_iv_ptr");
         let ptr = self.ctx.declare_var(&ptr_name, ptr_sort());
@@ -197,10 +208,26 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 self.ctx.declare_var(&name, ptr_sort())
             });
 
-        // Symbolic data array: sound over-approximation
-        let default_name = self.ctx.fresh_name("vec_iv_default");
-        let default_elem = self.ctx.declare_var(&default_name, elem_sort);
-        let data = Expr::const_array(ptr_sort(), default_elem);
+        // Symbolic data array: a genuine over-approximation — ONE fresh array,
+        // so every index is independent and unconstrained.
+        //
+        // This was `const_array(fresh_scalar)`, which maps every index to the
+        // SAME symbol. That is not an over-approximation, it is an extra
+        // CONSTRAINT asserting all elements are equal, and it made false
+        // statements provable:
+        //
+        //     let v = vec![1u8, 2u8];
+        //     assert!(v[0] == v[1]);   // native Rust panics here
+        //
+        // reported VERIFICATION:- SUCCESSFUL with PROOF_QUALIFIERS:clean,
+        // because both indices selected the one shared symbol. The doc comment
+        // on this function already promised "the solver considers all possible
+        // element values"; the code did not do it.
+        //
+        // `vec![elem; n]` (codegen_vec_from_elem) keeps its const_array: there
+        // every element really IS the same value, so a shared symbol is exact.
+        let data_name = self.ctx.fresh_name("vec_iv_data");
+        let data = self.ctx.declare_var(&data_name, array_sort);
 
         let ctor_name = crate::codegen_ay::names::resolve_ctor_name(&vec_sort, &vec_sort_name);
         let vec = Expr::datatype_constructor(
@@ -265,5 +292,41 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
             _ => None,
         }
+    }
+}
+
+/// Constrain an allocator-returned buffer pointer: non-null, and aligned to the
+/// element's alignment.
+///
+/// Alignment is read off the element SORT rather than a `Ty`, because that is
+/// what this lane has in hand. A bitvector of `w` bits is a primitive of `w/8`
+/// bytes and aligns to that; anything else (a datatype, an array) gets the
+/// non-null fact only. Declining to constrain an unknown sort is the fail-open
+/// direction and leaves that case exactly as it is today.
+fn constrain_allocator_pointer(
+    ctx: &mut crate::codegen_ay::context::AYCtx<'_, '_>,
+    ptr: &Expr,
+    elem_sort: &Sort,
+) {
+    let zero = Expr::bitvec_const(0u128, POINTER_WIDTH);
+    ctx.assert(ptr.clone().eq(zero.clone()).not());
+
+    // Only powers of two up to 16 are real primitive alignments; a wider
+    // bitvector is a flattened aggregate, not a scalar, so claiming its width
+    // as an alignment would be inventing a guarantee.
+    let Some(width_bits) = elem_sort.bitvec_width() else {
+        return;
+    };
+    let align = match width_bits {
+        8 => 1u128,
+        16 => 2,
+        32 => 4,
+        64 => 8,
+        128 => 16,
+        _ => return,
+    };
+    if align > 1 {
+        let mask = Expr::bitvec_const(align - 1, POINTER_WIDTH);
+        ctx.assert(ptr.clone().bvand(mask).eq(zero));
     }
 }

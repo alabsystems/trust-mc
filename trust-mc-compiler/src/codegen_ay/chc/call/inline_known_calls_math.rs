@@ -11,6 +11,8 @@ use num_bigint::BigInt;
 use rustc_public::mir::{LocalDecl, Operand};
 use rustc_public::ty::{RigidTy, TyKind};
 
+use super::inline_known_calls_raw_ptr::operand_is_raw_pointer_like;
+
 /// Pure BV encoding for exact math operations (abs, copysign).
 ///
 /// Unlike constant-folding in `math.rs`, these work on symbolic args because
@@ -55,8 +57,24 @@ pub(super) fn inline_exact_math_call(callee_path: &str, args: &[Expr]) -> Option
 /// Part of #3889: Inline wrapping integer arithmetic so nested method bodies
 /// (e.g. `i64::unsigned_abs` → `wrapping_abs` → `wrapping_neg` → `wrapping_sub`)
 /// resolve directly to BV operations instead of exhausting MAX_INLINE_DEPTH.
-pub(super) fn inline_wrapping_arith_expr(callee_path: &str, args: &[Expr]) -> Option<Expr> {
+///
+/// INTEGER receivers only. `<*const T>::wrapping_add(count)` takes an ELEMENT
+/// count that must be scaled by `size_of::<T>()`; the plain `bvadd` arms below
+/// would encode it as a BYTE offset. The width guard cannot separate the two
+/// (a BV64 pointer and a BV64 `usize` agree), so the receiver TYPE decides —
+/// see `inline_wrapping_ptr_arith_expr` for the scaled pointer encoding.
+pub(super) fn inline_wrapping_arith_expr(
+    callee_path: &str,
+    args: &[Expr],
+    first_arg: Option<&Operand>,
+    caller_locals: &[LocalDecl],
+) -> Option<Expr> {
     let method = callee_path.rsplit("::").next()?;
+    if matches!(method, "wrapping_add" | "wrapping_sub" | "wrapping_mul")
+        && wrapping_receiver_is_pointer(callee_path, first_arg, caller_locals)
+    {
+        return None;
+    }
     match method {
         // Part of #3973: guard on is_bitvec() — Int-lifted operands have
         // bitvec_width() == None, and None == None passes the old guard.
@@ -91,6 +109,32 @@ pub(super) fn inline_wrapping_arith_expr(callee_path: &str, args: &[Expr]) -> Op
         }
         _ => None,
     }
+}
+
+/// True when the receiver of a `wrapping_*` method is a POINTER, not an integer.
+///
+/// Prefers the receiver operand's MIR type; falls back to the callee path for
+/// call sites that cannot supply the operand, so a pointer receiver is never
+/// mistaken for an integer one (which would drop `size_of::<T>()` scaling).
+pub(super) fn wrapping_receiver_is_pointer(
+    callee_path: &str,
+    first_arg: Option<&Operand>,
+    caller_locals: &[LocalDecl],
+) -> bool {
+    if let Some(arg) = first_arg {
+        if operand_is_raw_pointer_like(arg, caller_locals) {
+            return true;
+        }
+        // A resolved non-pointer receiver type is authoritative: the path
+        // fallback below must not veto integer `wrapping_*`.
+        if arg.ty(caller_locals).is_ok() {
+            return false;
+        }
+    }
+    callee_path.contains("<impl *const ")
+        || callee_path.contains("<impl *mut ")
+        || callee_path.contains("::const_ptr::")
+        || callee_path.contains("::mut_ptr::")
 }
 
 /// Inline saturating integer arithmetic inside nested bodies so the inline

@@ -86,11 +86,47 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// semantics so prior stores remain visible.
     pub(in crate::codegen_ay::chc) mutable_static_state_idxs: HashSet<usize>,
 
+    /// Static state vars a FOREIGN callee could legally write: every `static
+    /// mut` plus every immutable static whose type is non-`Freeze` (interior
+    /// mutability). Linked C code can reach an exported symbol without Rust
+    /// ever handing it a pointer, so a call to an opaque C function must havoc
+    /// these. Populated alongside `mutable_static_state_idxs`; a superset of it.
+    pub(in crate::codegen_ay::chc) c_writable_static_state_idxs: HashSet<usize>,
+
+    /// Linker SYMBOL of every foreign (`extern "C"`) static, mapped to its
+    /// state slot.
+    ///
+    /// A `--c-lib` translation unit names an exported object by symbol; the
+    /// Rust path and `#[link_name]` may disagree, so the C front-end resolves
+    /// `S` through this table rather than by name matching.
+    pub(in crate::codegen_ay::chc) c_symbol_static_state_idx: HashMap<String, usize>,
+
     /// Concrete address expressions for each unique static, keyed by AllocId.
     /// Each static gets a distinct obj_id in the split-pointer scheme (BV32++BV32),
     /// making `&A as *const _ != &B as *const _` decidable.
     /// Part of #3496 Bug B: static address distinctness.
     pub(in crate::codegen_ay::chc) static_address_exprs: HashMap<AllocId, Expr>,
+
+    /// For a POINTER-typed static, the address of the allocation its
+    /// initializer points at, keyed by the static's state-var index.
+    ///
+    /// `static Z: &i32 = &14` has TWO allocations: `Z`'s own slot, which holds
+    /// a pointer, and the anonymous nested allocation holding `14`. Loading
+    /// `*Z_slot` yields the POINTER, so the loaded value addresses the nested
+    /// allocation — not `Z`'s slot. Without this map the load inherits the
+    /// slot's own object and `**Z` reads `Z`'s pointer bits as an `i32`.
+    pub(in crate::codegen_ay::chc) static_pointee_addrs: HashMap<usize, Expr>,
+
+    /// Initial value of the allocation a pointer-typed static points at, keyed
+    /// by the STATIC's state-var index (the same value as
+    /// `static_alloc_init_values`, reached without the allocation id).
+    pub(in crate::codegen_ay::chc) static_pointee_init_values: HashMap<usize, Expr>,
+
+    /// Initial value of the allocation a pointer-typed static points at, keyed
+    /// by that allocation's id. Shared by every static pointing at it — the
+    /// `FOO`/`BAR` pair in kani's `anon_static` both name the same anonymous
+    /// nested allocation.
+    pub(in crate::codegen_ay::chc) static_alloc_init_values: HashMap<AllocId, Expr>,
 
     /// Maps reference locals assigned from constant references to unit enums (Part of #1905).
     pub(in crate::codegen_ay::chc) const_ref_discriminants: HashMap<usize, u64>,
@@ -150,6 +186,14 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// handlers, which must not see read-only index results).
     pub(in crate::codegen_ay::chc) collection_index_refs:
         HashMap<usize, super::types::CollectionMutRef>,
+
+    /// Maps a local holding `&((*_e).f1.f2…)` — a reference INTO a collection
+    /// element — to the element location it denotes. See
+    /// [`super::types::CollectionElemFieldRef`]: without it these locals fall
+    /// through to the Mem-level symbolic-address mint and read a memory array
+    /// the collection was never stored into.
+    pub(in crate::codegen_ay::chc) collection_elem_field_refs:
+        HashMap<usize, super::types::CollectionElemFieldRef>,
 
     /// Maps VecAsSlice/deref_mut destination locals to the source Vec local.
     /// Set during VecAsSlice call handling; consumed by IndexMut to find the
@@ -244,6 +288,33 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
 }
 
 impl RefResolution {
+    pub(in crate::codegen_ay::chc) fn clear_path_insensitive_ref_metadata(&mut self, local: usize) {
+        self.bigint_ref_targets.remove(&local);
+        self.bigrational_ref_targets.remove(&local);
+        self.ref_targets.remove(&local);
+        self.ref_arg_pointee_idx.remove(&local);
+        self.coroutine_root_map.remove(&local);
+        self.static_ref_to_state_idx.remove(&local);
+        self.call_forwarded_raw_ptrs.remove(&local);
+        self.const_ref_discriminants.remove(&local);
+        self.const_ref_values.remove(&local);
+        self.const_ref_slice_views.remove(&local);
+        self.const_ref_promoted_obj_ids.remove(&local);
+        self.alloc_result_locals.remove(&local);
+        self.collection_mut_refs.remove(&local);
+        self.collection_index_refs.remove(&local);
+        self.collection_elem_field_refs.remove(&local);
+        self.slice_to_vec_local.remove(&local);
+        self.slice_to_vec_field_projections.remove(&local);
+        self.iter_to_collection_local.remove(&local);
+        self.promoted_raw_values.remove(&local);
+        self.subslice_len.remove(&local);
+        self.subslice_offset.remove(&local);
+        self.ptr_deref_to_arg_pointee.remove(&local);
+        self.arg_wrapper_field_pointee_idx.retain(|(root, _), _| *root != local);
+        self.subslice_addr_cache.retain(|(provenance, _), _| *provenance != local);
+    }
+
     pub(in crate::codegen_ay::chc) fn new() -> Self {
         Self {
             bigint_ref_targets: HashMap::new(),
@@ -258,7 +329,12 @@ impl RefResolution {
             static_ref_value_seeds: HashMap::new(),
             static_ref_len_seeds: HashMap::new(),
             mutable_static_state_idxs: HashSet::new(),
+            c_writable_static_state_idxs: HashSet::new(),
+            c_symbol_static_state_idx: HashMap::new(),
             static_address_exprs: HashMap::new(),
+            static_pointee_addrs: HashMap::new(),
+            static_pointee_init_values: HashMap::new(),
+            static_alloc_init_values: HashMap::new(),
             const_ref_discriminants: HashMap::new(),
             const_ref_values: HashMap::new(),
             const_ref_slice_views: HashMap::new(),
@@ -268,6 +344,7 @@ impl RefResolution {
             alloc_result_locals: HashSet::new(),
             collection_mut_refs: HashMap::new(),
             collection_index_refs: HashMap::new(),
+            collection_elem_field_refs: HashMap::new(),
             slice_to_vec_local: HashMap::new(),
             slice_to_vec_field_projections: HashMap::new(),
             iter_to_collection_local: HashMap::new(),

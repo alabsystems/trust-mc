@@ -121,6 +121,74 @@ pub(in crate::codegen_ay::chc) fn step_split_pointer_sub(
     PointerStep { result, same_object_ok: Some(same_object_ok) }
 }
 
+/// Exact-address pointer step for the WRAPPING family (`wrapping_offset`,
+/// `wrapping_byte_offset`, `wrapping_add`, `wrapping_sub`, `wrapping_byte_add`,
+/// `wrapping_byte_sub`).
+///
+/// # Why the wrapping family cannot use the split step
+///
+/// [`step_split_pointer`] adds into the LOW 32-BIT LANE ONLY, truncating the
+/// byte offset with `extract(31, 0)` and dropping any carry out of that lane.
+/// The offset's high 32 bits are DISCARDED, so every offset that is a nonzero
+/// multiple of 2^32 encodes as a no-op: `p.wrapping_byte_offset(1 << 32) == p`
+/// is derivable in the lane model but FALSE in Z/2^64, where no nonzero element
+/// is an additive identity. That is Kani's #1150 shape, and here it did not
+/// merely produce a spurious counterexample — the encoder folded the truncated
+/// step to a literal and STATICALLY DISCHARGED the false assertion, i.e. proved
+/// it.
+///
+/// This is NOT a defect in [`step_split_pointer`]. For `offset`/`add`/`sub`,
+/// leaving the allocation is UB, so the lane model is a sound approximation
+/// there, and its constant-foldable `obj_id` lane is what lets
+/// `const_obj_id_u32` resolve the allocation and discharge heap bounds checks
+/// (#3921). The `wrapping_*` family is different: it is DEFINED out of bounds
+/// and wraps the whole address space, so an offset that leaves the lane MUST
+/// change the object-id bits.
+///
+/// # One model per family — no hybrid
+///
+/// An earlier version of this function kept the lane model whenever the
+/// offset's high lane folded to zero, on the theory that the lane model then
+/// answers the zero/nonzero question exactly. It does not, and mixing the two
+/// models within a single chain is actively wrong: the lane step also drops the
+/// CARRY out of the low lane, so after an exact step leaves the pointer near
+/// the top of its lane, a following lane step loses the carry. That is exactly
+/// `check_wrap_around_ptr` in `expected/offset-wraps-around` —
+/// `p.wrapping_byte_add(usize::MAX).wrapping_byte_add(1)` must return `p`,
+/// and the hybrid returned `concat(obj_id - 1, 0)`. The wrapping family
+/// therefore gets ONE model, exact mod 2^64, end to end.
+///
+/// The constant fast-path is kept because it is already exact: `const_fold_step`
+/// folds in-lane steps to a literal and out-of-lane steps with full 64-bit
+/// wrapping arithmetic (#72), so it agrees with `bvadd`/`bvsub` on every input
+/// while preserving the literal form that memory scalarization wants.
+///
+/// # Cost
+///
+/// For a symbolic offset the `obj_id` lane stops folding, so a later deref of
+/// the result gets a symbolic `obj_valid` select from `heap_access_checks`
+/// rather than a resolved allocation bound. That costs precision, never
+/// soundness: the symbolic select is strictly MORE conservative, so this
+/// direction can only add counterexamples, never suppress a check. Provenance
+/// is unaffected — `offset_walk_identity_callee` already resolves the
+/// allocation through the whole `wrapping_*` family via the `known_alloc_ids`
+/// side-channel, which is keyed by local rather than by expression shape.
+pub(in crate::codegen_ay::chc) fn step_wrapping_pointer(
+    ptr: Expr,
+    byte_offset: Expr,
+    is_sub: bool,
+) -> Expr {
+    // Fully-constant steps: already exact, and keep the literal form.
+    if ptr.sort().bitvec_width() == Some(POINTER_WIDTH)
+        && POINTER_WIDTH == 64
+        && let Some(step) = const_fold_step(&ptr, &byte_offset, is_sub)
+    {
+        return step.result;
+    }
+
+    if is_sub { ptr.bvsub(byte_offset) } else { ptr.bvadd(byte_offset) }
+}
+
 /// Constant fast-path for the split-pointer step: when both the pointer and
 /// the byte offset evaluate to constants, perform the obj_id-preserving lane
 /// arithmetic numerically and return a literal result.
@@ -212,7 +280,68 @@ fn const_fold_step(ptr: &Expr, byte_offset: &Expr, is_sub: bool) -> Option<Point
 
 #[cfg(test)]
 mod tests {
+    use ay_bindings::Sort;
+
     use super::*;
+
+    /// The wrapping family must NOT truncate the offset to the low 32-bit lane.
+    /// `step_split_pointer` discards `extract(63, 32)` of the offset, which makes
+    /// every nonzero multiple of 2^32 an additive identity — the Kani #1150 shape.
+    #[test]
+    fn test_wrapping_step_does_not_truncate_symbolic_offset() {
+        let ptr = Expr::bitvec_const(0x0000_0002_0000_0000u128, 64);
+        let sym_offset = Expr::var("off", Sort::bitvec(64));
+
+        let split = step_split_pointer(ptr.clone(), sym_offset.clone()).result;
+        let wrapping = step_wrapping_pointer(ptr.clone(), sym_offset.clone(), false);
+
+        // The split step truncates: the offset's high lane never reaches the result.
+        assert!(
+            split.to_string().contains("extract"),
+            "split step should truncate the offset to the low lane: {split}"
+        );
+        // The wrapping step keeps the whole 64-bit offset.
+        assert_eq!(wrapping, ptr.bvadd(sym_offset), "wrapping step must be a full-width bvadd");
+    }
+
+    /// A constant step of exactly 2^32 must MOVE the pointer. Under the lane
+    /// model this folded to the base address and statically discharged
+    /// `assert_eq!(ptr, ptr.wrapping_byte_offset(1 << 32))` — a fabricated proof.
+    #[test]
+    fn test_wrapping_step_by_two_pow_32_moves_the_pointer() {
+        let ptr = Expr::bitvec_const(0x0000_0002_0000_0000u128, 64);
+        let two_pow_32 = Expr::bitvec_const(1u128 << 32, 64);
+
+        let moved = step_wrapping_pointer(ptr.clone(), two_pow_32, false);
+
+        assert_ne!(moved, ptr, "a 2^32 step must not fold back to the base pointer");
+        assert_eq!(moved, Expr::bitvec_const(0x0000_0003_0000_0000u128, 64));
+    }
+
+    /// Chained wrapping steps must compose exactly: `+usize::MAX` then `+1` is a
+    /// full 2^64 wrap back to the original address. A lane step at the second
+    /// hop drops the carry out of the low lane and lands on `obj_id - 1`
+    /// (`check_wrap_around_ptr` in `expected/offset-wraps-around`).
+    #[test]
+    fn test_wrapping_step_chain_wraps_around_to_base() {
+        let ptr = Expr::var("p", Sort::bitvec(64));
+        let usize_max = Expr::bitvec_const(u64::MAX as u128, 64);
+        let one = Expr::bitvec_const(1u128, 64);
+
+        let step1 = step_wrapping_pointer(ptr.clone(), usize_max, false);
+        let step2 = step_wrapping_pointer(step1, one.clone(), false);
+
+        // Both hops stay in the same (full-width) model, so the carry survives.
+        assert_eq!(step2, ptr.bvadd(Expr::bitvec_const(u64::MAX as u128, 64)).bvadd(one));
+    }
+
+    /// A zero step is the identity in the wrapping model too.
+    #[test]
+    fn test_wrapping_step_by_zero_is_identity() {
+        let ptr = Expr::bitvec_const(0x0000_0002_0000_0010u128, 64);
+        let zero = Expr::bitvec_const(0u128, 64);
+        assert_eq!(step_wrapping_pointer(ptr.clone(), zero, false), ptr);
+    }
 
     #[test]
     fn test_split_pointer_step_preserves_obj_id() {

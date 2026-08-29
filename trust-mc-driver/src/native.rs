@@ -882,12 +882,29 @@ fn private_exact_typed_prepared_input(
     obligation: &trust_mc_core::MirChcPdrObligation,
     options: &trust_mc_core::ChcPdrSolveOptions,
 ) -> Option<PreparedTypedChcPdrInput> {
-    let prepared = prepare_validated_typed_chc_pdr_input(obligation).ok()?;
+    let trace = std::env::var_os("TRUST_SEAL_TRACE").is_some();
+    let prepared = match prepare_validated_typed_chc_pdr_input(obligation) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if trace {
+                eprintln!(
+                    "[SEAL_TRACE] exact typed-input preparation failed before replay: {error:?}"
+                );
+            }
+            return None;
+        }
+    };
     let normalized = &prepared.normalized;
-    let Ok(candidate) =
-        trust_mc_core::validated_native_typed_chc_pdr_candidate(&verification.verdict)
-    else {
-        return None;
+    let candidate = match trust_mc_core::validated_native_typed_chc_pdr_candidate(
+        &verification.verdict,
+    ) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            if trace {
+                eprintln!("[SEAL_TRACE] typed CHC/PDR candidate validation failed: {error:?}");
+            }
+            return None;
+        }
     };
     let expected_cache_key = typed_full_verification_cache_key(obligation, options, normalized);
     let expected_typed_problem =
@@ -1178,9 +1195,9 @@ fn ay_chc_proof_run_artifact_descriptor(
     artifact: &ay_chc::ChcProofRunArtifact,
 ) -> serde_json::Value {
     serde_json::json!({
-        "schema": artifact.schema,
-        "role": artifact.role,
-        "digest": artifact.digest.to_json_value(),
+        "schema": artifact.schema(),
+        "role": artifact.role(),
+        "digest": artifact.digest().to_json_value(),
     })
 }
 
@@ -1588,6 +1605,93 @@ impl NativeTrustIrChcPdrRunner {
     }
 }
 
+/// The classification of one rejected `Alloca`: a short greppable bucket token
+/// plus a human-readable expansion.
+#[cfg(feature = "native-trust-ir-bundle")]
+struct AllocaRejectionReason {
+    /// `<lane1>/<lane2>`, or a single token when the instruction never reached
+    /// the two-lane predicate at all.
+    kind: String,
+    detail: String,
+}
+
+/// Why the guarded `Inst::Alloca` admission arm did not take this instruction.
+///
+/// DIAGNOSTIC ONLY — it decides nothing. It reproduces, in order, the three ways
+/// the guard can fail:
+///
+///  1. the arm's own pattern requires `count: None`, so an ARRAY alloca never
+///     reaches the predicate;
+///  2. likewise `align: None`, a caller-asserted alignment the translator
+///     ignores entirely;
+///  3. otherwise the arm called `single_cell_alloca_is_admissible` and it said
+///     no — ask it for both lanes' first blocking condition.
+///
+/// (3) re-runs the same pure predicate on the same inputs, so it always agrees
+/// with the guard that just rejected.
+#[cfg(feature = "native-trust-ir-bundle")]
+/// Admit `Inst::Borrow`/`BorrowMut` at the proof-authority input gate (R70).
+///
+/// DEFAULT-OFF. Flag-off is byte-identical to the post-merge fail-closed predicate,
+/// so the default lane and every `ProofAuthorityAttackShape` pin are untouched and
+/// one gate run can A/B it. The soundness argument lives at the arm, not here.
+///
+/// Read once per process, not per instruction.
+fn admit_transparent_borrow_instructions() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRUST_ADMIT_BORROW_INST").is_some())
+}
+
+// The cfg below was originally attached to this function; R70's insertion of
+// `admit_transparent_borrow_instructions` between the attribute and its target
+// silently re-pointed it, leaving this function compiled without its optional
+// deps (`trust_ir`, `trust-mc-trust-bmc`) — a build break on default features.
+#[cfg(feature = "native-trust-ir-bundle")]
+fn alloca_rejection_reason(
+    module: &trust_ir::Module,
+    function: &trust_ir::Function,
+    result: Option<trust_ir::value::ValueId>,
+    ty: &trust_ir::ty::Ty,
+    has_count: bool,
+    has_align: bool,
+) -> AllocaRejectionReason {
+    if has_count {
+        return AllocaRejectionReason {
+            kind: "alloca_count_some".to_string(),
+            detail: "array alloca: the extent is a runtime value, not an internally bound one"
+                .to_string(),
+        };
+    }
+    if has_align {
+        return AllocaRejectionReason {
+            kind: "alloca_align_some".to_string(),
+            detail: "caller-asserted alignment on the alloca; the translator models no alignment"
+                .to_string(),
+        };
+    }
+    let Some(result) = result else {
+        return AllocaRejectionReason {
+            kind: "alloca_no_result".to_string(),
+            detail: "the alloca binds no result value, so there is no cell pointer to gate"
+                .to_string(),
+        };
+    };
+    match trust_mc_trust_bmc::single_cell_alloca_rejection(module, function, result, ty) {
+        Some(rejection) => AllocaRejectionReason {
+            kind: rejection.kind(),
+            detail: rejection.to_string(),
+        },
+        // Unreachable while the guard and this call agree; reported rather than
+        // asserted so a diagnostic can never abort a verification run.
+        None => AllocaRejectionReason {
+            kind: "admissible_but_rejected".to_string(),
+            detail: "the admission predicate accepts this cell; the guard rejected it for another \
+                     reason (report this)"
+                .to_string(),
+        },
+    }
+}
+
 /// Validate the exact TrustIr semantics that the proof-grade translator is
 /// currently capable of preserving without importing unauthenticated source
 /// claims.
@@ -1755,6 +1859,16 @@ fn validate_native_bundle_proof_authority_input(
                             ),
                         ));
                     }
+                    // Opt-in, default-off (`TRUST_ADMIT_BORROW_INST`). Borrow and
+                    // BorrowMut are transparent aliases in the CHC translator: they
+                    // import no fact, never create a stack root, and inherit provenance
+                    // only from an already tracked referent. Every later load or store
+                    // remains independently gated by exact stack/provenance modeling or
+                    // an authorized ValidBorrow annotation. GEP remains fail-closed
+                    // below because its separate `valid_ref_ptrs` path needs a distinct
+                    // authority argument.
+                    trust_ir::Inst::Borrow { .. } | trust_ir::Inst::BorrowMut { .. }
+                        if admit_transparent_borrow_instructions() => {}
                     trust_ir::Inst::Borrow { .. } | trust_ir::Inst::BorrowMut { .. } => {
                         return Err(native_bundle_proof_authority_input_error(
                             "module.functions.instructions",
@@ -1807,15 +1921,48 @@ fn validate_native_bundle_proof_authority_input(
                     trust_ir::Inst::Alloca { ty, count: None, align: None }
                         if node.results.first().copied().is_some_and(|result| {
                             trust_mc_trust_bmc::single_cell_alloca_is_admissible(
-                                function, result, ty,
+                                &bundle.module,
+                                function,
+                                result,
+                                ty,
                             )
                         }) => {}
-                    trust_ir::Inst::Alloca { .. } => {
+                    // Preserve the fail-closed fallback while naming the exact
+                    // structural admission condition that rejected this alloca.
+                    trust_ir::Inst::Alloca { ty, count, align } => {
+                        // MEASUREMENT (2026-08-23): this arm holds the single
+                        // largest block of unknown rows on ny-cert, so it names
+                        // WHICH condition of the admissible arm above failed.
+                        // Purely diagnostic: `alloca_rejection_reason` reads the
+                        // module and returns strings, and the admission verdict
+                        // is still decided entirely by the guard on the arm
+                        // above, so the set of admitted Allocas is unchanged
+                        // whether or not the trace is enabled.
+                        let reason = alloca_rejection_reason(
+                            &bundle.module,
+                            function,
+                            node.results.first().copied(),
+                            ty,
+                            count.is_some(),
+                            align.is_some(),
+                        );
+                        if std::env::var_os("TRUST_ALLOCA_REJECT_TRACE").is_some() {
+                            eprintln!(
+                                "[ALLOCA_REJECT] kind={} fn=`{}` block=#{} instr={} ty={} detail={{{}}}",
+                                reason.kind,
+                                function.name,
+                                block.id.index(),
+                                instruction_index,
+                                ty,
+                                reason.detail
+                            );
+                        }
                         return Err(native_bundle_proof_authority_input_error(
                             "module.functions.instructions",
                             format!(
-                                "{location} uses Alloca without an internally bound extent, pointee-type, and alignment derivation"
-                            ),
+                                "{location} uses Alloca without an internally bound extent, pointee-type, and alignment derivation (ty={ty}, reason={})",
+                                reason.kind
+                             ),
                         ));
                     }
                     trust_ir::Inst::DialectOp(_) => {
@@ -3285,11 +3432,38 @@ fn fail_closed_lowering_sites(obligation: &trust_mc_core::MirChcPdrObligation) -
     obligation.native_metadata.as_ref().map_or(0, |meta| meta.fail_closed_lowering_site_count)
 }
 
-fn fail_closed_lowering_demotion_reason(sites: u32) -> String {
-    format!(
+/// The producer-recorded DISTINCT construct labels behind
+/// [`fail_closed_lowering_sites`] (`"Cast"`, `"IndirectCall"`, …), already
+/// sorted and deduplicated by the builder.
+///
+/// Pure diagnostic, strictly weaker than the count: it is never compared,
+/// thresholded or matched, and it reaches exactly one place — the text of
+/// [`fail_closed_lowering_demotion_reason`], on an obligation the COUNT has
+/// already demoted to Unknown. Absent metadata reads as EMPTY, which renders the
+/// message byte-identically to before this field existed.
+fn fail_closed_lowering_reasons(obligation: &trust_mc_core::MirChcPdrObligation) -> &[String] {
+    obligation
+        .native_metadata
+        .as_ref()
+        .map_or(&[][..], |meta| meta.fail_closed_lowering_reasons.as_slice())
+}
+
+/// Render the demotion reason. `sites` is the load-bearing part (it is what the
+/// callers gate on); `reasons` only NAMES the constructs so a 21-obligation
+/// "N unsupported trust_ir construct(s)" frontier is diagnosable without
+/// re-running the translator. An empty `reasons` reproduces the historical text
+/// exactly.
+fn fail_closed_lowering_demotion_reason(sites: u32, reasons: &[String]) -> String {
+    let mut message = format!(
         "fail-closed lowering reachable: {sites} unsupported trust_ir construct(s) lowered to \
          unconditional error rules; refutation demoted to unknown"
-    )
+    );
+    if !reasons.is_empty() {
+        message.push_str(" (constructs: ");
+        message.push_str(&reasons.join(", "));
+        message.push(')');
+    }
+    message
 }
 
 #[cfg(not(feature = "ay-chc-native"))]
@@ -3354,7 +3528,10 @@ fn solve_typed_chc_pdr_with_ay(
             if sites > 0 {
                 trust_mc_core::ChcPdrSolveOutcome::unknown(
                     obligation_id,
-                    fail_closed_lowering_demotion_reason(sites),
+                    fail_closed_lowering_demotion_reason(
+                        sites,
+                        fail_closed_lowering_reasons(&request.obligation),
+                    ),
                     stats,
                 )
                 .with_diagnostic(
@@ -3515,7 +3692,10 @@ fn solve_typed_chc_pdr_full_with_ay(
         crate::direct_smt_cex::AcyclicDecision::Unsafe(direct_witness) => {
             let sites = fail_closed_lowering_sites(&request.obligation);
             if sites > 0 {
-                let reason = fail_closed_lowering_demotion_reason(sites);
+                let reason = fail_closed_lowering_demotion_reason(
+                    sites,
+                    fail_closed_lowering_reasons(&request.obligation),
+                );
                 return Ok(TypedChcPdrFullVerification {
                     route,
                     cache_key: cache_key.clone(),
@@ -3807,17 +3987,17 @@ fn solve_typed_chc_pdr_full_with_ay(
     // metadata, replay-transcript artifacts (each with
     // `schema`/`role`/`digest`/`bytes()`), and the proof-run metadata
     // (`metadata_json`/`normalized_input_sha256`/`proof_status`/`result`). The
-    // raw `VerifiedChcResult` is read off `proof_run.run.result` for the
+    // raw `VerifiedChcResult` is read off `proof_run.result()` for the
     // Safe/Unsafe/Unknown match below (the invariant/cex payloads do not live on
     // the certificate). Reject-only `PdrInvariant` transport (certificate/
     // artifact/replay/checked-report bytes + AY acceptance guard) lives in
     // `emit_pdr_invariant_from_run`, shared with the IC3 loop lane so the
     // evidence-payload JSON schema strings stay byte-identical on both paths.
-    let run = &proof_run.run;
-    let certificate = proof_run.certificate(&problem);
+    let run = proof_run.result();
+    let certificate = proof_run.certificate();
     let metadata = certificate.metadata_json();
 
-    let (outcome, verdict) = match &run.result {
+    let (outcome, verdict) = match run {
         ay_chc::VerifiedChcResult::Safe(_) => {
             // Reject-only `PdrInvariant` transport via the shared helper. The
             // helper enforces the AY acceptance guard (`accepted &&
@@ -3825,7 +4005,7 @@ fn solve_typed_chc_pdr_full_with_ay(
             // obligation); a non-accepted Safe run yields `None`. Even a valid
             // candidate reports Unknown until fresh private-consumer replay.
             match emit_pdr_invariant_from_run(
-                &run.result,
+                run,
                 &certificate,
                 &request.obligation,
                 stats,
@@ -3852,7 +4032,10 @@ fn solve_typed_chc_pdr_full_with_ay(
             // attaches the branch's replay-verified refutation witness.
             let sites = fail_closed_lowering_sites(&request.obligation);
             if sites > 0 {
-                let reason = fail_closed_lowering_demotion_reason(sites);
+                let reason = fail_closed_lowering_demotion_reason(
+                    sites,
+                    fail_closed_lowering_reasons(&request.obligation),
+                );
                 (
                     trust_mc_core::ChcPdrSolveOutcome::unknown(
                         obligation_id,
@@ -4016,7 +4199,7 @@ fn solve_typed_chc_pdr_full_with_ay(
 /// the candidate.
 ///
 /// Fail-closed acceptance guard: the run must be `Safe` AND
-/// `certificate.accepted` AND `certificate.metadata.accepted_as_proof` AND the
+/// `certificate.accepted_as_proof()` (consumer evidence AND transcript metadata) AND the
 /// certificate's normalized-input hash must bind to `normalized_input`. Any
 /// miss returns `None`, so an unaccepted or mis-bound run can never be emitted.
 /// A successful carrier uses a Proved-shaped typed verdict only for private
@@ -4034,8 +4217,7 @@ fn emit_pdr_invariant_from_run(
     let ay_chc::VerifiedChcResult::Safe(verified_inv) = run else {
         return None;
     };
-    if !(certificate.accepted
-        && certificate.metadata.accepted_as_proof
+    if !(certificate.accepted_as_proof()
         && certificate.normalized_input_sha256()
             == trust_mc_core::EvidenceHash::sha256_bytes(normalized_input.as_bytes()).value)
     {
@@ -4043,20 +4225,20 @@ fn emit_pdr_invariant_from_run(
     }
 
     let metadata = certificate.metadata_json();
-    let proof_run_artifacts = &certificate.artifacts;
+    let proof_run_artifacts = certificate.artifacts();
     // The legacy `model` artifact is consumer-status metadata, not predicate
     // interpretations. Only AY's strict, bounded QF artifact may occupy
     // trust-mc's `PdrInvariantModel` transport slot. Absence means this Safe
     // result belongs to a different/non-replayable evidence class, so fail
     // closed before constructing even a reject-only candidate carrier.
-    let invariant_model_artifact = proof_run_artifacts.quantifier_free_invariant_model.as_ref()?;
-    let transcript_bytes = proof_run_artifacts.replay_transcript.bytes().to_vec();
+    let invariant_model_artifact = proof_run_artifacts.quantifier_free_invariant_model()?;
+    let transcript_bytes = proof_run_artifacts.replay_transcript().bytes().to_vec();
     let transcript_hash = trust_mc_core::EvidenceHash::sha256_bytes(&transcript_bytes);
     let invariant_model_bytes = invariant_model_artifact.bytes().to_vec();
     let replay = serde_json::json!({
         "schema": "trust_mc.typed-chc-pdr-replay-log/v3",
         "source": "ay_chc::ChcPdrProofRun::proof_run_artifacts",
-        "ay_candidate_accepted": certificate.accepted,
+        "ay_candidate_accepted": certificate.accepted_as_proof(),
         "normalized_input_sha256": certificate.normalized_input_sha256(),
         "referenced_solver_transcript": {
             "kind": "solver_transcript",
@@ -4068,20 +4250,20 @@ fn emit_pdr_invariant_from_run(
                 invariant_model_artifact
             ),
             "diagnostic_model_metadata": ay_chc_proof_run_artifact_descriptor(
-                &proof_run_artifacts.model
+                proof_run_artifacts.model()
             ),
             "replay_transcript": ay_chc_proof_run_artifact_descriptor(
-                &proof_run_artifacts.replay_transcript
+                proof_run_artifacts.replay_transcript()
             ),
         },
-        "ay_consumer_evidence": certificate.consumer_evidence.to_json_value(),
+        "ay_consumer_evidence": certificate.consumer_evidence().to_json_value(),
         "ay_transcript_metadata": metadata.clone(),
     });
     let replay_bytes = json_bytes(&replay);
     let replay_log_hash = trust_mc_core::EvidenceHash::sha256_bytes(&replay_bytes);
     let checked_report = serde_json::json!({
         "schema": "trust_mc.typed-chc-pdr-checked-proof-report/v3",
-        "ay_candidate_accepted": certificate.accepted,
+        "ay_candidate_accepted": certificate.accepted_as_proof(),
         "problem_kind": "chc-pdr",
         "proof_status": certificate.proof_status(),
         "result": certificate.result(),
@@ -4096,10 +4278,10 @@ fn emit_pdr_invariant_from_run(
                 invariant_model_artifact
             ),
             "diagnostic_model_metadata": ay_chc_proof_run_artifact_descriptor(
-                &proof_run_artifacts.model
+                proof_run_artifacts.model()
             ),
             "replay_transcript": ay_chc_proof_run_artifact_descriptor(
-                &proof_run_artifacts.replay_transcript
+                proof_run_artifacts.replay_transcript()
             ),
             "replay_log": {
                 "algorithm": replay_log_hash.algorithm,
@@ -4121,7 +4303,7 @@ fn emit_pdr_invariant_from_run(
             "relation_count": stats.relation_count,
             "clause_count": stats.clause_count,
         },
-        "ay_consumer_evidence": certificate.consumer_evidence.to_json_value(),
+        "ay_consumer_evidence": certificate.consumer_evidence().to_json_value(),
         "ay_transcript_metadata": metadata,
     });
 
@@ -4243,14 +4425,14 @@ fn try_ic3_loop_lane(
     let proof_run =
         ay_encode::invoke::prove_with_external_model(problem.clone(), candidate, &encode_cfg)
             .ok()?;
-    let certificate = proof_run.certificate(problem);
+    let certificate = proof_run.certificate();
 
     // Reuse the SAME reject-only `PdrInvariant` transport the normal Safe arm uses.
-    // `emit_pdr_invariant_from_run` re-checks `certificate.accepted &&
-    // accepted_as_proof && the normalized-input hash binds`; if the run is not
+    // `emit_pdr_invariant_from_run` re-checks `certificate.accepted_as_proof()
+    // && the normalized-input hash binds`; if the run is not
     // accepted (rejected candidate) it returns `None` and the lane yields `None`.
     let (outcome, verdict) = emit_pdr_invariant_from_run(
-        &proof_run.run.result,
+        proof_run.result(),
         &certificate,
         obligation,
         stats,
@@ -4617,6 +4799,103 @@ pub fn is_proof_grade_native_full_verification_verdict(
         classify_native_full_verification_verdict(verdict),
         trust_mc_core::ProofGradeVerdict::ProofGrade { .. }
     )
+}
+
+/// The two rejection buckets that never reach the two-lane predicate, because
+/// the admission arm's own PATTERN (`count: None, align: None`) excludes them.
+/// They cannot be exercised from `trust-mc-trust-bmc`, so they are pinned here.
+#[cfg(all(test, feature = "native-trust-ir-bundle"))]
+mod alloca_rejection_reason_tests {
+    use super::alloca_rejection_reason;
+    use trust_ir::inst::Inst;
+    use trust_ir::node::InstrNode;
+    use trust_ir::ty::Ty;
+    use trust_ir::value::{BlockId, FuncId, FuncTyId, ValueId};
+    use trust_ir::{Block, Function, Module};
+
+    /// The fixtures are hand-built `Function`s over scalar cells only, so the
+    /// module is consulted solely by `aggregate_field_tys_of` (which never fires
+    /// for `Ty::I64`). An empty module is therefore exact, not a stub.
+    fn empty_module() -> Module {
+        Module::new("alloca_reason")
+    }
+
+    fn function_with(body: Vec<InstrNode>) -> Function {
+        let mut function =
+            Function::new(FuncId::new(0), "alloca_reason", FuncTyId::new(0), BlockId::new(0));
+        let mut block = Block::new(BlockId::new(0));
+        block.body = body;
+        function.blocks = vec![block];
+        function
+    }
+
+    #[test]
+    fn an_array_alloca_is_named_as_such() {
+        let cell = ValueId::new(0);
+        let function = function_with(vec![
+            InstrNode::new(Inst::Alloca {
+                ty: Ty::I64,
+                count: Some(ValueId::new(9)),
+                align: None,
+            })
+            .with_result(cell),
+            InstrNode::new(Inst::Return { values: Vec::new() }),
+        ]);
+        let reason =
+            alloca_rejection_reason(&empty_module(), &function, Some(cell), &Ty::I64, true, false);
+        assert_eq!(reason.kind, "alloca_count_some");
+    }
+
+    #[test]
+    fn a_caller_aligned_alloca_is_named_as_such() {
+        let cell = ValueId::new(0);
+        let function = function_with(vec![
+            InstrNode::new(Inst::Alloca { ty: Ty::I64, count: None, align: Some(8) })
+                .with_result(cell),
+            InstrNode::new(Inst::Return { values: Vec::new() }),
+        ]);
+        let reason =
+            alloca_rejection_reason(&empty_module(), &function, Some(cell), &Ty::I64, false, true);
+        assert_eq!(reason.kind, "alloca_align_some");
+        // The extent check comes first, exactly as the arm's pattern reads.
+        let both =
+            alloca_rejection_reason(&empty_module(), &function, Some(cell), &Ty::I64, true, true);
+        assert_eq!(both.kind, "alloca_count_some");
+    }
+
+    #[test]
+    fn a_result_less_alloca_is_named_as_such() {
+        let function = function_with(vec![
+            InstrNode::new(Inst::Alloca { ty: Ty::I64, count: None, align: None }),
+            InstrNode::new(Inst::Return { values: Vec::new() }),
+        ]);
+        let reason =
+            alloca_rejection_reason(&empty_module(), &function, None, &Ty::I64, false, false);
+        assert_eq!(reason.kind, "alloca_no_result");
+    }
+
+    /// A metadata-less alloca defers to the two-lane predicate, and the bucket it
+    /// returns carries BOTH lanes so a gate log can be split on `/`.
+    #[test]
+    fn a_metadata_less_alloca_defers_to_the_admission_predicate() {
+        let cell = ValueId::new(0);
+        let function = function_with(vec![
+            InstrNode::new(Inst::Alloca { ty: Ty::I64, count: None, align: None })
+                .with_result(cell),
+            InstrNode::new(Inst::Load {
+                ty: Ty::I64,
+                ptr: cell,
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(1)),
+            InstrNode::new(Inst::Return { values: Vec::new() }),
+        ]);
+        let reason =
+            alloca_rejection_reason(&empty_module(), &function, Some(cell), &Ty::I64, false, false);
+        assert_eq!(reason.kind, "load_before_store/not_definitely_initialized");
+        assert!(reason.detail.contains("block-local="), "the detail names both lanes");
+    }
 }
 
 #[cfg(test)]
@@ -7811,6 +8090,28 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn transparent_borrow_input_gate_obeys_the_explicit_opt_in() {
+        let enabled = admit_transparent_borrow_instructions();
+        for shape in [ProofAuthorityAttackShape::Borrow, ProofAuthorityAttackShape::BorrowMut] {
+            let bundle = proof_authority_attack_bundle(shape);
+            let result = validate_native_bundle_proof_authority_input(&bundle, None);
+            if enabled {
+                result.unwrap_or_else(|error| {
+                    panic!("{shape:?} must pass when TRUST_ADMIT_BORROW_INST is set: {error}")
+                });
+            } else {
+                let error =
+                    result.expect_err("a transparent borrow must remain fail-closed by default");
+                let NativeSolveError::InvalidInput { detail, .. } = error else {
+                    panic!("{shape:?} must be rejected structurally");
+                };
+                assert!(detail.contains("borrow-checker validity"), "{shape:?}: {detail}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
     fn single_cell_alloca_is_default_on_but_escape_and_type_punning_fail_closed() {
         for shape in [
             ProofAuthorityAttackShape::ScalarAlloca,
@@ -9661,6 +9962,138 @@ mod tests {
             run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
                 .is_none(),
             "fail-closed lowering sites must suppress the refutation"
+        );
+    }
+
+    /// Helper: metadata carrying a fail-closed count and (optionally) the
+    /// distinct construct labels behind it.
+    fn fail_closed_metadata(
+        sites: u32,
+        reasons: &[&str],
+    ) -> trust_mc_core::NativeTypedChcObligationMetadata {
+        trust_mc_core::NativeTypedChcObligationMetadata::new(
+            "tRust",
+            "trust_ir-module",
+            None,
+            trust_mc_core::NativeArtifactDigest::new("sha256", "00".repeat(32)),
+            trust_mc_core::NativeArtifactDigest::new("sha256", "11".repeat(32)),
+            0,
+            "chc",
+            0,
+            vec![],
+            vec![],
+        )
+        .with_structural_reachability_complete(true)
+        .with_fail_closed_lowering_site_count(sites)
+        .with_fail_closed_lowering_reasons(reasons.iter().map(|r| (*r).to_string()))
+    }
+
+    /// DIAGNOSTIC SURFACING. The demotion message named a COUNT and nothing
+    /// else, so a "3 unsupported trust_ir construct(s)" obligation gave no way
+    /// to learn WHICH constructs blocked it. The distinct reasons must now
+    /// appear in the text, sorted and deduplicated.
+    ///
+    /// FAILS ON UNFIXED CODE: with the reason list dropped on the floor
+    /// (`let _ = reasons;`), the message carries no `(constructs: …)` clause.
+    #[test]
+    fn demotion_reason_names_the_distinct_blocking_constructs() {
+        let message = fail_closed_lowering_demotion_reason(
+            3,
+            &[String::from("Cast"), String::from("HeapAllocation"), String::from("IndirectCall")],
+        );
+        assert!(
+            message.contains("3 unsupported trust_ir construct(s)"),
+            "the count must survive verbatim: {message}"
+        );
+        assert!(
+            message.contains("(constructs: Cast, HeapAllocation, IndirectCall)"),
+            "the distinct reasons must be named: {message}"
+        );
+    }
+
+    /// BACKWARD COMPATIBILITY. Absent metadata (and metadata predating the
+    /// field) reads as an EMPTY reason list, and the message must then render
+    /// byte-identically to the historical text — no dangling "(constructs: )".
+    #[test]
+    fn demotion_reason_without_reasons_is_byte_identical_to_the_historical_text() {
+        let historical = "fail-closed lowering reachable: 2 unsupported trust_ir construct(s) \
+                          lowered to unconditional error rules; refutation demoted to unknown";
+        assert_eq!(fail_closed_lowering_demotion_reason(2, &[]), historical);
+
+        // An obligation with no native metadata at all resolves to the same
+        // empty slice (this is the "absent reads as nothing" contract).
+        let mut obligation = typed_native_chc_obligation(/* structurally_complete */ false);
+        obligation.native_metadata = None;
+        assert!(fail_closed_lowering_reasons(&obligation).is_empty());
+        assert_eq!(fail_closed_lowering_sites(&obligation), 0);
+    }
+
+    /// CANONICAL FORM. The metadata is serialized into hashed artifact bytes,
+    /// so the recorded list must not depend on the order the translator emitted
+    /// its diagnostics in. The builder sorts and dedups; two permutations of the
+    /// same multiset must produce byte-identical metadata.
+    #[test]
+    fn recorded_reasons_are_sorted_deduplicated_and_order_independent() {
+        let a = fail_closed_metadata(4, &["IndirectCall", "Cast", "IndirectCall", "Cast"]);
+        let b = fail_closed_metadata(4, &["Cast", "IndirectCall", "Cast", "IndirectCall"]);
+        assert_eq!(a.fail_closed_lowering_reasons, vec!["Cast", "IndirectCall"]);
+        assert_eq!(a, b, "permuted diagnostics must yield identical metadata");
+        assert_eq!(
+            serde_json::to_string(&a).expect("serialize"),
+            serde_json::to_string(&b).expect("serialize"),
+        );
+    }
+
+    /// ZERO VERDICT EFFECT (the whole point of this being diagnostic-only).
+    /// The COUNT is the only load-bearing value: a zero count with a fully
+    /// populated reason list must NOT demote anything, and a nonzero count must
+    /// demote with or without reasons. Nothing in the driver may branch on the
+    /// reason list.
+    ///
+    /// This one is a NEGATIVE property — it passes before and after the change
+    /// by design. Its teeth were checked by mutating the gate to read the reason
+    /// list (`!reasons.is_empty()` in place of `sites > 0`), which makes the
+    /// first assertion fail.
+    #[test]
+    #[cfg(feature = "ay-chc-native")]
+    fn reason_labels_alone_never_demote_and_never_alter_the_gate() {
+        let mut obligation =
+            loop_accumulator_obligation(trust_ir::ty::Ty::U8, 64, LoopAddend::ShiftedParam);
+
+        // (a) Reasons present, count ZERO — the lane must still run: a reason
+        //     label carries no demotion power of its own.
+        obligation.native_metadata =
+            Some(fail_closed_metadata(0, &["Cast", "IndirectCall", "HeapAllocation"]));
+        assert_eq!(fail_closed_lowering_sites(&obligation), 0);
+        assert_eq!(fail_closed_lowering_reasons(&obligation).len(), 3);
+        assert!(
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .is_some(),
+            "a zero count must not be demoted by the presence of reason labels"
+        );
+
+        // (b) Count nonzero, reasons EMPTY — still demoted (the count alone
+        //     governs, exactly as before the field existed).
+        obligation.native_metadata = Some(fail_closed_metadata(1, &[]));
+        assert!(
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .is_none(),
+            "the count alone must still suppress the refutation"
+        );
+
+        // (c) Count nonzero, reasons present — demoted, and the message names
+        //     them.
+        obligation.native_metadata = Some(fail_closed_metadata(1, &["Switch"]));
+        assert!(
+            run_bounded_unroll_lane(&obligation, &bounded_unroll::BOUNDED_UNROLL_K_LADDER)
+                .is_none(),
+        );
+        assert!(
+            fail_closed_lowering_demotion_reason(
+                fail_closed_lowering_sites(&obligation),
+                fail_closed_lowering_reasons(&obligation),
+            )
+            .contains("(constructs: Switch)")
         );
     }
 

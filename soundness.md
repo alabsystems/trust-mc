@@ -6,9 +6,9 @@
 # Soundness Boundaries
 
 trust-mc's current trust boundary is defined by three category families in
-`trust-mc-driver/src/unsoundness_counts.rs:25-83`: **14 demoted**, **5
-fail-closed**, and **13 sound-approximation** categories. The metadata enum in
-`trust-mc-metadata/src/diagnostics.rs:27-63` carries the same split, and the driver
+`trust-mc-driver/src/unsoundness_counts.rs:29-86`: **17 demoted**, **5
+fail-closed**, and **12 sound-approximation** categories. The metadata enum in
+`trust-mc-metadata/src/diagnostics.rs:27-67` carries the same split, and the driver
 has a compile-time coverage assertion so new categories cannot silently escape
 classification.
 
@@ -21,10 +21,8 @@ classification.
 
 `PROOF` with `sound_fallback_count = 0` is the strongest result surface trust-mc
 currently exposes; new fallback usage on a previously zero-fallback harness is
-an encoding-quality regression (see "Strongest Proof Surface" below). The
-`scripts/zero_fallback_canary.sh` checker that would automate that comparison
-is planned but NOT yet implemented (roadmap item 6.1 in
-`docs/roadmap-100-parity-2026-07-06.md`).
+an encoding-quality regression (see "Strongest Proof Surface" below). `scripts/zero_fallback_canary.sh` implements that comparison over the
+per-harness compiletest report (roadmap item 6.1, landed).
 
 ## U* False-PROOF / Replacement-Quality Hard Gates
 
@@ -48,12 +46,16 @@ driver demotes `PROOF` to failure and records the reason in
 | U12 | `inferable_predicate` | `trust-mc-metadata/src/diagnostics.rs:414-429` | `demotion_reasons` | A call was summarized with an uninterpreted, solver-inferable predicate. This can be useful diagnostically, but it is not trusted as replacement-quality proof evidence. |
 | U13 | `fp_bitvector_encoding` | `trust-mc-metadata/src/diagnostics.rs:734-743` | `demotion_reasons` | Floating-point values were modeled as bitvectors instead of SMT FP sorts, losing IEEE 754 rounding and NaN semantics. |
 | U14 | `rounding_assertion_bypass` | `trust-mc-metadata/src/diagnostics.rs:768-778` | `demotion_reasons` | A float rounding assertion was weakened to a finiteness tautology. The assertion is not checked as written, so any apparent proof is demoted. |
+| U15 | `offset_provenance_unresolved` | `trust-mc-metadata/src/diagnostics.rs` | `demotion_reasons` | Pointer-offset provenance could not be resolved, so the offset's base allocation is unknown to the model. |
+| U16 | `vec_field_fallback` | `trust-mc-metadata/src/diagnostics.rs` | `demotion_reasons` | Vec field selection fell back to a fresh symbolic because the base sort was not a datatype. Reclassified from sound-approximation: minting a solver-controlled symbolic for a program-produced value can mask a real violation. |
+| U17 | `pointee_synthesis_fallback` | `trust-mc-metadata/src/diagnostics.rs` | `demotion_reasons` | Pointer dereference codegen synthesized an unconstrained symbolic value because tracking was incomplete. Reclassified from sound-approximation for the same reason as U16. |
 
 ## O* Over-Approximation / Weakened-PROOF Interpretation
 
 These categories are listed in `SOUND_APPROXIMATION_CATEGORIES`. They do not
-demote `PROOF`, but they do increment `sound_fallback_count` and therefore mark
-the result as weaker than a zero-fallback proof. For non-`PROOF` runs, the same
+demote `PROOF`, and all but `chc_sound_havoc_drop` increment
+`sound_fallback_count` and therefore mark the result as weaker than a
+zero-fallback proof. For non-`PROOF` runs, the same
 counts also feed `ctrex_category` and `unknown_quality`.
 
 | ID | Category | Source | User-visible signal | What a result means |
@@ -63,14 +65,13 @@ counts also feed `ctrex_category` and `unknown_quality`.
 | O3 | `chc_translation_drop` | `trust-mc-metadata/src/diagnostics.rs:308-330` | `sound_fallback_count` | Place, constant, or projection translation returned `None`, so the affected state remained unconstrained. |
 | O4 | `into_option_drop` | `trust-mc-metadata/src/diagnostics.rs:517-527` | `sound_fallback_count` | `Result::Err` was converted to `None`, which skipped a translation path and weakened the resulting constraints. |
 | O5 | `abstracted_fallback` | `trust-mc-metadata/src/diagnostics.rs:555-565` | `sound_fallback_count` | Pre-inlined UTF8/Cow/String internals were approximated with fresh symbolic values instead of precise semantics. |
-| O6 | `vec_field_fallback` | `trust-mc-metadata/src/diagnostics.rs:574-585` | `sound_fallback_count` | Vec field selection fell back to a fresh symbolic because the base sort was not a datatype. Concrete field information was lost. |
-| O7 | `pointee_synthesis_fallback` | `trust-mc-metadata/src/diagnostics.rs:594-606` | `sound_fallback_count` | Pointer dereference codegen synthesized an unconstrained symbolic value because tracking was incomplete. |
-| O8 | `unhandled_calls` | `trust-mc-metadata/src/diagnostics.rs:358-370` | `sound_fallback_count` | A call fell through dispatch and returned an unconstrained value. The path is still explored, but with weakened semantics. |
-| O9 | `sort_harmonize_fresh_var` | `trust-mc-metadata/src/diagnostics.rs:689-701` | `sound_fallback_count` | Phi merge harmonization introduced fresh symbolic values after flatten/unflatten or sort mismatch failures. |
-| O10 | `ptr_metadata_unconstrained` | `trust-mc-metadata/src/diagnostics.rs:711-721` | `sound_fallback_count` | Pointer metadata such as slice length or vtable was replaced with an unconstrained symbolic value. |
-| O11 | `static_init_incomplete` | `trust-mc-metadata/src/diagnostics.rs:723-732` | `sound_fallback_count` | Static initialization could not be reconstructed from the allocation, so the static stayed unconstrained. |
-| O12 | `aggregate_encoding_gap` | `trust-mc-metadata/src/diagnostics.rs:745-755` | `sound_fallback_count` | Aggregate or discriminant construction fell back to a fresh symbolic because precise ADT encoding was unavailable. |
-| O13 | `stub_approximation` | `trust-mc-metadata/src/diagnostics.rs:757-766` | `sound_fallback_count` | A CHC stub returned a fresh symbolic value instead of a precise modeled result. |
+| O6 | `unhandled_calls` | `trust-mc-metadata/src/diagnostics.rs:358-370` | `sound_fallback_count` | A call fell through dispatch and returned an unconstrained value. The path is still explored, but with weakened semantics. |
+| O7 | `sort_harmonize_fresh_var` | `trust-mc-metadata/src/diagnostics.rs:689-701` | `sound_fallback_count` | Phi merge harmonization introduced fresh symbolic values after flatten/unflatten or sort mismatch failures. |
+| O8 | `ptr_metadata_unconstrained` | `trust-mc-metadata/src/diagnostics.rs:711-721` | `sound_fallback_count` | Pointer metadata such as slice length or vtable was replaced with an unconstrained symbolic value. |
+| O9 | `static_init_incomplete` | `trust-mc-metadata/src/diagnostics.rs:723-732` | `sound_fallback_count` | Static initialization could not be reconstructed from the allocation, so the static stayed unconstrained. |
+| O10 | `aggregate_encoding_gap` | `trust-mc-metadata/src/diagnostics.rs:745-755` | `sound_fallback_count` | Aggregate or discriminant construction fell back to a fresh symbolic because precise ADT encoding was unavailable. |
+| O11 | `stub_approximation` | `trust-mc-metadata/src/diagnostics.rs:757-766` | `sound_fallback_count` | A CHC stub returned a fresh symbolic value instead of a precise modeled result. |
+| O12 | `chc_sound_havoc_drop` | `trust-mc-metadata/src/diagnostics.rs` | (excluded from `sound_fallback_count`) | The recognized-clean subset of translation drops (certified fresh havoc). A spurious counterexample is still tagged `OverApproximation`, but the driver excludes this category from the sound-fallback proof qualifier, so an all-SoundHavoc proof still counts as clean. |
 
 ## F* Fail-Closed / Conservative Failure
 
@@ -96,9 +97,8 @@ The current strongest proof surface is defined as:
 Those zero-fallback harnesses are the best regression canaries for exact
 semantics. If a previously zero-fallback harness starts reporting
 `sound_fallback_count > 0`, encoding quality regressed even if the top-line
-verdict stayed `PROOF`. `scripts/zero_fallback_canary.sh` (roadmap item 6.1,
-not yet implemented) is the planned automation of this check over the
-per-harness compiletest report.
+verdict stayed `PROOF`. `scripts/zero_fallback_canary.sh` (roadmap item 6.1)
+automates this check over the per-harness compiletest report.
 
 ## Discriminating Regression Guards
 

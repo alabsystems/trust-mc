@@ -143,7 +143,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target_locals
     }
 
-    fn resolve_bmc_fn_ptr_callee(&self, func: &Operand) -> Option<(Instance, bool)> {
+    pub(in crate::codegen_ay::statement) fn resolve_bmc_fn_ptr_callee(
+        &self,
+        func: &Operand,
+    ) -> Option<(Instance, bool)> {
         let target_locals = self.collect_fn_ptr_copy_chain(func);
 
         // Scan for ReifyFnPointer/ClosureFnPointer casts.
@@ -191,6 +194,31 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         None
+    }
+
+    /// Scan this body for `ReifyFnPointer` casts whose target is a FOREIGN
+    /// item, returning the short names. Kept separate from
+    /// [`resolve_all_fn_ptr_callees`] because an extern declaration has no MIR
+    /// and `Instance::resolve` fails on it — the tuple registry structurally
+    /// cannot represent these.
+    pub(in crate::codegen_ay::statement) fn resolve_all_foreign_fn_ptr_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for bb in &self.body.blocks {
+            for stmt in &bb.statements {
+                if let StatementKind::Assign(_, rvalue) = &stmt.kind
+                    && let Rvalue::Cast(
+                        CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer),
+                        operand,
+                        _,
+                    ) = rvalue
+                    && self.is_foreign_call(operand)
+                {
+                    let full = self.callee_display_name(operand);
+                    names.push(full);
+                }
+            }
+        }
+        names
     }
 
     /// Scan this body for all ReifyFnPointer/ClosureFnPointer casts and resolve

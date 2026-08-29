@@ -25,7 +25,9 @@ use tracing::{debug, warn};
 use super::ChcCtx;
 use super::call::inline_shared::{PlaceResolver, inline_operand_to_expr};
 
-pub(in crate::codegen_ay) use closure_body::{ClosureBodyResult, translate_closure_body_as_expr};
+pub(in crate::codegen_ay) use closure_body::{
+    ClosureBodyResult, translate_closure_body_as_expr, translate_closure_body_with_params,
+};
 pub(in crate::codegen_ay::chc) use closure_captures::{
     extract_closure_captures, extract_inline_closure_captures,
 };

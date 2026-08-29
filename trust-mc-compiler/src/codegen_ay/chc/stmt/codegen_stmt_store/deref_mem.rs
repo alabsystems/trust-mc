@@ -41,6 +41,103 @@ fn projection_ty_is_heap_pointer(ty: rustc_public::ty::Ty) -> bool {
     }
 }
 
+/// Single-writer MIR summary of one local's defining rvalue.
+///
+/// The address-provenance walk needs the same handful of shapes over and over;
+/// summarising them once per body keeps each hop O(1) instead of rescanning
+/// every block (that rescan made a contract harness spend ~30s in codegen).
+/// `None` in the table means "not written exactly once by an unprojected
+/// assignment", which is the walk's existing bail condition.
+#[derive(Clone, Debug)]
+pub(in crate::codegen_ay::chc) enum ProvDef {
+    /// `_x = copy _y`
+    CopyLocal(usize),
+    /// `_x = &_y` / `_x = &raw _y`, no projections
+    RefLocal(usize),
+    /// `_x = &(*_y)` / `_x = &raw (*_y)` — a bare reborrow. The borrow of a
+    /// pointer's own pointee has the SAME address value as the pointer, so the
+    /// question "which local does this address?" transfers to `_y` unchanged.
+    RefDeref(usize),
+    /// `_x = &_y.f` — the walk cannot follow a projected borrow
+    RefProjected,
+    /// `_x = copy (_y.i)`
+    CopyField(usize, usize),
+    /// `_x = copy (*_y)`
+    CopyDeref(usize),
+    /// `_x = copy ((*_y).i)`
+    CopyDerefField(usize, usize),
+    /// Any aggregate; `tuple1` marks the one-element tuple closure-call
+    /// inlining builds. Operands are the unprojected copy/move source locals.
+    Aggregate { tuple1: bool, operands: Vec<Option<usize>> },
+    /// Anything else the walk refuses to cross.
+    Unsupported,
+}
+
+fn summarize_provenance_rvalue(rhs: &rustc_public::mir::Rvalue) -> ProvDef {
+    use rustc_public::mir::{AggregateKind, Operand, Rvalue};
+
+    let operand_local = |op: &Operand| match op {
+        Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => Some(p.local),
+        _ => None,
+    };
+
+    match rhs {
+        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => match p.projection.as_slice() {
+            [] => ProvDef::CopyLocal(p.local),
+            [ProjectionElem::Field(idx, _)] => ProvDef::CopyField(p.local, *idx),
+            [ProjectionElem::Deref] => ProvDef::CopyDeref(p.local),
+            [ProjectionElem::Deref, ProjectionElem::Field(idx, _)] => {
+                ProvDef::CopyDerefField(p.local, *idx)
+            }
+            _ => ProvDef::Unsupported,
+        },
+        Rvalue::Ref(_, _, p) | Rvalue::AddressOf(_, p) => match p.projection.as_slice() {
+            [] => ProvDef::RefLocal(p.local),
+            [ProjectionElem::Deref] => ProvDef::RefDeref(p.local),
+            _ => ProvDef::RefProjected,
+        },
+        Rvalue::Aggregate(kind, operands) => ProvDef::Aggregate {
+            tuple1: matches!(kind, AggregateKind::Tuple) && operands.len() == 1,
+            operands: operands.iter().map(operand_local).collect(),
+        },
+        _ => ProvDef::Unsupported,
+    }
+}
+
+/// Build the per-local summary table for `body`.
+pub(in crate::codegen_ay::chc) fn build_provenance_defs(
+    body: &rustc_public::mir::Body,
+) -> Vec<Option<ProvDef>> {
+    use rustc_public::mir::StatementKind;
+
+    let n = body.locals().len();
+    let mut counts = vec![0usize; n];
+    let mut defs: Vec<Option<ProvDef>> = vec![None; n];
+    for bb_data in &body.blocks {
+        for stmt in &bb_data.statements {
+            let StatementKind::Assign(lhs, rhs) = &stmt.kind else {
+                continue;
+            };
+            let local: usize = lhs.local;
+            if local >= n {
+                continue;
+            }
+            counts[local] += 1;
+            if lhs.projection.is_empty() {
+                defs[local] = Some(summarize_provenance_rvalue(rhs));
+            }
+        }
+    }
+    // More than one writer (branch merge, reassignment, or a projected write
+    // into the same local) makes the provenance path-dependent.
+    for (local, def) in defs.iter_mut().enumerate() {
+        if counts[local] != 1 {
+            *def = None;
+        }
+    }
+    defs
+}
+
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Recover a concrete alloc_id by tracing backward through MIR assignments
     /// and identity-like call results.
@@ -220,47 +317,143 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Some(slot_local)
     }
 
+    /// SECOND WITNESS for the ADDRESS-used-as-VALUE defect that
+    /// `deref_load_referent_local` describes, for the bodies whose reference
+    /// flow the MIR walk cannot follow.
+    ///
+    /// `deref_load_referent_local` answers the question from MIR alone, so it
+    /// goes silent the moment the pointer reaches this load through a cast or a
+    /// multiply-assigned local. A `#[kani::ensures]` closure is exactly that
+    /// shape: its captured `&mut Box<u32>` arrives as `_p = copy ((*_env).0)`
+    /// after a `&Closure` cast, so the walk returns `None`, the generic
+    /// `src_local_for_alloc` arm copies the POINTER's alloc_id onto the loaded
+    /// VALUE, and the `Box -> Unique -> NonNull -> *const T` extraction then
+    /// mints `bv32(slot)++bv32(0)` for the payload address — a memory cell no
+    /// rule ever writes at that type, so `**ptr < 101` is refutable against a
+    /// correct contract.
+    ///
+    /// The encoder already holds the missing fact under a different name.
+    /// `ref_targets[ptr_local] == (_L, [])` is its own record that the place
+    /// `*ptr_local` IS the place `_L` — the very fact `translate_place_with_deref`
+    /// uses to translate THIS load into a read of `_L`'s register. So the
+    /// loaded value is `_L`'s VALUE, and the allocation it points into is
+    /// whatever `_L`'s value points into (`known_alloc_ids[_L]`) — never `_L`'s
+    /// own slot. Deriving provenance from the same map that resolved the load
+    /// adds no assumption: were `ref_targets` wrong here, the load would
+    /// already be reading the wrong local.
+    ///
+    /// Three conditions keep this to the defect's exact shape:
+    /// - `projection == [Deref]` — a BARE `*_p`. With a trailing field
+    ///   (`(*_p).f`) the loaded value is `_L.f`, whose allocation is not
+    ///   `known_alloc_ids[_L]`, so that shape must not reach this rule.
+    /// - the recorded alloc_id for `ptr_local` is exactly `_L`'s own STACK SLOT
+    ///   object. A pointer already carrying a heap alloc_id is a genuine
+    ///   Box/Rc/NonNull chain and keeps its existing inheritance.
+    /// - the answer is a referent LOCAL, not an address. The caller forwards
+    ///   `known_alloc_ids[_L]` and FAILS CLOSED (drops the destination's
+    ///   alloc_id) when the referent has none, rather than substituting the
+    ///   slot id it happens to be holding.
+    fn deref_load_ref_target_referent_local(
+        &self,
+        ptr_local: usize,
+        projection: &[ProjectionElem],
+    ) -> Option<usize> {
+        if !matches!(projection, [ProjectionElem::Deref]) {
+            return None;
+        }
+        let &obj_id = self.known_alloc_ids.get(&ptr_local)?;
+        let slot_local = self.heap_state.local_idx_for_obj_id(obj_id)?;
+        let target = self.ref_resolution.ref_targets.get(&ptr_local)?;
+        if !target.projections.is_empty() || target.local != slot_local {
+            return None;
+        }
+        debug!(
+            ptr_local,
+            obj_id,
+            slot_local,
+            "GUARD4262_REF_TARGET_FIRED: deref load through a pointer whose ref_target \
+             is its own referent slot"
+        );
+        Some(slot_local)
+    }
+
+    /// The referent whose VALUE a deref load through `ptr_local` yields, from
+    /// either witness.
+    ///
+    /// Both witnesses answer the same question — "is `*ptr_local` the place
+    /// `_L`, so that the loaded value is `_L`'s value rather than an address
+    /// into `_L`?" — one from MIR, one from the encoder's own `ref_targets`.
+    /// Kept separate from `deref_load_referent_local` so the MIR-only witness,
+    /// which also drives Deref PLACE resolution in `codegen_expr_deref_resolve`,
+    /// keeps its exact current meaning there.
+    pub(in crate::codegen_ay::chc) fn deref_load_value_referent_local(
+        &self,
+        ptr_local: usize,
+        projection: &[ProjectionElem],
+    ) -> Option<usize> {
+        self.deref_load_referent_local(ptr_local)
+            .or_else(|| self.deref_load_ref_target_referent_local(ptr_local, projection))
+    }
+
     /// Bounded backward walk answering "does `ptr_local` provably hold
     /// `&_target` with no projections?".
+    fn ptr_provably_addresses_local(&self, ptr_local: usize, target: usize) -> bool {
+        self.mir_provable_referent_local(ptr_local) == Some(target)
+    }
+
+    /// Bounded backward walk answering "which local's slot does `ptr_local`
+    /// provably hold the address of?".
     ///
     /// Follows only unprojected `Use(Copy|Move)` wrappers and the
     /// single-element argument tuple that closure-call inlining introduces, so
     /// it never crosses a load, a cast, an offset, or a field projection, and
     /// it requires every local on the chain to be written exactly once so the
-    /// answer is path-independent. Any other shape answers `false`.
-    fn ptr_provably_addresses_local(&self, ptr_local: usize, target: usize) -> bool {
-        use rustc_public::mir::{AggregateKind, Operand, Rvalue, StatementKind};
+    /// answer is path-independent. Any other shape answers `None`.
+    ///
+    /// This is a pure MIR fact — no encoding state is consulted — so the
+    /// declaration pass may use it to seed `ref_targets` for a pointer that
+    /// never appears as `_p = &_L` in this body (a `&result` reaching a
+    /// contract closure arrives through a capture tuple instead).
+    pub(in crate::codegen_ay::chc) fn mir_provable_referent_local(
+        &self,
+        ptr_local: usize,
+    ) -> Option<usize> {
+        self.mir_provable_referent_local_at(ptr_local, 0)
+    }
 
+    fn mir_provable_referent_local_at(&self, ptr_local: usize, depth: usize) -> Option<usize> {
+        // Two of the hops below re-enter this walk on a different pointer.
+        if depth > 3 {
+            return None;
+        }
+        if let Some(memo) = self.provenance_walk_memo.borrow().get(&(ptr_local, depth)) {
+            return *memo;
+        }
+        let answer = self.mir_provable_referent_local_uncached(ptr_local, depth);
+        self.provenance_walk_memo.borrow_mut().insert((ptr_local, depth), answer);
+        answer
+    }
+
+    fn mir_provable_referent_local_uncached(
+        &self,
+        ptr_local: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        let defs = self.provenance_defs.get_or_init(|| build_provenance_defs(self.body));
         let mut current = ptr_local;
         for _ in 0..8 {
-            let mut def: Option<&Rvalue> = None;
-            let mut assign_count = 0usize;
-            for bb_data in &self.body.blocks {
-                for stmt in &bb_data.statements {
-                    if let StatementKind::Assign(lhs, rhs) = &stmt.kind
-                        && lhs.local == current
-                    {
-                        assign_count += 1;
-                        if lhs.projection.is_empty() {
-                            def = Some(rhs);
-                        }
-                    }
-                }
-            }
-            // More than one writer (branch merge, reassignment, or a projected
-            // write into the same local) makes the provenance path-dependent.
-            if assign_count != 1 {
-                return false;
-            }
-            match def {
-                Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p)))
-                    if p.projection.is_empty() =>
-                {
-                    current = p.local;
-                }
-                Some(Rvalue::Ref(_, _, p) | Rvalue::AddressOf(_, p)) => {
-                    return p.projection.is_empty() && p.local == target;
-                }
+            match defs.get(current)?.as_ref()? {
+                ProvDef::CopyLocal(src) => current = *src,
+                ProvDef::RefLocal(target) => return Some(*target),
+                // `_x = &(*_y)` is a reborrow: `_x` and `_y` hold the SAME
+                // address, so the walk continues on `_y` with the question
+                // unchanged. `#[kani::ensures]` capture lowering builds exactly
+                // this shape (`_cap = &(*_arg)`), and without the hop the walk
+                // stops at `RefProjected`, the deref-load through the capture
+                // keeps the referent SLOT's alloc_id, and `**ptr` in the
+                // post-state reads the `Box` local's own stack cell — a column
+                // no rule ever writes.
+                ProvDef::RefDeref(src) => current = *src,
                 // Closure-call inlining packs the callee's arguments into a
                 // one-element tuple and then binds the callee's parameter to
                 // the tuple local itself (`_p = move (_arg,)`, later read as
@@ -272,20 +465,63 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // ensures-closure parameter keeps the referent SLOT's obj_id,
                 // so `*result` reads the slot's own object instead of the
                 // pointer value stored in it (one deref level short).
-                Some(Rvalue::Aggregate(kind, operands))
-                    if matches!(kind, AggregateKind::Tuple) && operands.len() == 1 =>
-                {
-                    match &operands[0] {
-                        Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => {
-                            current = p.local;
-                        }
-                        _ => return false,
-                    }
+                ProvDef::Aggregate { tuple1: true, operands } => {
+                    current = (*operands.first()?)?;
                 }
-                _ => return false,
+                // A contract closure reads its captured reference back out of
+                // the capture aggregate: `_p = copy (_clo.0)`. The field's
+                // value IS the operand the aggregate was built from, so hop to
+                // that operand — the same (local, field) -> source
+                // identification `collect_aggregate_field_sources` makes for
+                // `ref_targets`. Without the hop the walk stops at a projected
+                // copy and `_d = copy (*_p)` inherits the CAPTURE's alloc_id,
+                // so `**ptr` in a `requires` reads the `Box`'s own stack slot
+                // as a `u32` (a cell no rule writes) instead of the heap value.
+                ProvDef::CopyField(base, field_idx) => {
+                    current = self.aggregate_field_source_local(*base, *field_idx)?;
+                }
+                // `_p = copy (*_q)` copies the VALUE held by whatever `_q`
+                // addresses. When `_q` provably addresses `_L`, `_p` and `_L`
+                // hold the SAME value, so the question "what does this pointer
+                // address?" transfers to `_L` unchanged.
+                ProvDef::CopyDeref(base) => {
+                    current = self.mir_provable_referent_local_at(*base, depth + 1)?;
+                }
+                // Same as the two hops above, composed: `_p = copy ((*_q).i)`
+                // reads field `i` out of the local `_q` addresses. The
+                // `ensures` closure reaches its captured `&mut Box` this way.
+                ProvDef::CopyDerefField(base, field_idx) => {
+                    let owner = self.mir_provable_referent_local_at(*base, depth + 1)?;
+                    current = self.aggregate_field_source_local(owner, *field_idx)?;
+                }
+                ProvDef::RefProjected
+                | ProvDef::Aggregate { tuple1: false, .. }
+                | ProvDef::Unsupported => return None,
             }
         }
-        false
+        None
+    }
+
+    /// Which local's value was placed in field `field_idx` of the aggregate
+    /// that defines `local`?
+    ///
+    /// Follows unprojected `Use(Copy|Move)` wrappers to the single aggregate
+    /// construction, then reads that field's operand. Every local on the path
+    /// must be written exactly once, so the answer is path-independent — the
+    /// same gate the surrounding walk uses.
+    fn aggregate_field_source_local(&self, local: usize, field_idx: usize) -> Option<usize> {
+        let defs = self.provenance_defs.get_or_init(|| build_provenance_defs(self.body));
+        let mut current = local;
+        for _ in 0..8 {
+            match defs.get(current)?.as_ref()? {
+                ProvDef::CopyLocal(src) => current = *src,
+                ProvDef::Aggregate { operands, .. } => {
+                    return *operands.get(field_idx)?;
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// Scan all MIR blocks for the assignment that defines `target_local`,
@@ -713,6 +949,44 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
 
                 self.emit_ref_target_array_update(&ref_target, rhs_expr, local_idx, bb_idx, acc);
+            }
+        } else if let Some(ref_target) =
+            self.ref_resolution.ref_targets.get(&local_idx).cloned()
+            && let Some(offset) = self.ref_resolution.subslice_offset.get(&local_idx).cloned()
+        {
+            // OFFSET case, narrowed. The guard above exists because MIRRORING a
+            // store through an offset pointer would overwrite the target
+            // local's state variable — corrupting e.g. a Vec's fld_ptr with the
+            // stored value. That hazard belongs to `mirror_scalar_ref_store`,
+            // which is still skipped here.
+            //
+            // The ARRAY-LANE write is a different operation: it stores into one
+            // element of an array-sorted state variable and cannot touch a
+            // pointer field. Skipping it too meant `a.as_mut_ptr().add(2)`
+            // wrote only into the address-indexed `mem` array, which nothing
+            // reads — so the pruner deleted the store entirely and
+            // `assert!(a[2] == 0)` was PROVED after writing 9.
+            //
+            // Gated on the target's state var actually being an ARRAY, so a Vec
+            // or struct target still takes the old path untouched.
+            let is_array_target = self
+                .try_state_idx_for_local(ref_target.local)
+                .and_then(|idx| self.state_var_mgr.state_vars.get(idx))
+                .is_some_and(|(_, sort)| sort.is_array());
+            if is_array_target {
+                debug!(
+                    local_idx,
+                    target = ref_target.local,
+                    "CHC: offset deref store -> indexed array lane update"
+                );
+                self.emit_ref_target_array_update_indexed(
+                    &ref_target,
+                    rhs_expr,
+                    local_idx,
+                    bb_idx,
+                    acc,
+                    Some(offset),
+                );
             }
         }
         if self.ref_resolution.ref_arg_pointee_idx.contains_key(&local_idx) {

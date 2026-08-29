@@ -368,8 +368,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             AssertMessage::RemainderByZero { .. } => "mod_by_zero_check",
             AssertMessage::Overflow { .. } => "overflow_check",
             AssertMessage::OverflowNeg { .. } => "overflow_check_neg",
-            AssertMessage::NullPointerDereference => "null_pointer_check",
-            AssertMessage::MisalignedPointerDereference { .. } => "alignment_check",
+            // rustc's ub-check asserts. Kani renders these as class
+            // `safety_check` with the rustc AssertKind texts ("null pointer
+            // dereference occurred" / "misaligned pointer dereference: ..."),
+            // which the corpus pins (zst, issue-3571, ptr_to_ref_cast). The
+            // CBMC-flavored `null_pointer_check` / `alignment_check` wordings
+            // stay on the place_deref instrumentation sites.
+            AssertMessage::NullPointerDereference => "raw_ptr_deref_null",
+            AssertMessage::MisalignedPointerDereference { .. } => "raw_ptr_deref_misaligned",
             AssertMessage::InvalidEnumConstruction { .. } => "enum_check",
             AssertMessage::ResumedAfterReturn { .. }
             | AssertMessage::ResumedAfterDrop { .. }

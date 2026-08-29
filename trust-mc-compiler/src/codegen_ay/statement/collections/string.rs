@@ -78,6 +78,45 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Codegen String operations (Part of #1312).
     ///
     /// String is modeled as a struct with (ptr, len, cap) fields.
+    /// Build a symbolic `String` of at most `bound` bytes.
+    ///
+    /// For `<String as BoundedArbitrary>::bounded_any::<N>()`. Modelling the
+    /// library's body faithfully would mean teaching codegen UTF-8 chunking;
+    /// modelling what the API PROMISES does not. A String built from N bytes
+    /// holds at most N bytes whatever the chunking does, because a valid UTF-8
+    /// prefix of an N-byte array cannot exceed N bytes.
+    ///
+    /// The contents stay unconstrained -- an over-approximation, and why this
+    /// is sound -- while the length gets the bound harnesses actually assert.
+    pub(in crate::codegen_ay::statement) fn codegen_bounded_string_value(
+        &mut self,
+        bound: u64,
+        destination: &Place,
+    ) {
+        let byte_array = Sort::array(ptr_sort(), bv8_sort());
+        let string_sort = struct_sort(RUST_STRING_SORT, names::vec_fields(byte_array.clone()));
+
+        let len_name = self.ctx.fresh_name("bounded_string_len");
+        let len = self.ctx.declare_var(&len_name, ptr_sort());
+        self.ctx.assert(len.clone().bvule(Expr::bitvec_const(u128::from(bound), POINTER_WIDTH)));
+
+        let data_name = self.ctx.fresh_name("bounded_string_data");
+        let data = self.ctx.declare_var(&data_name, byte_array);
+        let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
+
+        let string = Expr::datatype_constructor(
+            RUST_STRING_SORT,
+            RUST_STRING_CONS,
+            vec![zero.clone(), len, zero, data],
+            string_sort,
+        );
+        let base = self.ssa_base_name(destination);
+        let name = self.ssa_name_from_base(&base, true);
+        let var = self.ctx.declare_var(&name, string.sort().clone());
+        self.assert_ssa_def(var.clone(), string, &base);
+        self.env_update(std::sync::Arc::from(base), var);
+    }
+
     pub(in crate::codegen_ay::statement) fn codegen_string_stub(
         &mut self,
         stub_kind: StubKind,

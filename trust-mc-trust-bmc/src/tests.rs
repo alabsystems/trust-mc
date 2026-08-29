@@ -30,8 +30,8 @@ use trust_mc_core::violation::PropertyKind;
 
 use crate::translate::{TranslateOptions, const_to_expr, trust_ir_to_bmc_vc, ty_to_sort};
 use crate::{
-    NativeTrustMcBundleError, SEMANTICS_COVERAGE, SemanticsFamily, SemanticsStatus,
-    TrustIrChcUnsupportedReason, coverage_for_family, family_for_inst,
+    ChcTranslationOutput, NativeTrustMcBundleError, SEMANTICS_COVERAGE, SemanticsFamily,
+    SemanticsStatus, TrustIrChcUnsupportedReason, coverage_for_family, family_for_inst,
     trust_ir_function_to_chc_translation_output, trust_ir_to_chc_translation_outputs,
     trust_ir_to_chc_vc, trust_mc_bmc_vcs_from_native_bundle,
     trust_mc_chc_pdr_obligations_from_native_bundle,
@@ -190,6 +190,24 @@ fn native_digest(seed: u8) -> ProofDigest {
 }
 
 fn native_trust_mc_bundle(mode: TrustMcVerificationMode) -> NativeVerificationBundle {
+    native_trust_mc_bundle_inner(mode, false)
+}
+
+/// The same fixture with the REQUESTED function's body switched to an `f64`
+/// add — a construct the CHC translator cannot model precisely, so it lowers to
+/// an unconditionally reachable error rule and records a
+/// `FloatingPointArithmetic` diagnostic. Used to pin that the producer records
+/// the DISTINCT typed reasons alongside the fail-closed site count.
+fn native_trust_mc_bundle_with_fail_closed_lowering(
+    mode: TrustMcVerificationMode,
+) -> NativeVerificationBundle {
+    native_trust_mc_bundle_inner(mode, true)
+}
+
+fn native_trust_mc_bundle_inner(
+    mode: TrustMcVerificationMode,
+    fail_closed_lowering: bool,
+) -> NativeVerificationBundle {
     let source_digest = native_digest(0x51);
 
     let mut mb = ModuleBuilder::new("native_trust_mc_bundle");
@@ -205,15 +223,19 @@ fn native_trust_mc_bundle(mode: TrustMcVerificationMode) -> NativeVerificationBu
         fb.build();
     }
 
-    let add_ft = mb.add_func_type(vec![Ty::I32, Ty::I32], vec![Ty::I32]);
+    // `f64` arithmetic has no precise CHC model, so selecting it makes the
+    // translation fail closed (an unconditionally reachable error rule plus a
+    // `FloatingPointArithmetic` diagnostic) without changing anything else.
+    let add_ty = if fail_closed_lowering { Ty::F64 } else { Ty::I32 };
+    let add_ft = mb.add_func_type(vec![add_ty.clone(), add_ty.clone()], vec![add_ty.clone()]);
     {
         let mut fb = mb.function("trust_mc_checked_add", add_ft);
         let entry = fb.create_block();
         fb.switch_to_block(entry);
         fb.set_entry(entry);
-        let lhs = fb.add_block_param(entry, Ty::I32);
-        let rhs = fb.add_block_param(entry, Ty::I32);
-        let sum = fb.add(Ty::I32, lhs, rhs);
+        let lhs = fb.add_block_param(entry, add_ty.clone());
+        let rhs = fb.add_block_param(entry, add_ty.clone());
+        let sum = fb.add(add_ty, lhs, rhs);
         fb.ret(vec![sum]);
         fb.build();
     }
@@ -781,6 +803,75 @@ fn native_trust_mc_bundle_chc_rejects_invalid_translated_obligation_shape() {
     ));
 }
 
+/// DIAGNOSTIC SURFACING (producer half). The fail-closed lowering COUNT already
+/// reached the transport, so a demoted obligation could only say "N unsupported
+/// trust_ir construct(s)" — with no way to learn WHICH of the ~50 typed reasons
+/// blocked it short of re-running the translator. The producer must record the
+/// DISTINCT reason labels next to the count.
+///
+/// This pins the LINK: the recorded labels must be exactly the sorted, deduped
+/// labels of the diagnostics the very same translation produced.
+#[test]
+fn native_bundle_records_the_distinct_fail_closed_lowering_reasons() {
+    let bundle = native_trust_mc_bundle_with_fail_closed_lowering(TrustMcVerificationMode::Chc);
+    let obligations =
+        trust_mc_chc_pdr_obligations_from_native_bundle(&bundle, &TranslateOptions::default())
+            .expect("valid native trust_mc CHC request should translate");
+    let translated = obligations.into_iter().next().expect("one native trust_mc CHC obligation");
+    assert!(
+        !translated.diagnostics.is_empty(),
+        "the f64 fixture body must fail closed (else this test proves nothing)"
+    );
+    let metadata = translated
+        .obligation
+        .native_metadata
+        .as_ref()
+        .expect("typed native CHC obligation should carry bundle metadata");
+
+    assert_eq!(
+        metadata.fail_closed_lowering_site_count as usize,
+        translated.diagnostics.len(),
+        "the count must still be one per diagnostic"
+    );
+
+    let mut expected: Vec<String> =
+        translated.diagnostics.iter().map(|d| d.reason.label()).collect();
+    expected.sort();
+    expected.dedup();
+    assert_eq!(
+        metadata.fail_closed_lowering_reasons, expected,
+        "the recorded labels must be the distinct reasons of THIS translation"
+    );
+    assert!(
+        metadata
+            .fail_closed_lowering_reasons
+            .contains(&TrustIrChcUnsupportedReason::FloatingPointArithmetic.label()),
+        "the f64 add must surface as FloatingPointArithmetic, got {:?}",
+        metadata.fail_closed_lowering_reasons
+    );
+}
+
+/// The unchanged (integer) fixture must record NEITHER a count nor any reason —
+/// the field is empty whenever the translation is exact, so it never appears in
+/// the serialized metadata of a clean obligation.
+#[test]
+fn native_bundle_records_no_reasons_when_the_translation_is_exact() {
+    let bundle = native_trust_mc_bundle(TrustMcVerificationMode::Chc);
+    let obligations =
+        trust_mc_chc_pdr_obligations_from_native_bundle(&bundle, &TranslateOptions::default())
+            .expect("valid native trust_mc CHC request should translate");
+    let translated = obligations.into_iter().next().expect("one native trust_mc CHC obligation");
+    assert!(translated.diagnostics.is_empty(), "the i32 fixture body translates exactly");
+    let metadata = translated.obligation.native_metadata.as_ref().expect("bundle metadata");
+    assert_eq!(metadata.fail_closed_lowering_site_count, 0);
+    assert!(metadata.fail_closed_lowering_reasons.is_empty());
+    let json = serde_json::to_string(metadata).expect("serialize");
+    assert!(
+        !json.contains("fail_closed_lowering_reasons"),
+        "an empty reason list must not appear in the serialized metadata: {json}"
+    );
+}
+
 #[test]
 fn native_trust_mc_bundle_chc_metadata_binds_non_authoritative_candidate_evidence() {
     let bundle = native_trust_mc_bundle(TrustMcVerificationMode::Chc);
@@ -1261,6 +1352,61 @@ fn call_summary_fails_closed_on_unsummarizable_panicking_callee() {
         "a caller of an unsummarizable, panicking in-crate callee MUST fail closed \
          with a reachable error rule; modeling the call as havoc-no-error is a false \
          structural panic-freedom proof (bypasses the all_calls_target_proven_panic_free seam)"
+    );
+}
+
+#[test]
+fn call_summary_declines_select_arm_with_wrong_carrier_without_panicking() {
+    // Exercise only the caller translation so this reaches the direct-summary
+    // interpreter independently of the standalone callee's main translation.
+    let mut mb = ModuleBuilder::new("test_summary_select_wrong_carrier");
+    let callee_ft =
+        mb.add_func_type(vec![Ty::Bool, Ty::Bool, Ty::U64], vec![Ty::U64]);
+    let caller_ft =
+        mb.add_func_type(vec![Ty::Bool, Ty::Bool, Ty::U64], vec![Ty::U64]);
+
+    let callee = {
+        let mut fb = mb.function("summary_select_wrong_carrier_callee", callee_ft);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let cond = fb.add_block_param(entry, Ty::Bool);
+        let wrong_then = fb.add_block_param(entry, Ty::Bool);
+        let else_val = fb.add_block_param(entry, Ty::U64);
+        let selected = fb.select(Ty::U64, cond, wrong_then, else_val);
+        fb.ret(vec![selected]);
+        fb.build()
+    };
+
+    let caller = {
+        let mut fb = mb.function("summary_select_wrong_carrier_caller", caller_ft);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let cond = fb.add_block_param(entry, Ty::Bool);
+        let wrong_then = fb.add_block_param(entry, Ty::Bool);
+        let else_val = fb.add_block_param(entry, Ty::U64);
+        let selected = fb.call(callee, vec![cond, wrong_then, else_val]);
+        fb.ret(vec![selected]);
+        fb.build()
+    };
+
+    let module = mb.build();
+    let output = trust_ir_function_to_chc_translation_output(
+        &module,
+        caller,
+        &TranslateOptions::default(),
+    )
+    .expect("caller exists");
+    assert_eq!(output.diagnostics.len(), 1);
+    assert_eq!(output.diagnostics[0].family, SemanticsFamily::Calls);
+    assert_eq!(
+        output.diagnostics[0].reason,
+        TrustIrChcUnsupportedReason::UnsupportedDirectCallSummary
+    );
+    assert!(
+        output.vc.rules.iter().any(|rule| rule.head.name == "error"),
+        "declining a malformed direct-call summary must fail the caller closed"
     );
 }
 
@@ -2084,6 +2230,42 @@ fn typed_chc_translation_rejects_non_bool_condbr_condition() {
 }
 
 #[test]
+fn typed_chc_translation_fails_closed_on_select_arm_with_wrong_carrier() {
+    // The builder intentionally permits this malformed shape: the Select declares
+    // U64 while its then arm is Bool. The public translation API does not run the
+    // TrustIR validator, so the CHC boundary must fail closed rather than passing
+    // incompatible branches to AY's `ite` constructor and panicking.
+    let mut mb = ModuleBuilder::new("test_select_wrong_carrier_chc");
+    let ft = mb.add_func_type(vec![Ty::Bool, Ty::Bool, Ty::U64], vec![Ty::U64]);
+
+    let mut fb = mb.function("select_wrong_carrier_chc", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let cond = fb.add_block_param(entry, Ty::Bool);
+    let wrong_then = fb.add_block_param(entry, Ty::Bool);
+    let else_val = fb.add_block_param(entry, Ty::U64);
+    let selected = fb.select(Ty::U64, cond, wrong_then, else_val);
+    fb.ret(vec![selected]);
+    fb.build();
+
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    let output = &outputs[0];
+    assert_eq!(output.diagnostics.len(), 1);
+    assert_eq!(output.diagnostics[0].family, SemanticsFamily::Select);
+    assert_eq!(
+        output.diagnostics[0].reason,
+        TrustIrChcUnsupportedReason::MalformedControlFlow
+    );
+    assert_eq!(output.diagnostics[0].result_values, vec![selected]);
+    assert!(
+        output.vc.rules.iter().any(|rule| rule.head.name == "error"),
+        "a Select with a carrier-mismatched arm must fail closed"
+    );
+}
+
+#[test]
 fn typed_chc_translation_lowers_bool_eq_comparison() {
     let mut mb = ModuleBuilder::new("test_bool_eq_icmp_chc");
     let ft = mb.add_func_type(vec![Ty::Bool, Ty::Bool], vec![]);
@@ -2369,6 +2551,98 @@ fn typed_chc_translation_lowers_same_width_integer_cast_without_unsupported_diag
     assert!(
         matches!(branch_arg.value(), ExprValue::Var { name } if name == "bb0_v0"),
         "same-width integer cast should preserve the source bits without an extension wrapper"
+    );
+}
+
+/// A cast operand whose BOUND expression is WIDER than the carrier its declared
+/// `src_ty` names (here a 128-bit value id read by a `Trunc` that declares
+/// `src_ty = U64`) must be unified to the declared carrier BEFORE the
+/// lossless-narrowing obligation compares it against the re-extended low bits.
+///
+/// Regression: `Expr::eq` is contracted `REQUIRES: identical sorts`, and the
+/// narrowing-cast error rule compared the RAW operand (`BitVec 128`) against a
+/// re-extension built at `src_ty`'s width (`BitVec 64`), so trustc aborted with
+/// `EQ requires same sort: ... (_ BitVec 128) and (_ BitVec 64)` while verifying
+/// `num-bigint`/`num-traits` (u64 limbs with u128 intermediates).
+#[test]
+fn typed_chc_translation_unifies_over_wide_operand_carrier_on_narrowing_cast() {
+    let mut mb = ModuleBuilder::new("test_over_wide_trunc_operand_chc");
+    let ft = mb.add_func_type(vec![Ty::U128], vec![]);
+
+    let mut fb = mb.function("trunc_over_wide_carrier_chc", ft);
+    let entry = fb.create_block();
+    let exit = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+
+    // The value id is bound at the U128 carrier (128 bits) ...
+    let input = fb.add_block_param(entry, Ty::U128);
+    // ... but the cast declares a 64-bit source. 64 > 32, so the narrowing
+    // obligation fires and used to compare BitVec128 against BitVec64.
+    let cast = fb.cast(CastOp::Trunc, Ty::U64, Ty::U32, input);
+    fb.add_block_param(exit, Ty::U32);
+    fb.br(exit, vec![cast]);
+    fb.switch_to_block(exit);
+    fb.ret(vec![]);
+    fb.build();
+
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+
+    assert_eq!(outputs.len(), 1);
+    let output = &outputs[0];
+    // Explicit widening, NOT a give-up: the cast stays modeled.
+    assert!(
+        output.diagnostics.is_empty(),
+        "width-unified narrowing cast must not be demoted to an unsupported construct: {:?}",
+        output.diagnostics
+    );
+    // FAIL-CLOSED: the lossless-narrowing obligation must still be emitted.
+    assert!(
+        output.vc.rules.iter().any(|rule| rule.head.name == "error"),
+        "narrowing cast must keep its lossless-narrowing error rule"
+    );
+    // The cast result is a value of `dst_ty`, at `dst_ty`'s width.
+    let branch_arg = &head_arg_suffix(output, "bb1", 1)[0];
+    assert_eq!(
+        branch_arg.sort().bitvec_width(),
+        Some(32),
+        "trunc to U32 must produce a 32-bit result"
+    );
+}
+
+/// The widening direction of the same defect: a `ZExt` whose operand is bound at
+/// a carrier WIDER than the declared `src_ty` did not panic — it silently built
+/// `zero_extend(BitVec 128, 128 - 64)`, i.e. a **192-bit** expression bound to a
+/// `U128`-typed result, corrupting every downstream obligation that read it.
+/// Unifying to `src_ty` first makes the result exactly `dst_ty`-wide.
+#[test]
+fn typed_chc_translation_unifies_over_wide_operand_carrier_on_widening_cast() {
+    let mut mb = ModuleBuilder::new("test_over_wide_zext_operand_chc");
+    let ft = mb.add_func_type(vec![Ty::U128], vec![]);
+
+    let mut fb = mb.function("zext_over_wide_carrier_chc", ft);
+    let entry = fb.create_block();
+    let exit = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+
+    let input = fb.add_block_param(entry, Ty::U128);
+    let cast = fb.cast(CastOp::ZExt, Ty::U64, Ty::U128, input);
+    fb.add_block_param(exit, Ty::U128);
+    fb.br(exit, vec![cast]);
+    fb.switch_to_block(exit);
+    fb.ret(vec![]);
+    fb.build();
+
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+
+    assert_eq!(outputs.len(), 1);
+    let output = &outputs[0];
+    let branch_arg = &head_arg_suffix(output, "bb1", 1)[0];
+    assert_eq!(
+        branch_arg.sort().bitvec_width(),
+        Some(128),
+        "zext U64 -> U128 must produce a 128-bit result, never a 192-bit one"
     );
 }
 
@@ -2763,6 +3037,138 @@ fn typed_chc_translation_models_slice_length_metadata() {
         "slice-length (U64) metadata is now soundly modeled, not unsupported: {:?}",
         outputs[0].diagnostics
     );
+}
+
+/// Whether any rule of `vc` carries a `_ <= isize::MAX` bitvector path constraint —
+/// the slice-length bound `translate_node`'s `Inst::PtrMetadata` arm pushes.
+fn chc_vc_has_isize_max_len_bound(vc: &trust_mc_core::chc::ChcVc) -> bool {
+    let bound = Expr::bitvec_const(i64::MAX as i128, 64);
+    vc.rules.iter().any(|rule| {
+        rule.body
+            .constraints
+            .iter()
+            .any(|c| matches!(c.value(), ExprValue::BvULe(_, rhs) if rhs == &bound))
+    })
+}
+
+/// Build the EXACT witness function `pub fn f(s: &[T]) -> usize { s.len() + 1 }` —
+/// `PtrMetadata` for the length, then a checked `Add` whose no-overflow obligation is
+/// the thing the `len <= isize::MAX` path constraint discharges. `make_fat_ty` mints
+/// the fat-pointer type INSIDE this module so a `FatPtrKind::Slice(TyId)` element
+/// resolves against this module's own type table.
+fn chc_slice_len_plus_one_vc(
+    name: &str,
+    make_fat_ty: impl FnOnce(&mut ModuleBuilder) -> Ty,
+) -> ChcTranslationOutput {
+    let mut mb = ModuleBuilder::new(name);
+    let fat_ty = make_fat_ty(&mut mb);
+    let ft = mb.add_func_type(vec![fat_ty.clone()], vec![Ty::U64]);
+    let mut fb = mb.function(name, ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let ptr = fb.add_block_param(entry, fat_ty.clone());
+    let metadata = fb.ptr_metadata(fat_ty, Ty::U64, ptr);
+    let one = fb.iconst(Ty::U64, 1);
+    let sum = fb.add(Ty::U64, metadata, one);
+    fb.ret(vec![sum]);
+    fb.build();
+    let mut outputs =
+        trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    outputs.remove(0)
+}
+
+/// Trust (P0 ZST-slice-length FALSE PROOF): a ZERO-SIZED element breaks the
+/// `len <= isize::MAX` derivation. `isize::MAX` caps the total BYTE size, and only
+/// `size_of::<T>() >= 1` turns that into an ELEMENT-count cap; `[(); usize::MAX]`
+/// occupies zero bytes, so a `&[()]` length may legally reach `usize::MAX`.
+///
+/// WITNESS (the bound used to be pushed for EVERY `U64` metadata):
+/// ```ignore
+/// pub fn f(z: &[()]) -> usize { z.len() + 1 }   // proved no-overflow
+/// let v: Vec<()> = vec![(); usize::MAX];        // ... and really overflows
+/// ```
+/// The ZST slice must now get an UNCONSTRAINED fresh symbolic (fail-closed: the free
+/// value ranges over all of `u64` ⊇ the realizable lengths, so `len + 1` stays
+/// refutable), while the non-ZST companion below keeps the bound.
+#[test]
+fn typed_chc_zst_slice_length_metadata_carries_no_isize_bound() {
+    let output = chc_slice_len_plus_one_vc("zst_slice_len", |mb| {
+        let unit_elem = mb.add_type(Ty::Unit);
+        Ty::FatPtr(FatPtrKind::Slice(unit_elem))
+    });
+    assert!(
+        !chc_vc_has_isize_max_len_bound(&output.vc),
+        "a ZST-element slice length must NOT be bounded by isize::MAX (its length can \
+         reach usize::MAX): {:?}",
+        output.vc.rules
+    );
+}
+
+/// `str` metadata is a BYTE length and every byte is one byte, so `len <= isize::MAX`
+/// holds UNCONDITIONALLY — no element-type proof needed. Same split as
+/// `trust_types::total_call_summaries::total_summary_len_bound`.
+#[test]
+fn typed_chc_str_byte_length_metadata_keeps_isize_bound() {
+    let output = chc_slice_len_plus_one_vc("str_len", |_| Ty::FatPtr(FatPtrKind::Str));
+    assert!(
+        chc_vc_has_isize_max_len_bound(&output.vc),
+        "a `str` byte-length keeps the unconditional `len <= isize::MAX` bound: {:?}",
+        output.vc.rules
+    );
+}
+
+/// Known-true companion to the ZST case: a `&[u8]` element IS provably non-ZST, so
+/// `len <= isize::MAX` is a theorem and the bound must STILL be emitted — the fix
+/// must not be a blanket disable of the slice-length model.
+#[test]
+fn typed_chc_nonzst_slice_length_metadata_keeps_isize_bound() {
+    let output = chc_slice_len_plus_one_vc("nonzst_slice_len", |mb| {
+        let u8_elem = mb.add_type(Ty::U8);
+        Ty::FatPtr(FatPtrKind::Slice(u8_elem))
+    });
+    assert!(
+        output.diagnostics.is_empty(),
+        "a non-ZST slice length stays soundly modeled, not unsupported: {:?}",
+        output.diagnostics
+    );
+    assert!(
+        chc_vc_has_isize_max_len_bound(&output.vc),
+        "a non-ZST (u8) slice length keeps its `len <= isize::MAX` bound: {:?}",
+        output.vc.rules
+    );
+}
+
+/// The non-ZST proof must recurse through aggregates exactly like the three sibling
+/// gates: an all-ZST struct element (`struct Pad { a: (), b: () }`) is a ZST, so its
+/// slice gets NO bound; a struct with one non-ZST field does.
+#[test]
+fn typed_chc_slice_length_bound_follows_aggregate_element_zst_ness() {
+    for (struct_name, field_ty, expect_bound) in
+        [("Pad", Ty::Unit, false), ("Cell", Ty::U32, true)]
+    {
+        let output = chc_slice_len_plus_one_vc("aggregate_slice_len", |mb| {
+            let struct_id = mb.add_struct(StructDef {
+                id: StructId::new(0),
+                name: struct_name.to_string(),
+                fields: vec![
+                    FieldDef { name: "a".into(), ty: field_ty.clone(), offset: None },
+                    FieldDef { name: "b".into(), ty: Ty::Unit, offset: None },
+                ],
+                size: None,
+                align: None,
+                repr: Default::default(),
+            });
+            let elem = mb.add_type(Ty::Struct(struct_id));
+            Ty::FatPtr(FatPtrKind::Slice(elem))
+        });
+        assert_eq!(
+            chc_vc_has_isize_max_len_bound(&output.vc),
+            expect_bound,
+            "slice of `{struct_name}` (non-ZST field: {expect_bound}) bound mismatch"
+        );
+    }
 }
 
 #[test]
@@ -4141,6 +4547,54 @@ fn typed_chc_translation_now_models_nested_aggregate_stack_load() {
     assert!(
         !output.vc.rules.iter().any(|rule| rule.head.name == "error"),
         "nested aggregate stack loads no longer fail closed (recursive AggregateValue)"
+    );
+}
+
+#[test]
+fn typed_chc_translation_models_cross_block_alloca_access_as_owned_stack() {
+    // R3 (cross-block owned-stack consistency): an `Alloca` in the ENTRY block
+    // whose Store/Load happen in LATER blocks — the `let r = if c { .. } else
+    // { .. }` result-slot shape the bridge emits — is the SAME owned stack slot
+    // in every block (SSA ids are function-unique), so the accesses must not
+    // fail closed as unknown-pointer memory. The VALUE stays untracked across
+    // blocks (the load below is a fresh symbolic — havoc ⊇ real), so nothing
+    // becomes provable FROM the slot; only the spurious unconditional error
+    // rules disappear.
+    let mut mb = ModuleBuilder::new("test_cross_block_alloca_chc");
+    let ft = mb.add_func_type(vec![], vec![]);
+
+    // A STRUCT-typed slot: outside the mem2reg scalar-promotion fragment, so the
+    // cross-block accesses exercise the function-scoped owned-stack seeding
+    // itself (a scalar slot would be threaded precisely by promotion instead).
+    let slot_ty = Ty::Tuple(vec![Ty::U32, Ty::Bool]);
+    let mut fb = mb.function("cross_block_alloca_chc", ft);
+    let entry = fb.create_block();
+    let mid = fb.create_block();
+    let done = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let slot = fb.alloca(slot_ty.clone());
+    fb.br(mid, vec![]);
+    fb.switch_to_block(mid);
+    let value = fb.undef(slot_ty.clone());
+    fb.store(slot_ty.clone(), slot, value);
+    fb.br(done, vec![]);
+    fb.switch_to_block(done);
+    let _loaded = fb.load(slot_ty, slot);
+    fb.ret(vec![]);
+    fb.build();
+
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+
+    assert_eq!(outputs.len(), 1);
+    let output = &outputs[0];
+    assert!(
+        !output
+            .diagnostics
+            .iter()
+            .any(|d| d.reason == TrustIrChcUnsupportedReason::MemoryAccessWithoutPreciseModel),
+        "cross-block accesses to the function's own alloca are owned-stack, not unknown memory: {:?}",
+        output.diagnostics
     );
 }
 
@@ -6822,5 +7276,325 @@ fn narrowing_invalid_target_keeps_unsupported_rule() {
         count_error_rules(&narrow.vc),
         count_error_rules(&wide.vc),
         "a missing target is Unknown, not proof that the unsupported site is irrelevant"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `InsertElement` (array/vector element WRITE) modeling.
+//
+// Until this arm existed EVERY `InsertElement` fell into the fail-closed bucket
+// and emitted an UNCONDITIONALLY REACHABLE error rule
+// (`TrustIrChcUnsupportedReason::AggregateUpdate`), which makes every obligation
+// in the enclosing function unprovable by construction — while the READ side
+// (`ExtractElement`) had long been modeled without failing closed. The shape this
+// blocks in practice is the `[core::fmt::rt::Argument; N]` array that every
+// `format!`/`write!` builds: one `InsertElement` at a CONSTANT index per format
+// argument (see `tests/format_args_insert_element_modeling.rs`, which runs on a
+// verbatim `-Ztrust-dump=native-bundle` artifact).
+// ---------------------------------------------------------------------------
+
+/// How many `error`-head rules are UNCONDITIONALLY reachable — every constraint
+/// folds to the constant `true`. A rule that stays symbolic is counted neither
+/// way, so this distinguishes "modeled exactly" from "havoced" from "stale".
+fn unconditionally_reachable_error_rules(vc: &trust_mc_core::chc::ChcVc) -> usize {
+    vc.rules
+        .iter()
+        .filter(|rule| rule.head.name.as_str() == "error")
+        .filter(|rule| {
+            rule.body
+                .constraints
+                .iter()
+                .all(|c| trust_mc_core::chc_const_prop::eval::try_eval_to_bool(c) == Some(true))
+        })
+        .count()
+}
+
+fn aggregate_update_diagnostics(output: &ChcTranslationOutput) -> usize {
+    output
+        .diagnostics
+        .iter()
+        .filter(|d| d.reason == TrustIrChcUnsupportedReason::AggregateUpdate)
+        .count()
+}
+
+/// `[u32; 4]` with lane 2 written to the constant `7`, then read back. The
+/// `assert(lane == 5)` must be REFUTED (`!(7 == 5)` folds to `true`), which is
+/// only possible if the element write is modeled EXACTLY — a havoc leaves the
+/// constraint symbolic and this counts 0.
+///
+/// Pre-fix this failed on `diagnostics == 0`: the `InsertElement` emitted an
+/// `AggregateUpdate` fail-closed rule and the following `ExtractField` an
+/// `AggregateProjection` one.
+#[test]
+fn insert_element_at_a_constant_index_is_modeled_exactly() {
+    let mut mb = ModuleBuilder::new("insert_element_exact");
+    let u32_ty = mb.add_type(Ty::U32);
+    let arr_ty = Ty::Array(u32_ty, 4);
+    let ft = mb.add_func_type(vec![], vec![]);
+
+    let mut fb = mb.function("insert_element_exact", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let arr0 = fb.undef(arr_ty.clone());
+    let index = fb.iconst(Ty::I64, 2);
+    let seven = fb.iconst(Ty::U32, 7);
+    let arr1 = fb.insert_element(arr_ty, arr0, index, seven);
+    let lane = fb.extract_field(Ty::U32, arr1, 2);
+    let five = fb.iconst(Ty::U32, 5);
+    let cond = fb.icmp(ICmpOp::Eq, Ty::U32, lane, five);
+    fb.assert(cond);
+    fb.ret(vec![]);
+    fb.build();
+
+    let module = mb.build();
+    let output = trust_ir_function_to_chc_translation_output(
+        &module,
+        trust_ir::value::FuncId::new(0),
+        &TranslateOptions::default(),
+    )
+    .expect("translates");
+
+    assert_eq!(
+        output.diagnostics.len(),
+        0,
+        "a constant-index element write is exactly expressible and must NOT fail closed: {:?}",
+        output.diagnostics
+    );
+    assert_eq!(
+        unconditionally_reachable_error_rules(&output.vc),
+        1,
+        "lane 2 holds exactly 7, so `assert(lane == 5)` must fold to an unconditionally \
+         reachable error rule"
+    );
+}
+
+/// THE STALE-VALUE TRAP. Lane 2 is written `7` and then OVERWRITTEN with `0`.
+/// `assert(lane == 7)` must be REFUTED — the solver must not be able to prove the
+/// value the function already overwrote. A model that dropped the second write
+/// (or applied it to the wrong lane) folds `!(7 == 7)` to `false` and discharges
+/// the assertion: a FALSE PROOF. A havoc leaves it symbolic and also counts 0, so
+/// this pins exactness in both directions.
+#[test]
+fn insert_element_overwrite_does_not_leave_the_old_value_readable() {
+    let mut mb = ModuleBuilder::new("insert_element_overwrite");
+    let u32_ty = mb.add_type(Ty::U32);
+    let arr_ty = Ty::Array(u32_ty, 4);
+    let ft = mb.add_func_type(vec![], vec![]);
+
+    let mut fb = mb.function("insert_element_overwrite", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let arr0 = fb.undef(arr_ty.clone());
+    let index = fb.iconst(Ty::I64, 2);
+    let seven = fb.iconst(Ty::U32, 7);
+    let arr1 = fb.insert_element(arr_ty.clone(), arr0, index, seven);
+    let zero = fb.iconst(Ty::U32, 0);
+    let arr2 = fb.insert_element(arr_ty, arr1, index, zero);
+    let lane = fb.extract_field(Ty::U32, arr2, 2);
+    let old = fb.iconst(Ty::U32, 7);
+    let cond = fb.icmp(ICmpOp::Eq, Ty::U32, lane, old);
+    fb.assert(cond);
+    fb.ret(vec![]);
+    fb.build();
+
+    let module = mb.build();
+    let output = trust_ir_function_to_chc_translation_output(
+        &module,
+        trust_ir::value::FuncId::new(0),
+        &TranslateOptions::default(),
+    )
+    .expect("translates");
+
+    assert_eq!(
+        output.diagnostics.len(),
+        0,
+        "both writes are constant-index and exactly expressible: {:?}",
+        output.diagnostics
+    );
+    assert_eq!(
+        unconditionally_reachable_error_rules(&output.vc),
+        1,
+        "STALE READ: lane 2 was overwritten with 0, so `assert(lane == 7)` MUST be refuted — \
+         proving the pre-overwrite 7 would be a false proof"
+    );
+}
+
+/// An element write that makes the program genuinely panic must STILL be
+/// refuted. Lane 0 is written the constant `0` and then used as a divisor, so the
+/// divide-by-zero obligation must stay unconditionally reachable — modeling the
+/// write must not let the divisor drift to something nonzero.
+#[test]
+fn a_division_by_a_freshly_written_zero_element_is_still_refuted() {
+    let mut mb = ModuleBuilder::new("insert_element_div_zero");
+    let u32_ty = mb.add_type(Ty::U32);
+    let arr_ty = Ty::Array(u32_ty, 4);
+    let ft = mb.add_func_type(vec![], vec![Ty::U32]);
+
+    let mut fb = mb.function("insert_element_div_zero", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let arr0 = fb.undef(arr_ty.clone());
+    let index = fb.iconst(Ty::I64, 0);
+    let zero = fb.iconst(Ty::U32, 0);
+    let arr1 = fb.insert_element(arr_ty, arr0, index, zero);
+    let lane = fb.extract_field(Ty::U32, arr1, 0);
+    let hundred = fb.iconst(Ty::U32, 100);
+    let quotient = fb.udiv(Ty::U32, hundred, lane);
+    fb.ret(vec![quotient]);
+    fb.build();
+
+    let module = mb.build();
+    let output = trust_ir_function_to_chc_translation_output(
+        &module,
+        trust_ir::value::FuncId::new(0),
+        &TranslateOptions::default(),
+    )
+    .expect("translates");
+
+    assert_eq!(
+        output.diagnostics.len(),
+        0,
+        "the write is exactly expressible and must not fail closed: {:?}",
+        output.diagnostics
+    );
+    assert!(
+        unconditionally_reachable_error_rules(&output.vc) >= 1,
+        "`100 / a[0]` with `a[0] = 0` ALWAYS traps: modeling the element write must not \
+         discharge the divide-by-zero obligation"
+    );
+}
+
+/// A SYMBOLIC index names an unknown lane. "Copy the aggregate and replace lane
+/// i" is then simply the wrong model — every OTHER lane would stay readable as
+/// its old value while the real write could have landed on any of them — so it
+/// must keep the FAIL-CLOSED path.
+#[test]
+fn insert_element_at_a_symbolic_index_still_fails_closed() {
+    let mut mb = ModuleBuilder::new("insert_element_symbolic");
+    let u32_ty = mb.add_type(Ty::U32);
+    let arr_ty = Ty::Array(u32_ty, 4);
+    let ft = mb.add_func_type(vec![Ty::I64], vec![]);
+
+    let mut fb = mb.function("insert_element_symbolic", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let index = fb.add_block_param(entry, Ty::I64);
+    let arr0 = fb.undef(arr_ty.clone());
+    let zero = fb.iconst(Ty::U32, 0);
+    let _arr1 = fb.insert_element(arr_ty, arr0, index, zero);
+    fb.ret(vec![]);
+    fb.build();
+
+    let module = mb.build();
+    let output = trust_ir_function_to_chc_translation_output(
+        &module,
+        trust_ir::value::FuncId::new(0),
+        &TranslateOptions::default(),
+    )
+    .expect("translates");
+
+    assert_eq!(
+        aggregate_update_diagnostics(&output),
+        1,
+        "a symbolic element index has no exact single-lane model and must fail closed"
+    );
+}
+
+/// An out-of-bounds CONSTANT element write is TrustIR undefined behaviour (the
+/// interpreter raises `UndefinedBehavior`); there is no defined result to model,
+/// so it must keep the FAIL-CLOSED path rather than silently widening the
+/// aggregate or wrapping the index.
+#[test]
+fn insert_element_at_an_out_of_bounds_constant_index_still_fails_closed() {
+    let mut mb = ModuleBuilder::new("insert_element_oob");
+    let u32_ty = mb.add_type(Ty::U32);
+    let arr_ty = Ty::Array(u32_ty, 4);
+    let ft = mb.add_func_type(vec![], vec![]);
+
+    let mut fb = mb.function("insert_element_oob", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let arr0 = fb.undef(arr_ty.clone());
+    let index = fb.iconst(Ty::I64, 4);
+    let zero = fb.iconst(Ty::U32, 0);
+    let _arr1 = fb.insert_element(arr_ty, arr0, index, zero);
+    fb.ret(vec![]);
+    fb.build();
+
+    let module = mb.build();
+    let output = trust_ir_function_to_chc_translation_output(
+        &module,
+        trust_ir::value::FuncId::new(0),
+        &TranslateOptions::default(),
+    )
+    .expect("translates");
+
+    assert_eq!(
+        aggregate_update_diagnostics(&output),
+        1,
+        "lane 4 does not exist in `[u32; 4]`; an out-of-bounds write must fail closed"
+    );
+}
+
+/// A NEGATIVE constant element index is TrustIR undefined behaviour exactly like
+/// a too-large one — `interpret.rs :: runtime_index` rejects
+/// `int.signed && int.as_signed() < 0`. It must therefore ALSO fail closed.
+///
+/// The trap this pins: `constant_lane_index` reads the RAW bitvector constant, so
+/// an `I8` constant `-1` reads back as the UNSIGNED `255`, which is IN BOUNDS of a
+/// `[u32; 256]` and so slips past the out-of-bounds guard. The translator would
+/// then model a write that the reference semantics call UB and STATICALLY
+/// DISCHARGE `assert(a[255] == 7)` — a false proof, in the same width/signedness
+/// family as this campaign's earlier constant-reading P0s.
+///
+/// The declared index type is not consulted here: the guard is that the constant's
+/// top bit must be clear, so the signed and unsigned readings provably agree.
+#[test]
+fn insert_element_at_a_negative_constant_index_still_fails_closed() {
+    let mut mb = ModuleBuilder::new("insert_element_negative");
+    let u32_ty = mb.add_type(Ty::U32);
+    // 256 lanes so that the wrapped reading of `-1i8` (255) is IN BOUNDS and the
+    // existing out-of-bounds guard cannot be what rejects it.
+    let arr_ty = Ty::Array(u32_ty, 256);
+    let ft = mb.add_func_type(vec![], vec![]);
+
+    let mut fb = mb.function("insert_element_negative", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let arr0 = fb.undef(arr_ty.clone());
+    let index = fb.iconst(Ty::I8, -1);
+    let seven = fb.iconst(Ty::U32, 7);
+    let arr1 = fb.insert_element(arr_ty, arr0, index, seven);
+    let lane = fb.extract_field(Ty::U32, arr1, 255);
+    let same = fb.iconst(Ty::U32, 7);
+    let cond = fb.icmp(ICmpOp::Eq, Ty::U32, lane, same);
+    fb.assert(cond);
+    fb.ret(vec![]);
+    fb.build();
+
+    let module = mb.build();
+    let output = trust_ir_function_to_chc_translation_output(
+        &module,
+        trust_ir::value::FuncId::new(0),
+        &TranslateOptions::default(),
+    )
+    .expect("translates");
+
+    assert_eq!(
+        aggregate_update_diagnostics(&output),
+        1,
+        "`-1i8` is a NEGATIVE lane index (UB), not lane 255: it must fail closed rather than \
+         be modeled as a write to the wrapped lane"
+    );
+    assert!(
+        unconditionally_reachable_error_rules(&output.vc) >= 1,
+        "failing closed means the enclosing obligation stays unconditionally reachable; \
+         discharging `assert(a[255] == 7)` off a UB write would be a false proof"
     );
 }

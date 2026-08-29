@@ -31,6 +31,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 continue;
             };
             let Some(kind) = self.pointer_offset_metadata_kind(func) else { continue };
+            if !destination.projection.is_empty() {
+                continue;
+            }
             let Some(src_local) = (match args.first() {
                 Some(Operand::Copy(place) | Operand::Move(place))
                     if place.projection.is_empty() =>
@@ -46,6 +49,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
 
             let dest_local = destination.local;
+            if !self.path_insensitive_metadata_copy_is_unique(src_local, dest_local) {
+                self.ref_resolution.clear_path_insensitive_ref_metadata(dest_local);
+                continue;
+            }
             let delta = args
                 .get(1)
                 .and_then(|arg| self.resolve_decl_const_isize_operand(arg, &const_isize_locals))

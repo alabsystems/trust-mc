@@ -353,7 +353,67 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(result);
         }
 
-        self.translate_union_field_read_fallback(local_idx, root_expr, &field_projections)
+        if let Some(result) = self.translate_union_field_read_fallback(
+            local_idx,
+            root_expr.clone(),
+            &field_projections,
+        ) {
+            return Some(result);
+        }
+
+        // #1979 mirror, READ side: a 1-tuple IS its field 0. LAST RESORT.
+        //
+        // The write/type side erases `(T,)` entirely — `translate_ty` returns the
+        // sole element's sort (decl/codegen_types.rs, "Single-element tuples
+        // unwrap to their element") and `translate_tuple_aggregate` stores the
+        // element expression directly (stmt/codegen_stmt_aggregate.rs). The read
+        // side never grew the matching arm, so `Field(0)` on such a place asked
+        // `apply_field_selections` for a selector on a bitvec/bool container, got
+        // None, and the caller HAVOCED the destination and recorded a
+        // `chc_fallback` demotion (stmt/codegen_stmt/codegen_stmt_fallback.rs:187).
+        //
+        // That is a false counterexample on correct code. Reproducer, which
+        // FAILED with `assertion failed: a == n` before this arm:
+        //     let n: i32 = kani::any();
+        //     kani::assume(n < 1000 && n > -1000);
+        //     let t = (n,);
+        //     assert!(t.0 == n);
+        //
+        // Not a corner case: MIR passes closure arguments as a 1-tuple and the
+        // closure shim reads `_N.0`, so every closure argument was havoced and
+        // every harness touching one demoted.
+        //
+        // LAST RESORT ON PURPOSE: every selector above has already declined, so
+        // this can only fire where the caller would otherwise havoc. Placing it
+        // FIRST would shadow the normal selector for any `(T,)` that does keep a
+        // one-field datatype sort, returning the CONTAINER where field 0 was
+        // asked for — silently the wrong value. `(StructT,)` already translates
+        // correctly through the selectors above and must keep doing so.
+        //
+        // EXACT where it does fire: by construction of `translate_ty` the
+        // container sort IS the field sort, and by construction of
+        // `translate_tuple_aggregate` the stored value IS the field. Replacing a
+        // havoc with an identity removes no behaviour, so it cannot hide a bug —
+        // the reachable-error set after this patch is a SUBSET of before.
+        //
+        // Keyed on the MIR type `Tuple([T])`, deliberately NOT on the sort. A
+        // sort-only rule would also fire on a multi-field struct flattened to a
+        // wide bitvec and silently read the wrong bits — a false-PROOF shape.
+        if let Some(rustc_public::mir::ProjectionElem::Field(0, _)) = place.projection.first()
+            && let Some(local) = self.body.locals().get(local_idx)
+            && matches!(
+                local.ty.kind(),
+                TyKind::RigidTy(RigidTy::Tuple(ref elems)) if elems.len() == 1
+            )
+        {
+            if place.projection.len() == 1 {
+                return Some(root_expr);
+            }
+            let rest = Place { local: place.local, projection: place.projection[1..].to_vec() };
+            return self.translate_place_field_projection_tail(&rest, local_idx, root_expr);
+        }
+
+        None
     }
 
     fn has_index_like_projection(projection: &[rustc_public::mir::ProjectionElem]) -> bool {
@@ -613,7 +673,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     active_variant = None;
                 }
                 ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    let actual_offset = constant_index_offset(*offset, *min_length, *from_end);
+                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                    let Some(actual_offset) =
+                        constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        return None;
+                    };
                     let index_expr = Expr::bitvec_const(actual_offset as u128, POINTER_WIDTH);
                     if !current.sort().is_array() {
                         // Same BV-rooted scalar-array element extract as Index.

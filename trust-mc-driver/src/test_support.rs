@@ -63,6 +63,7 @@ pub(crate) fn test_result(
         proof_qualifiers: Vec::new(),
         proof_transcript_metadata: None,
         native_full_verification_verdict: None,
+        harness_feasibility: Default::default(),
     }
 }
 

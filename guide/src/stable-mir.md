@@ -110,7 +110,7 @@ Rust metadata can include encoded MIR, but this is optional and depends on how t
 
 ### trust-mc's Sysroot Configuration
 
-trust-mc builds its sysroot with `-Z always-encode-mir` (see `tools/build-kani/src/sysroot.rs:152`).
+trust-mc builds its sysroot with `-Z always-encode-mir` (see `tools/build-trust-mc/src/sysroot.rs:173`).
 This ensures MIR bodies are available for stdlib functions during verification.
 
 ### When `Instance::body()` Returns None
@@ -138,5 +138,5 @@ which can help identify unexpected missing implementations.
 ### References
 
 - Rust Compiler Dev Guide: [Libraries and metadata](https://rustc-dev-guide.rust-lang.org/backend/libs-and-metadata.html)
-- Sysroot build configuration: `tools/build-kani/src/sysroot.rs:148-155`
-- FunctionInlinePass diagnostics: `trust-mc-compiler/src/kani_middle/transform/inline.rs:342-365`
+- Sysroot build configuration: `tools/build-trust-mc/src/sysroot.rs:173`
+- FunctionInlinePass diagnostics: `trust-mc-compiler/src/kani_middle/transform/inline/mod.rs`

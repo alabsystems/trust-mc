@@ -103,12 +103,18 @@ impl KaniSession {
     /// must never be derived from an empty result set, so a
     /// harness-discovery bug can never become a silent false-pass channel.
     ///
+    /// `available_harnesses`: every harness name the metadata knows about, used
+    /// to answer "then what ARE the names?" when a `--harness` filter matches
+    /// nothing. The user cannot act on a rejection that does not say what the
+    /// alternatives were.
+    ///
     /// Note: Takes `self` "by ownership". This function wants to be able to drop before
     /// exiting with an error code, if needed.
     pub(crate) fn print_final_summary(
         self,
         results: &[HarnessResult<'_>],
         metadata_harness_count: usize,
+        available_harnesses: &[String],
     ) -> Result<()> {
         if self.args.common_args.quiet {
             // Count failures even in quiet mode — exit(1) on failure (#3255)
@@ -240,13 +246,19 @@ impl KaniSession {
             }
         }
         let ctrex_total = ctrex_encoding_gap + ctrex_over_approx + ctrex_genuine + ctrex_unknown;
-        if ctrex_total > 0 {
-            println!(
+        // Printed AFTER the `Complete -` line, not here. Kani's summary is the
+        // consecutive block `Summary: / Verification failed for - <h> /
+        // Complete - ...`, and the corpus matches it as a block; a line
+        // interposed between the per-harness list and `Complete -` breaks
+        // every such expectation while adding nothing — the breakdown reads
+        // the same below the block.
+        let ctrex_breakdown = (ctrex_total > 0).then(|| {
+            format!(
                 "CTREX breakdown: {ctrex_encoding_gap} EncodingGap, \
                  {ctrex_over_approx} OverApproximation, {ctrex_genuine} Genuine, \
                  {ctrex_unknown} Unknown"
-            );
-        }
+            )
+        });
 
         if total > 0 {
             let unval_parts = [
@@ -265,7 +277,22 @@ impl KaniSession {
                     "Complete - {succeeding} successfully verified harnesses, {failing} failures, {unval_suffix}, {total} total."
                 );
             }
-        } else {
+        }
+
+        if let Some(breakdown) = ctrex_breakdown {
+            println!("{breakdown}");
+        }
+
+        // The no-harness messaging below belongs to the `total == 0` case ONLY.
+        // When 6baa4d11f moved the CTREX breakdown under `Complete -`, it
+        // stitched this block onto `if let Some(breakdown)` instead — and a
+        // fully SUCCESSFUL run also has no breakdown, so every clean run
+        // printed "No proof harnesses ... were found to verify" after its own
+        // `Complete - N successfully verified harnesses` line, and a clean run
+        // with a single `--harness` filter bailed with "no harnesses matched
+        // the harness filter" (exit 1) naming the very harness it had just
+        // verified. Guard on total, as the pre-6baa4d11f structure did.
+        if total == 0 {
             match self.args.harnesses.as_slice() {
                 [] => {
                     // Exact Kani wording (kani-driver harness_runner.rs) — the
@@ -278,9 +305,9 @@ impl KaniSession {
                          \x20     let x: u32 = kani::any();\n\
                          \x20     my_function(x);\n\
                          \x20 }}\n\n\
-                         For more information, see:\n\
-                         \x20 - Tutorial: https://model-checking.github.io/kani/kani-tutorial.html\n\
-                         \x20 - Proof harness attributes: https://model-checking.github.io/kani/reference/attributes.html"
+                         For more information:\n\
+                         \x20 - trust-mc explain harness   what you can write in a harness\n\
+                         \x20 - trust-mc example --list    sample harnesses you can run now"
                     );
                     // Task #49: Kani treats a zero-harness crate as a SUCCESS
                     // (exit 0). Emit an explicit success-with-note verdict so
@@ -290,16 +317,45 @@ impl KaniSession {
                     // harnesses but none produced results, this must NOT
                     // report success (fail-closed).
                     if metadata_harness_count == 0 {
+                        // A verdict, but NOT a success claim. Task #49 added a
+                        // verdict line here so runners see one instead of
+                        // classifying the run as error/unknown; it said
+                        // SUCCESSFUL, which reads as "this crate is proved"
+                        // when nothing was checked at all.
+                        //
+                        // The exit code stays 0 deliberately. Kani exits 0 on a
+                        // zero-harness crate, seven script-based corpus tests
+                        // run trust-mc on one under `set -eu`, and a workspace
+                        // where a single member declares no harnesses should
+                        // not fail the build. So the exit contract is the one
+                        // documented exception in `explain exit-codes`, and the
+                        // wording is what stops carrying a claim it cannot
+                        // support.
                         println!(
-                            "VERIFICATION:- SUCCESSFUL (no proof harnesses were found to verify)"
+                            "[AY:NO_HARNESSES] {}: nothing was verified — this crate declares no \
+                             #[kani::proof] harnesses.",
+                            self.args
+                                .harnesses
+                                .first()
+                                .map_or("crate", std::string::String::as_str)
+                        );
+                        println!(
+                            "VERIFICATION:- INCONCLUSIVE (no proof harnesses were found to verify)"
                         );
                     }
                 }
                 [harness] => {
-                    bail!("no harnesses matched the harness filter: `{harness}`")
+                    bail!(
+                        "no harnesses matched the harness filter: `{harness}`{}",
+                        harness_suggestions(harness, available_harnesses)
+                    )
                 }
                 harnesses => {
-                    bail!("no harnesses matched the harness filters: `{}`", harnesses.join("`, `"))
+                    bail!(
+                        "no harnesses matched the harness filters: `{}`{}",
+                        harnesses.join("`, `"),
+                        harness_suggestions("", available_harnesses)
+                    )
                 }
             }
         }
@@ -369,7 +425,7 @@ mod tests {
         KaniSession {
             args,
             autoharness_compiler_flags: None,
-            kani_compiler: PathBuf::new(),
+            install: crate::session::InstallType::new().expect("install type"),
             temporaries: Mutex::default(),
         }
     }
@@ -418,4 +474,68 @@ mod tests {
 
         assert!(error.to_string().contains("Failed to create output directory"));
     }
+}
+
+/// Tell the user how to find the harness names that do exist.
+///
+/// `--harness` takes a substring filter, so a typo (or a name from a different
+/// file) simply matches nothing. Reporting only that the filter failed leaves
+/// the user to work out what they should have typed.
+///
+/// The names are usually NOT in hand here: the compiler codegens only the
+/// harnesses that match the filter, so when the filter matches nothing the
+/// metadata this function is handed is empty -- which is exactly the case that
+/// produced the error. Claiming "this crate has no harnesses" from that would
+/// be false for any crate whose harnesses simply have other names. So point at
+/// the listing instead, and only name names when a caller genuinely has the
+/// unfiltered set.
+fn harness_suggestions(filter: &str, available: &[String]) -> String {
+    if available.is_empty() {
+        return "\n       `--harness` matches by substring. Run `trust-mc --list <FILE.rs>`\n       \
+                (or `cargo trust-mc --list`) to see the harness names in this crate."
+            .to_string();
+    }
+
+    let closest = (!filter.is_empty())
+        .then(|| {
+            available
+                .iter()
+                .map(|name| (edit_distance(filter, name), name))
+                .filter(|(distance, name)| *distance * 3 <= name.len().max(filter.len()) * 2)
+                .min_by_key(|(distance, _)| *distance)
+                .map(|(_, name)| name)
+        })
+        .flatten();
+
+    // Long lists are worse than no list; point at `--list` past a readable few.
+    const MAX_LISTED: usize = 10;
+    let listed: Vec<&str> = available.iter().take(MAX_LISTED).map(String::as_str).collect();
+    let more = available.len().saturating_sub(listed.len());
+    let tail =
+        if more > 0 { format!(", and {more} more (`--list` for all)") } else { String::new() };
+
+    match closest {
+        Some(name) => format!(
+            "\n       Did you mean `{name}`?\n       Harnesses in this crate: {}{tail}",
+            listed.join(", ")
+        ),
+        None => format!("\n       Harnesses in this crate: {}{tail}", listed.join(", ")),
+    }
+}
+
+/// Levenshtein distance, used only to rank a typo against real harness names.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut current = vec![0usize; b_chars.len() + 1];
+
+    for (i, a_char) in a.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, b_char) in b_chars.iter().enumerate() {
+            let substitution = previous[j] + usize::from(a_char != *b_char);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b_chars.len()]
 }

@@ -348,6 +348,23 @@ pub struct ArtifactMetadata {
     /// are counted here so the driver can emit warnings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsoundness: Option<UnsoundnessCounters>,
+
+    /// The encoded harness body cannot produce ANY verification obligation.
+    ///
+    /// Zero checks has two very different causes, and the driver's vacuity
+    /// refusal (V4b) cannot tell them apart on its own:
+    ///   * the body genuinely has nothing to prove (`fn check() {}`, or a body
+    ///     that only constructs and drops values), which Kani reports as a
+    ///     clean `0 of 0 failed` SUCCESS; or
+    ///   * an obligation was dropped or folded away, and calling that a proof
+    ///     would be a false Safe.
+    /// Only the compiler can distinguish them, because only it sees the MIR.
+    /// `Some(true)` is POSITIVE evidence of the first case: the encoded body
+    /// contains no `Call` and no `Assert` terminator, so no obligation site
+    /// exists to have been dropped. Absent or `Some(false)` keeps the
+    /// fail-closed behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obligation_free_body: Option<bool>,
 }
 
 /// Counters for unsoundness detected during codegen.

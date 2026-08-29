@@ -386,6 +386,44 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         }
 
+        // `_d = copy (*_STATIC)` where the static is POINTER-typed: the load
+        // yields the static's VALUE, which addresses the allocation the
+        // initializer points at — never the static's own slot. Inheriting the
+        // slot's object here is the ADDRESS-USED-AS-VALUE shape: `*FOO` then
+        // reads `FOO`'s own 8-byte slot as an `i32`, a cell the entry mirror
+        // never writes at that type, so `assert_eq!(*FOO, 12)` is refutable.
+        if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rhs
+            && matches!(p.projection.as_slice(), [ProjectionElem::Deref])
+            && let Some(&vec_idx) = self.ref_resolution.static_ref_to_state_idx.get(&p.local)
+            && Self::deref_pointee_ty(self.body.locals()[p.local].ty).is_some_and(|pointee| {
+                matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)))
+            })
+        {
+            match self
+                .ref_resolution
+                .static_pointee_addrs
+                .get(&vec_idx)
+                .and_then(try_extract_data_obj_id)
+            {
+                Some(obj_id) => {
+                    debug!(
+                        local_idx,
+                        static_local = p.local,
+                        obj_id,
+                        "CHC: pointer-static load addresses the pointee allocation, not the slot"
+                    );
+                    self.known_alloc_ids.insert(local_idx, obj_id);
+                    self.ref_resolution.alloc_result_locals.insert(local_idx);
+                }
+                None => {
+                    // Pointee allocation unknown: leave the destination with no
+                    // allocation rather than the static's own slot.
+                    self.known_alloc_ids.remove(&local_idx);
+                }
+            }
+            return;
+        }
+
         let loaded_alloc_id = match rhs {
             // Part of #3871: `move (*_ptr)` loads the pointee value. The
             // destination must track the loaded object's alloc_id, not the
@@ -470,11 +508,51 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // Part of #3589: Without this, Rc::new stores through a
                 // reference whose address is symbolic, preventing store-to-load
                 // forwarding when the load uses alloc_id-based constant addresses.
-                // Only handle leading Deref: Ref(_, _, (*_base).fields)
+                //
+                // ONLY when the projections after the `Deref` add ZERO bytes.
+                //
+                // `known_alloc_ids` maps a local to an OBJECT ID and nothing
+                // else, so the address minted from it
+                // (`known_deref_base_addr_expr`) is always `obj ++ 0`. That is a
+                // true statement about `&(*base)` and about a field at offset 0,
+                // and a FALSE one about `&(*base).f` at any other offset — the
+                // byte offset lives in the reference's VALUE and this map has
+                // nowhere to put it.
+                //
+                // Forwarding it regardless COLLAPSED DISTINCT FIELDS ONTO ONE
+                // CELL and PROVED A FALSE ASSERTION:
+                //
+                //     #[repr(C)] struct S { a: u8, b: u8 }
+                //     let s = Box::new(S { a: 1, b: 2 });
+                //     assert!(*(&s.a) == *(&s.b));   // 1 == 2
+                //         -> SUCCESSFUL, 0 of 18 failed, PROOF_QUALIFIERS:clean
+                //
+                // and its inverse `!=` FAILED — both directions wrong, which is
+                // the signature of one shared cell. `Box<u8>` hid it for years
+                // because its payload sits at offset 0, the one case this
+                // rebase gets right; `Rc<T>`'s payload is at +16, so every Rc
+                // deref read a cell nothing had written.
+                //
+                // Offset 0 keeps #3589 working: the hops it needs
+                // (`&((*_11).0: NonNull<..>)` and the NonNull/Unique wrapper
+                // chain) are all at offset 0. Anything else fails closed.
                 Rvalue::Ref(_, _, p)
                     if matches!(p.projection.first(), Some(ProjectionElem::Deref)) =>
                 {
-                    Some(p.local)
+                    match self.constant_projection_byte_offset(p) {
+                        Some(0) => Some(p.local),
+                        _ => {
+                            debug!(
+                                local_idx,
+                                base = p.local,
+                                "CHC: alloc-id provenance dropped — `&(*base).f` carries a byte \
+                                 offset `known_alloc_ids` cannot represent (fail closed)"
+                            );
+                            self.known_alloc_ids.remove(&local_idx);
+                            self.ref_resolution.alloc_result_locals.remove(&local_idx);
+                            None
+                        }
+                    }
                 }
                 Rvalue::Ref(_, _, _) | Rvalue::CopyForDeref(_) => None,
                 _ => None,

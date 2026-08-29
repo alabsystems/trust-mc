@@ -83,17 +83,19 @@ fn test_heap_dealloc_marks_invalid() {
         let valid_after = ctx.heap_state.obj_valid.clone();
         assert_ne!(valid_before, valid_after);
 
-        // Fix #2763: Verify the constraint stores `false` (not `true`).
-        // The old assert_ne! only checked that obj_valid changed, which
-        // would also pass if dealloc incorrectly stored `true`.
+        // Fix #2763: Verify the constraint stores the FREED bit (not the alive
+        // one). The old assert_ne! only checked that obj_valid changed, which
+        // would also pass if dealloc incorrectly marked the object alive.
+        // The liveness range is `(_ BitVec 1)`, so freed is `#b0` — see
+        // `AYCtx::heap_valid_bit` for why it is not `Bool`.
         let dealloc_constraints: String = ctx.bmc_vc.constraints[constraints_before..]
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            dealloc_constraints.contains("false"),
-            "heap_dealloc must store false into obj_valid (mark freed); \
+            dealloc_constraints.contains("#b0"),
+            "heap_dealloc must store the freed bit into obj_valid; \
              constraints:\n{dealloc_constraints}"
         );
     });

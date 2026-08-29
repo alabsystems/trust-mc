@@ -202,6 +202,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 }
 
+/// Largest literal `new_len` that may be written as an explicit `store` chain
+/// instead of the quantified relation. Each slot costs one array `store`; the
+/// cap keeps a `resize(10_000, x)` from unrolling.
+const MAX_UNROLLED_RESIZE_LEN: u64 = 64;
+
+/// How many ground index instances of the quantified resize relation to spell
+/// out when the lengths are not literals. Each instance is implied by the
+/// `forall` it accompanies, so this trades VC size for the derivation's ability
+/// to use the relation at all.
+const GROUND_RESIZE_INSTANCES: u64 = 32;
+
+/// The literal value of a bitvector constant, if `e` is one.
+fn bitvec_const_u64(e: &Expr) -> Option<u64> {
+    match e.value() {
+        ay_bindings::ExprValue::BitVecConst { value, .. } => u64::try_from(value).ok(),
+        _ => None,
+    }
+}
+
 pub(in crate::codegen_ay::chc) fn quantified_resize_growth_array(
     data: Expr,
     old_len: Expr,
@@ -212,27 +231,71 @@ pub(in crate::codegen_ay::chc) fn quantified_resize_growth_array(
         return (data, Expr::bool_const(true), true);
     };
 
-    let fresh = declare_pending_var(chc_fresh_name("__resize_data"), data.sort().clone());
-    let idx_name = chc_fresh_name("__resize_idx");
-    let idx_sort = ptr_sort();
-    let idx = Expr::var(&idx_name, idx_sort.clone());
-
-    let prefix_eq = fresh.clone().select(idx.clone()).eq(data.clone().select(idx.clone()));
-    let mut quantified_body = idx.clone().bvult(old_len.clone()).implies(prefix_eq);
-
     let fill_value = fill_value
         .map(|fill| coerce_array_element(fill, &data.sort()))
         .filter(|fill| fill.sort() == &data_arr.element_sort);
     let modeled_fill = fill_value.is_some();
 
-    if let Some(fill_value) = fill_value {
-        let in_grown_suffix =
-            idx.clone().bvuge(old_len.clone()).and(idx.clone().bvult(new_len.clone()));
-        let fill_eq = fresh.clone().select(idx).eq(fill_value);
-        quantified_body = quantified_body.and(in_grown_suffix.implies(fill_eq));
+    // Preferred form: say the whole thing in the array theory's own vocabulary.
+    //
+    // The quantified relation further down states the resize correctly, but a
+    // `forall` in a CHC RULE BODY is outside what the solver's CHC portfolio
+    // discharges — it answers `unknown` on the quantified query, and the
+    // in-process derivation treats the premise as non-constraining, so
+    // `v.resize(4, p); assert!(v[3] == p)` reports a counterexample against a
+    // true assertion. One `store` per slot below the new length carries the
+    // same fact quantifier-free, and carries it more precisely: `store`
+    // preserves every other index by definition, so the prefix needs no
+    // premise and no fresh array is introduced at all.
+    if let Some(new) = bitvec_const_u64(&new_len)
+        && new <= MAX_UNROLLED_RESIZE_LEN
+        && let Some(fill) = fill_value.clone()
+    {
+        // Each slot holds the value it has AFTER the resize: the old element
+        // while the index is still inside the old length, the fill value once
+        // past it. Indices at or above `new_len` are untouched. This covers
+        // growth AND shrink — when `old_len >= new_len` every guard is false
+        // and the result is `data` element-for-element.
+        let mut out = data.clone();
+        for slot in 0..new {
+            let idx = Expr::bitvec_const(i128::from(slot), POINTER_WIDTH);
+            let grown = idx.clone().bvuge(old_len.clone());
+            let kept = data.clone().select(idx.clone());
+            out = out.store(idx, Expr::ite(grown, fill.clone(), kept));
+        }
+        return (out, Expr::bool_const(true), true);
     }
 
-    let resize_relation = Expr::forall(vec![(idx_name, idx_sort)], quantified_body);
+    let fresh = declare_pending_var(chc_fresh_name("__resize_data"), data.sort().clone());
+    let idx_name = chc_fresh_name("__resize_idx");
+    let idx_sort = ptr_sort();
+
+    // The relation, stated at one index. Used for the bound variable and again
+    // for each ground index below.
+    let body_at = |at: &Expr| {
+        let prefix_eq = fresh.clone().select(at.clone()).eq(data.clone().select(at.clone()));
+        let mut body = at.clone().bvult(old_len.clone()).implies(prefix_eq);
+        if let Some(fill) = &fill_value {
+            let in_grown_suffix =
+                at.clone().bvuge(old_len.clone()).and(at.clone().bvult(new_len.clone()));
+            let fill_eq = fresh.clone().select(at.clone()).eq(fill.clone());
+            body = body.and(in_grown_suffix.implies(fill_eq));
+        }
+        body
+    };
+
+    let idx = Expr::var(&idx_name, idx_sort.clone());
+    let mut resize_relation = Expr::forall(vec![(idx_name, idx_sort)], body_at(&idx));
+    // The lengths are not literal here, so the slot count is unknown and the
+    // `store` chain above does not apply. Spell the relation out at the low
+    // ground indices anyway: these are instances of the `forall` just above, so
+    // they add no assumption the resize does not already make, and they are the
+    // instances a derivation that skips the quantifier would otherwise miss.
+    for slot in 0..GROUND_RESIZE_INSTANCES {
+        let at = Expr::bitvec_const(i128::from(slot), POINTER_WIDTH);
+        resize_relation = resize_relation.and(body_at(&at));
+    }
+
     let is_growing = old_len.bvult(new_len);
     (Expr::ite(is_growing, fresh, data), resize_relation, modeled_fill)
 }

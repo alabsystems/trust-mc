@@ -89,6 +89,7 @@ pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_edition<F>(
         bmc_vc.query.produce_model = config.produce_models;
         bmc_vc.query.logic = Some(config.select_logic(false).to_owned());
         let ctx: AYCtx<'_, 'static> = AYCtx {
+            obligation_free_body_by_fn: std::collections::HashMap::new(),
             tcx,
             queries: QueryDb::default(),
             config,

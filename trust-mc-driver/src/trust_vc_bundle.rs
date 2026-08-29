@@ -38,7 +38,7 @@ pub(crate) fn verify_trust_vc_bundle(session: KaniSession, bundle_path: &Path) -
     let results = [HarnessResult { harness: &harness, result }];
     // Exactly one synthetic harness — the zero-harness success-with-note
     // path must never trigger here.
-    session.print_final_summary(&results, 1)
+    session.print_final_summary(&results, 1, &[])
 }
 
 fn synthetic_bundle_harness(source_id: &str, bundle_path: &Path) -> HarnessMetadata {

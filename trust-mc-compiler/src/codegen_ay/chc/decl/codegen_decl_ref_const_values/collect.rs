@@ -217,6 +217,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
             let Some(candidates) = by_src.get(&src_local) else { continue };
             for candidate in candidates {
+                if !self.path_insensitive_metadata_copy_is_unique(src_local, candidate.dest_local) {
+                    self.clear_path_insensitive_ref_metadata(candidate.dest_local);
+                    continue;
+                }
                 if self.ref_resolution.const_ref_values.contains_key(&candidate.dest_local) {
                     continue;
                 }
@@ -279,6 +283,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dest_local: usize,
         const_op: &rustc_public::mir::ConstOperand,
     ) {
+        if self.local_has_multiple_whole_definitions(dest_local) {
+            self.clear_path_insensitive_ref_metadata(dest_local);
+            return;
+        }
         let mir_const = &const_op.const_;
         let ty = mir_const.ty();
         debug!("Pass4.1 scan: _{} = Use(Const), ty={:?}", dest_local, ty.kind());

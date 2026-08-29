@@ -6,7 +6,7 @@
 //!
 //! Extracted from context.rs as part of #2093.
 
-use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
+use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort};
 use ay_bindings::{Expr, Sort};
 
 use super::AYCtx;
@@ -21,7 +21,8 @@ mod realloc;
 /// - Allocation never fails (sound over-approximation)
 ///
 /// The model uses SMT arrays to track object validity and sizes:
-/// - obj_valid: Array<BV<POINTER_WIDTH>, Bool> - tracks which allocations are alive
+/// - obj_valid: Array<BV<POINTER_WIDTH>, BV1> - tracks which allocations are alive
+///   (`#b1` alive, `#b0` freed — see `AYCtx::heap_valid_bit` for why not `Bool`)
 /// - obj_size: Array<BV<POINTER_WIDTH>, BV<POINTER_WIDTH>> - tracks allocation sizes
 ///
 /// Address space partitioning: Each allocation gets a non-overlapping region
@@ -33,7 +34,7 @@ pub(in crate::codegen_ay) struct HeapState {
     /// ID 0 is reserved for null pointer representation.
     pub(super) next_alloc_id: u64,
     /// Object validity array: obj_valid[ptr_id] = alive
-    /// Sort: (Array (_ BitVec POINTER_WIDTH) Bool)
+    /// Sort: (Array (_ BitVec POINTER_WIDTH) (_ BitVec 1))
     pub(super) obj_valid: Option<Expr>,
     /// Object size array: obj_size[ptr_id] = size_in_bytes
     /// Sort: (Array (_ BitVec POINTER_WIDTH) (_ BitVec POINTER_WIDTH))
@@ -80,6 +81,50 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     #[must_use]
     fn heap_object_expr_from_alloc_id(id: u64) -> Expr {
         Expr::bitvec_const(id as u128, POINTER_WIDTH)
+    }
+
+    /// The liveness bit stored in `obj_valid`: `#b1` alive, `#b0` freed.
+    ///
+    /// # Why a 1-bit bitvector and not `Bool`
+    ///
+    /// The two ranges denote the same relation, so this changes no obligation.
+    /// What differs is whether ay can build a MODEL for it. A `Bool`-ranged
+    /// array that is BOTH selected under a negation (`double_free_check`,
+    /// `use_after_free_check`) and rewritten by a `store` (the dealloc update)
+    /// leaves ay's array reasoning incomplete: it still decides `unsat`, so no
+    /// passing proof ever depended on this, but for any query with a
+    /// counterexample it answers `unknown (:reason-unknown incomplete)`. The
+    /// driver has no decided failing property then, files the run as
+    /// `UndecidedModel`, and prints `0 of 0 failed` /
+    /// `INCONCLUSIVE (solver undecided)` — a harness that FAILS, reported with
+    /// no failing check at all.
+    ///
+    /// Minimal witness (`ay 0.16.0`), `unknown` as written and `sat` with the
+    /// array's range changed to `(_ BitVec 1)` and the select compared to `#b1`:
+    ///
+    /// ```text
+    /// (declare-const hv  (Array (_ BitVec 64) Bool))
+    /// (declare-const hv2 (Array (_ BitVec 64) Bool))
+    /// (declare-const p (_ BitVec 64))
+    /// (declare-const q (_ BitVec 64))
+    /// (declare-const v Bool)
+    /// (assert (= v (not (select hv (bvudiv p #x0000000000100000)))))
+    /// (assert (= hv2 (store hv (bvudiv q #x0000000000100000) false)))
+    /// (assert v)
+    /// (check-sat)
+    /// ```
+    #[must_use]
+    fn heap_valid_bit(alive: bool) -> Expr {
+        Expr::bitvec_const(u128::from(alive), 1)
+    }
+
+    /// Read `obj_valid[obj]` as a Bool predicate ("this object is alive").
+    ///
+    /// Keeps every caller's sort contract (`Sort::Bool`) unchanged while the
+    /// array itself carries the 1-bit range described on [`Self::heap_valid_bit`].
+    #[must_use]
+    fn heap_valid_select(valid_arr: &Expr, obj: Expr) -> Expr {
+        valid_arr.clone().select(obj).eq(Self::heap_valid_bit(true))
     }
 
     #[must_use]
@@ -167,7 +212,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
 
         // Update heap validity array and emit constraint
         if let Some(valid_arr) = self.heap_state.obj_valid.take() {
-            let new_valid = valid_arr.store(ptr_obj.clone(), Expr::bool_const(true));
+            let new_valid = valid_arr.store(ptr_obj.clone(), Self::heap_valid_bit(true));
             self.heap_state.obj_valid = Some(self.declare_ssa_var_eq_expr("heap_valid", new_valid));
         }
 
@@ -240,14 +285,14 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         // CHC path has this at stubs_alloc_heap_ops.rs:202-204.
         // The violation is satisfiable when ptr was already freed (obj_valid[obj_id(ptr)] == false).
         if let Some(ref valid_arr) = self.heap_state.obj_valid {
-            let is_valid = valid_arr.clone().select(ptr_obj.clone());
+            let is_valid = Self::heap_valid_select(valid_arr, ptr_obj.clone());
             self.record_property_violation(is_valid.not(), "double_free_check");
         }
 
         // Mark allocation as invalid: obj_valid[obj_id(ptr)] = false
         // Emit SSA constraint so the solver sees the deallocation.
         if let Some(valid_arr) = self.heap_state.obj_valid.take() {
-            let new_valid = valid_arr.store(ptr_obj, Expr::bool_const(false));
+            let new_valid = valid_arr.store(ptr_obj, Self::heap_valid_bit(false));
             self.heap_state.obj_valid =
                 Some(self.declare_ssa_var_eq_expr("heap_dealloc_valid", new_valid));
         }
@@ -264,7 +309,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         self.ensure_heap_arrays_initialized();
         if let Some(valid_arr) = self.heap_state.obj_valid.take() {
             let obj_id = self.heap_pointer_object(ptr);
-            let new_valid = valid_arr.store(obj_id, Expr::bool_const(false));
+            let new_valid = valid_arr.store(obj_id, Self::heap_valid_bit(false));
             self.heap_state.obj_valid =
                 Some(self.declare_ssa_var_eq_expr("heap_no_provenance_valid", new_valid));
         }
@@ -283,7 +328,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         self.ensure_heap_arrays_initialized();
         if let Some(valid_arr) = self.heap_state.obj_valid.take() {
             let obj_id = self.heap_pointer_object(ptr);
-            let invalidated = valid_arr.clone().store(obj_id, Expr::bool_const(false));
+            let invalidated = valid_arr.clone().store(obj_id, Self::heap_valid_bit(false));
             let new_valid = Expr::ite(condition, invalidated, valid_arr);
             self.heap_state.obj_valid =
                 Some(self.declare_ssa_var_eq_expr("heap_no_provenance_cond_valid", new_valid));
@@ -301,7 +346,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             // entries to false. This ensures kani::mem predicates (can_write,
             // can_dereference, same_allocation) don't produce false positives on
             // valid stack or heap pointers. Part of #1229.
-            let valid_arr = Expr::const_array(ptr_sort(), Expr::bool_const(true));
+            let valid_arr = Expr::const_array(ptr_sort(), Self::heap_valid_bit(true));
             self.heap_state.obj_valid = Some(valid_arr);
         }
 
@@ -380,7 +425,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
 
         let ptr_obj = self.heap_pointer_object(ptr.clone());
         let base_valid = if let Some(ref valid_arr) = self.heap_state.obj_valid {
-            valid_arr.clone().select(ptr_obj.clone())
+            Self::heap_valid_select(valid_arr, ptr_obj.clone())
         } else {
             return Expr::bool_const(true);
         };
@@ -388,6 +433,17 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         match size {
             None => base_valid,
             Some(size_expr) => {
+                // The size operand is a Rust `usize`, but its ENCODED width can
+                // arrive narrower (sort-inference defaults some rvalues to
+                // 32-bit). `eq`/`bvadd` against POINTER_WIDTH constants then
+                // panicked inside ay-bindings ("EQ requires same sort: (_
+                // BitVec 32) and (_ BitVec 64)") — seen from the IsAllocated
+                // hook in loop-contract/for_loop_for_map, where the caught
+                // panic demoted the harness. Zero-extend to the pointer width:
+                // it preserves the encoded value exactly (usize is unsigned),
+                // so this changes no constraint semantics.
+                let size_expr =
+                    coerce_bitvec_width_safe(size_expr, POINTER_WIDTH, SignExtension::ZeroExtend);
                 let zero = Expr::bitvec_const(0u128, POINTER_WIDTH);
                 let one = Expr::bitvec_const(1u128, POINTER_WIDTH);
                 let size_is_zero = size_expr.clone().eq(zero);
@@ -419,6 +475,19 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     ///   `addr / HEAP_STRIDE == (addr + size - 1) / HEAP_STRIDE`
     /// ensuring the entire object fits in one region.
     ///
+    /// # Oversized objects
+    ///
+    /// An object strictly larger than `HEAP_STRIDE` cannot fit in one region,
+    /// so the constraint above would be *unsatisfiable* — the wrap-around bound
+    /// emitted alongside it (`addr <= MAX - (size - 1)`) rules out the only
+    /// other way to satisfy it. Asserting it anyway makes the whole harness
+    /// infeasible and every check passes vacuously (see
+    /// `docs/findings/2026-08-20-vacuous-proofs-in-the-corpus.md`). Instead the
+    /// object is reported as an unsupported construct: the region assertion is
+    /// skipped (dropping an assertion only widens the modelled behaviours, so
+    /// it cannot hide a bug) and an unconditional violation is recorded so the
+    /// harness fails loudly rather than proving nothing.
+    ///
     /// # Arguments
     /// * `addr` - Symbolic address of the stack local (pointer-width BV)
     /// * `size` - Size of the object in bytes (must be > 0)
@@ -426,10 +495,24 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// # Contracts
     /// REQUIRES: addr.sort() == ptr_sort()
     /// REQUIRES: size > 0
-    /// ENSURES: Adds one assertion to the constraint set
+    /// ENSURES: Adds one assertion to the constraint set, unless the object is
+    ///          larger than `HEAP_STRIDE`, in which case an
+    ///          `unsupported_oversized_object` violation is recorded instead.
     pub(in crate::codegen_ay) fn heap_constrain_within_region(&mut self, addr: Expr, size: u64) {
         if size <= 1 {
             return; // Single-byte objects can never straddle a boundary.
+        }
+        if size > HEAP_STRIDE {
+            // Modelling limit, not an infeasible path: say so explicitly.
+            self.unsupported(
+                "object larger than the heap region stride",
+                format!(
+                    "object of {size} bytes exceeds HEAP_STRIDE ({HEAP_STRIDE} bytes); \
+                     the byte-addressed model cannot place it in a single allocation region"
+                ),
+            );
+            self.record_property_violation(Expr::bool_const(true), "unsupported_oversized_object");
+            return;
         }
         let start_obj = self.heap_pointer_object(addr.clone());
         let end_addr = addr.bvadd(Expr::bitvec_const((size - 1) as u128, POINTER_WIDTH));

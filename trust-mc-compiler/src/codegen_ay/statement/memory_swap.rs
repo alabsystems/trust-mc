@@ -71,6 +71,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let old_x = self.typed_swap_load_old_value(x_pointee.as_ref(), ptr_x.clone(), size as u32);
         let old_y = self.typed_swap_load_old_value(y_pointee.as_ref(), ptr_y.clone(), size as u32);
 
+        // FC-06(bmc): swap writes are env-level, invisible to the ref-deref
+        // store hook — certify each against a non-empty modifies footprint
+        // (by pointer value or tracked name) so a modifies-only checked
+        // swap discharges its per-store assigns obligations (corpus:
+        // function-contract/modifies/simple_only_verification_modifies
+        // emitted zero VCs and the vacuity gate refused the proof).
+        let x_base = x_pointee.as_ref().and_then(|p| p.load_base.clone());
+        let y_base = y_pointee.as_ref().and_then(|p| p.load_base.clone());
+        self.bmc_modifies_certify_swap_store(x_base.as_deref());
+        self.bmc_modifies_certify_swap_store(y_base.as_deref());
+
         // Cross-store: *x = old_y, *y = old_x
         self.ctx.store_memory_bytes(ptr_x, old_y.clone());
         self.ctx.store_memory_bytes(ptr_y, old_x.clone());
@@ -138,6 +149,24 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let var = self.ctx.declare_var(&ssa_name, value.sort().clone());
         self.assert_ssa_def(var.clone(), value, base);
         self.env_update(base.to_owned(), var);
+    }
+
+    /// Resolve a (possibly `_deref`-aliased) pointee base name to its root
+    /// plus every alias along the chain. Used by typed_swap and by the
+    /// contract havoc (`write_any_slim`) so a store through an alias
+    /// refreshes ALL names that denote the same storage.
+    pub(super) fn resolve_deref_pointee_chain(&self, pointee_base: &str) -> Vec<String> {
+        match self.typed_swap_resolve_deref_pointee(pointee_base) {
+            Some(resolved) => {
+                let mut v = vec![resolved.base];
+                v.extend(resolved.aliases);
+                if !v.iter().any(|n| n == pointee_base) {
+                    v.push(pointee_base.to_owned());
+                }
+                v
+            }
+            None => vec![pointee_base.to_owned()],
+        }
     }
 
     fn typed_swap_resolve_deref_pointee(

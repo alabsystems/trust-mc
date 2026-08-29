@@ -64,9 +64,15 @@ impl KaniSession {
                     }
 
                     if !unit_tests.is_empty() {
+                        // Name the tool the user actually ran. This text is
+                        // inherited from upstream, where "Kani" was correct;
+                        // here it sends someone to a different project's CLI
+                        // for a flag this one implements. No .expected file
+                        // asserts the wording -- the playback tests only
+                        // invoke the flag.
                         println!(
-                            "INFO: To automatically add the concrete playback unit test(s) to the \
-                             src code, run Kani with `--concrete-playback=inplace`.",
+                            "INFO: To add these tests to the source automatically, rerun with \
+                             `--concrete-playback=inplace`.",
                         );
                     }
                 }

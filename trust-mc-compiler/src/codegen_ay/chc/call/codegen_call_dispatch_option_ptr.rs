@@ -218,6 +218,12 @@ fn dispatch_stub_via_route_table<'tcx, 'body>(
                 stmt_constraints: dcx.stmt_constraints,
                 modified_locals: dcx.modified_locals,
             };
+            // SOUNDNESS: unwrap/expect survive fn_inline as Call terminators, so
+            // the library body's panic edge never reaches codegen. Emit the
+            // None/Err-panic obligation HERE (BMC twin: codegen_option_unwrap_impl).
+            if stub.is_unwrap_expect() {
+                ctx.emit_unwrap_expect_panic_obligation(&cx, dcx.bb_idx);
+            }
             handler(ctx, &cx);
         } else {
             ctx.record_diverging_call_drop(

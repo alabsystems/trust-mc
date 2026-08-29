@@ -8,36 +8,50 @@
 
 use super::*;
 
-fn assert_array_backed_lane_stores(rebuilt: &Expr, elements: &[Expr]) {
+/// The constructor wraps a FRESH array variable, and the lanes are pinned by
+/// per-index `(= (select arr i) elem_i)` assertions emitted alongside — NOT by
+/// a store-chain folded into the constructor. AY answers `unknown
+/// (:reason-unknown incomplete)` on the store-chain shape when the elements
+/// are selects out of a constructor-equated array (the exact query
+/// simd_insert emits), so the encoding switched; this helper pins the select
+/// form and that every lane is constrained exactly once.
+fn assert_array_backed_lane_selects(rebuilt: &Expr, elements: &[Expr], added: &[Constraint]) {
     let ExprValue::DatatypeConstructor { args, .. } = rebuilt.value() else {
         panic!("rebuilt SIMD should be a datatype constructor");
     };
     assert_eq!(args.len(), 1, "U32x4 constructor should have exactly one array field");
+    let ExprValue::Var { name: arr_name } = args[0].value() else {
+        panic!("constructor should wrap a fresh array variable, got {:?}", args[0].value());
+    };
 
-    let mut stores = Vec::new();
-    let mut cursor = args[0].clone();
-    while let ExprValue::Store { array, index, value } = cursor.value() {
-        stores.push((index.clone(), value.clone()));
-        cursor = array.clone();
-    }
-    stores.reverse();
-    assert_eq!(
-        stores.len(),
-        elements.len(),
-        "constructor should store exactly one value per SIMD lane"
-    );
-
-    for (lane, (index, value)) in stores.iter().enumerate() {
-        match index.value() {
-            ExprValue::BitVecConst { value, width } => {
-                assert_eq!(*width, POINTER_WIDTH, "lane index should be POINTER_WIDTH-wide");
-                assert_eq!(*value, BigInt::from(lane as u64), "wrong lane index stored");
+    // Every lane must be pinned by exactly one
+    // `(= (select arr <lane>) <element>)` assert on THIS fresh array.
+    for (lane, expected) in elements.iter().enumerate() {
+        let lane_idx = BigInt::from(lane as u64);
+        let mut found = 0usize;
+        for cmd in added {
+            let Constraint::Assert { expr, .. } = cmd else { continue };
+            let ExprValue::Eq(lhs, rhs) = expr.value() else { continue };
+            let ExprValue::Select { array, index } = lhs.value() else { continue };
+            let ExprValue::Var { name } = array.value() else { continue };
+            if name != arr_name {
+                continue;
             }
-            other => panic!("expected bitvector lane index, got {other:?}"),
+            let ExprValue::BitVecConst { value, width } = index.value() else { continue };
+            if *value != lane_idx {
+                continue;
+            }
+            assert_eq!(*width, POINTER_WIDTH, "lane index should be POINTER_WIDTH-wide");
+            assert_eq!(
+                rhs, expected,
+                "constrained lane value should match extracted element at lane {lane}"
+            );
+            found += 1;
         }
         assert_eq!(
-            value, &elements[lane],
-            "stored lane value should match extracted element at lane {lane}"
+            found, 1,
+            "lane {lane} should have exactly one select-equality constraint \
+             (zero means an unconstrained lane)"
         );
     }
 }
@@ -172,11 +186,13 @@ fn test_simd_construct_expr_roundtrip_u32x4() {
         let arg_expr = codegen.codegen_operand(&local_operand(1)).expect("arg 1 expr");
         let elements = codegen.simd_extract_elements(&arg_expr, &layout).expect("extract elements");
 
+        let before = codegen.ctx.program.commands().len();
         let rebuilt = codegen
             .simd_construct_expr(elements.clone(), &layout, simd_ty)
             .expect("should reconstruct U32x4 from extracted elements");
         assert_eq!(rebuilt.sort(), arg_expr.sort(), "rebuilt SIMD expression should keep type");
-        assert_array_backed_lane_stores(&rebuilt, &elements);
+        let added = &codegen.ctx.program.commands()[before..];
+        assert_array_backed_lane_selects(&rebuilt, &elements, added);
     });
 }
 

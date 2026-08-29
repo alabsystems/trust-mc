@@ -100,6 +100,40 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         )
     }
 
+    /// Pre-inline dispatch for `Range`/`RangeInclusive::contains`.
+    ///
+    /// The MIR `FunctionInlinePass` deliberately does NOT inline these
+    /// (`handler_boundaries::is_handler_backed_range_contains`) because
+    /// expanding through `RangeBounds::{start,end}_bound` and `Bound<&T>` turns
+    /// value comparisons into reference-address comparisons. But the CHC
+    /// `range_contains` handler only ran from the tail catch-all, AFTER
+    /// `fn_inline` — which claimed the call, found the `RangeBounds::contains`
+    /// body over the inline block budget, and bound the result to a FRESH
+    /// SYMBOLIC BOOL. `(0..=1).contains(&x)` was then unconstrained, failing
+    /// even for a concrete in-range `x`.
+    ///
+    /// Intercept here so the preserved handler boundary actually reaches its
+    /// handler. `try_codegen_range_contains` returns false when it cannot
+    /// resolve the bounds, leaving the existing dispatch chain untouched.
+    pub(in crate::codegen_ay::chc) fn try_dispatch_call_range_contains_pre_inline(
+        &mut self,
+        dcx: &DispatchCallContext<'_>,
+    ) -> bool {
+        let Some(target) = dcx.target else { return false };
+        let callee_path = dcx
+            .callee_path
+            .clone()
+            .or_else(|| self.resolve_callee_path(dcx.func))
+            .or_else(|| self.resolve_fn_def_name(dcx.func));
+        let Some(ref path) = callee_path else { return false };
+        if !super::codegen_call_cmp_string::range_contains::detect_range_contains(path) {
+            return false;
+        }
+        super::codegen_call_cmp_string::range_contains::try_codegen_range_contains(
+            self, dcx, *target, path,
+        )
+    }
+
     /// Record a diverging call (`target=None`) that was claimed by a dispatcher
     /// but did not emit a transition or error rule.
     pub(in crate::codegen_ay::chc) fn record_diverging_call_drop(

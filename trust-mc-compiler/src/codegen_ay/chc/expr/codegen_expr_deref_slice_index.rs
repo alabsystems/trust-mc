@@ -74,7 +74,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 local_idx,
             ),
             ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                let actual_offset = constant_index_offset(*offset, *min_length, *from_end);
+                // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                let Some(actual_offset) = constant_index_offset(*offset, *min_length, *from_end)
+                else {
+                    return SliceDerefIndexResult::NotApplicable;
+                };
                 self.try_slice_deref_index_via_memory(
                     current_expr,
                     elem_ty,

@@ -127,6 +127,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Part of #9271: When the condition is untranslatable, emit a conservative
     /// `from -> error()` rule and still keep the successor reachable. This is
     /// fail-closed: "cannot check safety" must not become PROOF.
+    /// Extract the human-readable message a `kani::safety_check(cond, msg)`
+    /// carries in `args[1]`, when it is a const `&str` (the shape every
+    /// in-tree emitter uses). Mirrors `emit_kani_assert_error_rule`.
+    fn safety_check_message(
+        &mut self,
+        args: &[rustc_public::mir::Operand],
+    ) -> Option<String> {
+        let (bytes, _) = self.try_extract_const_str_bytes(args.get(1)?)?;
+        String::from_utf8(bytes).ok()
+    }
+
     pub(in crate::codegen_ay::chc) fn hook_safety_check(&mut self, dcx: &DispatchCallContext<'_>) {
         let bb_idx = dcx.bb_idx;
         let from_app = dcx.from_app;
@@ -143,7 +154,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Condition translatable — emit proper error rule: from ∧ !cond → error()
             let violation = bool_cond.clone().not();
             // BSEM-18: per-property head for this safety check.
-            let error_app = self.register_error_head(PropertyKind::MemorySafety, bb_idx, None);
+            // `kani::safety_check(cond, "msg")` carries its message in
+            // args[1], exactly like `kani::assert`. Dropping it made every
+            // loop-contract obligation (invariant base case, inductive step,
+            // decreases ranking) surface as a bare "CHC verification: memory
+            // safety" with no Description — indistinguishable from a real
+            // memory-safety failure, and from each other. Surface it.
+            let message = self.safety_check_message(dcx.args);
+            let error_app =
+                self.register_error_head(PropertyKind::MemorySafety, bb_idx, message);
             let body = RuleBody::from_base_and_extra(
                 Some(from_app.clone()),
                 stmt_constraints,
@@ -204,7 +223,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Condition translatable — emit proper error rule: from ∧ !cond → error()
             let violation = bool_cond.clone().not();
             // BSEM-18: per-property head for this safety check.
-            let error_app = self.register_error_head(PropertyKind::MemorySafety, bb_idx, None);
+            // `kani::safety_check(cond, "msg")` carries its message in
+            // args[1], exactly like `kani::assert`. Dropping it made every
+            // loop-contract obligation (invariant base case, inductive step,
+            // decreases ranking) surface as a bare "CHC verification: memory
+            // safety" with no Description — indistinguishable from a real
+            // memory-safety failure, and from each other. Surface it.
+            let message = self.safety_check_message(dcx.args);
+            let error_app =
+                self.register_error_head(PropertyKind::MemorySafety, bb_idx, message);
             let body = RuleBody::from_base_and_extra(
                 Some(from_app.clone()),
                 stmt_constraints,

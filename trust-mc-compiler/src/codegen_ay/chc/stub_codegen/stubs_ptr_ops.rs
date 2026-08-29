@@ -21,7 +21,7 @@ use super::ChcCtx;
 use super::chc_call_context::ChcCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
-use super::pointer_step::{step_split_pointer, step_split_pointer_sub};
+use super::pointer_step::{step_split_pointer, step_split_pointer_sub, step_wrapping_pointer};
 use super::stubs::StubKind;
 use super::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 
@@ -229,6 +229,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         args: &[Operand],
         modified_locals: &HashSet<usize>,
         is_sub: bool,
+        signed_count: bool,
     ) -> Option<Expr> {
         if args.len() < 2 {
             return None;
@@ -238,21 +239,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let ptr = coerce_bitvec_width_safe(ptr, POINTER_WIDTH, SignExtension::ZeroExtend);
 
         let byte_count = self.translate_operand_with_modified(&args[1], modified_locals)?;
-        let byte_count =
-            coerce_bitvec_width_safe(byte_count, POINTER_WIDTH, SignExtension::ZeroExtend);
+        // `wrapping_byte_offset` takes an ISIZE. Zero-extending a narrow
+        // negative count turns a backwards step into a huge forwards one, so
+        // the extension must follow the count's SIGNEDNESS, not the opcode.
+        // `wrapping_byte_add`/`wrapping_byte_sub` take a usize and keep
+        // zero-extension.
+        let count_ext =
+            if signed_count { SignExtension::SignExtend } else { SignExtension::ZeroExtend };
+        let byte_count = coerce_bitvec_width_safe(byte_count, POINTER_WIDTH, count_ext);
 
-        // Split-add keeps the obj_id lane intact so the eventual deref's heap
-        // bounds check still sees a foldable obj_id (whole-width bvadd smears a
-        // symbolic count across the id bits and the bounds clause gets dropped).
-        // Wrapping pointer arithmetic is defined even out of bounds, so
-        // same_object_ok is not enforced here; an OOB deref of the result is
-        // caught by heap_access_checks.
-        let result = if is_sub {
-            step_split_pointer_sub(ptr, byte_count).result
-        } else {
-            step_split_pointer(ptr, byte_count).result
-        };
-        Some(result)
+        // Wrapping pointer arithmetic is DEFINED out of bounds and wraps the
+        // whole address space, so the step must be exact mod 2^64. The plain
+        // split step truncates the offset to the low 32-bit lane and drops the
+        // carry out of it, which collapses every nonzero multiple of 2^32 to a
+        // no-op — `p.wrapping_byte_offset(1 << 32) == p` became derivable, and
+        // the encoder statically discharged that false assertion. An OOB deref
+        // of the result is still caught by heap_access_checks.
+        Some(step_wrapping_pointer(ptr, byte_count, is_sub))
     }
 
     /// Emit transition for wrapping byte pointer arithmetic (`wrapping_byte_add/sub/offset`).
@@ -264,9 +267,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let dest_local = cx.destination.local;
         let is_sub = cx.stub == StubKind::PtrWrappingByteSub;
 
-        let Some(result_expr) =
-            self.translate_ptr_wrapping_byte_call(cx.args, cx.modified_locals, is_sub)
-        else {
+        let Some(result_expr) = self.translate_ptr_wrapping_byte_call(
+            cx.args,
+            cx.modified_locals,
+            is_sub,
+            cx.stub == StubKind::PtrWrappingByteOffset,
+        ) else {
             warn!(
                 fn_name = %self.fn_name,
                 "CHC: wrapping_byte pointer translation failed; emitting unconstrained transition with fallback metadata"

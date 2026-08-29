@@ -48,8 +48,11 @@ pub(super) fn apply_inline_subslice(
     let (start, end) = if from_end {
         // from_end=true: array[from..len-to]. Recover with known compile-time length.
         let len = known_len?;
-        (from as usize, (len - to) as usize)
+        (from as usize, len.checked_sub(to)? as usize)
     } else {
+        if known_len.is_some_and(|len| to > len) {
+            return None;
+        }
         (from as usize, to as usize)
     };
     if end <= start {
@@ -89,13 +92,17 @@ pub(in crate::codegen_ay) fn apply_inline_subslice_write(
     if !current.sort().is_array() {
         return None;
     }
+    let known_len = match ctx.resolve_body_ty(current_ty).kind() {
+        TyKind::RigidTy(RigidTy::Array(_, len_const)) => Some(len_const.eval_target_usize().ok()?),
+        _ => None,
+    };
     let (start, end) = if from_end {
-        let len = match ctx.resolve_body_ty(current_ty).kind() {
-            TyKind::RigidTy(RigidTy::Array(_, len_const)) => len_const.eval_target_usize().ok()?,
-            _ => return None,
-        };
-        (from as usize, (len - to) as usize)
+        let len = known_len?;
+        (from as usize, len.checked_sub(to)? as usize)
     } else {
+        if known_len.is_some_and(|len| to > len) {
+            return None;
+        }
         (from as usize, to as usize)
     };
     if end <= start {
@@ -113,4 +120,32 @@ pub(in crate::codegen_ay) fn apply_inline_subslice_write(
         result = result.store(dst_idx, elem);
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use ay_bindings::{Expr, Sort};
+
+    use super::apply_inline_subslice;
+    use crate::codegen_ay::types::POINTER_WIDTH;
+
+    #[test]
+    fn zero_zero_identity_depends_on_from_end_polarity() {
+        let source = Expr::const_array(Sort::bitvec(POINTER_WIDTH), Expr::bitvec_const(7, 8));
+
+        assert_eq!(apply_inline_subslice(&source, 0, 0, true, Some(4)), Some(source.clone()));
+        assert_eq!(apply_inline_subslice(&source, 0, 0, false, Some(4)), None);
+    }
+
+    #[test]
+    fn from_end_underflow_fails_closed() {
+        let source = Expr::const_array(Sort::bitvec(POINTER_WIDTH), Expr::bitvec_const(7, 8));
+        assert_eq!(apply_inline_subslice(&source, 0, 5, true, Some(4)), None);
+    }
+
+    #[test]
+    fn absolute_end_beyond_known_array_fails_closed() {
+        let source = Expr::const_array(Sort::bitvec(POINTER_WIDTH), Expr::bitvec_const(7, 8));
+        assert_eq!(apply_inline_subslice(&source, 0, 5, false, Some(4)), None);
+    }
 }

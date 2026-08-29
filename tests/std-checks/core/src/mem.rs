@@ -13,8 +13,8 @@ pub mod contracts {
     /// Note: this uses `PartialEq` to compare values, which ignores padding bytes.
     #[kani::modifies(x)]
     #[kani::modifies(y)]
-    #[kani::ensures(|_| old(*x) == *y)]
-    #[kani::ensures(|_| old(*y) == *x)]
+    #[kani::ensures(|_| old((*x).clone()) == *y)]
+    #[kani::ensures(|_| old((*y).clone()) == *x)]
     pub fn swap<T: Clone + PartialEq>(x: &mut T, y: &mut T) {
         std::mem::swap(x, y)
     }
@@ -24,8 +24,8 @@ pub mod contracts {
     /// Note: postconditions use PartialEq, which ignores padding bytes.
     /// The src value is captured via old() since it's moved by the function.
     #[kani::modifies(dest)]
-    #[kani::ensures(|result| old(*dest) == *result)]
-    #[kani::ensures(|_| *dest == old(src))]
+    #[kani::ensures(|result| old((*dest).clone()) == *result)]
+    #[kani::ensures(|_| *dest == old(src.clone()))]
     pub fn replace<T: Clone + PartialEq>(dest: &mut T, src: T) -> T {
         std::mem::replace(dest, src)
     }

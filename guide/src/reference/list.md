@@ -12,7 +12,7 @@ equivalent shortcuts. The current options are:
 The default format is `pretty`, which prints a table to the terminal, e.g:
 
 ```
-trust-mc Rust Verifier 0.65.0 (standalone)
+trust_mc Rust Verifier 0.3.0 (standalone)
 
 Contracts:
 +-------+----------+-------------------------------+----------------------------------------------------------------+

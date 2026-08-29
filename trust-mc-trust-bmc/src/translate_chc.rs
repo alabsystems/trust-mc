@@ -17,7 +17,7 @@ use trust_ir::dialect::trust_rust::is_thread_local_addr;
 use trust_ir::inst::{BinOp, CastOp, ICmpOp, Inst, SwitchCase, UnOp};
 use trust_ir::node::InstrNode;
 use trust_ir::proof::ProofAnnotation;
-use trust_ir::ty::Ty;
+use trust_ir::ty::{FatPtrKind, Ty};
 use trust_ir::value::{BlockId, FuncId, ValueId};
 use trust_ir::{Block, Function, Module};
 use trust_mc_core::chc::{ChcQuery, ChcVc, RelationApp, RelationDecl, Rule, RuleBody};
@@ -128,6 +128,26 @@ pub enum TrustIrChcUnsupportedReason {
     NonBooleanCondition,
 }
 
+impl TrustIrChcUnsupportedReason {
+    /// Stable short label for this reason, for DIAGNOSTIC text only.
+    ///
+    /// The demotion message a demoted obligation carries says only "N
+    /// unsupported trust_ir construct(s)"; the count reaches the transport but
+    /// the typed reason did not, so there was no way to learn WHICH of these
+    /// ~50 constructs blocked a given obligation without re-running the
+    /// translator. This is the label the producer records alongside the count.
+    ///
+    /// Derived from the variant name via `Debug` deliberately: a hand-written
+    /// match would silently start returning a wrong/placeholder label for a
+    /// variant added later, whereas this cannot drift. NOTHING parses these
+    /// strings — no verdict, gate or acceptance check reads them — so the only
+    /// contract they carry is legibility.
+    #[must_use]
+    pub fn label(self) -> String {
+        format!("{self:?}")
+    }
+}
+
 /// Translate every function in a `trust_ir::Module` into typed CHC VCs.
 pub fn trust_ir_to_chc_vc(module: &Module, options: &TranslateOptions) -> Vec<ChcVc> {
     trust_ir_to_chc_translation_outputs(module, options)
@@ -181,6 +201,28 @@ struct ChcFuncTranslator<'a> {
     // precisely modeled (a non-scalar struct gets no `stack_cell`), so it must not
     // fail closed; the value is simply left untracked (loads → fresh-symbolic).
     stack_ptrs: BTreeSet<ValueId>,
+    // R3 (cross-block owned-stack consistency): every `Alloca` RESULT id in the
+    // WHOLE function, precomputed before block translation. SSA result ids are
+    // function-unique and immutable, so "this id is the function's own stack
+    // slot" is a block-independent fact — but `stack_ptrs`/`ptr_provenance` are
+    // (correctly) per-block VALUE state and are cleared at each block entry,
+    // which made an access through an alloca pointer from a LATER block (the
+    // pervasive `let r = if c { … } else { … }` result-slot shape main's bridge
+    // emits across blocks) fail closed as an unknown pointer. Seeding each
+    // block's `stack_ptrs` + provenance ROOT from this set restores exactly the
+    // same-block treatment: the ACCESS is a safe owned-slot access (never a
+    // wild pointer), while the VALUE stays untracked across blocks — a
+    // cross-block store is dropped and a cross-block load stays fresh-symbolic
+    // (havoc ⊇ real: obligations depending on it can only become unknown /
+    // refuted-under-abstraction, never falsely proved). The stale-cell guard is
+    // untouched: precise cells still exist only in their defining block.
+    func_alloca_ptrs: BTreeSet<ValueId>,
+    // The declared type of each single-cell (`count: None`) alloca, so a
+    // constant-lane `GEP` walk rooted at an alloca resolves in EVERY block
+    // (`extend_exact_gep_lanes` sourced its root type from the per-block
+    // `stack_cells`, which does not exist outside the defining block). Static
+    // type information only — never a value fact.
+    func_alloca_tys: BTreeMap<ValueId, Ty>,
     // Pointers that are SAFE references (`&T`/`&mut T`): reference-typed function
     // parameters and field/element addresses (`GEP`) derived from them. A field
     // projection off a safe reference is borrow-checker-guaranteed in-bounds, so it
@@ -199,11 +241,33 @@ struct ChcFuncTranslator<'a> {
     // translator does not model (a call argument, a stored *value*, a `Select`,
     // an instruction whose reads are not statically enumerable, …). A store
     // through a pointer with no provenance may alias exactly these, so it
-    // invalidates them. Recorded in instruction order, which is sound because a
-    // cell only exists in the block that allocas it (`stack_cells` is cleared per
-    // block) and promoted cells are alias-free by construction, so a pointer used
-    // by a store cannot have captured an address that escapes only later.
+    // invalidates them. The per-block discoveries are supplemented by
+    // `function_escaped_bases`, which keeps promotion of a transparently derived
+    // or call-escaping cell sound across block resets.
     escaped_cell_bases: BTreeSet<ValueId>,
+    /// WHOLE-FUNCTION escape baseline, computed once and NEVER cleared per block.
+    ///
+    /// `escaped_cell_bases` above is per-block: it is cleared at every block boundary and
+    /// repopulated as instructions are walked. That is exact while a tracked cell cannot
+    /// outlive its def block — which is true only because
+    /// `compute_promotable_cells` step 2 disqualifies every cell whose pointer is used by
+    /// a `GEP` or a `Call`, so no ESCAPING cell is ever promoted and threaded.
+    ///
+    /// The moment promotion is widened to admit GEP-derived cells, that stops holding: a
+    /// base that escaped into a call in block B1 is absent from the per-block set when B2
+    /// is translated, so neither `invalidate_cells_escaping_into_call` nor
+    /// `invalidate_store_targets` would fire in B2 — while the promoted value IS threaded
+    /// into B2 via `block_promoted_cells`. That is a stale read across a block boundary,
+    /// i.e. a false proof.
+    ///
+    /// So this baseline is the SOUNDNESS PREREQUISITE for widening promotion, and it is
+    /// landed first and separately for exactly that reason. It is re-seeded into
+    /// `escaped_cell_bases` at every block reset, which makes all three consumers
+    /// function-aware through ONE change point rather than three.
+    ///
+    /// Strictly MORE invalidation than before ⇒ strictly weaker ⇒ sound. It can only turn
+    /// a precise tracked value into a havoc, never the reverse.
+    function_escaped_bases: BTreeSet<ValueId>,
     ptr_parts: BTreeMap<ValueId, (Expr, Expr)>,
     // Deterministic slice-length metadata per SSA fat value: the real
     // fat-pointer metadata IS a function of the value, so every `PtrMetadata`
@@ -352,6 +416,29 @@ impl ValueBinding {
     }
 }
 
+/// R63 LANE TRACE (diagnostic only, env-gated, no verdict effect).
+/// Set TRUST_LANE_TRACE=1 to learn WHICH fail-closed exit the interior-pointer lane read
+/// takes on a real crate. R62 proved the cell is admitted AND promoted with the widening
+/// on, yet the projected read still did not resolve -- so exactly one of these exits fires
+/// and nothing in the log says which.
+fn lane_trace(exit: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("TRUST_LANE_TRACE").is_some()) {
+        eprintln!("R63_LANE_TRACE {exit}");
+    }
+}
+
+/// R66: the same trace, but GATED to loads whose pointer is actually GEP-DERIVED, and
+/// carrying the function name. R65's trace fired on EVERY `stack_cells` miss, so ordinary
+/// provenance-free loads swamped the signal (2120 exit1 / 113 exit3) and neither survivor
+/// could be quoted as a cause. This one only speaks about the case it was built for.
+fn lane_trace_gep(exit: &str, is_gep_derived: bool, function: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if is_gep_derived && *ON.get_or_init(|| std::env::var_os("TRUST_LANE_TRACE").is_some()) {
+        eprintln!("R66_GEP_LANE {exit} fn={function}");
+    }
+}
+
 impl<'a> ChcFuncTranslator<'a> {
     fn new(func: &'a Function, module: &'a Module, options: &'a TranslateOptions) -> Self {
         Self {
@@ -363,9 +450,12 @@ impl<'a> ChcFuncTranslator<'a> {
             aggregates: BTreeMap::new(),
             stack_cells: BTreeMap::new(),
             stack_ptrs: BTreeSet::new(),
+            func_alloca_ptrs: BTreeSet::new(),
+            func_alloca_tys: BTreeMap::new(),
             valid_ref_ptrs: BTreeSet::new(),
             ptr_provenance: BTreeMap::new(),
             escaped_cell_bases: BTreeSet::new(),
+            function_escaped_bases: BTreeSet::new(),
             ptr_parts: BTreeMap::new(),
             ptr_metadata_syms: BTreeMap::new(),
             block_param_bindings: BTreeMap::new(),
@@ -384,6 +474,21 @@ impl<'a> ChcFuncTranslator<'a> {
     }
 
     fn translate(mut self) -> ChcTranslationOutput {
+        // R3: precompute the function-scoped owned-stack-slot facts (see the
+        // `func_alloca_ptrs` field doc). Pure instruction-syntax scan — result
+        // ids and declared types only, no value state.
+        for block in &self.func.blocks {
+            for node in &block.body {
+                if let Inst::Alloca { ty, count, .. } = &node.inst
+                    && let Some(result) = node.results.first()
+                {
+                    self.func_alloca_ptrs.insert(*result);
+                    if count.is_none() {
+                        self.func_alloca_tys.insert(*result, ty.clone());
+                    }
+                }
+            }
+        }
         self.declare_block_relations();
         self.add_entry_rule();
 
@@ -503,17 +608,41 @@ impl<'a> ChcFuncTranslator<'a> {
         // observe it. See `compute_live_params` for the soundness argument.
         self.block_live_params = self.compute_live_params(&threaded, &def_block);
 
-        // mem2reg: promote scalar single-cell allocas that are used ONLY via direct
-        // Load/Store (never aliased) into a THREADED prefix of every block relation,
-        // whose value is UPDATED by stores. This recovers loop-carried mutable state
+        // mem2reg: promote single-cell allocas used through direct Load/Store and
+        // narrowly guarded transparent derivations into a THREADED prefix of every
+        // block relation, whose value is UPDATED by stores. This recovers loop-carried
+        // mutable state
         // (`let mut acc`/`let mut count`) that the per-block `stack_cells` reset drops,
         // turning otherwise-nullary loop-block predicates into real threaded state.
+        // A cell may be a precise scalar (one leaf) or a TRACKABLE AGGREGATE (one leaf
+        // per flattened scalar leaf) — `promotable_cell_ty` decides, and it is exactly
+        // the set `fresh_stack_cell_value` builds a tracked binding for.
         // `compute_live_params` is reused verbatim: a cell's Load/Store `ptr` operand
         // is collected exactly like a value use, so a cell is threaded into precisely
         // the blocks whose reachable code can Load/Store it (and never its def block,
         // which is excluded via `cell_def`). Threading it is exact — not an
-        // over-approximation — because promotion is granted only to un-aliased cells,
-        // whose threaded value is provably the cell's only value.
+        // over-approximation — because promotion rejects unbounded aliases and admits
+        // only direct accesses plus explicitly modeled transparent derivations, whose
+        // threaded binding remains the cell's complete modeled value.
+        // Whole-function escape baseline — computed BEFORE any block is translated, so it
+        // is available in every block including ones translated before the escape's own
+        // block. Any alloca whose classification is not `Contained` has its address reach
+        // something we do not model away, so it is permanently invalidation-eligible.
+        // `Unbounded` cells are never tracked at all, so in practice this carries the
+        // `IntoCallsOnly` ones; including both keeps the predicate conservative and means
+        // a future change to the admission rules cannot silently un-invalidate a cell.
+        self.function_escaped_bases = self
+            .func
+            .blocks
+            .iter()
+            .flat_map(|block| block.body.iter())
+            .filter(|node| matches!(&node.inst, Inst::Alloca { .. }))
+            .filter_map(|node| node.results.first().copied())
+            .filter(|result| {
+                stack_alloca_escape_classification(self.func, *result) != StackCellEscape::Contained
+            })
+            .collect();
+
         let (promoted, cell_def) = self.compute_promotable_cells();
         self.promoted_cells = promoted.clone();
         self.cell_def_block = cell_def.clone();
@@ -563,8 +692,13 @@ impl<'a> ChcFuncTranslator<'a> {
             // the own params, so every block relation's signature is exactly
             // [SSA threaded] ++ [promoted cells] ++ [own params]. A cell is never
             // carried by its own def block (it is created there by the Alloca), and
-            // dead cells (no reachable Load/Store) are dropped. Each promoted cell is
-            // a precise scalar, so it flattens to a single relation leaf.
+            // dead cells (no reachable Load/Store) are dropped. A promoted cell
+            // flattens to ONE relation leaf when it is a precise scalar and to one
+            // leaf per flattened scalar leaf when it is a trackable aggregate —
+            // `declare_relation_binding_rec` recurses, and `ValueBinding::flat_args`
+            // (used by `block_app` and `add_transition_rule`) walks the identical
+            // depth-first order, so the formal signature and every application stay
+            // leaf-aligned.
             let live_cells = self.block_live_cells.get(&block.id).cloned().unwrap_or_default();
             let mut cell_bindings = Vec::new();
             let mut cell_list = Vec::new();
@@ -819,9 +953,9 @@ impl<'a> ChcFuncTranslator<'a> {
         live
     }
 
-    /// mem2reg candidate analysis: find scalar single-cell allocas whose result
-    /// pointer is NEVER aliased, so their current value can be threaded through
-    /// block relations (like an SSA param, but updated by stores) exactly.
+    /// mem2reg candidate analysis: find single-cell allocas whose result pointer is
+    /// NEVER aliased, so their current value can be threaded through block relations
+    /// (like an SSA param, but updated by stores) exactly.
     ///
     /// Returns the promotable `(ValueId, Ty)` list (deterministic, ordered by the
     /// alloca result's index) and a `result_index -> def_block` map.
@@ -837,10 +971,19 @@ impl<'a> ChcFuncTranslator<'a> {
     /// cell's only value — hence the candidate is disqualified and keeps today's
     /// (per-block, non-threaded) behavior. A type-mismatched Load/Store also
     /// disqualifies, since the flattened relation leaf would not match the cell.
+    ///
+    /// The candidate's cell TYPE is restricted only by `promotable_cell_ty` — a
+    /// precise scalar or a trackable aggregate, one relation leaf per flattened
+    /// scalar leaf. The argument above never inspects the cell's shape: because the
+    /// pointer is un-aliased and every access is a WHOLE-CELL, exact-type Load/Store
+    /// (a field projection needs a `GEP`, whose `base` use disqualifies the
+    /// candidate), the cell's value is a pure function of the Store sequence for an
+    /// aggregate exactly as it is for a scalar. Enums are excluded by
+    /// `promotable_cell_ty` — see its doc.
     fn compute_promotable_cells(
         &self,
     ) -> (Vec<(ValueId, Ty)>, std::collections::BTreeMap<u32, BlockId>) {
-        compute_promotable_cells_of(self.func)
+        compute_promotable_cells_of(self.module, self.func)
     }
 
     fn add_entry_rule(&mut self) {
@@ -865,7 +1008,32 @@ impl<'a> ChcFuncTranslator<'a> {
         self.stack_cells.clear();
         self.stack_ptrs.clear();
         self.ptr_provenance.clear();
-        self.escaped_cell_bases.clear();
+        // Re-seed, do NOT clear to empty: the whole-function baseline must survive
+        // every block boundary or invalidation cannot fire for a threaded cell.
+        self.escaped_cell_bases = self.function_escaped_bases.clone();
+        // R3 (cross-block owned-stack consistency): re-seed every block with the
+        // block-independent fact "these SSA ids are the function's own stack
+        // slots" — exactly what `translate_alloca` records in the defining
+        // block. This restores the same-block treatment for an access reaching
+        // the alloca from a later block: the ACCESS is safe (owned slot, so no
+        // fail-closed memory/pointer-arithmetic error), while the VALUE stays
+        // untracked (`stack_cells` is not seeded — a cross-block store is
+        // dropped and a cross-block load havocs to fresh-symbolic; havoc ⊇ real,
+        // never a false proof). Runs AFTER the clears and BEFORE the mem2reg
+        // seeding below, whose promoted cells overwrite compatibly.
+        //
+        // DELIBERATELY NOT seeded: `ptr_provenance`. Pre-populating provenance
+        // roots would make `record_interior_pointer_escapes`' conservative
+        // "reads not statically enumerable ⇒ every interior pointer escaped"
+        // arm fire from the first instruction of every block (provenance would
+        // never be empty), demoting precisely-tracked same-block cells that the
+        // baseline kept exact. Cross-block GEP chains instead recover their
+        // root at the GEP itself (see the alloca-root fallback there), which
+        // enters provenance only when a derivation actually occurs — the same
+        // point the defining block enters it.
+        for alloca in self.func_alloca_ptrs.clone() {
+            self.stack_ptrs.insert(alloca);
+        }
         // Bind the threaded immutable-parameter prefix first so a block's own
         // params (which redeclare a threaded id on a back-edge) win on conflict.
         if let (Some(threaded), Some(bindings)) = (
@@ -897,6 +1065,34 @@ impl<'a> ChcFuncTranslator<'a> {
                 self.stack_cells
                     .insert(*cell, StackCell { ty: ty.clone(), value: binding.clone() });
                 self.stack_ptrs.insert(*cell);
+                // R60: re-seed the PROVENANCE ROOT too, not just the value and the
+                // owned-slot fact.
+                //
+                // `ptr_provenance` is cleared at every block boundary and re-established
+                // only by `translate_alloca`, which runs in the DEF BLOCK. So a threaded
+                // cell arrives here with its value and its `stack_ptrs` membership intact
+                // but with NO provenance — and a `GEP` on it in this block therefore
+                // resolves to nothing, the interior-pointer read cannot find the cell, and
+                // it havocs. That is the mechanical reason a cross-block field projection
+                // cannot be modelled today, and it is why the cross-block bucket
+                // (`store_/load_in_other_block`, 221 rows at R59, 181 of them
+                // aggregate-typed) is unreachable rather than merely unattempted.
+                //
+                // SOUNDNESS. This asserts exactly what `translate_alloca` asserts in the
+                // def block: the cell is its own provenance root at the empty lane path.
+                // It is a TRUE fact about a cell that `compute_promotable_cells` has
+                // already proved un-aliased — promotion is granted only to cells with no
+                // escaping use, so no other pointer can be a provenance root for it. It
+                // adds no admission and no discharge; it only lets a read that the model
+                // already threads resolve to the value it already carries.
+                //
+                // Count-inert on its own: promotion still disqualifies any cell with a
+                // `GEP` use, so no projected cell is threaded yet. This lands FIRST and
+                // ALONE as the prerequisite, exactly as `invalidate_cells_escaping_into_call`
+                // and `function_escaped_bases` did — the widening that consumes it is a
+                // separate change with its own soundness argument.
+                self.ptr_provenance
+                    .insert(*cell, PtrProvenance { base: *cell, lanes: Some(Vec::new()) });
             }
         }
         if let Some(bindings) = self.block_param_bindings.get(&block.id) {
@@ -930,6 +1126,7 @@ impl<'a> ChcFuncTranslator<'a> {
         path_constraints: &mut Vec<Expr>,
     ) -> bool {
         self.record_interior_pointer_escapes(&node.inst);
+        self.invalidate_cells_escaping_into_call(&node.inst);
         match &node.inst {
             Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
                 self.translate_integer_binop(*op, ty, *lhs, *rhs, node, from, path_constraints);
@@ -1188,9 +1385,35 @@ impl<'a> ChcFuncTranslator<'a> {
                     self.bind_first_result(node, result);
                     return false;
                 };
-                let then_expr = self.resolve(*then_val, ty);
-                let else_expr = self.resolve(*else_val, ty);
-                self.bind_first_result(node, Expr::ite(cond_expr, then_expr, else_expr));
+                // `resolve` is not type-checked: malformed TrustIR can bind an arm to a
+                // different carrier (Bool vs BV, or incompatible float widths). Width
+                // normalization repairs valid integer width drift, but deliberately
+                // leaves incompatible carriers unchanged. Check both arms exactly and
+                // use AY's panic-proof constructor before accepting the Select.
+                let then_expr =
+                    normalize_expr_to_exact_ty(&self.resolve(*then_val, ty), ty);
+                let else_expr =
+                    normalize_expr_to_exact_ty(&self.resolve(*else_val, ty), ty);
+                let selected = match (then_expr, else_expr) {
+                    (Some(then_expr), Some(else_expr)) => {
+                        Expr::try_ite(cond_expr, then_expr, else_expr).ok()
+                    }
+                    _ => None,
+                };
+                let Some(selected) = selected else {
+                    let result = self.fresh_symbolic("unsupported_result", ty);
+                    self.bind_first_result(node, result);
+                    self.add_unsupported_error(
+                        block,
+                        instruction_index,
+                        node,
+                        TrustIrChcUnsupportedReason::MalformedControlFlow,
+                        from,
+                        path_constraints,
+                    );
+                    return false;
+                };
+                self.bind_first_result(node, selected);
                 false
             }
             Inst::NullPtr => {
@@ -1418,7 +1641,22 @@ impl<'a> ChcFuncTranslator<'a> {
                     // out-of-range step keeps the base but drops to "unknown offset",
                     // making a later store havoc the whole cell rather than silently
                     // update the wrong lane.
-                    if let Some(base_provenance) = self.ptr_provenance.get(base).cloned()
+                    // R3 (cross-block owned-stack consistency): a GEP whose base
+                    // is one of the FUNCTION's own alloca results but has no
+                    // per-block provenance entry (the alloca lives in an earlier
+                    // block) roots a fresh provenance chain here — exactly the
+                    // {base, whole-cell} root `translate_alloca` records in the
+                    // defining block. Static SSA-identity fact only; entering
+                    // provenance at the derivation site (not block entry) keeps
+                    // `record_interior_pointer_escapes`' emptiness fast-path and
+                    // its conservative escape accounting byte-identical for
+                    // blocks that never touch an alloca interior.
+                    let base_provenance = self.ptr_provenance.get(base).cloned().or_else(|| {
+                        self.func_alloca_ptrs
+                            .contains(base)
+                            .then(|| PtrProvenance { base: *base, lanes: Some(Vec::new()) })
+                    });
+                    if let Some(base_provenance) = base_provenance
                         && let Some(result) = node.results.first()
                     {
                         let lanes = base_provenance.lanes.and_then(|lanes| {
@@ -1470,33 +1708,53 @@ impl<'a> ChcFuncTranslator<'a> {
                 self.bind_first_result(node, data);
                 false
             }
-            Inst::PtrMetadata { ptr_ty: _, metadata_ty, ptr } => {
+            Inst::PtrMetadata { ptr_ty, metadata_ty, ptr } => {
                 let metadata = if let Some((_, metadata)) = self.ptr_parts.get(ptr) {
                     metadata.clone()
                 } else if matches!(metadata_ty, Ty::Unit) {
                     Expr::true_()
                 } else if matches!(metadata_ty, Ty::U64) {
                     // A slice/str fat-pointer's metadata is its element/byte LENGTH
-                    // (usize == U64), which the language guarantees lies in
-                    // [0, isize::MAX] (total byte size <= isize::MAX, each element
-                    // >= 1 byte). Model it as a fresh symbolic bounded by isize::MAX
-                    // instead of an opaque unsupported value, so the CHC/PDR lane can
-                    // prove obligations over `s.len()` — e.g. `s.len() + 1` no-overflow
-                    // and `while i < s.len() { i += 1 }`. SOUND for proofs AND cex: the
-                    // length is a genuine free value and EVERY value in [0, isize::MAX]
-                    // is a realizable length, so this neither over- nor under-approximates.
-                    // Gated to `U64` so a `dyn Trait` vtable pointer (Ty::Ptr) is NOT
-                    // mis-bounded — it keeps the opaque-unsupported path below.
+                    // (usize == U64). Model it as a symbolic instead of an opaque
+                    // unsupported value, so the CHC/PDR lane can prove obligations over
+                    // `s.len()` — e.g. `s.len() + 1` no-overflow and
+                    // `while i < s.len() { i += 1 }`. Gated to `U64` so a `dyn Trait`
+                    // vtable pointer (Ty::Ptr) is NOT mis-bounded — it keeps the
+                    // opaque-unsupported path below.
                     //
-                    // DETERMINISTIC per SSA value (`ptr_metadata_syms`): the real
-                    // metadata is a function of the fat value, so repeated reads
-                    // of the SAME `ValueId` reuse one symbol. This is what lets a
-                    // producer-asserted exact length (`Assume(PtrMetadata(v) ==
-                    // len)`, the faithful `&str`-constant lowering) bind every
-                    // later `s.len()` read of the same value in the same clause
-                    // scope, instead of evaporating against a fresh symbol. The
-                    // isize::MAX bound is (re-)pushed at EVERY read site because
-                    // path constraints are per-clause, not per-symbol.
+                    // Trust (P0 ZST-slice-length FALSE PROOF): the `len <= isize::MAX`
+                    // upper bound is a theorem ONLY when the element is provably NON-ZST.
+                    // `isize::MAX` caps the total BYTE size, so it caps the ELEMENT count
+                    // only via `size_of::<T>() >= 1`. A ZERO-sized element breaks that
+                    // step: `[(); usize::MAX]` occupies 0 bytes, so a `&[()]` length may
+                    // legally reach `usize::MAX`. The bound used to be pushed for EVERY
+                    // U64 metadata, which false-PROVED
+                    //
+                    //     pub fn f(z: &[()]) -> usize { z.len() + 1 }
+                    //
+                    // no-overflow (`len <= isize::MAX` ⟹ `len + 1` fits), while
+                    // `let v: Vec<()> = vec![(); usize::MAX]; f(&v)` really overflows.
+                    // `fat_ptr_metadata_len_is_isize_bounded` therefore admits the bound
+                    // only for `str` (a BYTE length — every byte is 1 byte) and for a
+                    // slice whose element type is PROVABLY non-ZST, mirroring the three
+                    // sibling gates (`trust_vcgen::build_len_call_bound_facts` /
+                    // `nonzst_slice_len_vars`, the bridge's
+                    // `conjoin_native_slice_len_bounds`, and the `str`-vs-slice split in
+                    // `trust_types::total_call_summaries`). Every other shape keeps an
+                    // UNCONSTRAINED symbolic — a sound over-approximation (the free value
+                    // ranges over all of `u64` ⊇ the realizable lengths), so an
+                    // obligation over a ZST length stays unknown/refuted, never proved.
+                    //
+                    // With the bound present the modeling is still exact in both
+                    // directions: the length is a genuine free value and EVERY value in
+                    // [0, isize::MAX] is a realizable length for a non-ZST element.
+                    //
+                    // DETERMINISTIC per SSA value (`ptr_metadata_syms`): metadata is a
+                    // function of the fat value, so repeated reads of the SAME `ValueId`
+                    // reuse one symbol. A producer-asserted exact length therefore binds
+                    // every later read of that value. The conditional bound is pushed at
+                    // EVERY read site because path constraints are per-clause, not
+                    // per-symbol.
                     let metadata = match self.ptr_metadata_syms.get(ptr) {
                         Some(existing) => existing.clone(),
                         None => {
@@ -1505,8 +1763,10 @@ impl<'a> ChcFuncTranslator<'a> {
                             fresh
                         }
                     };
-                    let isize_max = Expr::bitvec_const(i64::MAX as i128, 64);
-                    path_constraints.push(metadata.clone().bvule(isize_max));
+                    if fat_ptr_metadata_len_is_isize_bounded(self.module, ptr_ty) {
+                        let isize_max = Expr::bitvec_const(i64::MAX as i128, 64);
+                        path_constraints.push(metadata.clone().bvule(isize_max));
+                    }
                     metadata
                 } else {
                     let result = self.fresh_symbolic("ptr_metadata", metadata_ty);
@@ -1655,7 +1915,7 @@ impl<'a> ChcFuncTranslator<'a> {
                     self.bind_first_result(node, data);
                     return false;
                 }
-                if let Some(result) = self.eval_cast(*op, src_ty, dst_ty, *operand) {
+                if let Some((src_val, result)) = self.eval_cast(*op, src_ty, dst_ty, *operand) {
                     self.bind_first_result(node, result);
                     // A1 SOUNDNESS: a NARROWING integer cast (`CastOp::Trunc`, src wider than
                     // dst) loses bits unless the value already fits the destination. Emit the
@@ -1680,7 +1940,12 @@ impl<'a> ChcFuncTranslator<'a> {
                         )
                         && src_w > dst_w
                     {
-                        let src_val = self.resolve(*operand, src_ty);
+                        // `src_val` is the operand already coerced to `src_ty`'s carrier
+                        // by `eval_cast`, so it is EXACTLY `src_w` bits and `reext` below
+                        // — `dst_w` kept bits re-extended by `src_w - dst_w` — matches it
+                        // by construction. Re-resolving the raw binding here instead
+                        // compared a `BitVec 128` against a `BitVec 64` and tripped
+                        // `Expr::eq`'s same-sort contract.
                         let kept = src_val.clone().extract(dst_w - 1, 0);
                         let reext = if dst_ty.is_signed() {
                             kept.sign_extend(src_w - dst_w)
@@ -1826,9 +2091,41 @@ impl<'a> ChcFuncTranslator<'a> {
                 );
                 false
             }
-            Inst::InsertElement { ty: dst_ty, .. }
-            | Inst::FCmp { ty: dst_ty, .. }
-            | Inst::LoadSlot { ty: dst_ty, .. } => {
+            // An array/vector element WRITE. The symmetric counterpart of the
+            // `InsertField` arm above (struct/tuple field write): TrustIR
+            // `InsertElement` is a PURE functional update — it READS `array` and
+            // BINDS A NEW SSA result; the source value's binding is never mutated
+            // (`trust_ir::interpret::eval_insert_element` clones before assigning).
+            // So there is no in-place location whose tracked value a model could
+            // leave stale; the only thing that must be right is the RESULT binding.
+            //
+            // Before this arm existed, EVERY `InsertElement` fell into the
+            // fail-closed bucket below and emitted an UNCONDITIONALLY REACHABLE
+            // error rule, which makes every obligation in the enclosing function
+            // unprovable by construction — even though the READ side
+            // (`ExtractElement`) has long been modeled without failing closed and
+            // a `[T; N <= 256]` is already a fully trackable N-field aggregate
+            // (`immediate_aggregate_field_tys`). The pervasive shape this blocks is
+            // the `[core::fmt::rt::Argument; N]` array every `format!`/`write!`
+            // builds: one `InsertElement` at a CONSTANT index per format argument.
+            Inst::InsertElement { ty, array, index, value } => {
+                if let Some(result) = self.eval_insert_element(ty, *array, *index, *value) {
+                    self.bind_aggregate_result(node, result, ty);
+                } else {
+                    let result = self.fresh_symbolic("unsupported_result", ty);
+                    self.bind_first_result(node, result);
+                    self.add_unsupported_error(
+                        block,
+                        instruction_index,
+                        node,
+                        TrustIrChcUnsupportedReason::AggregateUpdate,
+                        from,
+                        path_constraints,
+                    );
+                }
+                false
+            }
+            Inst::FCmp { ty: dst_ty, .. } | Inst::LoadSlot { ty: dst_ty, .. } => {
                 let result_ty =
                     if matches!(&node.inst, Inst::FCmp { .. }) { &Ty::Bool } else { dst_ty };
                 let result = self.fresh_symbolic("unsupported_result", result_ty);
@@ -1928,7 +2225,16 @@ impl<'a> ChcFuncTranslator<'a> {
                 // A borrow is a transparent alias, so it inherits the referent's
                 // interior-pointer provenance verbatim. Without this, `*(&mut local)`
                 // and `*(&mut local.field)` lose their base and the write is dropped.
-                if let Some(provenance) = self.ptr_provenance.get(ptr).cloned()
+                // R3: a borrow of one of the FUNCTION's own allocas from a block
+                // other than the defining one roots the same {base, whole-cell}
+                // provenance the defining block would have inherited (see the GEP
+                // arm's alloca-root fallback for the rationale and scope).
+                let provenance = self.ptr_provenance.get(ptr).cloned().or_else(|| {
+                    self.func_alloca_ptrs
+                        .contains(ptr)
+                        .then(|| PtrProvenance { base: *ptr, lanes: Some(Vec::new()) })
+                });
+                if let Some(provenance) = provenance
                     && let Some(result_id) = node.results.first()
                 {
                     self.ptr_provenance.insert(*result_id, provenance);
@@ -2025,12 +2331,120 @@ impl<'a> ChcFuncTranslator<'a> {
         let Some(value) = self.fresh_stack_cell_value(ty) else {
             return;
         };
+        // Trust (Fix a): DEMOTE a precisely-trackable cell to OPAQUE — leave the
+        // pointer in `stack_ptrs` (inserted above) but record NO `stack_cell` — when
+        // its pointer ESCAPES or its direct Load/Store accesses are type-inconsistent.
+        // Either condition would let a hidden write through an ALIAS, or a
+        // silently-dropped mismatched-type Store, leave the tracked value STALE, so a
+        // later same-type Load would read a fabricated value (a FALSE PROOF). With no
+        // `stack_cell`, every later Load misses (`translate_stack_load` returns `false`)
+        // and havocs to a fresh symbolic while `known_stack` suppresses the memory
+        // error, and every later Store misses and is dropped (havoc ⊇ real) — an
+        // UNCONDITIONAL sound over-approximation. A promoted cell is type-consistent and
+        // never `Unbounded` by construction. `Contained` cells stay precise;
+        // `IntoCallsOnly` cells stay tracked but are havoced at every call. Thus the
+        // guard does not demote a threaded cell without its promotion analysis already
+        // refusing it. Removes facts only — a previously-lenient proof that relied on
+        // tracking an escaping cell now becomes UNKNOWN (sound), never a false proof.
+        //
+        // NARROWED (half 2 of the provenance model). The escape half of this guard is
+        // now `stack_alloca_escape_classification`, which walks the GEP/Borrow
+        // derivation closure instead of testing the alloca id alone. `Unbounded` still
+        // demotes exactly as before. `IntoCallsOnly` is admitted, and is sound ONLY
+        // because `invalidate_cells_escaping_into_call` havocs the cell at every call
+        // its pointer reaches — precise before the call, havoc after. The two halves
+        // must never be separated; admitting this without that invalidation is a
+        // completed false proof.
+        //
+        // The strictly-conservative `stack_alloca_pointer_is_non_escaping` is left
+        // untouched and still exported, because the driver gate's contract text names
+        // it. `Contained` implies it; the added coverage is precisely the GEP/Borrow
+        // derivations it counted as escapes despite
+        // `record_interior_pointer_escapes` treating those same positions as TRACKED.
+        // The type-match half is unchanged: it guards a different false proof (a
+        // silently-dropped mismatched-type Store leaving a stale value).
+        if matches!(
+            stack_alloca_escape_classification(self.func, result),
+            StackCellEscape::Unbounded
+        ) || !stack_alloca_cell_accesses_match_type(self.func, result, ty)
+        {
+            return;
+        }
         self.stack_cells.insert(result, StackCell { ty: ty.clone(), value });
+    }
+
+    /// R66: is `ptr` the RESULT of a `GEP`? Used only to gate the diagnostic trace so
+    /// ordinary provenance-free loads stop swamping the signal. No verdict effect.
+    fn ptr_is_gep_derived(&self, ptr: ValueId) -> bool {
+        self.func.blocks.iter().flat_map(|b| b.body.iter()).any(|n| {
+            matches!(&n.inst, Inst::GEP { .. }) && n.results.iter().any(|r| *r == ptr)
+        })
     }
 
     fn translate_stack_load(&mut self, ty: &Ty, ptr: ValueId, node: &InstrNode) -> bool {
         let Some(cell) = self.stack_cells.get(&ptr).cloned() else {
-            return false;
+            // R63: INTERIOR-POINTER LANE READ — the mirror of the store side.
+            //
+            // This lookup is keyed by the LOAD's `ptr` operand, which for a GEP-derived
+            // pointer is the GEP RESULT, not the cell base. So a field read through
+            // `&s.a` missed here and havoced, even for a cell that is tracked and (once
+            // promoted) threaded. Stores through interior pointers have had a precise
+            // lane since the provenance work (`model_indirect_store` / `store_cell_lane`,
+            // pinned by `field_store_through_borrow_is_modeled_precisely`); LOADS had
+            // none. That asymmetry — not the admission gate, not the promotion candidate
+            // set (R62 proved both fine) — is what blocked the cross-block projected read.
+            //
+            // SOUNDNESS. This is an ADDITION on the exactly-resolving path only; every
+            // other case still falls through to `return false`, which havocs, exactly as
+            // before. `lanes` is `Some` only when `extend_exact_gep_lanes` resolved every
+            // step to a CONSTANT field index with a matching type — `None` means an
+            // unknown offset and is refused here. The extracted leaf's type must equal the
+            // load type, so a mismatched-width or wrong-field read cannot borrow a leaf it
+            // does not name. It reads a value the model already carries; it cannot
+            // manufacture one.
+            let Some(provenance) = self.ptr_provenance.get(&ptr).cloned() else {
+                lane_trace("exit1_no_provenance");
+                lane_trace_gep("exit1_no_provenance", self.ptr_is_gep_derived(ptr), &self.func.name);
+                return false;
+            };
+            let Some(lanes) = provenance.lanes else {
+                lane_trace("exit2_lanes_none");
+                lane_trace_gep("exit2_lanes_none", self.ptr_is_gep_derived(ptr), &self.func.name);
+                return false;
+            };
+            // Exactly one constant lane: a nested path is not modelled here, and the
+            // empty path is the whole cell, which the direct lookup above already covers.
+            let [(field, field_ty)] = lanes.as_slice() else {
+                let e3 = if lanes.is_empty() { "exit3a_empty_path" } else { "exit3b_nested_chain" };
+                lane_trace(e3);
+                lane_trace_gep(e3, self.ptr_is_gep_derived(ptr), &self.func.name);
+                return false;
+            };
+            if field_ty != ty {
+                lane_trace("exit4_field_ty_mismatch");
+                lane_trace_gep("exit4_field_ty_mismatch", self.ptr_is_gep_derived(ptr), &self.func.name);
+                return false;
+            }
+            let Some(base_cell) = self.stack_cells.get(&provenance.base).cloned() else {
+                lane_trace("exit5_base_not_tracked");
+                lane_trace_gep("exit5_base_not_tracked", self.ptr_is_gep_derived(ptr), &self.func.name);
+                return false;
+            };
+            let ValueBinding::Aggregate(aggregate) = base_cell.value else {
+                lane_trace("exit6_base_not_aggregate");
+                lane_trace_gep("exit6_base_not_aggregate", self.ptr_is_gep_derived(ptr), &self.func.name);
+                return false;
+            };
+            let Some(leaf) = aggregate.fields.get(*field).cloned() else {
+                return false;
+            };
+            match leaf {
+                ValueBinding::Scalar(expr) => self.bind_first_result(node, expr),
+                ValueBinding::Aggregate(nested) => {
+                    self.bind_aggregate_result(node, nested, ty)
+                }
+            }
+            return true;
         };
         if cell.ty != *ty {
             return false;
@@ -2070,9 +2484,27 @@ impl<'a> ChcFuncTranslator<'a> {
 
     /// The constant field/element lane a `GEP` index denotes, or `None` when the
     /// index is symbolic (or too large to be a lane).
+    ///
+    /// SIGNEDNESS: a `BitVecConst` carries the RAW UNSIGNED bitvector, so a
+    /// negative signed constant reads back WRAPPED — `-1i8` arrives as `255`.
+    /// Taking that at face value names a DIFFERENT lane than the program does,
+    /// and a negative lane index is undefined behaviour in the reference
+    /// semantics anyway (`trust-ir :: interpret.rs :: runtime_index` rejects
+    /// `int.signed && int.as_signed() < 0`). Worse, a wrapped index can land back
+    /// IN BOUNDS — `-1i8` -> lane 255 of a `[T; 256]` — so the caller's
+    /// bounds check is not a backstop for it.
+    ///
+    /// Requiring the TOP BIT to be CLEAR makes the signed and unsigned readings
+    /// provably agree, so this stays correct without consulting the index's
+    /// declared type (which this layer does not have). Declining is FAIL-CLOSED at
+    /// both call sites: the element-write path keeps its unconditional
+    /// `AggregateUpdate` error rule and the GEP path records an unknown offset.
     fn constant_lane_index(&self, index: ValueId) -> Option<usize> {
         match self.values.get(&index)?.value() {
-            ay_bindings::ExprValue::BitVecConst { value, .. } => {
+            ay_bindings::ExprValue::BitVecConst { value, width } => {
+                if value.bits() >= u64::from(*width) {
+                    return None;
+                }
                 value.to_string().parse::<usize>().ok()
             }
             _ => None,
@@ -2092,7 +2524,16 @@ impl<'a> ChcFuncTranslator<'a> {
         field: usize,
         pointee_ty: &Ty,
     ) -> Option<Vec<(usize, Ty)>> {
-        let mut lane_ty = self.stack_cells.get(&base)?.ty.clone();
+        // R3: the lane walk's ROOT type is static declaration information. Source
+        // it from the per-block cell when one exists (byte-identical to before),
+        // else from the function-scoped alloca type map so a constant-lane chain
+        // rooted at an alloca resolves in EVERY block, not only the defining one.
+        // The walk itself is unchanged: every step still demands exact layout
+        // evidence, and any uncertainty keeps `lanes: None` (fail-closed).
+        let mut lane_ty = match self.stack_cells.get(&base) {
+            Some(cell) => cell.ty.clone(),
+            None => self.func_alloca_tys.get(&base)?.clone(),
+        };
         for (prior_field, prior_pointee_ty) in &lanes {
             lane_ty = self.exact_gep_lane_ty(&lane_ty, *prior_field, prior_pointee_ty)?;
         }
@@ -2319,6 +2760,49 @@ impl<'a> ChcFuncTranslator<'a> {
     /// with the same shape when possible, because a promoted cell's binding is part
     /// of its block relation's signature; only a cell whose type can no longer be
     /// given a fresh binding is dropped (a later `Load` then havocs anyway).
+    /// CALL-INVALIDATION. A tracked cell whose interior pointer reaches a CALL must be
+    /// havoc'd at that call, because the callee may write through it.
+    ///
+    /// THE HOLE THIS CLOSES. `record_interior_pointer_escapes` already records call
+    /// arguments — `Inst::Call` takes its `_ => uses` arm, so the escaped base lands in
+    /// `escaped_cell_bases`. But that set had only TWO consumers,
+    /// `invalidate_store_targets` and `store_target_cell_survives`, and BOTH are reached
+    /// solely from the `Store`/`AtomicStore` path. So the escape was recorded and then
+    /// acted on only if an unrelated indirect store happened to follow. For
+    /// `f(&mut local)` with no intervening unknown store, the next `Load` returned the
+    /// tracked PRE-CALL value: a stale read of memory the callee may have overwritten.
+    /// That is a completed false proof, and it is why the coarse whole-function escape
+    /// guard in `translate_alloca` could not simply be narrowed — that guard was the only
+    /// thing covering this.
+    ///
+    /// SOUNDNESS. Invalidation is `fresh_stack_cell_value` — an unconstrained havoc, or
+    /// removal of the cell when the type has no trackable value. It only ever REMOVES
+    /// facts, so a proof that previously relied on a stale post-call value now becomes
+    /// UNKNOWN. It cannot manufacture one. This is deliberately independent of whether the
+    /// callee is bundled, proven, or absent: an unproven or absent callee is exactly the
+    /// case where we know least about what it wrote.
+    ///
+    /// `CallIndirect` is included: an unresolved target is strictly less known than a
+    /// resolved one.
+    fn invalidate_cells_escaping_into_call(&mut self, inst: &Inst) {
+        if !matches!(inst, Inst::Call { .. } | Inst::CallIndirect { .. }) {
+            return;
+        }
+        if self.escaped_cell_bases.is_empty() || self.stack_cells.is_empty() {
+            return;
+        }
+        // Collect first: `invalidate_stack_cell` takes `&mut self`.
+        let escaped: Vec<ValueId> = self
+            .escaped_cell_bases
+            .iter()
+            .copied()
+            .filter(|base| self.stack_cells.contains_key(base))
+            .collect();
+        for base in escaped {
+            self.invalidate_stack_cell(base);
+        }
+    }
+
     fn invalidate_stack_cell(&mut self, base: ValueId) {
         let Some(cell_ty) = self.stack_cells.get(&base).map(|cell| cell.ty.clone()) else {
             return;
@@ -2874,12 +3358,22 @@ impl<'a> ChcFuncTranslator<'a> {
                         if is_call_summary_scalar_ty(ty) =>
                     {
                         let cond_expr = call_summary_bool(&state.locals, *cond)?;
-                        let then_expr = call_summary_scalar(&state.locals, *then_val)?;
-                        let else_expr = call_summary_scalar(&state.locals, *else_val)?;
+                        // Decline the summary when malformed TrustIR gives either arm
+                        // an incompatible carrier. The caller then takes the existing
+                        // fail-closed UnsupportedDirectCallSummary path.
+                        let then_expr = normalize_expr_to_exact_ty(
+                            &call_summary_scalar(&state.locals, *then_val)?,
+                            ty,
+                        )?;
+                        let else_expr = normalize_expr_to_exact_ty(
+                            &call_summary_scalar(&state.locals, *else_val)?,
+                            ty,
+                        )?;
+                        let selected = Expr::try_ite(cond_expr, then_expr, else_expr).ok()?;
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Scalar(Expr::ite(cond_expr, then_expr, else_expr)),
+                            ValueBinding::Scalar(selected),
                         )?;
                     }
                     Inst::NullPtr => {
@@ -3744,6 +4238,54 @@ impl<'a> ChcFuncTranslator<'a> {
         Some(result)
     }
 
+    /// EXACT model of an array/vector element WRITE, the element-index analogue of
+    /// [`Self::eval_insert_field`]. `Some` is returned ONLY when the update can be
+    /// expressed exactly; the caller keeps the pre-existing FAIL-CLOSED path
+    /// (an unconditionally reachable error rule) for `None` — deliberately NOT a
+    /// havoc that would forget the write.
+    ///
+    /// Exactness requires ALL of:
+    /// * `ty` — which TrustIR fixes to be the ARRAY's own type, not the element's
+    ///   (`trust_ir::interpret::eval_insert_element` starts with
+    ///   `expect_ty(array, result_ty)`) — is a trackable aggregate. For `[T; N]`
+    ///   with `N <= 256` `immediate_aggregate_field_tys` already yields N copies of
+    ///   `T`, and `aggregate_field_tys` additionally enforces the flattened-leaf
+    ///   budget.
+    /// * the index is a COMPILE-TIME CONSTANT. A symbolic index names an unknown
+    ///   lane, for which "copy the aggregate and replace field i" is simply the
+    ///   WRONG model (it would leave every other lane readable as its old value
+    ///   while the real write could have landed on any of them), so it fails closed.
+    /// * that constant is IN BOUNDS. An out-of-bounds element write is TrustIR
+    ///   undefined behaviour (the interpreter raises `UndefinedBehavior`); there is
+    ///   no defined result to model, so it fails closed.
+    /// * the source array resolves to an aggregate binding of matching arity.
+    ///
+    /// Soundness of the exact arm rests on TrustIR `InsertElement` being a PURE
+    /// functional update — the result is a fresh SSA value and the source array
+    /// value keeps its own (still correct) binding — so modeling it cannot leave a
+    /// stale value readable through any surviving name.
+    fn eval_insert_element(
+        &mut self,
+        ty: &Ty,
+        array: ValueId,
+        index: ValueId,
+        value: ValueId,
+    ) -> Option<AggregateValue> {
+        let field_tys = self.aggregate_field_tys(ty)?;
+        let element_index = self.constant_lane_index(index)?;
+        let element_ty = field_tys.get(element_index)?.clone();
+        let mut result = self.resolve_aggregate(array, ty)?;
+        if result.fields.len() != field_tys.len() {
+            return None;
+        }
+        result.fields[element_index] = if is_scalar_field_ty(&element_ty) {
+            ValueBinding::Scalar(self.resolve(value, &element_ty))
+        } else {
+            ValueBinding::Aggregate(self.resolve_aggregate(value, &element_ty)?)
+        };
+        Some(result)
+    }
+
     fn eval_binop(&mut self, op: BinOp, ty: &Ty, lhs: &Expr, rhs: &Expr) -> Expr {
         let lhs = &normalize_expr_to_ty(lhs, ty);
         let rhs = &normalize_expr_to_ty(rhs, ty);
@@ -3800,7 +4342,7 @@ impl<'a> ChcFuncTranslator<'a> {
                     .clone()
                     .try_ne(rhs.clone())
                     .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
-// Trust: the DEDICATED boolean connectives (trust-ir 4b06918) -- the same
+                // Trust: the DEDICATED boolean connectives (trust-ir 4b06918) -- the same
                 // logical semantics as the `And`/`Or`/`Xor` arms above, which MIR
                 // reaches only through opcode overloading. Explicit arms, not the
                 // catch-all: havocing them to a fresh symbolic would discard exactly
@@ -3817,7 +4359,7 @@ impl<'a> ChcFuncTranslator<'a> {
                     .clone()
                     .try_ne(rhs.clone())
                     .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
-                                _ => self.fresh_symbolic("binop_result", ty),
+                _ => self.fresh_symbolic("binop_result", ty),
             }
         } else {
             self.fresh_symbolic("binop_result", ty)
@@ -3863,15 +4405,25 @@ impl<'a> ChcFuncTranslator<'a> {
         }
     }
 
+    /// Resolve `operand` into the carrier its DECLARED `src_ty` names (see
+    /// [`cast_operand_in_src_carrier`]) and apply the cast.
+    ///
+    /// Returns `(src_in_declared_carrier, result)`. Handing the coerced source back is
+    /// load-bearing: the caller's lossless-narrowing obligation MUST be built from the
+    /// same expression the result was derived from. Re-`resolve`-ing the operand there
+    /// re-introduced the raw, possibly wrong-width binding — which is exactly how the
+    /// `EQ requires same sort` abort happened.
     fn eval_cast(
         &mut self,
         op: CastOp,
         src_ty: &Ty,
         dst_ty: &Ty,
         operand: ValueId,
-    ) -> Option<Expr> {
+    ) -> Option<(Expr, Expr)> {
         let operand = self.resolve(operand, src_ty);
-        eval_cast_expr(op, src_ty, dst_ty, operand)
+        let operand = cast_operand_in_src_carrier(src_ty, operand)?;
+        let result = eval_cast_expr(op, src_ty, dst_ty, operand.clone())?;
+        Some((operand, result))
     }
 
     /// UNWRAP a single-pointer-newtype struct value (`NonNull`/`Box`/…) to its
@@ -3956,7 +4508,57 @@ fn resize_bitvec_for_int_to_ptr(expr: Expr, src_ty: &Ty, src_width: u32) -> Expr
     }
 }
 
+/// Coerce a cast operand into the carrier its DECLARED `src_ty` names.
+///
+/// `ChcFuncTranslator::resolve` returns whatever expression is currently BOUND to a
+/// value id; it is not width-typed, so the binding can carry a different bitvector
+/// width than the type the consuming instruction declares for that operand (a u64
+/// limb read out of a u128 intermediate is the shape `num-bigint`/`num-traits`
+/// exercises). Every other operand consumer in this file already re-establishes the
+/// declared carrier with `normalize_expr_to_ty` before use — `translate_integer_binop`,
+/// `eval_binop`, `eval_icmp`, `integer_binop_no_overflow_condition` and the `UnOp::Neg`
+/// arms all do. `Inst::Cast` was the sole omission, with two consequences:
+///
+///   * the lossless-narrowing obligation compared the RAW binding against a
+///     re-extension built at `src_ty`'s width, violating `Expr::eq`'s
+///     `REQUIRES: identical sorts` and aborting trustc with
+///     `EQ requires same sort: ... (_ BitVec 128) and (_ BitVec 64)`; and
+///   * a widening `ZExt`/`SExt` off an over-wide binding silently produced an
+///     OVER-WIDE result (`zero_extend` of a 128-bit carrier by `dst - src = 64`
+///     bits yields 192 bits) that was then bound to a `dst_ty`-typed value.
+///
+/// The extension direction is taken from `src_ty`'s SIGNEDNESS (`normalize_expr_to_ty`
+/// picks `sign_extend` for a signed type and `zero_extend` otherwise) — the one place
+/// that information exists. `Expr::eq` must never be "fixed" by widening inside the
+/// binding layer: it cannot know the signedness, and guessing changes the meaning of
+/// the comparison.
+///
+/// Narrowing an OVER-wide binding takes the low `width(src_ty)` bits. That is the only
+/// reinterpretation consistent with the operand's declared MIR type — a value of type
+/// `src_ty` has its meaning in those bits under both extension conventions — and it is
+/// already the semantics the cast RESULT commits to (`eval_cast_expr`'s `Trunc` arm
+/// extracts `dst_ty`'s low bits from whatever carrier it is handed). Unifying here only
+/// makes the obligation agree with the value the same call already produces.
+///
+/// Returns `None` — an honest UNKNOWN via the caller's `TrustIrChcUnsupportedReason::Cast`
+/// fail-closed path — when width normalization CANNOT reconcile the sorts, i.e. when
+/// the disagreement is not a bitvector-width disagreement at all: a Bool-sorted binding
+/// under an integer `src_ty`, an integer-sorted binding under `Ty::Bool`, or a float
+/// `src_ty` (where `normalize_expr_to_ty` deliberately refuses to fabricate bits,
+/// because f32<->f64 re-biases the exponent and is NOT zero-extension or truncation of
+/// the bit pattern). Each of those previously panicked inside the `Expr` contract or
+/// bound a wrong-sorted result; a lost proof is the correct trade.
+fn cast_operand_in_src_carrier(src_ty: &Ty, operand: Expr) -> Option<Expr> {
+    let coerced = normalize_expr_to_ty(&operand, src_ty);
+    (*coerced.sort() == ty_to_sort(src_ty)).then_some(coerced)
+}
+
 fn eval_cast_expr(op: CastOp, src_ty: &Ty, dst_ty: &Ty, operand: Expr) -> Option<Expr> {
+    // Re-establish `src_ty`'s carrier before ANY width arithmetic below: every arm
+    // derives its widths from the TYPES, so an operand whose binding disagrees would
+    // otherwise be extended/extracted against the wrong base width. Idempotent when the
+    // operand already matches, so a well-formed cast is unaffected.
+    let operand = cast_operand_in_src_carrier(src_ty, operand)?;
     match op {
         CastOp::ZExt | CastOp::SExt | CastOp::Trunc
             if src_ty.is_integer() && dst_ty.is_integer() =>
@@ -4268,24 +4870,437 @@ fn aggregate_field_tys_of(module: &Module, ty: &Ty) -> Option<Vec<Ty>> {
     immediate_aggregate_field_tys(module, ty)
 }
 
+/// Proof-authority admission class for a single-cell (`count: None`) stack `Alloca`,
+/// mirroring `translate_alloca`'s (translate_chc.rs) tracked-vs-opaque decision EXACTLY.
+///
+/// - `OpaqueSafe`: the translator leaves the cell opaque — `fresh_stack_cell_value`
+///   returns `None`, so `translate_alloca` records the pointer in `stack_ptrs` but NOT
+///   `stack_cells`. A later Load then misses `stack_cells` (`translate_stack_load`
+///   returns `false`) and havocs to a fresh symbolic while `known_stack` suppresses the
+///   memory-access error; a later Store likewise misses and is dropped. This is an
+///   UNCONDITIONAL sound over-approximation (havoc ⊇ real), so no escape/volatile
+///   reasoning is required.
+/// - `RequiresNonEscape`: the translator tracks the cell's fields precisely
+///   (`aggregate_field_tys_of` is `Some`, so `fresh_stack_cell_value` builds a
+///   `ValueBinding::Aggregate` and `translate_alloca` inserts a `stack_cell`). A later
+///   Load returns the precisely tracked last-stored value. This is sound ONLY if BOTH
+///   (a) the cell pointer never escapes ([`stack_alloca_pointer_is_non_escaping`]) — else
+///   a write through an alias leaves the tracked value stale — AND (b) every direct
+///   Load/Store of it uses the cell type ([`stack_alloca_cell_accesses_match_type`]) —
+///   else a silently-dropped mismatched-type store leaves the tracked value stale. Either
+///   staleness lets a dependent Load read a fabricated value (a FALSE PROOF).
+/// - `NotAggregate`: `ty` is a scalar/other shape this classifier does not own (the
+///   scalar-cell arm or an unconditional reject handles those).
+///
+/// The classification is EXACT because for every cell shape below,
+/// `is_precise_stack_scalar_ty` is `false` (`is_ordered_scalar_ty`/`Ty::Bool` never match
+/// Struct/Tuple/Array/Unit/Closure/Enum), so `fresh_stack_cell_value(ty)` is `Some`
+/// (tracked) iff `aggregate_field_tys_of(module, ty).is_some()` and `None` (opaque)
+/// otherwise — the same predicate this function branches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackCellAdmission {
+    /// Translator models the cell opaquely (havoc-on-read) — unconditionally sound.
+    OpaqueSafe,
+    /// Translator tracks the cell precisely — sound only if the pointer never escapes.
+    RequiresNonEscape,
+    /// Not an aggregate/enum cell shape this arm owns.
+    NotAggregate,
+}
+
+/// Classify an `Alloca` cell type for proof-authority admission, MATCHING
+/// `translate_alloca`'s tracked-vs-opaque decision EXACTLY. Both this function and the
+/// translator route through `aggregate_field_tys_of` — the translator via the
+/// `self.aggregate_field_tys` method, which is literally
+/// `aggregate_field_tys_of(self.module, ty)` — so the tracked/opaque split cannot drift.
+/// See [`StackCellAdmission`] for the per-variant soundness argument.
+pub fn classify_aggregate_stack_cell(module: &Module, ty: &Ty) -> StackCellAdmission {
+    let is_cell_shape = matches!(
+        ty,
+        Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, _) | Ty::Unit | Ty::Closure(_) | Ty::Enum(_)
+    );
+    if !is_cell_shape {
+        return StackCellAdmission::NotAggregate;
+    }
+    if aggregate_field_tys_of(module, ty).is_some() {
+        StackCellAdmission::RequiresNonEscape
+    } else {
+        StackCellAdmission::OpaqueSafe
+    }
+}
+
+/// `true` iff `translate_alloca` would model a `count: None` stack `Alloca` of `ty`
+/// OPAQUELY — i.e. `fresh_stack_cell_value(ty)` returns `None`, so `translate_alloca`
+/// records the pointer in `stack_ptrs` but NOT `stack_cells`. Every later Load then
+/// misses `stack_cells` (`translate_stack_load` returns `false`) and havocs to a fresh
+/// symbolic (with `known_stack` suppressing the memory-access error); every later Store
+/// likewise misses and is dropped. This is an UNCONDITIONAL sound over-approximation
+/// (havoc ⊇ real): there is NO tracked value that an aliased write or a mismatched-type
+/// store could leave stale, so no escape / type / volatile guard is required.
+///
+/// This is EXACTLY `fresh_stack_cell_value`'s `None` predicate: `ty` is neither a precise
+/// stack scalar (`is_precise_stack_scalar_ty`) nor a trackable aggregate
+/// (`aggregate_field_tys_of` is `Some`). `aggregate_field_tys_of == None` also guarantees
+/// `fresh_stack_cell_value`'s aggregate branch cannot even be reached, so the equivalence
+/// is exact — this function is `true` iff the translator leaves the cell opaque. Covers
+/// `FatPtr` (`&str`/`&[T]`/`&Path`), floats (`F16`/`F32`/`F64`), `Char`, `Set`/`Seq`/
+/// `Record`, and any opaque/over-budget aggregate that `classify_aggregate_stack_cell`
+/// reports as `NotAggregate` (a non-cell shape) or `OpaqueSafe`.
+pub fn stack_cell_is_translator_opaque(module: &Module, ty: &Ty) -> bool {
+    !is_precise_stack_scalar_ty(ty) && aggregate_field_tys_of(module, ty).is_none()
+}
+
+/// The cell types mem2reg promotion may thread through the block relations: EXACTLY
+/// the types the translator gives a TRACKED binding to, i.e. the logical negation of
+/// [`stack_cell_is_translator_opaque`] and — by construction — exactly
+/// `fresh_stack_cell_value(ty).is_some()`.
+///
+/// A precise stack scalar flattens to ONE relation leaf; a trackable aggregate
+/// (`aggregate_field_tys_of` is `Some`) flattens to one leaf per FLATTENED SCALAR LEAF,
+/// in the depth-first order `declare_relation_binding_rec` declares and
+/// `ValueBinding::flat_args` applies — the same leaf threading the entry-parameter and
+/// call-summary lanes already use. Nothing else is required: the whole promotion
+/// soundness argument (see `compute_promotable_cells_of`) is about the cell POINTER's
+/// use set, not about the cell's shape.
+///
+/// EXCLUDED, and each falls out of `aggregate_field_tys_of` returning `None` rather
+/// than from a special case here:
+/// - `Ty::Enum` — `immediate_aggregate_field_tys` has no enum arm, because an enum
+///   value is a DISCRIMINANT plus a variant-dependent payload and this translator has
+///   no per-variant leaf model for it. A leaf vector that ignored the discriminant
+///   would let a merge forward one variant's payload onto a path carrying another.
+/// - `Ty::FatPtr` / floats / `Char` / `Set` / `Seq` / `Record` — not aggregates and not
+///   `is_precise_stack_scalar_ty`; the translator havocs these cells.
+/// - an aggregate with a non-trackable leaf, an array longer than 256, or any type over
+///   `MAX_AGGREGATE_LEAVES` — `aggregate_leaf_count_within` declines, so the translator
+///   would model the cell opaquely and there is no binding to thread.
+fn promotable_cell_ty(module: &Module, ty: &Ty) -> bool {
+    is_precise_stack_scalar_ty(ty) || aggregate_field_tys_of(module, ty).is_some()
+}
+
+/// `true` iff `alloca_result` is used ONLY as the `ptr` operand of `Load`/`Store` —
+/// never as a value operand (a `Store`'s `value`, a call arg, a `Return`, or any operand
+/// of an opaque instruction). Mirrors the ESCAPE half of `compute_promotable_cells`
+/// step 2 for a single result and STRICTLY conservative: any ambiguity (an
+/// unrecognized/opaque instruction, or the result appearing in any non-`ptr` position)
+/// reports escaping (`false`).
+///
+/// This is HALF of the guard that keeps a precisely-tracked
+/// ([`StackCellAdmission::RequiresNonEscape`]) stack cell sound: if the pointer never
+/// escapes, no write through an alias can make the tracked value stale. `Inst::Load` has
+/// exactly one value operand — `ptr` (see `Inst::Load { ty, ptr, volatile, align }`), so
+/// a Load can only use the pointer as `ptr`; a `Store`'s `ptr` use is the legitimate
+/// write INTO the cell, while its `value` use is the pointer escaping into memory.
+///
+/// The OTHER half — [`stack_alloca_cell_accesses_match_type`] — is REQUIRED alongside
+/// this one: a DIRECT (`ptr`-operand) Store of a DIFFERENT type than the cell is silently
+/// dropped by `translate_stack_store` (it `return`s `false` on `cell_ty != *ty` without
+/// updating the cell, and `known_stack` then suppresses the memory error), so a later
+/// same-type Load reads the STALE precise value — a false proof. `compute_promotable_cells`
+/// step 2 disqualifies exactly that mismatch (lines ~799-814); this pair reproduces the
+/// full disqualification.
+/// How an alloca's address — and every pointer DERIVED from it by `GEP`/`Borrow`/
+/// `BorrowMut` — is used across the function.
+///
+/// This is the provenance-aware refinement of [`stack_alloca_pointer_is_non_escaping`],
+/// which is deliberately left BYTE-IDENTICAL: the driver's proof-authority gate
+/// (`native.rs`) documents its unconditional admission of `RequiresNonEscape` cells as
+/// resting on that exact predicate, so it is not edited in place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StackCellEscape {
+    /// No use lets the address reach code we cannot see: only `Load`s, `Store`s
+    /// THROUGH it, and the `GEP`/`Borrow` derivations feeding those.
+    Contained,
+    /// The address, or an interior pointer derived from it, reaches a `Call`/
+    /// `CallIndirect` argument — and is otherwise contained. Each such call is an
+    /// invalidation point (`invalidate_cells_escaping_into_call`), so the cell may
+    /// still be tracked: precise before the call, havoc after it.
+    IntoCallsOnly,
+    /// The address reaches memory (a `Store`'s VALUE), an indirect call's callee
+    /// slot, a block argument, a return, or an instruction whose uses are not
+    /// statically enumerable. There is no single program point at which to
+    /// invalidate, so the cell must not be tracked at all.
+    Unbounded,
+}
+
+/// OPT-IN (default OFF): admit a def-block-local field projection into the promotion lane.
+///
+/// SOUND as far as the pins can tell — all three
+/// (`aggregate_cell_hazards_stay_fail_closed`,
+/// `promotion_widens_only_on_trackable_aggregate_cells`,
+/// `a_field_projected_aggregate_cell_is_refused_for_escaping`) stay GREEN with it on,
+/// which the earlier escape-only attempt could not manage. But it is UNMEASURED, and on
+/// real lowered IR it admits EVERY previously-rejected cell in the
+/// `alloca_rejection_taxonomy_on_lowered_modules` fixtures — enough that the coverage
+/// canary "has rejected allocas" no longer holds. That is plausibly the lever working, and
+/// it is equally plausibly over-admission; only a gate run separates those.
+///
+/// So it ships default-OFF rather than weakening that canary to make my own change pass.
+/// Flag-off is byte-identical to the historical predicate. Read once per process.
+fn promote_def_block_projections() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRUST_PROMOTE_DEF_BLOCK_PROJECTIONS").is_some())
+}
+
+/// Admit a TRANSPARENT BORROW of a promotion candidate (`&local` / `&mut local`).
+///
+/// MEASURED, not guessed (R67). Driving the already-shipped
+/// `TRUST_ALLOCA_REJECT_TRACE` over ny-cert and histogramming the promoted-lane
+/// `pointer_used_by_instruction` records by the instruction they name gives:
+///
+/// ```text
+///   42  inst=Borrow
+///   27  inst=BorrowMut
+///    3  inst=GEP
+/// ```
+///
+/// So THIS is the arm that refuses ny-cert, and field projection never was: the
+/// Alloca gate owns 159 of 399 obligations and one promoted-lane reason owns 147
+/// of those. The sibling [`promote_def_block_projections`] lever addresses the
+/// 3, which is why R59 lane C and R66 both measured inert — the def-block-locality
+/// clause was never why they were inert.
+///
+/// Ships default-OFF for the same reason as its sibling: flag-off is byte-identical
+/// to the historical predicate, so one gate run can A/B it. Read once per process.
+fn promote_cell_borrows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRUST_PROMOTE_CELL_BORROWS").is_some())
+}
+
+/// Whether `inst` is a TRANSPARENT BORROW of promotion candidate `cell` which the
+/// translator models exactly and whose derived pointers all stay inside the model.
+///
+/// SPLIT OUT FROM THE STEP-2 ARM ON PURPOSE. [`promote_cell_borrows`] is a
+/// process-global `OnceLock`, so a test cannot toggle the flag in-process; a
+/// tripwire that could only run under an env var is a tripwire that does not run.
+/// Keeping the decision here lets `a_borrow_stored_as_a_value_is_still_refused`
+/// exercise the real predicate in the DEFAULT lane.
+///
+/// The escape classification is the load-bearing half — see the call site.
+fn borrow_use_is_transparently_promotable(func: &Function, inst: &Inst, cell: ValueId) -> bool {
+    matches!(
+        inst,
+        Inst::Borrow { ptr } | Inst::BorrowMut { ptr } if ptr.index() == cell.index()
+    ) && stack_alloca_escape_classification(func, cell) != StackCellEscape::Unbounded
+}
+
+/// Classify how `alloca_result` and its derived interior pointers escape.
+///
+/// WHY A DERIVED-POINTER CLOSURE. [`stack_alloca_pointer_is_non_escaping`] tests uses of
+/// the alloca id ALONE, and treats every non-`Load`/`Store`-`ptr` use as an escape. A
+/// `GEP` on the alloca is such a use, so `&mut s.a` — the pervasive field-access shape —
+/// disqualifies the whole cell. That is why the precise interior-pointer store lane
+/// (`store_cell_lane` / `model_indirect_store`) was unreachable: a coarse guard in front
+/// of a precise model. But a `GEP` base and a borrow referent are exactly the positions
+/// `record_interior_pointer_escapes` calls TRACKED — it propagates provenance through
+/// them rather than treating them as escapes. This function applies that same
+/// classification to the admission decision, so the two agree.
+///
+/// SOUNDNESS OBLIGATION FOR `IntoCallsOnly`. Admitting it is sound only because every
+/// `Call`/`CallIndirect` invalidates every tracked cell whose pointer reached it. The two
+/// must ship together and must not be separated: without the invalidation, a callee's
+/// write through `&mut local` would leave the pre-call value readable, which is a
+/// completed false proof. The store-side hazard is already covered independently —
+/// `invalidate_store_targets` havocs on an unknown store once the base is in
+/// `escaped_cell_bases`.
+///
+/// Anything not positively recognized is [`StackCellEscape::Unbounded`]: this fails
+/// closed, matching the conservative-`true` contract of `collect_inst_value_uses`. Note
+/// the failure mode for an UNMODELLED DERIVATION is also closed rather than open: if some
+/// instruction outside the {GEP, Borrow, BorrowMut} closure produces a new pointer from
+/// one of ours, that instruction still USES a derived pointer, so it lands on the `_` arm
+/// and the whole cell becomes `Unbounded`. A derivation we do not understand costs
+/// precision, never soundness.
+///
+/// THE CROSS-BLOCK COUPLING. Promotion may opt into a narrowly recognized GEP or
+/// transparent Borrow/BorrowMut use. Such a promoted cell survives block resets, so its
+/// soundness depends on the whole-function machinery installed with this classifier:
+/// `function_escaped_bases` is re-seeded into every block, promoted cells regain a
+/// provenance root, and every direct or indirect call invalidates call-escaping cells.
+/// `Unbounded` cells remain unpromotable. Treat the classification, whole-function escape
+/// baseline, provenance re-seed, call invalidation, and promotion guards as one unit.
+pub(crate) fn stack_alloca_escape_classification(
+    func: &Function,
+    alloca_result: ValueId,
+) -> StackCellEscape {
+    // Fixpoint over GEP/Borrow derivations. The IR is SSA, but a derivation may be
+    // written before the block that defines its base is visited, so iterate to
+    // stability rather than assuming a single ordered pass suffices.
+    let mut derived: BTreeSet<ValueId> = BTreeSet::new();
+    derived.insert(alloca_result);
+    loop {
+        let mut grew = false;
+        for block in &func.blocks {
+            for node in &block.body {
+                let base = match &node.inst {
+                    Inst::GEP { base, .. } => *base,
+                    Inst::Borrow { ptr } | Inst::BorrowMut { ptr } => *ptr,
+                    _ => continue,
+                };
+                if !derived.contains(&base) {
+                    continue;
+                }
+                for result in &node.results {
+                    grew |= derived.insert(*result);
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut escape = StackCellEscape::Contained;
+    for block in &func.blocks {
+        // Terminators live in `block.body` (hence `translate_node`'s `is_terminator()`
+        // check), so a `Ret` or a branch handing a derived pointer to a successor as a
+        // block argument is caught by the fail-closed `_` arm below — a derived pointer
+        // that outlives this block's tracking state is never admitted.
+        for node in &block.body {
+            let mut uses = Vec::new();
+            if collect_inst_value_uses(&node.inst, &mut uses) {
+                // Uses not statically enumerable. Only decisive if this instruction
+                // could touch one of our pointers at all, which we cannot rule out.
+                if !derived.is_empty() {
+                    return StackCellEscape::Unbounded;
+                }
+                continue;
+            }
+            if !uses.iter().any(|u| derived.contains(u)) {
+                continue;
+            }
+            // Positional, never by membership: `store p, p` must count the VALUE
+            // position even though the same id is also the tracked pointer operand.
+            match &node.inst {
+                // The sole pointer operand is the tracked position.
+                Inst::Load { .. }
+                | Inst::AtomicLoad { .. }
+                | Inst::Borrow { .. }
+                | Inst::BorrowMut { .. }
+                | Inst::EndBorrow { .. } => {}
+                // `ptr` is tracked; a derived pointer in the VALUE position puts the
+                // address INTO memory, where no invalidation point exists.
+                Inst::Store { value, .. } | Inst::AtomicStore { value, .. } => {
+                    if derived.contains(value) {
+                        return StackCellEscape::Unbounded;
+                    }
+                }
+                // `base` is tracked; a derived pointer used as an INDEX is not a
+                // pointer use we model.
+                Inst::GEP { indices, .. } => {
+                    if indices.iter().any(|i| derived.contains(i)) {
+                        return StackCellEscape::Unbounded;
+                    }
+                }
+                // Every argument position is an escape, but a recoverable one: the
+                // call is itself the invalidation point.
+                Inst::Call { .. } => escape = StackCellEscape::IntoCallsOnly,
+                Inst::CallIndirect { callee, .. } => {
+                    // The callee SLOT is not an argument — a derived pointer there is
+                    // being executed, not passed.
+                    if derived.contains(callee) {
+                        return StackCellEscape::Unbounded;
+                    }
+                    escape = StackCellEscape::IntoCallsOnly;
+                }
+                // Deliberately not enumerated: anything else that reads one of our
+                // pointers is outside the model.
+                _ => return StackCellEscape::Unbounded,
+            }
+        }
+    }
+    escape
+}
+
+pub fn stack_alloca_pointer_is_non_escaping(func: &Function, alloca_result: ValueId) -> bool {
+    let id = alloca_result.index();
+    for block in &func.blocks {
+        for node in &block.body {
+            match &node.inst {
+                // A Load reads only through `ptr`; that use does not let the pointer
+                // escape.
+                Inst::Load { .. } => {}
+                // A Store's `ptr` use writes INTO the cell (allowed); the pointer
+                // appearing as the stored `value` means it escaped into memory.
+                Inst::Store { value, .. } => {
+                    if value.index() == id {
+                        return false;
+                    }
+                }
+                // Every other instruction: any value use of the pointer is an escape.
+                // `collect_inst_value_uses` returns `true` (conservative) for opaque /
+                // unrecognized instructions, which we treat as escaping.
+                other => {
+                    let mut uses = Vec::new();
+                    let conservative = collect_inst_value_uses(other, &mut uses);
+                    if conservative {
+                        return false;
+                    }
+                    if uses.iter().any(|u| u.index() == id) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `true` iff every DIRECT (`ptr`-operand) `Load`/`Store` of `alloca_result` reads/writes
+/// the SAME type as the cell (`cell_ty`, the `Alloca`'s pointee type). This is the second
+/// half of the [`StackCellAdmission::RequiresNonEscape`] guard and is REQUIRED for
+/// soundness, NOT precision: `translate_stack_store` silently DROPS a Store whose type
+/// differs from the tracked cell (`cell_ty != *ty` ⇒ early `return false`, cell value
+/// left UNCHANGED), and the `Store` caller then suppresses the memory error because the
+/// pointer is `known_stack`. A subsequent same-type `Load` therefore returns the STALE
+/// precise value that the mismatched store should have overwritten — a FALSE PROOF.
+/// Pointers are untyped in TrustIr (`Ty::Ptr`), so `validate_module` does NOT tie a
+/// Store's type to the alloca's pointee; only this check does. Reproduces the type-match
+/// disqualification of `compute_promotable_cells` step 2 (the `cell_ty != ty` arms). A
+/// mismatched-type Load alone is sound (it havocs), but is rejected here too to mirror
+/// step 2 exactly — harmless, since the admissible whole-aggregate return slot reads and
+/// writes a single consistent type.
+pub fn stack_alloca_cell_accesses_match_type(
+    func: &Function,
+    alloca_result: ValueId,
+    cell_ty: &Ty,
+) -> bool {
+    let id = alloca_result.index();
+    for block in &func.blocks {
+        for node in &block.body {
+            match &node.inst {
+                Inst::Load { ty, ptr, .. } | Inst::Store { ty, ptr, .. } => {
+                    if ptr.index() == id && ty != cell_ty {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
 /// mem2reg candidate analysis, free of `&self` so the proof-grade ADMISSION
 /// predicate and the translator run the SAME analysis rather than two prose-
 /// synchronized copies. See `ChcTranslator::compute_promotable_cells` for the
 /// soundness argument; this is that function's whole body, moved verbatim.
 fn compute_promotable_cells_of(
+    module: &Module,
     func: &Function,
 ) -> (Vec<(ValueId, Ty)>, std::collections::BTreeMap<u32, BlockId>) {
     use std::collections::{BTreeMap, BTreeSet};
 
-    // 1. Candidates: every `Alloca { count: None }` of a precise scalar type
-    //    with a first result. Keyed by result index for cheap membership tests.
+    // 1. Candidates: every `Alloca { count: None }` whose cell type the translator
+    //    tracks precisely (`promotable_cell_ty` — a precise scalar OR a trackable
+    //    aggregate, i.e. exactly `fresh_stack_cell_value(ty).is_some()`) with a first
+    //    result. Keyed by result index for cheap membership tests.
     let mut candidate_ty: BTreeMap<u32, Ty> = BTreeMap::new();
     let mut candidate_val: BTreeMap<u32, ValueId> = BTreeMap::new();
     let mut def_block: BTreeMap<u32, BlockId> = BTreeMap::new();
     for block in &func.blocks {
         for node in &block.body {
             if let Inst::Alloca { ty, count: None, .. } = &node.inst
-                && is_precise_stack_scalar_ty(ty)
+                && promotable_cell_ty(module, ty)
                 && let Some(result) = node.results.first()
             {
                 candidate_ty.insert(result.index(), ty.clone());
@@ -4342,6 +5357,124 @@ fn compute_promotable_cells_of(
                     } else {
                         for used in uses {
                             if candidate_ty.contains_key(&used.index()) {
+                                // R58 half 2: DEF-BLOCK-LOCAL FIELD PROJECTION.
+                                //
+                                // This arm is what stops a `&mut s.a` cell from ever being
+                                // promoted, which is why its cross-block accesses then fail
+                                // the block-local lane as `store_/load_in_other_block` —
+                                // 209 + 12 rows at R56, the largest remaining bucket.
+                                //
+                                // A `GEP` on the cell is admitted ONLY when it sits in the
+                                // cell's own DEF BLOCK. That is what keeps the
+                                // `FieldProjected` hazard fail-closed for the same reason
+                                // and via the same guard as before: that fixture's `GEP` is
+                                // in the JOIN block — a block that CONSUMES the threaded
+                                // value — so it still lands on `disqualified` below and
+                                // `aggregate_cell_hazards_stay_fail_closed` keeps passing
+                                // untouched. The pin is preserved, not flipped.
+                                //
+                                // SOUNDNESS. With every projection confined to the def
+                                // block, each one happens while the cell is locally tracked
+                                // in `stack_cells`, where the precise interior-pointer store
+                                // lane applies — updating the exact leaf on a constant lane,
+                                // or havocing the cell on a symbolic/mismatched one. Both
+                                // are sound. `add_transition_rule` then forwards whatever
+                                // the cell holds at end of block, so the value threaded into
+                                // successors is either precise or havoc, never stale. Blocks
+                                // that RECEIVE the threaded value perform only whole-cell
+                                // Load/Store by construction of this very check, so no
+                                // projection can read a leaf the threading did not carry.
+                                // That is why the exactness of any individual lane does not
+                                // need re-deciding here — the translator already fails
+                                // closed on it via `store_target_cell_survives`.
+                                //
+                                // The escape condition is REQUIRED, and it is what R58
+                                // half 1 made checkable across blocks: an `Unbounded` cell
+                                // stays disqualified, and an `IntoCallsOnly` cell is
+                                // invalidated at every call in EVERY block because
+                                // `function_escaped_bases` is re-seeded at each block reset.
+                                // Without half 1 this admission would be a cross-block stale
+                                // read.
+                                // The cell must be an AGGREGATE. A `GEP` on a scalar cell is
+                                // not a field projection, there is no leaf for it to select,
+                                // and the threaded value has no structure to keep in step —
+                                // `promotion_widens_only_on_trackable_aggregate_cells` pins
+                                // exactly that, and caught this arm admitting an `i64`.
+                                let projectable_aggregate = candidate_ty
+                                    .get(&used.index())
+                                    .is_some_and(|ty| {
+                                        matches!(
+                                            ty,
+                                            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, _)
+                                        )
+                                    });
+                                let def_block_local_projection = promote_def_block_projections()
+                                    && projectable_aggregate
+                                    && matches!(
+                                        other,
+                                        Inst::GEP { base, .. } if base.index() == used.index()
+                                    )
+                                    && def_block.get(&used.index()) == Some(&block.id)
+                                    && candidate_val.get(&used.index()).is_some_and(|cell| {
+                                        stack_alloca_escape_classification(func, *cell)
+                                            != StackCellEscape::Unbounded
+                                    });
+                                // R68: TRANSPARENT BORROW OF THE CELL (`&local`, `&mut local`).
+                                //
+                                // MEASURED (R67), and it inverts the previous plan: of the
+                                // promoted-lane `pointer_used_by_instruction` records on
+                                // ny-cert, 42 name `Borrow`, 27 `BorrowMut`, and 3 `GEP`.
+                                // The sibling projection arm above addresses the 3. That is
+                                // why R59 lane C and R66 both measured inert — not the
+                                // def-block-locality clause, which was never the reason.
+                                //
+                                // SOUNDNESS, and why this is EXACT rather than merely
+                                // havoc-tolerant. `translate_node`'s Borrow arm binds the
+                                // borrow result to the SAME resolved pointer as its referent
+                                // and inherits the referent's provenance verbatim (with the
+                                // R3 alloca-root fallback for a borrow taken outside the def
+                                // block). So a Load/Store through the borrow is
+                                // indistinguishable from one through the cell pointer and
+                                // lands on the same `stack_cells` entry. The model already
+                                // handles this shape; only this analysis refused it.
+                                //
+                                // THE ESCAPE GUARD IS LOAD-BEARING HERE, NOT A PRECISION
+                                // FILTER — this is the one condition that must never be
+                                // dropped. Step 2's alias check tests whether the CANDIDATE's
+                                // id appears as a `Store` value. A borrow binds a NEW SSA id,
+                                // so storing the BORROW RESULT into another cell would slip
+                                // past that check. Today that hole is unreachable because the
+                                // borrow itself disqualifies the cell; admitting borrows makes
+                                // it reachable, and the only thing that closes it is
+                                // `stack_alloca_escape_classification`, whose derivation
+                                // closure includes GEP/Borrow/BorrowMut RESULTS and whose
+                                // fail-closed `_` arm classifies any use of a derived pointer
+                                // outside {Load ptr, Store ptr, GEP base, borrow referent} as
+                                // `Unbounded`. `a_borrow_stored_as_a_value_is_still_refused`
+                                // pins exactly that, and is the false-proof tripwire for this
+                                // arm: if it ever goes green, this widening is unsound.
+                                //
+                                // An `IntoCallsOnly` cell is admitted because every
+                                // Call/CallIndirect invalidates it via
+                                // `invalidate_cells_escaping_into_call`, in EVERY block —
+                                // `function_escaped_bases` is re-seeded at each block reset
+                                // (R58 half 1), which is precisely the cross-block
+                                // re-establishment the note on
+                                // `stack_alloca_escape_classification` demands before
+                                // promotion may be loosened.
+                                //
+                                // DELIBERATELY NO `projectable_aggregate` REQUIREMENT — the
+                                // one place this arm is WIDER than the projection arm. A GEP
+                                // on a scalar selects no leaf (and
+                                // `promotion_widens_only_on_trackable_aggregate_cells` rightly
+                                // pins it out), but a borrow of a scalar selects the WHOLE
+                                // cell: lane path `[]`, exactly what the block-entry re-seed
+                                // installs. R67 observes `ty=u64` borrows.
+                                let transparent_borrow = promote_cell_borrows()
+                                    && borrow_use_is_transparently_promotable(func, other, used);
+                                if def_block_local_projection || transparent_borrow {
+                                    continue;
+                                }
                                 disqualified.insert(used.index());
                             }
                         }
@@ -4407,11 +5540,55 @@ fn compute_promotable_cells_of(
 /// Everything else the block-local clause guards against is already discharged
 /// by promotion itself: aliasing (any non-`ptr` use disqualifies) and type
 /// punning (a mismatched access type disqualifies).
+///
+/// AGGREGATE CELLS. The cell need not be a scalar: `promotable_cell_ty` admits any
+/// type the translator tracks precisely, which threads one relation leaf per
+/// FLATTENED SCALAR LEAF. The four conditions above and the promotion argument are
+/// unchanged and type-agnostic; what needs saying is why the CFG MERGE stays exact
+/// per leaf.
+///
+/// There is no join FUNCTION to get wrong. A block relation's least fixpoint is the
+/// UNION of its incoming transition rules, and `add_transition_rule` emits one rule
+/// per edge whose head arguments are `binding.flat_args()` of the SOURCE block's
+/// current cell value — the whole binding, atomically, from ONE predecessor. So a
+/// merge block's cell columns are always some single predecessor's leaves, never a
+/// leaf-wise mixture and never a predecessor-independent default. A cell written in
+/// one predecessor and not another therefore reads, on the unwritten path, exactly
+/// what that predecessor carried in (its own incoming relation argument, or the
+/// `Alloca`'s fresh symbol if that predecessor is the def block) — never the other
+/// path's stored value. Leaf ALIGNMENT is structural: `declare_relation_binding_rec`
+/// pushes sorts and `ValueBinding::flat_args` pushes arguments in the same
+/// depth-first, left-to-right expansion of `aggregate_field_tys_of`, and every
+/// binding the cell can hold is built from that same table
+/// (`fresh_stack_cell_value` at the `Alloca` and at `invalidate_stack_cell`,
+/// `resolve_aggregate` at a `Store`), so the arity cannot drift.
+///
+/// DEFINITE INITIALIZATION still does the work it does for scalars. The
+/// fresh-symbol-per-cell seeding is self-consistent rather than `undef` for an
+/// aggregate exactly as for a scalar, so the same false-prove shape exists and the
+/// same across-blocks MUST dataflow excludes it. Note the dataflow is whole-cell:
+/// it has no notion of a partly-initialized aggregate — which is sound here only
+/// because a partial write needs a `GEP` on the cell pointer, and a `GEP` base use
+/// disqualifies the candidate at promotion step 2. Every admitted access is a
+/// whole-cell, exact-type `Load`/`Store`.
+#[cfg(test)]
 fn promoted_cell_alloca_is_admissible(
+    module: &Module,
     function: &Function,
     alloca_result: ValueId,
     ty: &Ty,
 ) -> bool {
+    promoted_cell_alloca_reject(module, function, alloca_result, ty).is_none()
+}
+
+/// The reason form of `promoted_cell_alloca_is_admissible`; `None` = admitted.
+/// Behavior unchanged — each `return false` became a `return Some(..)` in place.
+fn promoted_cell_alloca_reject(
+    module: &Module,
+    function: &Function,
+    alloca_result: ValueId,
+    ty: &Ty,
+) -> Option<PromotedAllocaReject> {
     let result = alloca_result.index();
 
     // The instruction being admitted must be the metadata-less, exact-typed
@@ -4426,16 +5603,241 @@ fn promoted_cell_alloca_is_admissible(
         })
     });
     if !defines_exact_cell {
-        return false;
+        return Some(PromotedAllocaReject::NoExactDefiningAlloca);
     }
 
     // The translator's own promotion verdict — not a restatement of it.
-    let (promoted, _) = compute_promotable_cells_of(function);
+    let (promoted, _) = compute_promotable_cells_of(module, function);
+    if !promoted.iter().any(|(cell, cell_ty)| cell.index() == result && cell_ty == ty) {
+        return Some(PromotedAllocaReject::NotPromotable(promotion_blocker_of(
+            module, function, result, ty,
+        )));
+    }
+
+    // No unmodeled access qualifier anywhere on this cell.
+    for block in &function.blocks {
+        for node in &block.body {
+            match &node.inst {
+                Inst::Load { ptr, volatile, align, .. }
+                | Inst::Store { ptr, volatile, align, .. } => {
+                    if ptr.index() == result && (*volatile || align.is_some()) {
+                        return Some(if *volatile {
+                            PromotedAllocaReject::AccessVolatile
+                        } else {
+                            PromotedAllocaReject::AccessAligned
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if promoted_cell_is_definitely_initialized(function, result) {
+        None
+    } else {
+        Some(PromotedAllocaReject::NotDefinitelyInitialized)
+    }
+}
+
+/// DIAGNOSTIC-ONLY refinement of "the translator would not promote this cell":
+/// a single-candidate mirror of `compute_promotable_cells_of` steps 1 and 2.
+///
+/// It is deliberately NOT the admission authority — `promoted_cell_alloca_reject`
+/// has already consulted `compute_promotable_cells_of` and decided to reject by
+/// the time this runs. If this mirror ever drifts from the real analysis the only
+/// consequence is a mislabeled histogram bucket (or `Unclassified`), never an
+/// admitted cell.
+fn promotion_blocker_of(
+    module: &Module,
+    function: &Function,
+    result: u32,
+    ty: &Ty,
+) -> PromotionBlocker {
+    // Step 1: only a cell the translator tracks precisely is ever a candidate.
+    if !promotable_cell_ty(module, ty) {
+        return PromotionBlocker::PointeeNotPreciseScalar { ty: ty.to_string() };
+    }
+
+    // Step 2, restricted to this candidate.
+    for block in &function.blocks {
+        for node in &block.body {
+            match &node.inst {
+                Inst::Load { ty: access_ty, ptr, .. } => {
+                    if ptr.index() == result && access_ty != ty {
+                        return PromotionBlocker::AccessTypeMismatch {
+                            access: "load",
+                            access_ty: access_ty.to_string(),
+                            cell_ty: ty.to_string(),
+                        };
+                    }
+                }
+                Inst::Store { ty: access_ty, ptr, value, .. } => {
+                    if ptr.index() == result && access_ty != ty {
+                        return PromotionBlocker::AccessTypeMismatch {
+                            access: "store",
+                            access_ty: access_ty.to_string(),
+                            cell_ty: ty.to_string(),
+                        };
+                    }
+                    if value.index() == result {
+                        return PromotionBlocker::PointerStoredAsValue;
+                    }
+                }
+                other => {
+                    let mut uses = Vec::new();
+                    if collect_inst_value_uses(other, &mut uses) {
+                        return PromotionBlocker::OpaqueInstruction {
+                            inst: inst_variant_name(other),
+                        };
+                    }
+                    if uses.iter().any(|value| value.index() == result) {
+                        return PromotionBlocker::PointerUsedByInstruction {
+                            inst: inst_variant_name(other),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    PromotionBlocker::Unclassified
+}
+
+/// The pre-taxonomy boolean body of `promoted_cell_alloca_reject`, kept VERBATIM
+/// for `alloca_reject_parity_tests`. Never compiled outside tests.
+#[cfg(test)]
+fn promoted_cell_alloca_is_admissible_reference(
+    module: &Module,
+    function: &Function,
+    alloca_result: ValueId,
+    ty: &Ty,
+) -> bool {
+    let result = alloca_result.index();
+
+    let defines_exact_cell = function.blocks.iter().any(|block| {
+        block.body.iter().any(|node| {
+            node.results.iter().any(|value| value.index() == result)
+                && matches!(
+                    &node.inst,
+                    Inst::Alloca { ty: cell_ty, count: None, align: None } if cell_ty == ty
+                )
+        })
+    });
+    if !defines_exact_cell {
+        return false;
+    }
+
+    let (promoted, _) = compute_promotable_cells_of(module, function);
     if !promoted.iter().any(|(cell, cell_ty)| cell.index() == result && cell_ty == ty) {
         return false;
     }
 
-    // No unmodeled access qualifier anywhere on this cell.
+    for block in &function.blocks {
+        for node in &block.body {
+            match &node.inst {
+                Inst::Load { ptr, volatile, align, .. }
+                | Inst::Store { ptr, volatile, align, .. } => {
+                    if ptr.index() == result && (*volatile || align.is_some()) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    promoted_cell_is_definitely_initialized(function, result)
+}
+
+/// The lane-2 predicate AS IT STOOD BEFORE the aggregate-cell widening: candidate
+/// collection restricted to `is_precise_stack_scalar_ty`, everything else identical.
+/// Never compiled outside tests.
+///
+/// This is the DIRECTIONAL parity control. `promoted_cell_alloca_is_admissible_reference`
+/// above tracks the live predicate, so it can only prove the taxonomy rewrite is
+/// verdict-inert; it cannot notice the widening itself. This one is frozen at the
+/// scalar-only behaviour, and `promotion_widens_only_on_trackable_aggregate_cells`
+/// asserts the live predicate differs from it ONLY by ADMITTING a cell whose type is a
+/// trackable non-scalar aggregate. Any other divergence — a narrowing, or a widening on
+/// a scalar / enum / fat-pointer / over-budget cell — is a parity FAILURE.
+#[cfg(test)]
+fn promoted_cell_alloca_is_admissible_scalar_reference(
+    function: &Function,
+    alloca_result: ValueId,
+    ty: &Ty,
+) -> bool {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let result = alloca_result.index();
+
+    let defines_exact_cell = function.blocks.iter().any(|block| {
+        block.body.iter().any(|node| {
+            node.results.iter().any(|value| value.index() == result)
+                && matches!(
+                    &node.inst,
+                    Inst::Alloca { ty: cell_ty, count: None, align: None } if cell_ty == ty
+                )
+        })
+    });
+    if !defines_exact_cell {
+        return false;
+    }
+
+    // `compute_promotable_cells_of`, frozen at the pre-widening step 1.
+    let mut candidate_ty: BTreeMap<u32, Ty> = BTreeMap::new();
+    for block in &function.blocks {
+        for node in &block.body {
+            if let Inst::Alloca { ty, count: None, .. } = &node.inst
+                && is_precise_stack_scalar_ty(ty)
+                && let Some(candidate) = node.results.first()
+            {
+                candidate_ty.insert(candidate.index(), ty.clone());
+            }
+        }
+    }
+    let mut disqualified: BTreeSet<u32> = BTreeSet::new();
+    for block in &function.blocks {
+        for node in &block.body {
+            match &node.inst {
+                Inst::Load { ty: access_ty, ptr, .. } => {
+                    if let Some(cell_ty) = candidate_ty.get(&ptr.index())
+                        && cell_ty != access_ty
+                    {
+                        disqualified.insert(ptr.index());
+                    }
+                }
+                Inst::Store { ty: access_ty, ptr, value, .. } => {
+                    if let Some(cell_ty) = candidate_ty.get(&ptr.index())
+                        && cell_ty != access_ty
+                    {
+                        disqualified.insert(ptr.index());
+                    }
+                    if candidate_ty.contains_key(&value.index()) {
+                        disqualified.insert(value.index());
+                    }
+                }
+                other => {
+                    let mut uses = Vec::new();
+                    if collect_inst_value_uses(other, &mut uses) {
+                        for id in candidate_ty.keys() {
+                            disqualified.insert(*id);
+                        }
+                    } else {
+                        for used in uses {
+                            if candidate_ty.contains_key(&used.index()) {
+                                disqualified.insert(used.index());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if candidate_ty.get(&result) != Some(ty) || disqualified.contains(&result) {
+        return false;
+    }
+
     for block in &function.blocks {
         for node in &block.body {
             match &node.inst {
@@ -4616,6 +6018,218 @@ fn promoted_cell_block_transfer(block: &Block, cell: u32, mut state: bool) -> (b
     (state, true)
 }
 
+/// Why lane 1 (`block_local_alloca_reject`) declined a cell.
+///
+/// DIAGNOSTIC ONLY. Every variant corresponds one-to-one with a `return false`
+/// in the historical boolean predicate, in the same order, so constructing a
+/// reason cannot change which cells are admitted — the admission verdict is
+/// exactly `reason.is_none()`. `block_local_alloca_is_admissible_reference`
+/// (test-only) keeps the original boolean body verbatim and
+/// `alloca_reject_parity_tests` asserts the two agree on every fixture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockLocalAllocaReject {
+    /// The pointee is neither a precise stack scalar nor a (possibly opaque)
+    /// aggregate — e.g. a fat pointer or a bare `Ty::Ptr`.
+    PointeeNotScalarOrAggregate { ty: String },
+    /// No `Alloca { count: None, align: None, ty: <exactly this ty> }` in the
+    /// function defines this value.
+    NoExactDefiningAlloca,
+    /// A `Load` through the cell pointer outside the defining block. This is
+    /// the clause a cross-block escape analysis would have to replace.
+    LoadInOtherBlock { block: u32, definition_block: u32 },
+    /// A `Load` in the defining block not preceded there by a `Store`.
+    LoadBeforeStore { block: u32 },
+    LoadVolatile { block: u32 },
+    LoadAligned { block: u32 },
+    LoadTypeMismatch { block: u32, access_ty: String, cell_ty: String },
+    StoreInOtherBlock { block: u32, definition_block: u32 },
+    StoreVolatile { block: u32 },
+    StoreAligned { block: u32 },
+    StoreTypeMismatch { block: u32, access_ty: String, cell_ty: String },
+    /// The cell POINTER itself is the stored value — it escaped into memory.
+    PointerStoredAsValue { block: u32 },
+    /// An instruction whose operands `collect_inst_value_uses` does not
+    /// enumerate appears anywhere in the function; it could read any pointer.
+    OpaqueInstruction { block: u32, inst: String },
+    /// The cell pointer is an operand of some instruction other than a direct
+    /// `Load`/`Store` through it (a `GEP` base, a `Call` argument, a `Borrow`).
+    PointerUsedByInstruction { block: u32, inst: String },
+}
+
+impl BlockLocalAllocaReject {
+    /// Short, stable, greppable token — the histogram bucket name.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::PointeeNotScalarOrAggregate { .. } => "pointee_not_scalar_or_aggregate",
+            Self::NoExactDefiningAlloca => "no_exact_defining_alloca",
+            Self::LoadInOtherBlock { .. } => "load_in_other_block",
+            Self::LoadBeforeStore { .. } => "load_before_store",
+            Self::LoadVolatile { .. } => "load_volatile",
+            Self::LoadAligned { .. } => "load_aligned",
+            Self::LoadTypeMismatch { .. } => "load_type_mismatch",
+            Self::StoreInOtherBlock { .. } => "store_in_other_block",
+            Self::StoreVolatile { .. } => "store_volatile",
+            Self::StoreAligned { .. } => "store_aligned",
+            Self::StoreTypeMismatch { .. } => "store_type_mismatch",
+            Self::PointerStoredAsValue { .. } => "pointer_stored_as_value",
+            Self::OpaqueInstruction { .. } => "opaque_instruction",
+            Self::PointerUsedByInstruction { .. } => "pointer_used_by_instruction",
+        }
+    }
+}
+
+impl std::fmt::Display for BlockLocalAllocaReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind())?;
+        match self {
+            Self::PointeeNotScalarOrAggregate { ty } => write!(f, "(ty={ty})"),
+            Self::NoExactDefiningAlloca => Ok(()),
+            Self::LoadInOtherBlock { block, definition_block }
+            | Self::StoreInOtherBlock { block, definition_block } => {
+                write!(f, "(at=#{block},def=#{definition_block})")
+            }
+            Self::LoadBeforeStore { block }
+            | Self::LoadVolatile { block }
+            | Self::LoadAligned { block }
+            | Self::StoreVolatile { block }
+            | Self::StoreAligned { block }
+            | Self::PointerStoredAsValue { block } => write!(f, "(at=#{block})"),
+            Self::LoadTypeMismatch { block, access_ty, cell_ty }
+            | Self::StoreTypeMismatch { block, access_ty, cell_ty } => {
+                write!(f, "(at=#{block},access={access_ty},cell={cell_ty})")
+            }
+            Self::OpaqueInstruction { block, inst }
+            | Self::PointerUsedByInstruction { block, inst } => {
+                write!(f, "(at=#{block},inst={inst})")
+            }
+        }
+    }
+}
+
+/// Why the translator's mem2reg pass would not PROMOTE the cell — the refinement
+/// of [`PromotedAllocaReject::NotPromotable`].
+///
+/// DIAGNOSTIC ONLY, and unlike the two lane predicates this one is a *mirror* of
+/// `compute_promotable_cells_of` step 1/2 restricted to a single candidate, not
+/// the analysis itself. The authority for "was it promoted" remains
+/// `compute_promotable_cells_of`; drift here can only mislabel a histogram
+/// bucket, never admit a cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromotionBlocker {
+    /// Never even a promotion CANDIDATE: the translator does not track this cell
+    /// type precisely, so there is no binding to thread (`promotable_cell_ty` is
+    /// `false` — see its doc for the exact set).
+    ///
+    /// The bucket TOKEN is deliberately unchanged (`not_promotable.
+    /// pointee_not_precise_scalar`) so gate-log histograms stay comparable across
+    /// the R49 boundary, but the CONDITION is now wider than its name: promotion
+    /// covers precise scalars AND trackable aggregates, so a `struct`/`tuple`/
+    /// `array`/`closure`/`unit` cell no longer lands here. What still does:
+    /// `enum` (no per-variant leaf model), fat pointers, floats, `char`, and any
+    /// aggregate with a non-trackable leaf or over `MAX_AGGREGATE_LEAVES`.
+    PointeeNotPreciseScalar { ty: String },
+    AccessTypeMismatch { access: &'static str, access_ty: String, cell_ty: String },
+    PointerStoredAsValue,
+    OpaqueInstruction { inst: String },
+    PointerUsedByInstruction { inst: String },
+    /// The mirror found no blocker although the authority says not promoted —
+    /// report it rather than guessing.
+    Unclassified,
+}
+
+impl PromotionBlocker {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::PointeeNotPreciseScalar { .. } => "not_promotable.pointee_not_precise_scalar",
+            Self::AccessTypeMismatch { .. } => "not_promotable.access_type_mismatch",
+            Self::PointerStoredAsValue => "not_promotable.pointer_stored_as_value",
+            Self::OpaqueInstruction { .. } => "not_promotable.opaque_instruction",
+            Self::PointerUsedByInstruction { .. } => "not_promotable.pointer_used_by_instruction",
+            Self::Unclassified => "not_promotable.unclassified",
+        }
+    }
+}
+
+impl std::fmt::Display for PromotionBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind())?;
+        match self {
+            Self::PointeeNotPreciseScalar { ty } => write!(f, "(ty={ty})"),
+            Self::AccessTypeMismatch { access, access_ty, cell_ty } => {
+                write!(f, "({access},access={access_ty},cell={cell_ty})")
+            }
+            Self::OpaqueInstruction { inst } | Self::PointerUsedByInstruction { inst } => {
+                write!(f, "(inst={inst})")
+            }
+            Self::PointerStoredAsValue | Self::Unclassified => Ok(()),
+        }
+    }
+}
+
+/// Why lane 2 (`promoted_cell_alloca_reject`) declined a cell. Same one-to-one
+/// correspondence with the historical boolean's `return false`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromotedAllocaReject {
+    NoExactDefiningAlloca,
+    NotPromotable(PromotionBlocker),
+    AccessVolatile,
+    AccessAligned,
+    NotDefinitelyInitialized,
+}
+
+impl PromotedAllocaReject {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NoExactDefiningAlloca => "no_exact_defining_alloca",
+            Self::NotPromotable(blocker) => blocker.kind(),
+            Self::AccessVolatile => "access_volatile",
+            Self::AccessAligned => "access_aligned",
+            Self::NotDefinitelyInitialized => "not_definitely_initialized",
+        }
+    }
+}
+
+impl std::fmt::Display for PromotedAllocaReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPromotable(blocker) => write!(f, "{blocker}"),
+            other => write!(f, "{}", other.kind()),
+        }
+    }
+}
+
+/// Both lanes' reasons for one declined `Alloca`. Produced only when
+/// [`single_cell_alloca_is_admissible`] is `false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleCellAllocaRejection {
+    pub block_local: BlockLocalAllocaReject,
+    pub promoted: PromotedAllocaReject,
+}
+
+impl SingleCellAllocaRejection {
+    /// `<lane1>/<lane2>` — the pair of bucket tokens, for a grep-only histogram
+    /// over an ordinary gate log.
+    pub fn kind(&self) -> String {
+        format!("{}/{}", self.block_local.kind(), self.promoted.kind())
+    }
+}
+
+impl std::fmt::Display for SingleCellAllocaRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "block-local={} promoted={}", self.block_local, self.promoted)
+    }
+}
+
+/// The variant name of `inst`, taken from its derived `Debug` rendering so this
+/// cannot drift as `Inst` grows variants. Reject path only.
+fn inst_variant_name(inst: &Inst) -> String {
+    let rendered = format!("{inst:?}");
+    let end = rendered
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(rendered.len());
+    rendered[..end].to_string()
+}
+
 /// Whether proof-grade native ingestion may admit a metadata-less, single-cell
 /// `Alloca` without importing source authority.
 ///
@@ -4634,23 +6248,245 @@ fn promoted_cell_block_transfer(block: &Block, cell: u32, mut state: bool) -> (b
 /// rather than an admission premise.
 ///
 /// The second lane is `promoted_cell_alloca_is_admissible` — the mem2reg
-/// promotion the translator already performs, which models an un-aliased scalar
-/// cell exactly ACROSS blocks. Neither lane subsumes the other: the block-local
-/// one also covers aggregates (never promoted), the promoted one also covers
-/// cross-block and uninitialized-on-some-path cells.
+/// promotion the translator already performs, which models an un-aliased cell
+/// exactly ACROSS blocks. Neither lane subsumes the other: the block-local one also
+/// covers cells the translator models OPAQUELY (enums, fat pointers, over-budget
+/// aggregates — never promoted), the promoted one also covers cross-block cells.
 pub fn single_cell_alloca_is_admissible(
+    module: &Module,
     function: &Function,
     alloca_result: ValueId,
     ty: &Ty,
 ) -> bool {
-    block_local_alloca_is_admissible(function, alloca_result, ty)
-        || promoted_cell_alloca_is_admissible(function, alloca_result, ty)
+    single_cell_alloca_rejection(module, function, alloca_result, ty).is_none()
+}
+
+/// The reason form of [`single_cell_alloca_is_admissible`]: `None` iff the cell
+/// is admitted, otherwise BOTH lanes' first blocking condition.
+///
+/// This is the sole implementation — the boolean above is defined as
+/// `.is_none()` — so a verdict cannot differ between the measured and unmeasured
+/// paths. The `?` keeps the original `||` short-circuit exactly: lane 2 runs only
+/// when lane 1 declined.
+pub fn single_cell_alloca_rejection(
+    module: &Module,
+    function: &Function,
+    alloca_result: ValueId,
+    ty: &Ty,
+) -> Option<SingleCellAllocaRejection> {
+    let block_local = block_local_alloca_reject(function, alloca_result, ty)?;
+    let promoted = promoted_cell_alloca_reject(module, function, alloca_result, ty)?;
+    Some(SingleCellAllocaRejection { block_local, promoted })
 }
 
 /// Lane 1 of [`single_cell_alloca_is_admissible`]: the per-block `stack_cells`
-/// model. Unchanged behavior — split out only so the two lanes can be measured
-/// independently.
+/// model. `None` = admitted.
+///
+/// Behavior is UNCHANGED from the boolean original: each `return false` became a
+/// `return Some(..)` in place, and the disjunctive access guard was expanded into
+/// the same conditions tested in the same order, so the first one that held is
+/// named. `block_local_alloca_is_admissible_reference` holds the original body
+/// and the parity test pins them together.
+fn block_local_alloca_reject(
+    function: &Function,
+    alloca_result: ValueId,
+    ty: &Ty,
+) -> Option<BlockLocalAllocaReject> {
+    let aggregate = matches!(
+        ty,
+        Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, _) | Ty::Unit | Ty::Closure(_) | Ty::Enum(_)
+    );
+    if !is_precise_stack_scalar_ty(ty) && !aggregate {
+        return Some(BlockLocalAllocaReject::PointeeNotScalarOrAggregate { ty: ty.to_string() });
+    }
+
+    let result = alloca_result.index();
+    let Some(definition_block) = function.blocks.iter().find_map(|block| {
+        block
+            .body
+            .iter()
+            .any(|node| {
+                node.results.iter().any(|value| value.index() == result)
+                    && matches!(
+                        &node.inst,
+                        Inst::Alloca { ty: cell_ty, count: None, align: None } if cell_ty == ty
+                    )
+            })
+            .then_some(block.id)
+    }) else {
+        return Some(BlockLocalAllocaReject::NoExactDefiningAlloca);
+    };
+
+    // Whole-function, so computed ONCE: the derivation closure is a fixpoint and
+    // evaluating it per instruction would make this gate quadratic in body size.
+    //
+    // OPT-IN (default OFF). Widening this gate is SOUND — the translator models both
+    // admitted classes precisely, `IntoCallsOnly` via `invalidate_cells_escaping_into_call`
+    // — but R54 + the R53 solver census say it is not yet USEFUL, and may be harmful:
+    // of the 47 ny-cert obligations that already reach the solver, 43 come back REFUTED
+    // (`counterexample evidence is not a proof` is emitted only for
+    // `FullVerificationVerdict::Failed`), because unmodelled calls contribute an
+    // unconditionally reachable error rule and inlined callee panic paths are guarded
+    // only by caller path constraints. Freeing ~90 more Alloca rows would move them into
+    // a bucket with a measured 0/47 proof rate, and a refutation is routed to FAILED —
+    // so defaulting this ON risks moving ny-cert's `failed` off 0 with spurious
+    // havoc-induced counterexamples.
+    //
+    // So it ships flag-gated rather than silently on: flag-off is byte-identical to the
+    // historical predicate, and one gate run can A/B it. Turn it on once the CHC
+    // encoding can actually discharge a panic-freedom obligation for this crate.
+    //
+    // THE FLAG IS PROVEN ON THE LIVE PATH, which is precisely what R54 could not show for
+    // the translator-only change. Running the suite with the flag set turns R49's
+    // inertness pins RED — `parity_with_the_original_boolean_predicates` and
+    // `parity_on_the_mem2reg_fixtures` report "verdict changed on
+    // `pointer_used_by_instruction` probed at i64: left true, right false". Those tests
+    // exist to detect exactly this, and their failure under the flag is them WORKING:
+    // the gate now admits a cell it used to refuse. They pin the DEFAULT lane, so they
+    // are green in every normal run and must NOT be weakened to accommodate the flag —
+    // a future reader who "fixes" them deletes the only evidence that this lever bites.
+    //
+    // Read once per process, not per alloca.
+    static WIDEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let widen = *WIDEN
+        .get_or_init(|| std::env::var_os("TRUST_ALLOCA_ESCAPE_GATE_WIDEN").is_some());
+    let escape = if widen {
+        stack_alloca_escape_classification(function, alloca_result)
+    } else {
+        StackCellEscape::Unbounded
+    };
+
+    let mut initialized = false;
+    for block in &function.blocks {
+        let at = block.id.index();
+        for node in &block.body {
+            match &node.inst {
+                Inst::Load { ty: access_ty, ptr, volatile, align } => {
+                    if ptr.index() == result {
+                        if block.id != definition_block {
+                            return Some(BlockLocalAllocaReject::LoadInOtherBlock {
+                                block: at,
+                                definition_block: definition_block.index(),
+                            });
+                        }
+                        if !initialized {
+                            return Some(BlockLocalAllocaReject::LoadBeforeStore { block: at });
+                        }
+                        if *volatile {
+                            return Some(BlockLocalAllocaReject::LoadVolatile { block: at });
+                        }
+                        if align.is_some() {
+                            return Some(BlockLocalAllocaReject::LoadAligned { block: at });
+                        }
+                        if access_ty != ty {
+                            return Some(BlockLocalAllocaReject::LoadTypeMismatch {
+                                block: at,
+                                access_ty: access_ty.to_string(),
+                                cell_ty: ty.to_string(),
+                            });
+                        }
+                    }
+                }
+                Inst::Store { ty: access_ty, ptr, value, volatile, align } => {
+                    if ptr.index() == result {
+                        if block.id != definition_block {
+                            return Some(BlockLocalAllocaReject::StoreInOtherBlock {
+                                block: at,
+                                definition_block: definition_block.index(),
+                            });
+                        }
+                        if *volatile {
+                            return Some(BlockLocalAllocaReject::StoreVolatile { block: at });
+                        }
+                        if align.is_some() {
+                            return Some(BlockLocalAllocaReject::StoreAligned { block: at });
+                        }
+                        if access_ty != ty {
+                            return Some(BlockLocalAllocaReject::StoreTypeMismatch {
+                                block: at,
+                                access_ty: access_ty.to_string(),
+                                cell_ty: ty.to_string(),
+                            });
+                        }
+                    }
+                    if value.index() == result {
+                        return Some(BlockLocalAllocaReject::PointerStoredAsValue { block: at });
+                    }
+                    if ptr.index() == result {
+                        initialized = true;
+                    }
+                }
+                other => {
+                    // R55 — THE CONSUMER HALF. These two arms are the ADMISSION gate; the
+                    // provenance model landed in `translate_alloca` is the TRACKING
+                    // decision. They were independent, and that is why the provenance
+                    // model measured FLAT on ny-cert (R54: escape bucket 92 -> 90): the
+                    // driver refused the input here before the translator's improved
+                    // tracking was ever exercised. Producer without consumer.
+                    //
+                    // `escape` is the SAME whole-function classification `translate_alloca`
+                    // now uses, so gate and translator move in LOCKSTEP. That lockstep is
+                    // the soundness condition, and it is directional:
+                    //   gate admits + translator demotes  -> harmless (havoc, imprecise)
+                    //   gate admits + translator UNSOUND  -> FALSE PROOF
+                    // Admitting `Contained`/`IntoCallsOnly` is legal ONLY because the
+                    // translator models exactly those two soundly — `IntoCallsOnly` via
+                    // `invalidate_cells_escaping_into_call` (precise before the call,
+                    // havoc after). Widening this gate BEFORE that landed would have been
+                    // the false proof; that is why it is a separate, later commit.
+                    //
+                    // `Unbounded` still rejects with the identical reason, so the
+                    // fail-closed default is unchanged: a pointer reaching memory, a
+                    // return, a block argument, an indirect call's callee slot, or any
+                    // instruction whose uses are not statically enumerable is refused
+                    // exactly as before.
+                    //
+                    // The classifier subsumes the opaque case: it returns `Unbounded`
+                    // whenever `collect_inst_value_uses` is conservative, so a non-
+                    // `Unbounded` verdict already proves no opaque instruction is present.
+                    // Both arms are nevertheless kept and merely guarded, so this stays a
+                    // pure narrowing of when they fire rather than a deletion.
+                    let mut uses = Vec::new();
+                    if collect_inst_value_uses(other, &mut uses) {
+                        if escape == StackCellEscape::Unbounded {
+                            // An opaque instruction may read any in-scope pointer.
+                            return Some(BlockLocalAllocaReject::OpaqueInstruction {
+                                block: at,
+                                inst: inst_variant_name(other),
+                            });
+                        }
+                        continue;
+                    }
+                    if uses.iter().any(|value| value.index() == result)
+                        && escape == StackCellEscape::Unbounded
+                    {
+                        return Some(BlockLocalAllocaReject::PointerUsedByInstruction {
+                            block: at,
+                            inst: inst_variant_name(other),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Boolean view of lane 1, for the existing lane-level tests.
+#[cfg(test)]
 fn block_local_alloca_is_admissible(function: &Function, alloca_result: ValueId, ty: &Ty) -> bool {
+    block_local_alloca_reject(function, alloca_result, ty).is_none()
+}
+
+/// The pre-taxonomy boolean body of `block_local_alloca_reject`, kept VERBATIM so
+/// `alloca_reject_parity_tests` can prove the reason-returning rewrite admits
+/// exactly the same cells. Never compiled outside tests.
+#[cfg(test)]
+fn block_local_alloca_is_admissible_reference(
+    function: &Function,
+    alloca_result: ValueId,
+    ty: &Ty,
+) -> bool {
     let aggregate = matches!(
         ty,
         Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, _) | Ty::Unit | Ty::Closure(_) | Ty::Enum(_)
@@ -4813,6 +6649,20 @@ fn declare_relation_binding_rec(
 
 fn is_precise_stack_scalar_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Bool) || is_ordered_scalar_ty(ty)
+}
+
+/// Normalize valid integer width drift, then require the expression to inhabit
+/// the exact carrier declared by `ty`. `Sort` equality is not sufficient for
+/// this boundary because AY's equality historically did not always distinguish
+/// bitvector widths; compare the carrier kind and width explicitly.
+fn normalize_expr_to_exact_ty(expr: &Expr, ty: &Ty) -> Option<Expr> {
+    let normalized = normalize_expr_to_ty(expr, ty);
+    let expected = ty_to_sort(ty);
+    if expected.is_bool() {
+        return normalized.sort().is_bool().then_some(normalized);
+    }
+    let expected_width = expected.bitvec_width()?;
+    (normalized.sort().bitvec_width() == Some(expected_width)).then_some(normalized)
 }
 
 fn is_call_summary_scalar_ty(ty: &Ty) -> bool {
@@ -5157,7 +7007,50 @@ pub fn proof_grade_cast_is_admissible(
             let thin_unwrap = is_newtype_struct(src_ty) && is_thin_pointer_ty(dst_ty);
             let int_pack = is_pointer_width_unsigned_ty(src_ty) && is_newtype_struct(dst_ty);
             let int_unpack = is_newtype_struct(src_ty) && is_pointer_width_unsigned_ty(dst_ty);
-            thin_thin || fat_same || thin_wrap || thin_unwrap || int_pack || int_unpack
+            // SAME-WIDTH INTEGER BITCAST — gate/translator lockstep restoration, not a
+            // new model. `translate_cast` already lowers this arm EXACTLY, as the
+            // identity on the bit-vector carrier:
+            //     CastOp::Bitcast if src_ty.is_integer() && dst_ty.is_integer() => {
+            //         let src_width = src_ty.bit_width_with(HOST_POINTER_BITS)?;
+            //         let dst_width = dst_ty.bit_width_with(HOST_POINTER_BITS)?;
+            //         (src_width == dst_width).then_some(operand)
+            //     }
+            // Only THIS admission predicate omitted it, so `i128 -> u128` and
+            // `i64 -> u64` were refused at the gate despite being modelled precisely —
+            // the same producer-without-consumer split that made the provenance model
+            // measure flat in R54. native.rs's merge note (2026-08-22) records that this
+            // branch retired its own same-width Bitcast admit arm in favour of upstream's
+            // stricter set; this restores it on the translator's terms.
+            //
+            // SOUNDNESS. A bitcast between two integer types of EQUAL bit width is the
+            // identity on the bits: no truncation, no extension, no reinterpretation of
+            // a sign bit that the BV carrier does not already represent. Signedness is
+            // not part of the carrier, so `i128 -> u128` changes nothing the model can
+            // observe. Widths are matched via `bit_width_with(HOST_POINTER_BITS)`, the
+            // same call the translator uses, so `usize`/`isize` resolve identically on
+            // both sides and cannot disagree.
+            //
+            // FAIL-CLOSED ON UNKNOWN WIDTH: the translator's `?` makes an unknown width
+            // fall through to unsupported, so an admitted-but-unmodelled cast must be
+            // impossible here. Both widths must be `Some` AND equal; a `None == None`
+            // comparison would admit exactly the pair the translator refuses, which is
+            // why this is written as an explicit match rather than `==` on the Options.
+            let int_identity = src_ty.is_integer()
+                && dst_ty.is_integer()
+                && matches!(
+                    (
+                        src_ty.bit_width_with(HOST_POINTER_BITS),
+                        dst_ty.bit_width_with(HOST_POINTER_BITS),
+                    ),
+                    (Some(src_width), Some(dst_width)) if src_width == dst_width
+                );
+            thin_thin
+                || fat_same
+                || thin_wrap
+                || thin_unwrap
+                || int_pack
+                || int_unpack
+                || int_identity
         }
         CastOp::PtrToInt => {
             is_thin_pointer_ty(src_ty) && is_pointer_width_unsigned_ty(dst_ty)
@@ -5167,6 +7060,69 @@ pub fn proof_grade_cast_is_admissible(
 }
 
 const POINTER_NEWTYPE_FUEL: u32 = 8;
+
+/// Recursion budget for [`ty_is_definitely_non_zst`] — a self-referential type table
+/// entry must terminate at `false` (no bound) rather than spin.
+const NON_ZST_FUEL: u32 = 8;
+
+/// Trust (P0 ZST-slice-length FALSE PROOF): whether a value of `ty` is PROVABLY at
+/// least one byte wide.
+///
+/// Conservative and FAIL-CLOSED — `true` only for shapes proved `>= 1` byte: a scalar
+/// or pointer (`bit_width_with` reports a nonzero width), a NON-EMPTY array/vector of
+/// a non-ZST element, and a tuple/struct with at least one non-ZST field. Everything
+/// else — `Ty::Unit`, an empty or all-ZST aggregate, `[T; 0]`, an enum, a closure, an
+/// unresolvable table id, or an unknown variant — answers `false`, i.e. NOT bounded,
+/// which is the sound direction (a missed proof, never a false one).
+///
+/// Faithful port of `trust_vcgen::ty_is_definitely_non_zst` and the bridge's
+/// `native_ty_is_definitely_non_zst`, which gate the SAME `len <= isize::MAX` bound in
+/// the two other lanes; the recursion needs `module` here because trust-ir puts
+/// array-element and struct-field types behind table ids.
+fn ty_is_definitely_non_zst(module: &Module, ty: &Ty, fuel: u32) -> bool {
+    if fuel == 0 {
+        return false;
+    }
+    // Scalars, floats, thin/fat pointers, references, `Rc`, vectors: a nonzero bit
+    // width IS the non-ZST proof. `Ty::Unit` and every aggregate report `None` here
+    // and fall through to the structural arms below.
+    if ty.bit_width_with(HOST_POINTER_BITS).is_some_and(|bits| bits > 0) {
+        return true;
+    }
+    match ty {
+        Ty::Array(elem, len) => {
+            *len > 0
+                && module
+                    .ty(*elem)
+                    .is_some_and(|elem| ty_is_definitely_non_zst(module, elem, fuel - 1))
+        }
+        Ty::Tuple(tys) => tys.iter().any(|t| ty_is_definitely_non_zst(module, t, fuel - 1)),
+        Ty::Struct(id) => module.struct_def(*id).is_some_and(|def| {
+            def.fields.iter().any(|f| ty_is_definitely_non_zst(module, &f.ty, fuel - 1))
+        }),
+        _ => false,
+    }
+}
+
+/// Trust (P0 ZST-slice-length FALSE PROOF): whether the METADATA of a fat pointer of
+/// type `ptr_ty` is a length provably confined to `[0, isize::MAX]`.
+///
+/// * `FatPtr(Str)` — the metadata is a BYTE length and every byte is one byte, so the
+///   allocation-size limit bounds it UNCONDITIONALLY (the same `str`-vs-slice split
+///   `trust_types::total_call_summaries::total_summary_len_bound` already draws).
+/// * `FatPtr(Slice(elem))` — bounded ONLY when `elem` is provably non-ZST; a `&[()]`
+///   length may legally reach `usize::MAX`.
+/// * anything else — a `dyn Trait` vtable pointer, an element the module's type table
+///   cannot resolve, or a non-fat `ptr_ty` spelling — is NOT bounded (fail-closed).
+fn fat_ptr_metadata_len_is_isize_bounded(module: &Module, ptr_ty: &Ty) -> bool {
+    match ptr_ty {
+        Ty::FatPtr(FatPtrKind::Str) => true,
+        Ty::FatPtr(FatPtrKind::Slice(elem)) => module
+            .ty(*elem)
+            .is_some_and(|elem| ty_is_definitely_non_zst(module, elem, NON_ZST_FUEL)),
+        _ => false,
+    }
+}
 
 /// A zero-sized marker field (`PhantomData`, `Unit`) — skipped when deciding
 /// whether a struct is a single-pointer NEWTYPE. `PhantomData` lowers to an
@@ -5322,10 +7278,12 @@ mod aggregate_leaf_budget_tests {
 
 #[cfg(test)]
 mod mem2reg_tests {
-    //! mem2reg promotion: a loop-carried mutable scalar stack alloca used ONLY via
-    //! direct Load/Store must become threaded block-relation state (so a loop
-    //! predicate is no longer nullary), while any aliased alloca must be left
-    //! un-promoted (soundness).
+    //! mem2reg promotion: a loop-carried mutable stack alloca used ONLY via direct
+    //! Load/Store must become threaded block-relation state (so a loop predicate is
+    //! no longer nullary), while any aliased alloca must be left un-promoted
+    //! (soundness). The cell may be a precise scalar or a trackable AGGREGATE; the
+    //! `build_aggregate_clamp_join` fixtures below carry the aggregate half,
+    //! including the CFG-merge and definite-initialization hazards.
     use super::*;
     use trust_ir_build::ModuleBuilder;
 
@@ -5565,10 +7523,10 @@ mod mem2reg_tests {
             "the store/load are outside the defining block, so lane 1 must still reject"
         );
         assert!(
-            promoted_cell_alloca_is_admissible(func, cell, &Ty::U64),
+            promoted_cell_alloca_is_admissible(&module, func, cell, &Ty::U64),
             "an un-aliased scalar cell the translator promotes is exactly modeled across blocks"
         );
-        assert!(single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+        assert!(single_cell_alloca_is_admissible(&module, func, cell, &Ty::U64));
 
         // The admission premise must be the translator's OWN verdict.
         let options = TranslateOptions::default();
@@ -5597,7 +7555,7 @@ mod mem2reg_tests {
             "the promotion analysis itself ignores `volatile` — which is exactly why \
              admission must not"
         );
-        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+        assert!(!single_cell_alloca_is_admissible(&module, func, cell, &Ty::U64));
     }
 
     /// The translator ignores `align` entirely, so a caller-asserted alignment is
@@ -5606,7 +7564,7 @@ mod mem2reg_tests {
     fn rejects_caller_asserted_alignment_on_a_promoted_cell() {
         let (module, cell, _join) = build_clamp_join(false, true, false);
         let func = &module.functions[0];
-        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+        assert!(!single_cell_alloca_is_admissible(&module, func, cell, &Ty::U64));
     }
 
     /// An aliased cell is not promoted, so neither lane may admit it.
@@ -5614,7 +7572,7 @@ mod mem2reg_tests {
     fn rejects_aliased_cross_block_cell() {
         let (module, cell, _join) = build_clamp_join(false, false, true);
         let func = &module.functions[0];
-        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+        assert!(!single_cell_alloca_is_admissible(&module, func, cell, &Ty::U64));
     }
 
     /// An uninitialized read must stay fail-closed. The translator seeds an
@@ -5663,7 +7621,7 @@ mod mem2reg_tests {
              exactly why admission also demands definite initialization"
         );
         assert!(!promoted_cell_is_definitely_initialized(func, cell.index()));
-        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::U64));
+        assert!(!single_cell_alloca_is_admissible(&module, func, cell, &Ty::U64));
     }
 
     /// A loop whose only store is inside the body does NOT initialize the header's
@@ -5704,7 +7662,7 @@ mod mem2reg_tests {
         let module = mb.build();
         let func = &module.functions[0];
         assert!(!promoted_cell_is_definitely_initialized(func, cell.index()));
-        assert!(!single_cell_alloca_is_admissible(func, cell, &Ty::I64));
+        assert!(!single_cell_alloca_is_admissible(&module, func, cell, &Ty::I64));
     }
 
     /// The counterpart: `build_count_to_ten` stores in the entry block before the
@@ -5714,7 +7672,514 @@ mod mem2reg_tests {
         let (module, acc, ..) = build_count_to_ten();
         let func = &module.functions[0];
         assert!(promoted_cell_is_definitely_initialized(func, acc.index()));
-        assert!(single_cell_alloca_is_admissible(func, acc, &Ty::I64));
+        assert!(single_cell_alloca_is_admissible(&module, func, acc, &Ty::I64));
+    }
+
+    /// Which hazard the aggregate clamp/join fixture carries.
+    #[derive(Clone, Copy, Debug)]
+    enum AggregateJoinShape {
+        /// Both arms store the whole cell; the join loads it. The control.
+        Clean,
+        /// Only the `then` arm stores — the join's load is uninitialized on the
+        /// `else` path, so promotion alone would fabricate a value.
+        OneArmOnly,
+        /// The `else` arm's store is `volatile`.
+        VolatileStore,
+        /// The `else` arm's store carries a caller-asserted alignment.
+        AlignedStore,
+        /// The `else` arm stores a DIFFERENT type through the cell pointer.
+        MismatchedStore,
+        /// The join takes a `GEP` on the cell pointer — a FIELD PROJECTION.
+        FieldProjected,
+        /// The join leaks the cell pointer into another cell.
+        Aliased,
+    }
+
+    /// The aggregate twin of `build_clamp_join`, in the shape the bridge lowers a
+    /// multi-block aggregate local into: ALLOCA in the entry block, a whole-cell
+    /// STORE in each arm, a whole-cell LOAD in the join. Returns
+    /// `(module, cell, cell ty, join block)`.
+    fn build_aggregate_clamp_join(shape: AggregateJoinShape) -> (Module, ValueId, Ty, BlockId) {
+        let pair = Ty::Tuple(vec![Ty::U64, Ty::U64]);
+        let mut mb = ModuleBuilder::new("mem2reg_aggregate_join");
+        let ft = mb.add_func_type(vec![Ty::Bool, pair.clone()], vec![pair.clone()]);
+        let mut fb = mb.function("pair_join", ft);
+
+        let entry = fb.create_block();
+        let then_block = fb.create_block();
+        let else_block = fb.create_block();
+        let join = fb.create_block();
+        fb.set_entry(entry);
+
+        fb.switch_to_block(entry);
+        let cond = fb.add_block_param(entry, Ty::Bool);
+        let p = fb.add_block_param(entry, pair.clone());
+        let cell = fb.alloca(pair.clone());
+        fb.condbr(cond, then_block, vec![], else_block, vec![]);
+
+        fb.switch_to_block(then_block);
+        fb.store(pair.clone(), cell, p);
+        fb.br(join, vec![]);
+
+        fb.switch_to_block(else_block);
+        let seven = fb.iconst(Ty::U64, 7);
+        let q = fb.insert_field(pair.clone(), p, 0, seven);
+        match shape {
+            AggregateJoinShape::OneArmOnly => {}
+            AggregateJoinShape::VolatileStore => fb.store_volatile(pair.clone(), cell, q),
+            AggregateJoinShape::AlignedStore => fb.store_aligned(pair.clone(), cell, q, 8),
+            AggregateJoinShape::MismatchedStore => fb.store(Ty::U64, cell, seven),
+            _ => fb.store(pair.clone(), cell, q),
+        }
+        fb.br(join, vec![]);
+
+        fb.switch_to_block(join);
+        match shape {
+            AggregateJoinShape::FieldProjected => {
+                let zero = fb.iconst(Ty::U64, 0);
+                let _addr = fb.gep(Ty::U64, cell, vec![zero]);
+            }
+            AggregateJoinShape::Aliased => {
+                let sink = fb.alloca(Ty::Ptr);
+                fb.store(Ty::Ptr, sink, cell);
+            }
+            _ => {}
+        }
+        let k = fb.load(pair.clone(), cell);
+        fb.ret(vec![k]);
+        fb.build();
+
+        (mb.build(), cell, pair, join)
+    }
+
+    fn relation_arity(output: &ChcTranslationOutput, block: BlockId) -> usize {
+        output
+            .vc
+            .relations
+            .iter()
+            .find(|rel| rel.name == block_relation_name(block))
+            .expect("the block relation is declared")
+            .arity()
+    }
+
+    /// END TO END: a cross-block AGGREGATE cell is promoted and its leaves are
+    /// threaded through the join relation, exactly as a scalar cell's single leaf
+    /// is. The arity DIFFERENTIAL against the aliased build is what pins "two
+    /// leaves, one per tuple field" without hard-coding the (liveness-dependent)
+    /// threaded-parameter prefix.
+    #[test]
+    fn promotes_and_threads_a_cross_block_aggregate_cell() {
+        let (module, cell, pair, join) = build_aggregate_clamp_join(AggregateJoinShape::Clean);
+        let func = &module.functions[0];
+        let options = TranslateOptions::default();
+
+        let translator = ChcFuncTranslator::new(func, &module, &options);
+        let (promoted, def_block) = translator.compute_promotable_cells();
+        assert!(
+            promoted.iter().any(|(value, ty)| *value == cell && *ty == pair),
+            "the un-aliased whole-cell tuple must be promoted"
+        );
+        assert_eq!(def_block.get(&cell.index()), Some(&func.entry));
+
+        assert!(
+            block_local_alloca_reject(func, cell, &pair).is_some(),
+            "lane 1 is block-local, so it still rejects the cross-block accesses"
+        );
+        assert!(single_cell_alloca_is_admissible(&module, func, cell, &pair));
+
+        let output = translate_function(func, &module, &options);
+        assert!(output.diagnostics.is_empty(), "the promoted aggregate lowers with no diagnostics");
+
+        let (aliased_module, ..) = build_aggregate_clamp_join(AggregateJoinShape::Aliased);
+        let aliased = translate_function(&aliased_module.functions[0], &aliased_module, &options);
+        assert_eq!(
+            relation_arity(&output, join) - relation_arity(&aliased, join),
+            2,
+            "promotion adds exactly one relation leaf per flattened tuple field"
+        );
+    }
+
+    /// LEAF-ARITY AGREEMENT, the one thing a malformed CHC could come from. In the
+    /// block-local lane an aggregate cell binding never crosses a relation boundary;
+    /// in the promotion lane it does, so the declaration
+    /// (`declare_relation_binding_rec`) and every application (`flat_args` of the
+    /// binding built by `fresh_stack_cell_value` at the `Alloca` and by
+    /// `resolve_aggregate` at each `Store`) must expand the type identically.
+    /// A NESTED cell exercises the recursion; the two expansions differ in field
+    /// precedence (`resolve_field_binding` tests `is_scalar_field_ty` first,
+    /// `declare_relation_binding_rec` tests `aggregate_field_tys_of` first), which is
+    /// only benign because those two predicates are disjoint — this pins that.
+    #[test]
+    fn a_nested_aggregate_cell_threads_one_relation_leaf_per_scalar_leaf() {
+        let inner = Ty::Tuple(vec![Ty::U64, Ty::Bool]);
+        let outer = Ty::Tuple(vec![Ty::U64, inner, Ty::Unit]);
+
+        let build = |alias: bool| {
+            let mut mb = ModuleBuilder::new("mem2reg_nested_join");
+            let ft = mb.add_func_type(vec![Ty::Bool, outer.clone()], vec![outer.clone()]);
+            let mut fb = mb.function("nested_join", ft);
+            let entry = fb.create_block();
+            let then_block = fb.create_block();
+            let else_block = fb.create_block();
+            let join = fb.create_block();
+            fb.set_entry(entry);
+
+            fb.switch_to_block(entry);
+            let cond = fb.add_block_param(entry, Ty::Bool);
+            let p = fb.add_block_param(entry, outer.clone());
+            let cell = fb.alloca(outer.clone());
+            fb.condbr(cond, then_block, vec![], else_block, vec![]);
+
+            fb.switch_to_block(then_block);
+            fb.store(outer.clone(), cell, p);
+            fb.br(join, vec![]);
+
+            fb.switch_to_block(else_block);
+            let seven = fb.iconst(Ty::U64, 7);
+            let q = fb.insert_field(outer.clone(), p, 0, seven);
+            fb.store(outer.clone(), cell, q);
+            fb.br(join, vec![]);
+
+            fb.switch_to_block(join);
+            if alias {
+                let sink = fb.alloca(Ty::Ptr);
+                fb.store(Ty::Ptr, sink, cell);
+            }
+            let k = fb.load(outer.clone(), cell);
+            fb.ret(vec![k]);
+            fb.build();
+            (mb.build(), cell, join)
+        };
+
+        let (module, cell, join) = build(false);
+        let (aliased_module, ..) = build(true);
+        let options = TranslateOptions::default();
+
+        assert!(single_cell_alloca_is_admissible(&module, &module.functions[0], cell, &outer));
+        let output = translate_function(&module.functions[0], &module, &options);
+        let aliased = translate_function(&aliased_module.functions[0], &aliased_module, &options);
+        assert!(output.diagnostics.is_empty());
+        assert_eq!(
+            relation_arity(&output, join) - relation_arity(&aliased, join),
+            3,
+            "(u64, (u64, bool), ()) is three scalar leaves — the unit field contributes none"
+        );
+    }
+
+    /// THE JOIN. Each incoming edge of the join carries the SOURCE block's own cell
+    /// leaves — there is no leaf-wise merge function and no shared default — so the
+    /// two arms' rules must reach the join relation with DIFFERENT arguments. A
+    /// single rule, or two identical ones, would mean one arm's stored value is
+    /// readable on the other arm's path (a false proof).
+    #[test]
+    fn each_join_edge_carries_its_own_predecessors_aggregate_leaves() {
+        let (module, .., join) = build_aggregate_clamp_join(AggregateJoinShape::Clean);
+        let options = TranslateOptions::default();
+        let output = translate_function(&module.functions[0], &module, &options);
+
+        let name = block_relation_name(join);
+        let heads: Vec<&Vec<Expr>> = output
+            .vc
+            .rules
+            .iter()
+            .filter(|rule| *rule.head.name == *name)
+            .map(|rule| rule.head.args.as_ref())
+            .collect();
+        assert_eq!(heads.len(), 2, "one transition rule per predecessor arm");
+        assert_ne!(
+            format!("{:?}", heads[0]),
+            format!("{:?}", heads[1]),
+            "the two arms must reach the join with different cell leaves"
+        );
+    }
+
+    /// A cell stored on ONE branch only is uninitialized on the other path. The
+    /// translator seeds an un-stored cell with ONE stable fresh binding, which is
+    /// self-consistent across reads rather than `undef` — a false-prove shape — so
+    /// definite initialization must refuse it for an aggregate exactly as it does
+    /// for a scalar.
+    #[test]
+    fn rejects_an_aggregate_cell_stored_on_one_branch_only() {
+        let (module, cell, pair, _join) =
+            build_aggregate_clamp_join(AggregateJoinShape::OneArmOnly);
+        let func = &module.functions[0];
+        let options = TranslateOptions::default();
+        let translator = ChcFuncTranslator::new(func, &module, &options);
+        let (promoted, _def) = translator.compute_promotable_cells();
+        assert!(
+            promoted.iter().any(|(value, _)| *value == cell),
+            "the cell is still un-aliased, so promotion alone would admit it — which is \
+             exactly why admission also demands definite initialization"
+        );
+        assert!(!promoted_cell_is_definitely_initialized(func, cell.index()));
+        assert!(!single_cell_alloca_is_admissible(&module, func, cell, &pair));
+    }
+
+    /// The four remaining hazards, unchanged by the widening: a volatile store (kept
+    /// as a promoted cell by the analysis, which ignores `volatile`, and therefore
+    /// refused by admission), an unmodeled alignment claim, a type-punned store, and
+    /// a field projection. None may reach the proof lane for an aggregate cell any
+    /// more than for a scalar one.
+    #[test]
+    fn aggregate_cell_hazards_stay_fail_closed() {
+        // The lane-2 bucket is pinned, not just the verdict: a hazard that were
+        // rejected for the WRONG reason (e.g. the field projection passing the
+        // escape check and being caught only by definite initialization) would be a
+        // guard that stops working the moment the fixture changes shape.
+        for (shape, expected) in [
+            (AggregateJoinShape::VolatileStore, "access_volatile"),
+            (AggregateJoinShape::AlignedStore, "access_aligned"),
+            (AggregateJoinShape::MismatchedStore, "not_promotable.access_type_mismatch"),
+            (AggregateJoinShape::FieldProjected, "not_promotable.pointer_used_by_instruction"),
+            (AggregateJoinShape::Aliased, "not_promotable.pointer_stored_as_value"),
+        ] {
+            let (module, cell, pair, _join) = build_aggregate_clamp_join(shape);
+            let func = &module.functions[0];
+            let rejection = single_cell_alloca_rejection(&module, func, cell, &pair)
+                .unwrap_or_else(|| panic!("{shape:?} must stay fail-closed"));
+            assert_eq!(rejection.promoted.kind(), expected, "{shape:?} refused for the wrong reason");
+        }
+    }
+
+    #[test]
+    fn def_block_projection_gate_obeys_the_explicit_opt_in() {
+        let pair = Ty::Tuple(vec![Ty::U64, Ty::U64]);
+        let mut mb = ModuleBuilder::new("mem2reg_def_block_projection");
+        let ft = mb.add_func_type(vec![pair.clone()], vec![pair.clone()]);
+        let mut fb = mb.function("projected", ft);
+        let entry = fb.create_block();
+        let join = fb.create_block();
+        fb.set_entry(entry);
+
+        fb.switch_to_block(entry);
+        let seed = fb.add_block_param(entry, pair.clone());
+        let cell = fb.alloca(pair.clone());
+        fb.store(pair.clone(), cell, seed);
+        let zero = fb.iconst(Ty::U64, 0);
+        let field = fb.gep(Ty::U64, cell, vec![zero]);
+        let seven = fb.iconst(Ty::U64, 7);
+        fb.store(Ty::U64, field, seven);
+        fb.br(join, vec![]);
+
+        fb.switch_to_block(join);
+        let value = fb.load(pair.clone(), cell);
+        fb.ret(vec![value]);
+        fb.build();
+
+        let module = mb.build();
+        let admitted =
+            single_cell_alloca_rejection(&module, &module.functions[0], cell, &pair).is_none();
+        assert_eq!(
+            admitted,
+            promote_def_block_projections(),
+            "only TRUST_PROMOTE_DEF_BLOCK_PROJECTIONS may admit this exact projection"
+        );
+    }
+
+    /// R68 fixtures, and the shape R67 MEASURED as ny-cert's dominant Alloca
+    /// refusal: a local that is BORROWED, with its store and load straddling block
+    /// boundaries. The promoted-lane `pointer_used_by_instruction` records name
+    /// `Borrow` 42 times and `BorrowMut` 27 against `GEP` 3 — so the
+    /// `build_aggregate_clamp_join` fixtures above model the RARE case. This models
+    /// the common one.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BorrowShape {
+        /// `&mut local`, stored through in a LATER block and loaded in a third —
+        /// the transparent alias `translate_node`'s Borrow arm models exactly.
+        Transparent,
+        /// The same, on a SCALAR cell. Pins that this arm deliberately does not
+        /// require a projectable aggregate: unlike a GEP, a borrow selects the
+        /// WHOLE cell, so there is no leaf for it to miss. R67 sees `ty=u64`.
+        ScalarTransparent,
+        /// THE HAZARD: the borrow RESULT is written into memory. A borrow binds a
+        /// NEW SSA id, so step 2's candidate-id alias check is structurally blind
+        /// to it; only the escape classifier's derivation closure sees it.
+        StoredAsValue,
+    }
+
+    fn build_borrowed_cross_block(shape: BorrowShape) -> (Module, ValueId, Ty) {
+        let cell_ty = if shape == BorrowShape::ScalarTransparent {
+            Ty::U64
+        } else {
+            Ty::Tuple(vec![Ty::U64, Ty::U64])
+        };
+        let mut mb = ModuleBuilder::new("mem2reg_borrow_cross_block");
+        let ft = mb.add_func_type(vec![Ty::Bool, cell_ty.clone()], vec![cell_ty.clone()]);
+        let mut fb = mb.function("borrowed", ft);
+
+        let entry = fb.create_block();
+        let arm = fb.create_block();
+        let join = fb.create_block();
+        fb.set_entry(entry);
+
+        fb.switch_to_block(entry);
+        let cond = fb.add_block_param(entry, Ty::Bool);
+        let seed = fb.add_block_param(entry, cell_ty.clone());
+        let cell = fb.alloca(cell_ty.clone());
+        fb.store(cell_ty.clone(), cell, seed); // definite initialization in the def block
+        let borrowed = fb.borrow_mut(cell); // THE BORROW
+        if shape == BorrowShape::StoredAsValue {
+            let sink = fb.alloca(Ty::Ptr);
+            fb.store(Ty::Ptr, sink, borrowed); // the ADDRESS goes into memory
+        }
+        fb.condbr(cond, arm, vec![], join, vec![]);
+
+        // Cross-block, and THROUGH the borrow — the exact shape that lands in the
+        // `store_in_other_block` bucket (109 of ny-cert's 159 Alloca rows).
+        fb.switch_to_block(arm);
+        fb.store(cell_ty.clone(), borrowed, seed);
+        fb.br(join, vec![]);
+
+        fb.switch_to_block(join);
+        let out = fb.load(cell_ty.clone(), cell);
+        fb.ret(vec![out]);
+        fb.build();
+
+        (mb.build(), cell, cell_ty)
+    }
+
+    /// Run the real step-2 predicate on the fixture's borrow. Called directly
+    /// because `promote_cell_borrows()` is a process-global `OnceLock` — a pin that
+    /// could only run under an env var is a pin that does not run.
+    fn borrow_is_transparently_promotable(module: &Module, cell: ValueId) -> bool {
+        let func = &module.functions[0];
+        func.blocks
+            .iter()
+            .flat_map(|block| block.body.iter())
+            .find(|node| {
+                matches!(
+                    &node.inst,
+                    Inst::Borrow { ptr } | Inst::BorrowMut { ptr } if ptr.index() == cell.index()
+                )
+            })
+            .map(|node| borrow_use_is_transparently_promotable(func, &node.inst, cell))
+            .expect("the fixture borrows the cell")
+    }
+
+    /// THE FALSE-PROOF TRIPWIRE for the R68 borrow arm. If this ever goes green the
+    /// widening is UNSOUND: the cell's address is in memory, an unknown store can
+    /// reach it, and promoting it would thread a value that a later write through
+    /// the leaked pointer silently invalidates.
+    ///
+    /// Step 2's own alias check cannot catch this — it tests whether the CANDIDATE's
+    /// id appears as a `Store` value, and a borrow binds a new id. The escape
+    /// classification is the only thing standing here, which is why the arm requires
+    /// it rather than treating it as a precision filter.
+    #[test]
+    fn a_borrow_stored_as_a_value_is_still_refused() {
+        let (module, cell, _) = build_borrowed_cross_block(BorrowShape::StoredAsValue);
+        assert!(
+            !borrow_is_transparently_promotable(&module, cell),
+            "a borrow whose RESULT is written into memory must never be promotable",
+        );
+        assert_eq!(
+            stack_alloca_escape_classification(&module.functions[0], cell),
+            StackCellEscape::Unbounded,
+            "and it must be refused for the ESCAPE reason, not incidentally",
+        );
+    }
+
+    /// The positive half: the transparent cross-block borrow the arm exists to
+    /// admit, on both an aggregate and a scalar cell.
+    #[test]
+    fn a_transparent_cross_block_borrow_is_promotable() {
+        for shape in [BorrowShape::Transparent, BorrowShape::ScalarTransparent] {
+            let (module, cell, _) = build_borrowed_cross_block(shape);
+            assert!(borrow_is_transparently_promotable(&module, cell), "{shape:?}");
+            assert_ne!(
+                stack_alloca_escape_classification(&module.functions[0], cell),
+                StackCellEscape::Unbounded,
+                "{shape:?} must not be Unbounded",
+            );
+        }
+    }
+
+    /// DEFAULT-LANE INERTNESS, and bucket preservation. With the flag off every
+    /// shape stays refused, in the SAME histogram bucket as before the change, so
+    /// gate logs remain comparable across it.
+    ///
+    /// Like the R49 inertness pins, this test is EXPECTED to fail when the suite is
+    /// run with `TRUST_PROMOTE_CELL_BORROWS` set — that failure is the pin working,
+    /// and is the evidence the lever actually bites. It must not be weakened to
+    /// accommodate the flag.
+    #[test]
+    fn the_borrow_arm_is_default_off_and_bucket_preserving() {
+        for shape in [
+            BorrowShape::Transparent,
+            BorrowShape::ScalarTransparent,
+            BorrowShape::StoredAsValue,
+        ] {
+            let (module, cell, ty) = build_borrowed_cross_block(shape);
+            let func = &module.functions[0];
+            let rejection = single_cell_alloca_rejection(&module, func, cell, &ty)
+                .unwrap_or_else(|| panic!("{shape:?} must stay refused in the default lane"));
+            assert_eq!(
+                rejection.promoted.kind(),
+                "not_promotable.pointer_used_by_instruction",
+                "{shape:?} refused for the wrong reason",
+            );
+        }
+    }
+
+    #[test]
+    fn transparent_borrow_gate_obeys_the_explicit_opt_in() {
+        for shape in [BorrowShape::Transparent, BorrowShape::ScalarTransparent] {
+            let (module, cell, ty) = build_borrowed_cross_block(shape);
+            let admitted =
+                single_cell_alloca_rejection(&module, &module.functions[0], cell, &ty).is_none();
+            assert_eq!(
+                admitted,
+                promote_cell_borrows(),
+                "only TRUST_PROMOTE_CELL_BORROWS may admit {shape:?}"
+            );
+        }
+
+        let (module, cell, ty) = build_borrowed_cross_block(BorrowShape::StoredAsValue);
+        assert!(
+            single_cell_alloca_rejection(&module, &module.functions[0], cell, &ty).is_some(),
+            "a borrow stored as a value must remain fail-closed in both modes"
+        );
+    }
+
+    #[test]
+    fn call_escape_admission_gate_obeys_the_explicit_opt_in() {
+        let mut mb = ModuleBuilder::new("alloca_call_escape_gate");
+        let caller_ty = mb.add_func_type(vec![], vec![]);
+        let callee_ty = mb.add_func_type(vec![Ty::Ptr], vec![]);
+
+        let mut caller = mb.function("caller", caller_ty);
+        let entry = caller.create_block();
+        caller.set_entry(entry);
+        caller.switch_to_block(entry);
+        let cell = caller.alloca(Ty::I64);
+        let one = caller.iconst(Ty::I64, 1);
+        caller.store(Ty::I64, cell, one);
+        let borrowed = caller.borrow_mut(cell);
+        let _call = caller.call(FuncId::new(1), vec![borrowed]);
+        let _value = caller.load(Ty::I64, cell);
+        caller.ret(vec![]);
+        caller.build();
+
+        let mut callee = mb.function("sink", callee_ty);
+        let entry = callee.create_block();
+        callee.set_entry(entry);
+        callee.switch_to_block(entry);
+        let _pointer = callee.add_block_param(entry, Ty::Ptr);
+        callee.ret(vec![]);
+        callee.build();
+
+        let module = mb.build();
+        assert_eq!(
+            stack_alloca_escape_classification(&module.functions[0], cell),
+            StackCellEscape::IntoCallsOnly
+        );
+        let admitted =
+            single_cell_alloca_rejection(&module, &module.functions[0], cell, &Ty::I64).is_none();
+        assert_eq!(
+            admitted,
+            std::env::var_os("TRUST_ALLOCA_ESCAPE_GATE_WIDEN").is_some(),
+            "only TRUST_ALLOCA_ESCAPE_GATE_WIDEN may admit this call-escaping cell"
+        );
     }
 
     /// The refactor that made the admission predicate call the translator's
@@ -5727,8 +8192,799 @@ mod mem2reg_tests {
         let translator = ChcFuncTranslator::new(func, &module, &options);
         assert_eq!(
             translator.compute_promotable_cells().0.len(),
-            compute_promotable_cells_of(func).0.len()
+            compute_promotable_cells_of(&module, func).0.len()
         );
-        assert_eq!(translator.compute_promotable_cells().1, compute_promotable_cells_of(func).1);
+        assert_eq!(
+            translator.compute_promotable_cells().1,
+            compute_promotable_cells_of(&module, func).1
+        );
+    }
+}
+
+#[cfg(test)]
+mod unsupported_reason_label_tests {
+    //! The typed fail-closed reason must reach the transport as a legible label.
+    //! Before this, only the COUNT crossed the boundary, so a demoted obligation
+    //! reported "N unsupported trust_ir construct(s)" with no way to learn which
+    //! of the ~50 constructs blocked it.
+    use super::TrustIrChcUnsupportedReason;
+
+    /// The label is the variant name, verbatim — pinned for the families that
+    /// actually show up on the ny-cert frontier.
+    #[test]
+    fn label_is_the_variant_name() {
+        assert_eq!(TrustIrChcUnsupportedReason::Cast.label(), "Cast");
+        assert_eq!(TrustIrChcUnsupportedReason::IndirectCall.label(), "IndirectCall");
+        assert_eq!(TrustIrChcUnsupportedReason::HeapAllocation.label(), "HeapAllocation");
+        assert_eq!(
+            TrustIrChcUnsupportedReason::FloatingPointArithmetic.label(),
+            "FloatingPointArithmetic"
+        );
+        assert_eq!(
+            TrustIrChcUnsupportedReason::MemoryAccessWithoutPreciseModel.label(),
+            "MemoryAccessWithoutPreciseModel"
+        );
+    }
+
+    /// Distinct reasons must not collide onto one label, or the surfaced list
+    /// would silently under-report the blocking families.
+    #[test]
+    fn labels_are_distinct_across_the_families_we_surface() {
+        let reasons = [
+            TrustIrChcUnsupportedReason::Cast,
+            TrustIrChcUnsupportedReason::UnaryOperation,
+            TrustIrChcUnsupportedReason::AggregateProjection,
+            TrustIrChcUnsupportedReason::AggregateUpdate,
+            TrustIrChcUnsupportedReason::MemoryAccessWithoutPreciseModel,
+            TrustIrChcUnsupportedReason::HeapAllocation,
+            TrustIrChcUnsupportedReason::PointerArithmetic,
+            TrustIrChcUnsupportedReason::Switch,
+            TrustIrChcUnsupportedReason::IndirectCall,
+            TrustIrChcUnsupportedReason::UnknownDirectCall,
+            TrustIrChcUnsupportedReason::RecursiveDirectCall,
+            TrustIrChcUnsupportedReason::FloatingPointArithmetic,
+            TrustIrChcUnsupportedReason::FloatingPointComparison,
+        ];
+        let mut labels: Vec<String> = reasons.iter().map(|r| r.label()).collect();
+        let total = labels.len();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(labels.len(), total, "reason labels must be injective: {labels:?}");
+    }
+}
+
+#[cfg(test)]
+mod alloca_reject_taxonomy_tests {
+    //! The `Alloca` admission gate holds the largest block of unknown rows on the
+    //! ny-cert strict lane, and "411 rejections" says nothing about WHY. These
+    //! tests pin one synthetic function per rejection reason so the histogram the
+    //! driver prints is trustworthy, and — more importantly — prove the
+    //! reason-returning rewrite is VERDICT-INERT: `*_reference` holds the original
+    //! boolean bodies verbatim and `parity_with_the_original_boolean_predicates`
+    //! runs every fixture through both.
+    use super::*;
+    use trust_ir::dialect::DialectInst;
+    use trust_ir::ty::{EnumDef, EnumVariant};
+    use trust_ir::value::{EnumId, FuncTyId, TyId};
+
+    /// The fixtures are hand-built `Function`s, so the module only has to answer
+    /// `aggregate_field_tys_of` for the types they use. `Ty::Tuple` carries its own
+    /// field types, so the only entry that matters is the ENUM definition — and even
+    /// that is present for honesty rather than necessity: `immediate_aggregate_field_tys`
+    /// has no `Ty::Enum` arm at all, so a defined and an undefined enum are equally
+    /// non-trackable.
+    fn taxonomy_module() -> Module {
+        let mut module = Module::new("alloca_taxonomy");
+        module.enums.push(EnumDef::new(
+            EnumId::new(0),
+            "Choice",
+            vec![
+                EnumVariant {
+                    name: "A".to_string(),
+                    fields: Vec::new(),
+                    field_names: Vec::new(),
+                },
+                EnumVariant {
+                    name: "B".to_string(),
+                    fields: vec![Ty::I64],
+                    field_names: Vec::new(),
+                },
+            ],
+        ));
+        module
+    }
+
+    fn func(entry: u32, blocks: Vec<Block>) -> Function {
+        let mut function =
+            Function::new(FuncId::new(0), "alloca_taxonomy", FuncTyId::new(0), BlockId::new(entry));
+        function.blocks = blocks;
+        function
+    }
+
+    fn block(id: u32, body: Vec<InstrNode>) -> Block {
+        let mut block = Block::new(BlockId::new(id));
+        block.body = body;
+        block
+    }
+
+    fn alloca(result: u32, ty: Ty) -> InstrNode {
+        InstrNode::new(Inst::Alloca { ty, count: None, align: None })
+            .with_result(ValueId::new(result))
+    }
+
+    fn store(ptr: u32, value: u32, ty: Ty) -> InstrNode {
+        InstrNode::new(Inst::Store {
+            ty,
+            ptr: ValueId::new(ptr),
+            value: ValueId::new(value),
+            volatile: false,
+            align: None,
+        })
+    }
+
+    fn load(result: u32, ptr: u32, ty: Ty) -> InstrNode {
+        InstrNode::new(Inst::Load {
+            ty,
+            ptr: ValueId::new(ptr),
+            volatile: false,
+            align: None,
+        })
+        .with_result(ValueId::new(result))
+    }
+
+    fn ret() -> InstrNode {
+        InstrNode::new(Inst::Return { values: Vec::new() })
+    }
+
+    fn br(target: u32) -> InstrNode {
+        InstrNode::new(Inst::Br { target: BlockId::new(target), args: Vec::new() })
+    }
+
+    /// Every fixture below, as `(label, function, cell, cell ty)`.
+    fn fixtures() -> Vec<(&'static str, Function, ValueId, Ty)> {
+        let cell = ValueId::new(0);
+        let i64_ = Ty::I64;
+        let mut all: Vec<(&'static str, Function, ValueId, Ty)> = Vec::new();
+
+        // Admitted control: block-local scalar, store then load.
+        all.push((
+            "admissible_block_local",
+            func(0, vec![block(0, vec![alloca(0, i64_.clone()), store(0, 1, i64_.clone()),
+                load(2, 0, i64_.clone()), ret()])]),
+            cell,
+            i64_.clone(),
+        ));
+
+        // Lane 1: the pointee is neither a precise scalar nor an aggregate.
+        let fat = Ty::FatPtr(FatPtrKind::Slice(TyId::new(0)));
+        all.push((
+            "pointee_not_scalar_or_aggregate",
+            func(0, vec![block(0, vec![alloca(0, fat.clone()), ret()])]),
+            cell,
+            fat,
+        ));
+
+        // No `Alloca { count: None, align: None, ty }` defines the cell: here the
+        // defining alloca carries a DIFFERENT type than the one being admitted.
+        all.push((
+            "no_exact_defining_alloca",
+            func(0, vec![block(0, vec![alloca(0, Ty::I32), ret()])]),
+            cell,
+            i64_.clone(),
+        ));
+
+        // A load in a block other than the defining one. This is the shape
+        // `trust-ir-bridge::promote_local_to_memory` emits for EVERY multi-block
+        // local, which is the only reason it emits an `Alloca` at all.
+        all.push((
+            "load_in_other_block",
+            func(
+                0,
+                vec![
+                    block(0, vec![alloca(0, i64_.clone()), store(0, 1, i64_.clone()), br(1)]),
+                    block(1, vec![load(2, 0, i64_.clone()), ret()]),
+                ],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+        all.push((
+            "store_in_other_block",
+            func(
+                0,
+                vec![
+                    block(0, vec![alloca(0, i64_.clone()), br(1)]),
+                    block(1, vec![store(0, 1, i64_.clone()), ret()]),
+                ],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+
+        all.push((
+            "load_before_store",
+            func(0, vec![block(0, vec![alloca(0, i64_.clone()), load(2, 0, i64_.clone()), ret()])]),
+            cell,
+            i64_.clone(),
+        ));
+
+        all.push((
+            "load_volatile",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, i64_.clone()),
+                        store(0, 1, i64_.clone()),
+                        InstrNode::new(Inst::Load {
+                            ty: i64_.clone(),
+                            ptr: cell,
+                            volatile: true,
+                            align: None,
+                        })
+                        .with_result(ValueId::new(2)),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+        all.push((
+            "load_aligned",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, i64_.clone()),
+                        store(0, 1, i64_.clone()),
+                        InstrNode::new(Inst::Load {
+                            ty: i64_.clone(),
+                            ptr: cell,
+                            volatile: false,
+                            align: Some(8),
+                        })
+                        .with_result(ValueId::new(2)),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+        all.push((
+            "load_type_mismatch",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, i64_.clone()),
+                        store(0, 1, i64_.clone()),
+                        load(2, 0, Ty::I32),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+
+        all.push((
+            "store_volatile",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, i64_.clone()),
+                        InstrNode::new(Inst::Store {
+                            ty: i64_.clone(),
+                            ptr: cell,
+                            value: ValueId::new(1),
+                            volatile: true,
+                            align: None,
+                        }),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+        all.push((
+            "store_aligned",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, i64_.clone()),
+                        InstrNode::new(Inst::Store {
+                            ty: i64_.clone(),
+                            ptr: cell,
+                            value: ValueId::new(1),
+                            volatile: false,
+                            align: Some(8),
+                        }),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+        all.push((
+            "store_type_mismatch",
+            func(0, vec![block(0, vec![alloca(0, i64_.clone()), store(0, 1, Ty::I32), ret()])]),
+            cell,
+            i64_.clone(),
+        ));
+
+        // The cell POINTER is the stored value — it escaped into memory.
+        all.push((
+            "pointer_stored_as_value",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, i64_.clone()),
+                        alloca(3, Ty::Ptr),
+                        store(3, 0, Ty::Ptr),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+
+        // A `GEP` on the cell pointer: the shape a struct FIELD projection takes.
+        all.push((
+            "pointer_used_by_instruction",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, i64_.clone()),
+                        store(0, 1, i64_.clone()),
+                        InstrNode::new(Inst::GEP {
+                            pointee_ty: i64_.clone(),
+                            base: cell,
+                            indices: vec![ValueId::new(4)],
+                            inbounds: false,
+                        })
+                        .with_result(ValueId::new(5)),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+
+        // An instruction whose operands the use-collector cannot enumerate poisons
+        // EVERY cell in the function, even one it never mentions.
+        all.push((
+            "opaque_instruction",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, i64_.clone()),
+                        store(0, 1, i64_.clone()),
+                        InstrNode::new(Inst::DialectOp(Box::new(DialectInst::new(
+                            "verif", "bfs_step",
+                        )))),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+
+        // A cross-block TRACKABLE AGGREGATE cell: lane 1 still rejects (the store is
+        // not in the defining block) and lane 2 now ADMITS it — this is the whole
+        // point of the aggregate widening, and it is the shape behind ny-cert's
+        // `store_in_other_block/not_promotable.pointee_not_precise_scalar` bucket.
+        // It is deliberately kept in `fixtures()` (rather than moved out) so the
+        // parity tests below see it: `promotion_widens_only_on_trackable_aggregate_cells`
+        // is what pins that this flip is the INTENDED one.
+        all.push((
+            "aggregate_cross_block",
+            func(
+                0,
+                vec![
+                    block(0, vec![alloca(0, Ty::Tuple(vec![Ty::I64, Ty::I64])), br(1)]),
+                    block(
+                        1,
+                        vec![store(0, 1, Ty::Tuple(vec![Ty::I64, Ty::I64])), ret()],
+                    ),
+                ],
+            ),
+            cell,
+            Ty::Tuple(vec![Ty::I64, Ty::I64]),
+        ));
+
+        // An ENUM cell in exactly the same shape. `immediate_aggregate_field_tys`
+        // has no enum arm — an enum is a DISCRIMINANT plus a variant-dependent
+        // payload and this translator has no per-variant leaf model — so the cell is
+        // modeled OPAQUELY and promotion must never reach it. Both lanes reject.
+        let choice = Ty::Enum(EnumId::new(0));
+        all.push((
+            "enum_cross_block",
+            func(
+                0,
+                vec![
+                    block(0, vec![alloca(0, choice.clone()), br(1)]),
+                    block(1, vec![store(0, 1, choice.clone()), ret()]),
+                ],
+            ),
+            cell,
+            choice,
+        ));
+
+        // A cross-block aggregate whose cell pointer is a GEP base — the FIELD
+        // PROJECTION shape. Promotion step 2 disqualifies a GEP base, so widening the
+        // pointee type must NOT let a field-projected cell through.
+        let pair = Ty::Tuple(vec![Ty::I64, Ty::I64]);
+        all.push((
+            "aggregate_field_projected",
+            func(
+                0,
+                vec![
+                    block(0, vec![alloca(0, pair.clone()), store(0, 1, pair.clone()), br(1)]),
+                    block(
+                        1,
+                        vec![
+                            InstrNode::new(Inst::GEP {
+                                pointee_ty: Ty::I64,
+                                base: cell,
+                                indices: vec![ValueId::new(4)],
+                                inbounds: false,
+                            })
+                            .with_result(ValueId::new(5)),
+                            ret(),
+                        ],
+                    ),
+                ],
+            ),
+            cell,
+            pair,
+        ));
+
+        // An ARRAY alloca never reaches the predicate (the driver arm's pattern
+        // requires `count: None`), but the predicate must still decline it.
+        all.push((
+            "array_alloca_count_some",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        InstrNode::new(Inst::Alloca {
+                            ty: i64_.clone(),
+                            count: Some(ValueId::new(9)),
+                            align: None,
+                        })
+                        .with_result(cell),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+        all.push((
+            "aligned_alloca",
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        InstrNode::new(Inst::Alloca {
+                            ty: i64_.clone(),
+                            count: None,
+                            align: Some(8),
+                        })
+                        .with_result(cell),
+                        ret(),
+                    ],
+                )],
+            ),
+            cell,
+            i64_.clone(),
+        ));
+
+        all
+    }
+
+    /// Lane 1's verdict on a fixture. Probed directly, because a cross-block
+    /// SCALAR cell that lane 1 rejects is legitimately ADMITTED by lane 2 — see
+    /// `a_cross_block_scalar_is_admitted_by_the_promotion_lane`.
+    fn block_local_reason_for(label: &str) -> BlockLocalAllocaReject {
+        let all = fixtures();
+        let (_, function, cell, ty) =
+            all.iter().find(|(name, ..)| *name == label).expect("fixture exists");
+        block_local_alloca_reject(function, *cell, ty)
+            .unwrap_or_else(|| panic!("fixture `{label}` must be rejected by lane 1"))
+    }
+
+    fn reason_for(label: &str) -> SingleCellAllocaRejection {
+        let all = fixtures();
+        let (_, function, cell, ty) =
+            all.iter().find(|(name, ..)| *name == label).expect("fixture exists");
+        single_cell_alloca_rejection(&taxonomy_module(), function, *cell, ty)
+            .unwrap_or_else(|| panic!("fixture `{label}` must be rejected"))
+    }
+
+    #[test]
+    fn the_admissible_control_is_admitted_and_has_no_reason() {
+        let all = fixtures();
+        let (_, function, cell, ty) = all
+            .iter()
+            .find(|(name, ..)| *name == "admissible_block_local")
+            .expect("control exists");
+        let module = taxonomy_module();
+        assert!(single_cell_alloca_is_admissible(&module, function, *cell, ty));
+        assert_eq!(single_cell_alloca_rejection(&module, function, *cell, ty), None);
+    }
+
+    #[test]
+    fn each_block_local_reason_is_named() {
+        for label in [
+            "pointee_not_scalar_or_aggregate",
+            "no_exact_defining_alloca",
+            "load_in_other_block",
+            "store_in_other_block",
+            "load_before_store",
+            "load_volatile",
+            "load_aligned",
+            "load_type_mismatch",
+            "store_volatile",
+            "store_aligned",
+            "store_type_mismatch",
+            "pointer_stored_as_value",
+            "pointer_used_by_instruction",
+            "opaque_instruction",
+        ] {
+            assert_eq!(
+                block_local_reason_for(label).kind(),
+                label,
+                "fixture `{label}` must classify as `{label}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cross_block_access_names_both_the_access_and_the_defining_block() {
+        assert_eq!(
+            block_local_reason_for("store_in_other_block"),
+            BlockLocalAllocaReject::StoreInOtherBlock { block: 1, definition_block: 0 }
+        );
+        assert_eq!(
+            block_local_reason_for("load_in_other_block"),
+            BlockLocalAllocaReject::LoadInOtherBlock { block: 1, definition_block: 0 }
+        );
+    }
+
+    /// Lane 1 is block-local by construction, but a cross-block SCALAR cell is
+    /// exactly what lane 2 (mem2reg promotion) exists to admit — so a cross-block
+    /// access is only fatal for cells promotion cannot reach, i.e. aggregates.
+    /// This is the load-bearing asymmetry behind the ny-cert histogram.
+    #[test]
+    fn a_cross_block_scalar_is_admitted_by_the_promotion_lane() {
+        for label in ["store_in_other_block", "load_in_other_block"] {
+            let all = fixtures();
+            let (_, function, cell, ty) =
+                all.iter().find(|(name, ..)| *name == label).expect("fixture exists");
+            assert!(
+                block_local_alloca_reject(function, *cell, ty).is_some(),
+                "lane 1 rejects the cross-block access in `{label}`"
+            );
+            assert!(
+                single_cell_alloca_is_admissible(&taxonomy_module(), function, *cell, ty),
+                "lane 2 still ADMITS the cross-block scalar in `{label}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_type_mismatch_names_both_types() {
+        assert_eq!(
+            block_local_reason_for("store_type_mismatch"),
+            BlockLocalAllocaReject::StoreTypeMismatch {
+                block: 0,
+                access_ty: "i32".to_string(),
+                cell_ty: "i64".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_escaping_use_names_the_instruction_that_took_the_pointer() {
+        assert_eq!(
+            block_local_reason_for("pointer_used_by_instruction"),
+            BlockLocalAllocaReject::PointerUsedByInstruction { block: 0, inst: "GEP".to_string() }
+        );
+        assert_eq!(
+            block_local_reason_for("opaque_instruction"),
+            BlockLocalAllocaReject::OpaqueInstruction { block: 0, inst: "DialectOp".to_string() }
+        );
+    }
+
+    /// The R49 frontier, now cleared: a cross-block TRACKABLE aggregate — the shape
+    /// behind ny-cert's dominant `store_in_other_block/…pointee_not_precise_scalar`
+    /// bucket — is admitted by the promotion lane, exactly as the cross-block scalar
+    /// already was. Lane 1 must still reject it, so the differential (not just the
+    /// verdict) stays pinned.
+    #[test]
+    fn a_cross_block_trackable_aggregate_is_admitted_by_the_promotion_lane() {
+        let all = fixtures();
+        let (_, function, cell, ty) =
+            all.iter().find(|(name, ..)| *name == "aggregate_cross_block").expect("fixture exists");
+        let module = taxonomy_module();
+        assert_eq!(
+            block_local_alloca_reject(function, *cell, ty).map(|reason| reason.kind()),
+            Some("store_in_other_block"),
+            "lane 1 is block-local, so it still rejects"
+        );
+        assert!(
+            promoted_cell_alloca_reject(&module, function, *cell, ty).is_none(),
+            "lane 2 promotes the un-aliased, whole-cell, definitely-initialized tuple"
+        );
+        assert!(single_cell_alloca_is_admissible(&module, function, *cell, ty));
+    }
+
+    /// The bound on the widening. An ENUM cell in the identical shape stays rejected
+    /// by BOTH lanes: the translator models it opaquely (no per-variant leaf model),
+    /// so there is no binding to thread and promotion must not claim one. The bucket
+    /// token is unchanged, which is why its doc says the condition — not the name —
+    /// moved.
+    #[test]
+    fn an_enum_cell_is_still_never_a_promotion_candidate() {
+        let module = taxonomy_module();
+        assert!(
+            !promotable_cell_ty(&module, &Ty::Enum(EnumId::new(0))),
+            "an enum carries a discriminant this leaf model cannot represent"
+        );
+        let reason = reason_for("enum_cross_block");
+        assert_eq!(reason.block_local.kind(), "store_in_other_block");
+        assert_eq!(reason.promoted.kind(), "not_promotable.pointee_not_precise_scalar");
+    }
+
+    /// The other bound: widening the POINTEE type does not widen the ACCESS shape.
+    /// A cell whose pointer is a `GEP` base is a field projection, and promotion
+    /// step 2 disqualifies it — so it is refused for ESCAPING, not for its type.
+    /// (Whole-cell access is what makes the whole-cell definite-initialization
+    /// dataflow sufficient; a partly-initialized aggregate is unrepresentable here.)
+    #[test]
+    fn a_field_projected_aggregate_cell_is_refused_for_escaping() {
+        let reason = reason_for("aggregate_field_projected");
+        assert_eq!(reason.block_local.kind(), "pointer_used_by_instruction");
+        assert_eq!(
+            reason.promoted,
+            PromotedAllocaReject::NotPromotable(PromotionBlocker::PointerUsedByInstruction {
+                inst: "GEP".to_string()
+            }),
+            "the GEP base is what disqualifies it, not the pointee type"
+        );
+    }
+
+    #[test]
+    fn an_array_or_aligned_alloca_is_declined_by_both_lanes() {
+        assert_eq!(reason_for("array_alloca_count_some").block_local.kind(), "no_exact_defining_alloca");
+        assert_eq!(reason_for("array_alloca_count_some").promoted.kind(), "no_exact_defining_alloca");
+        assert_eq!(reason_for("aligned_alloca").block_local.kind(), "no_exact_defining_alloca");
+        assert_eq!(reason_for("aligned_alloca").promoted.kind(), "no_exact_defining_alloca");
+    }
+
+    #[test]
+    fn reason_kinds_are_stable_grep_tokens() {
+        // The gate log histogram is built by grepping `reason=<lane1>/<lane2>`, so
+        // a bucket name must never contain a separator that breaks the split.
+        for (_, function, cell, ty) in fixtures() {
+            if let Some(reason) = single_cell_alloca_rejection(&taxonomy_module(), &function, cell, &ty)
+            {
+                let kind = reason.kind();
+                assert_eq!(kind.matches('/').count(), 1, "exactly one lane separator: {kind}");
+                assert!(
+                    kind.chars().all(|c| c.is_ascii_lowercase() || "_./".contains(c)),
+                    "bucket names stay grep-safe: {kind}"
+                );
+            }
+        }
+    }
+
+    /// VERDICT INERTNESS. The reason-returning rewrite must admit exactly the
+    /// cells the original booleans admitted — on every fixture, for BOTH lanes
+    /// independently and for the combined predicate.
+    #[test]
+    fn parity_with_the_original_boolean_predicates() {
+        let module = taxonomy_module();
+        for (label, function, cell, ty) in fixtures() {
+            assert_eq!(
+                block_local_alloca_reject(&function, cell, &ty).is_none(),
+                block_local_alloca_is_admissible_reference(&function, cell, &ty),
+                "lane 1 verdict changed on `{label}`"
+            );
+            assert_eq!(
+                promoted_cell_alloca_reject(&module, &function, cell, &ty).is_none(),
+                promoted_cell_alloca_is_admissible_reference(&module, &function, cell, &ty),
+                "lane 2 verdict changed on `{label}`"
+            );
+            assert_eq!(
+                single_cell_alloca_is_admissible(&module, &function, cell, &ty),
+                block_local_alloca_is_admissible_reference(&function, cell, &ty)
+                    || promoted_cell_alloca_is_admissible_reference(&module, &function, cell, &ty),
+                "combined verdict changed on `{label}`"
+            );
+        }
+    }
+
+    /// The same parity, over every cell of every function the OTHER test modules
+    /// build — including the real cross-block promotion shapes.
+    #[test]
+    fn parity_on_the_mem2reg_fixtures() {
+        let module = taxonomy_module();
+        for (label, function, cell, ty) in fixtures() {
+            for probe_ty in [ty.clone(), Ty::I64, Ty::I32, Ty::Ptr, Ty::Unit] {
+                assert_eq!(
+                    single_cell_alloca_is_admissible(&module, &function, cell, &probe_ty),
+                    block_local_alloca_is_admissible_reference(&function, cell, &probe_ty)
+                        || promoted_cell_alloca_is_admissible_reference(
+                            &module, &function, cell, &probe_ty
+                        ),
+                    "verdict changed on `{label}` probed at {probe_ty}"
+                );
+            }
+        }
+    }
+
+    /// DIRECTIONAL PARITY — the guard on the aggregate widening itself.
+    ///
+    /// `promoted_cell_alloca_is_admissible_scalar_reference` is frozen at the lane's
+    /// PRE-widening behaviour (candidate collection restricted to
+    /// `is_precise_stack_scalar_ty`, everything else identical). The live predicate
+    /// may differ from it in exactly ONE way: it may ADMIT a cell whose type is a
+    /// trackable NON-SCALAR aggregate. It may never narrow, and it may never widen on
+    /// a scalar, an enum, a fat pointer, or an over-budget aggregate. Every fixture is
+    /// probed at its own type and at a spread of others, including the two aggregate
+    /// shapes and the enum.
+    #[test]
+    fn promotion_widens_only_on_trackable_aggregate_cells() {
+        let module = taxonomy_module();
+        let probes = [
+            Ty::I64,
+            Ty::I32,
+            Ty::Ptr,
+            Ty::Unit,
+            Ty::Tuple(vec![Ty::I64, Ty::I64]),
+            Ty::Enum(EnumId::new(0)),
+            Ty::FatPtr(FatPtrKind::Slice(TyId::new(0))),
+        ];
+        for (label, function, cell, ty) in fixtures() {
+            for probe_ty in std::iter::once(ty.clone()).chain(probes.iter().cloned()) {
+                let now = promoted_cell_alloca_reject(&module, &function, cell, &probe_ty).is_none();
+                let before =
+                    promoted_cell_alloca_is_admissible_scalar_reference(&function, cell, &probe_ty);
+                if now == before {
+                    continue;
+                }
+                assert!(now && !before, "the promotion lane NARROWED on `{label}` at {probe_ty}");
+                assert!(
+                    !is_precise_stack_scalar_ty(&probe_ty)
+                        && aggregate_field_tys_of(&module, &probe_ty).is_some(),
+                    "the promotion lane widened on `{label}` at {probe_ty}, which is not a \
+                     trackable aggregate"
+                );
+            }
+        }
     }
 }

@@ -26,6 +26,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if !self.detect_slice_as_ptr_call(func) {
                 continue;
             }
+            if !destination.projection.is_empty() {
+                continue;
+            }
             let Some(arg) = args.first().cloned() else { continue };
             propagations.push((destination.local, arg));
         }
@@ -48,6 +51,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 continue;
             };
             if !self.detect_str_as_bytes_call(func) {
+                continue;
+            }
+            if !destination.projection.is_empty() {
                 continue;
             }
             let Some(arg) = args.first().cloned() else { continue };

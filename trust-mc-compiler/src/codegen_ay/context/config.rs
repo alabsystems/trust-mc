@@ -106,6 +106,23 @@ pub(in crate::codegen_ay) struct AYConfig {
     /// skipped to keep the postcondition obligation intact. Cyclic contract
     /// harnesses keep const-prop (they rely on it for invariant synthesis).
     pub(in crate::codegen_ay) is_contract_proof: bool,
+    /// Emit the per-assertion reachability flag (`ay_reach_kani_assert_<n>`)
+    /// that lets the driver report an assertion as UNREACHABLE.
+    ///
+    /// Mirrors Kani's `--assertion-reach-checks` (the driver passes it unless
+    /// the user asked for `--no-assertion-reach-checks`). Kani generates the
+    /// companion reachability check ONLY for assertions, and with the checks
+    /// turned off an assertion in dead code reports the solver's own verdict —
+    /// SUCCESS — instead of UNREACHABLE. Two corpus files pin exactly that
+    /// (`expected/reach/turned-off`, `expected/assert-location/debug-assert`).
+    ///
+    /// SOUNDNESS: the flag governs only the SUCCESS -> UNREACHABLE *annotation*
+    /// of an already-discharged check. It never removes an obligation (the
+    /// `ay_violation_*` predicate is emitted either way), and it cannot mask a
+    /// FAILURE (only non-failing checks are ever annotated). Whole-harness
+    /// vacuity is adjudicated by `probe_harness_reachable`, which does not read
+    /// these per-check flags, so the V4 gate is unaffected.
+    pub(in crate::codegen_ay) assertion_reach_checks: bool,
 }
 
 impl Default for AYConfig {
@@ -134,6 +151,10 @@ impl Default for AYConfig {
             has_explicit_unwind: false,
             uninit_checks: false,
             is_contract_proof: false,
+            // Default ON so a compiler invoked without the driver keeps the
+            // richer UNREACHABLE annotation; the driver sets it from the user's
+            // `--assertion-reach-checks` / `--no-assertion-reach-checks` choice.
+            assertion_reach_checks: true,
         }
     }
 }

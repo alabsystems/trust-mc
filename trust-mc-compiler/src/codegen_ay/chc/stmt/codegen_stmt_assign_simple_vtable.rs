@@ -22,13 +22,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// Captures vtable discriminants from unsize coercions, identity-like
     /// rvalues, wrapper deref loads, and raw fat-pointer aggregates.
+    ///
+    /// Returns `true` when the destination's `__vtable_sv_N__out` was bound
+    /// here. Every branch below binds that ONE variable, so a caller that
+    /// binds it again in the same statement would emit a second equality on
+    /// it — and if the two disagree the block constraints become UNSAT, which
+    /// silently makes the whole harness unreachable rather than failing. See
+    /// [`Self::apply_late_vtable_propagation`], which must honour this.
+    #[must_use]
     pub(in crate::codegen_ay::chc) fn apply_vtable_tracking(
         &mut self,
         rhs: &Rvalue,
         rhs_expr: &Expr,
         local_idx: usize,
         acc: &mut StmtAccumulator<'_>,
-    ) {
+    ) -> bool {
+        let constraints_before = acc.constraints.len();
         // Recover wrapper-dyn unsize vtables before generic capture.
         if let Some(vtable_constraint) = self.try_capture_unsize_coercion_vtable(rhs, local_idx) {
             acc.constraints.push(vtable_constraint);
@@ -85,18 +94,36 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
         }
+
+        acc.constraints.len() > constraints_before
     }
 
     /// Apply late vtable propagation through identity-like rvalues.
     ///
     /// Called after the main assignment constraint is emitted, to propagate
-    /// vtable discriminants through Copy/Move/Ref/Cast chains.
+    /// vtable discriminants through Copy/Move/Ref/Cast chains. This is a
+    /// FALLBACK for rvalues [`Self::apply_vtable_tracking`] could not resolve,
+    /// so it is skipped outright when that pass already bound the
+    /// destination's vtable state variable.
+    ///
+    /// Running it anyway is what a dyn->dyn coercion used to do: `_d = _s as
+    /// &dyn Any` where `_s: &(dyn Any + Send)` captured the TARGET trait's
+    /// vtable id from the concrete source type, then propagated `_s`'s
+    /// SOURCE-trait id onto the same `__out` variable. The two ids differ, so
+    /// the block asserted `1 == 0` and every path through the harness became
+    /// infeasible — a vacuous "proof" that verified nothing. A source that
+    /// carries no vtable state var (the common `&T -> &dyn T` unsize) never
+    /// hit it, which is why only the dyn->dyn shape was affected.
     pub(in crate::codegen_ay::chc) fn apply_late_vtable_propagation(
         &mut self,
         rhs: &Rvalue,
         local_idx: usize,
         acc: &mut StmtAccumulator<'_>,
+        already_bound: bool,
     ) {
+        if already_bound {
+            return;
+        }
         if let Some(src_local) = extract_vtable_source_local(rhs) {
             if let Some(vtable_constraint) =
                 self.propagate_vtable_discriminant(src_local, local_idx)

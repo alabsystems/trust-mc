@@ -49,7 +49,9 @@ pub enum UnsoundnessCategory {
     HeapCheckUnknownLayout,
     IteratorUnsoundness,
     BigIntUnsoundness,
-    // ── SoundApproximation (11): tracked as proof/counterexample qualifications ──
+    // ── SoundApproximation (12): tracked as proof/counterexample qualifications ──
+    //    (VecFieldFallback and PointeeSynthesisFallback appear in this block for
+    //     layout only; class() puts them in Demoted — see the note above.)
     AssumeDroppedTransition,
     ChcCoerceEqDrop,
     ChcTranslationDrop,
@@ -798,6 +800,20 @@ pub struct AggregateEncodingGapInfo {
     pub count: usize,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub per_harness: BTreeMap<String, usize>,
+    /// Per-harness gap REASONS, which for the nested-call lane carry the
+    /// callee: `inline_nested_call_fallback_symbolic@<callee_path>`.
+    ///
+    /// The walker records these at the point of decision
+    /// (`terminator_exec.rs`, `ctx.record_aggregate_gap`) and until now nothing
+    /// drained them outside unit tests, so the count was reportable and the
+    /// CAUSE was not. That matters more here than for most counters: a
+    /// 2026-08-23 corpus run had `nested_call_overapprox` on 62 non-parity
+    /// rows — 42 of them `oracle=success, observed=fail`, i.e. spurious
+    /// counterexamples built on an invented return value — and naming the
+    /// responsible callees is the whole difference between "over-approximated
+    /// somewhere" and a ranked fix list.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_harness_reasons: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
 /// Stub approximation (#3447).

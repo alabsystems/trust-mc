@@ -226,22 +226,60 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// `str` after stripping references/raw pointers — and NOT inside an ADT.
+    ///
+    /// The companion of [`Self::type_contains_str`] without its `Adt` arm. The
+    /// difference is the whole point: `Option<&str>` CONTAINS a `str` but is not
+    /// one, and comparing two `Option<&str>` is enum equality, not string
+    /// equality.
+    fn ty_is_str_after_refs(ty: &rustc_public::ty::Ty) -> bool {
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Str) => true,
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => {
+                Self::ty_is_str_after_refs(&inner)
+            }
+            _ => false, // external enum: TyKind
+        }
+    }
+
     fn detect_string_eq_shared_impl(&self, func: &Operand, callee_path: &str) -> Option<StubKind> {
         if !callee_path.ends_with("::eq") || !callee_path.contains("PartialEq") {
             return None;
         }
 
         let func_ty = func.ty(self.body.locals()).ok()?;
-        let fn_args = match func_ty.kind() {
-            TyKind::RigidTy(RigidTy::FnDef(_, args)) => args,
-            _ => return None, // external enum: TyKind
-        };
+        if !matches!(func_ty.kind(), TyKind::RigidTy(RigidTy::FnDef(_, _))) {
+            return None;
+        }
 
-        fn_args
-            .0
-            .iter()
-            .any(|arg| matches!(arg, GenericArgKind::Type(ty) if Self::type_contains_str(&ty)))
-            .then_some(StubKind::StringEq)
+        // Route on the RECEIVER TYPE, not on "a `str` appears somewhere in the
+        // generic args".
+        //
+        // The old predicate was `fn_args.iter().any(type_contains_str)`, and
+        // `type_contains_str` recurses into ADT generic arguments. So
+        // `<Option<&str> as PartialEq>::eq` was compiled as STRING equality over
+        // two `&Option<&str>` thin pointers. `resolve_string_backing`
+        // (codegen_call_string_backing.rs) then correctly refuses them, the
+        // comparison result becomes a FREE Bool, and the assertion is discharged
+        // against nothing — the harness reports a counterexample built on a value
+        // the solver invented.
+        //
+        // Measured before this change (shipped binary, --ay-chc):
+        //     let a: Option<&str> = None; assert!(a == None);   FAILED, string_eq_imprecise=1
+        //     let a: Option<u8>  = None; assert!(a == None);    SUCCESSFUL   (control)
+        //     let a = "h";               assert!(a == "h");     SUCCESSFUL   (precise eq works)
+        // The `Option<u8>` control shows the enum comparison is fine; only the
+        // presence of `str` INSIDE the enum broke it.
+        //
+        // `PartialEq::eq` takes `&self`, so the monomorphised first input is
+        // `&&str` for a `&str` receiver and `&Option<&str>` for the enum. Testing
+        // it after stripping references keeps genuine string comparisons on the
+        // precise byte-array path and sends everything else back to ordinary
+        // structural equality. `fn_sig` precedent: kani_middle/transform/contracts.rs.
+        let fn_sig = func_ty.kind().fn_sig()?;
+        let binder = fn_sig.skip_binder();
+        let receiver = binder.inputs().first()?;
+        Self::ty_is_str_after_refs(receiver).then_some(StubKind::StringEq)
     }
 
     /// Detect if a type is a tracked collection for CHC length tracking (Part of #1814, #1632).

@@ -20,14 +20,26 @@ use tracing::{debug, warn};
 
 use crate::args::ChcTrackLevel;
 use crate::codegen_ay::provenance::Loc;
-use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width_safe};
+use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 
 use super::codegen_expr_signedness::ExprSignedness;
 use super::stmt_accumulator::StmtAccumulator;
 use super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use crate::codegen_ay::chc::call::codegen_call_kani_model::CallKaniModel;
 
 // Re-export for codegen_stmt/mod.rs which imports extract_vtable_source_local.
 pub(in crate::codegen_ay::chc) use super::codegen_stmt_assign_simple_vtable::extract_vtable_source_local;
+
+/// Byte width of an array element sort, for converting a byte offset into an
+/// element index. `None` for sorts whose in-memory width is not known here
+/// (datatypes, nested arrays) so the caller fails closed instead of guessing.
+fn element_byte_width(elem_sort: &ay_bindings::Sort) -> Option<usize> {
+    if elem_sort.is_bool() {
+        return Some(1);
+    }
+    let bits = elem_sort.bitvec_width()?;
+    Some(((bits / 8) as usize).max(1))
+}
 
 fn ty_is_nonzero(ty: &rustc_public::ty::Ty) -> bool {
     match ty.kind() {
@@ -90,7 +102,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.update_local_signedness_from_rvalue(local_idx, rhs);
 
         // --- VTable tracking (pre-assignment) ---
-        self.apply_vtable_tracking(rhs, &rhs_expr, local_idx, acc);
+        let vtable_bound = self.apply_vtable_tracking(rhs, &rhs_expr, local_idx, acc);
 
         // --- Core assignment: sort coercion + SSA emission ---
         if let Some((out_name, out_sort)) =
@@ -229,7 +241,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.apply_collection_propagation(rhs, &rhs_expr, local_idx, acc);
 
             // --- Late VTable propagation ---
-            self.apply_late_vtable_propagation(rhs, local_idx, acc);
+            self.apply_late_vtable_propagation(rhs, local_idx, acc, vtable_bound);
 
             // --- Mem-level mirroring ---
             if self.track_level >= ChcTrackLevel::Mem {
@@ -333,11 +345,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
 
-        let idx = coerce_bitvec_width_safe(
-            addr_expr,
-            array_sort.index_sort.bitvec_width()?,
-            SignExtension::ZeroExtend,
-        );
+        let idx_width = array_sort.index_sort.bitvec_width()?;
+        // TWO index spaces meet here, and they are not interchangeable:
+        //   * a type-indexed `mem_*` array is indexed by the ABSOLUTE address;
+        //   * a LOCAL's own array state var is indexed by the ELEMENT INDEX.
+        // Feeding the absolute address into the latter selects a cell no store
+        // ever wrote, so `*arr.as_ptr()` and `arr[0]` denote two unrelated
+        // symbolic values. Recover the element index from the split pointer's
+        // offset lane (the byte offset inside the object) divided by the
+        // element's byte width.
+        let idx = if self.resolve_local_from_state_expr(rhs_expr).is_some() {
+            let elem_bytes = element_byte_width(&array_sort.element_sort)?;
+            let addr =
+                coerce_bitvec_width_safe(addr_expr, POINTER_WIDTH, SignExtension::ZeroExtend);
+            let byte_off = coerce_bitvec_width_safe(
+                addr.extract(POINTER_WIDTH / 2 - 1, 0),
+                idx_width,
+                SignExtension::ZeroExtend,
+            );
+            if elem_bytes == 1 {
+                byte_off
+            } else {
+                byte_off.bvudiv(Expr::bitvec_const(elem_bytes as u128, idx_width))
+            }
+        } else {
+            coerce_bitvec_width_safe(addr_expr, idx_width, SignExtension::ZeroExtend)
+        };
         debug!(ptr_local, "assign: Array→element select via deref pointer address (#4022)");
         Some(rhs_expr.clone().select(idx))
     }

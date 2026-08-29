@@ -7,9 +7,9 @@
 //! Extracted from `codegen_stmt_assign_projection.rs` per #4130 to keep files under 500 lines.
 //! Contains: handle_field_index_store.
 
+use ay_bindings::Expr;
 use rustc_public::mir::{Place, ProjectionElem};
 use tracing::debug;
-use ay_bindings::Expr;
 
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 
@@ -137,7 +137,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     coerce_bitvec_width_safe(raw, POINTER_WIDTH, SignExtension::ZeroExtend)
                 }
                 ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    let actual_index = constant_index_offset(*offset, *min_length, *from_end);
+                    // A from-end index needs the slice's runtime length; this
+                    // path has no authenticated length, so fail closed.
+                    let Some(actual_index) = constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        return false;
+                    };
                     Expr::bitvec_const(actual_index as u128, POINTER_WIDTH)
                 }
                 _ => return false,
@@ -224,7 +229,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 coerce_bitvec_width_safe(raw, POINTER_WIDTH, SignExtension::ZeroExtend)
             }
             ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                let actual = constant_index_offset(*offset, *min_length, *from_end);
+                // A from-end index needs the slice's runtime length; this
+                // path has no authenticated length, so fail closed.
+                let Some(actual) = constant_index_offset(*offset, *min_length, *from_end) else {
+                    return false;
+                };
                 Expr::bitvec_const(actual as u128, POINTER_WIDTH)
             }
             _ => return false,

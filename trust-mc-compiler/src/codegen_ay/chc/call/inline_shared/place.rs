@@ -443,7 +443,12 @@ fn resolve_local_projections(
             // already handles this; this adds the symmetric read path.
             ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
                 if current.sort().is_array() {
-                    let idx = super::super::constant_index_offset(*offset, *min_length, *from_end);
+                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                    let Some(idx) =
+                        super::super::constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        return None;
+                    };
                     let idx_expr = Expr::bitvec_const(idx as u128, POINTER_WIDTH);
                     current = current.select(idx_expr);
                 } else {
@@ -669,7 +674,12 @@ fn resolve_capture_field(
             // Part of #3188: ConstantIndex on captures (e.g., tuple destructuring).
             ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
                 if current.sort().is_array() {
-                    let idx = super::super::constant_index_offset(*offset, *min_length, *from_end);
+                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                    let Some(idx) =
+                        super::super::constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        return None;
+                    };
                     let idx_expr = Expr::bitvec_const(idx as u128, POINTER_WIDTH);
                     current = current.select(idx_expr);
                 } else {

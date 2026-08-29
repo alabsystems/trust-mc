@@ -13,7 +13,7 @@ use crate::codegen_ay::float_arithmetic::{int_max_bits, int_min_bits, unsigned_m
 /// semantics for NaN, infinities, and out-of-range values.
 ///
 /// Part of #3787.
-pub(in crate::codegen_ay::chc) fn build_float_to_int_saturating_expr(
+pub(in crate::codegen_ay) fn build_float_to_int_saturating_expr(
     value: &Expr,
     target_width: u32,
     is_signed: bool,
@@ -83,11 +83,34 @@ pub(in crate::codegen_ay::chc) fn build_float_to_int_saturating_expr(
 /// well-defined conversion as UB (no false positives) — e.g. the exact value
 /// `INT_MIN` and fractional values in `(INT_MIN - 1, INT_MIN)` remain safe
 /// because truncation is toward zero.
-pub(in crate::codegen_ay::chc) fn build_float_to_int_ub_free_predicate(
+pub(in crate::codegen_ay) fn build_float_to_int_ub_free_predicate(
     value: &Expr,
     target_width: u32,
     is_signed: bool,
 ) -> Option<Expr> {
+    let (non_finite, out_of_range) =
+        build_float_to_int_ub_components(value, target_width, is_signed)?;
+    Some(non_finite.or(out_of_range).not())
+}
+
+/// The two INDEPENDENT reasons `float_to_int_unchecked` is UB, kept apart.
+///
+/// Returns `(non_finite, out_of_range)`, each true exactly when that reason
+/// applies. `build_float_to_int_ub_free_predicate` is just their negated union.
+///
+/// They are separated because the two are distinguishable to a user and rustc
+/// reports them differently — "attempt to convert a non-finite value to an
+/// integer" versus "attempt to convert a value out of range of the target
+/// integer" — and a checker that collapsed them would name the wrong cause.
+/// Kept in ONE place rather than reimplemented per lane: the bit-level float
+/// reasoning here is subtle (the `INT_MIN` boundary below is exactly the kind
+/// of thing that diverges silently when copied), and it is soundness-relevant
+/// in both.
+pub(in crate::codegen_ay) fn build_float_to_int_ub_components(
+    value: &Expr,
+    target_width: u32,
+    is_signed: bool,
+) -> Option<(Expr, Expr)> {
     let width = value.sort().bitvec_width()?;
     let (exp_hi, exp_lo, _mant_bits, bias) = ieee754_params(width)?;
     let exp_width = exp_hi - exp_lo + 1;
@@ -112,7 +135,7 @@ pub(in crate::codegen_ay::chc) fn build_float_to_int_ub_free_predicate(
     let e_ge = |k: u32| e.clone().bvsge(Expr::bitvec_const(k as u128, work_width));
 
     // A finite float has magnitude |v| ≥ 2^E and < 2^(E+1), so |v| ≥ 2^k iff E ≥ k.
-    let ub = if is_signed {
+    let out_of_range = if is_signed {
         // Positive: value ≥ 2^(w-1) exceeds INT_MAX ⇒ UB.
         let pos_overflow = sign_is_neg.clone().not().and(e_ge(target_width - 1));
         // Negative: value ≤ INT_MIN - 1 ⇒ UB. |value| ≥ 2^(w-1) covers exactly
@@ -120,16 +143,19 @@ pub(in crate::codegen_ay::chc) fn build_float_to_int_ub_free_predicate(
         let neg_overflow = sign_is_neg
             .clone()
             .and(e_ge(target_width).or(e_ge(target_width - 1).and(mantissa_nonzero)));
-        special_exp.or(pos_overflow).or(neg_overflow)
+        pos_overflow.or(neg_overflow)
     } else {
         // Positive: value ≥ 2^w exceeds UINT_MAX ⇒ UB.
         let pos_overflow = sign_is_neg.clone().not().and(e_ge(target_width));
         // Negative: value ≤ -1 (i.e. |value| ≥ 1, E ≥ 0) does not fit ⇒ UB.
         let neg_ub = sign_is_neg.clone().and(e_ge(0));
-        special_exp.or(pos_overflow).or(neg_ub)
+        pos_overflow.or(neg_ub)
     };
 
-    Some(ub.not())
+    // The out-of-range term is only meaningful for a FINITE value: the
+    // all-ones exponent would otherwise decode as a huge E and report the
+    // wrong cause for a NaN. Mask it so exactly one reason fires.
+    Some((special_exp.clone(), special_exp.not().and(out_of_range)))
 }
 
 #[cfg(test)]

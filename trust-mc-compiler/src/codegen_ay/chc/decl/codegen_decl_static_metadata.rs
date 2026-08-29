@@ -14,6 +14,7 @@ use tracing::debug;
 
 use crate::codegen_ay::ptr_repr::PtrRepr;
 
+use super::super::stmt::codegen_stmt_projection::constant_index_offset;
 use super::ChcCtx;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -72,6 +73,34 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let Some(value) = self.projected_immutable_static_value(place) else {
             return false;
         };
+        // `const_ref_values[X]` answers "what is `*X`?" — see
+        // `try_resolve_const_ref_deref`. When `_dest = copy (*STATIC)` loads a
+        // POINTER-typed static, `value` is the pointer itself, so recording it
+        // here answers `*_dest` with `_dest`'s own address bits: `*Z == 14`
+        // becomes a comparison of `Z`'s obj-id/offset word against 14 and the
+        // assertion is refutable. A pointer-typed static's referent value is
+        // one level further in, and that is what this entry must carry.
+        if matches!(
+            self.body.locals()[dest_local].ty.kind(),
+            TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..))
+        ) {
+            let Some(&vec_idx) = self.ref_resolution.static_ref_to_state_idx.get(&place.local)
+            else {
+                return false;
+            };
+            let Some(pointee_value) =
+                self.ref_resolution.static_pointee_init_values.get(&vec_idx).cloned()
+            else {
+                return false;
+            };
+            self.ref_resolution.const_ref_values.insert(dest_local, pointee_value);
+            debug!(
+                src = place.local,
+                dest = dest_local,
+                "CHC: propagated pointer-static referent value through the pointer level"
+            );
+            return true;
+        }
         // Address-vs-value: the metadata half is recorded only when the place's
         // Rust TYPE says a metadata half exists, and only when the term is a
         // GENUINE fat pointer.
@@ -135,8 +164,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     Expr::bitvec_const(value as u128, crate::codegen_ay::types::POINTER_WIDTH)
                 }
                 ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    let actual =
-                        if *from_end { min_length.saturating_sub(*offset) } else { *offset };
+                    let actual = constant_index_offset(*offset, *min_length, *from_end)?;
                     Expr::bitvec_const(actual as u128, crate::codegen_ay::types::POINTER_WIDTH)
                 }
                 _ => return None,

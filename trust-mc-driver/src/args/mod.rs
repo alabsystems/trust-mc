@@ -113,7 +113,7 @@ pub(crate) struct CargoKaniArgs {
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum CargoKaniSubcommand {
     /// Create and run harnesses automatically for eligible functions. Implies -Z function-contracts and -Z loop-contracts.
-    /// See https://model-checking.github.io/kani/reference/experimental/autoharness.html for documentation.
+    /// See `trust-mc explain harness` and guide/src/reference/experimental/autoharness.md.
     Autoharness(Box<autoharness_args::CargoAutoharnessArgs>),
 
     /// List contracts and harnesses.

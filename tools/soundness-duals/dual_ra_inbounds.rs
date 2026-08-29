@@ -1,3 +1,6 @@
+// Oracle: NOT-GENUINE — a SAFE program: must PASS, or fail only via a
+// DEMOTION (OverApproximation/Unknown), never with a Genuine counterexample.
+//
 // Raw-alloc in-bounds read — must PASS or demote honestly.
 use std::alloc::{Layout, alloc};
 

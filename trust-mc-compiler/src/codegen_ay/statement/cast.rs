@@ -9,7 +9,7 @@ use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::mir::Operand;
 use rustc_public::rustc_internal;
 use rustc_public::ty::{AdtKind, RigidTy, TyKind};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{IntoOption, PointerCoercion, StatementCodegen};
 use crate::codegen_ay::types::SignExtension;
@@ -52,7 +52,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         operand: &Operand,
         target_ty: rustc_public::ty::Ty,
     ) -> Option<Expr> {
-        warn!(?kind, "ENTRY codegen_cast_with_kind");
+        // Entry trace, not a diagnostic: this fires on EVERY cast, and `a as u64`
+        // is not something to warn a user about. At warn! it reached the default
+        // output, so any real crate printed a line per cast between the harness
+        // name and its verdict.
+        debug!(?kind, "ENTRY codegen_cast_with_kind");
         // Part of #3809: Transmute gets a dedicated handler that checks
         // rustc layout compatibility before allowing DT→DT structural coercion.
         // Part of #3192: Subtype is handled identically to Transmute, matching

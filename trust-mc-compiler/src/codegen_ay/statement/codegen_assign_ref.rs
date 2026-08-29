@@ -191,6 +191,93 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
+    /// The ssa base name a borrow of `place` must use when `place`'s LAST
+    /// projection is a `Field` that reads through a SORT-ERASED wrapper
+    /// (`ManuallyDrop`/`MaybeUninit`/`NonZero`/…).
+    ///
+    /// Such a wrapper has no separate representation from its payload — see
+    /// [`StatementCodegen::erased_wrapper_field_sort`] — so `&mut (w.N)` and
+    /// `&mut w` name the SAME storage, and the borrow must inherit the wrapper's
+    /// base name rather than the syntactic `..._field_N` that `ssa_base_name`
+    /// would build.
+    ///
+    /// Two shapes, both exact (no approximation):
+    /// * `(_w.N)` — the wrapper is a local, so the name is that local's.
+    /// * `((*_r).N)` — the wrapper is `*_r`, whose storage the deref ladder already
+    ///   names `ref_pointees[_r]`; that is the name to inherit.
+    ///
+    /// Anything else returns `None` and keeps the existing syntactic name.
+    fn erased_wrapper_pointee_alias(&mut self, place: &Place) -> Option<Arc<str>> {
+        let last = place.projection.len().checked_sub(1)?;
+        let ProjectionElem::Field(field_idx, field_ty) = &place.projection[last] else {
+            return None;
+        };
+        let wrapper = Place { local: place.local, projection: place.projection[..last].to_vec() };
+        let wrapper_ty = wrapper.ty(self.body.locals()).into_option()?;
+        Self::erased_wrapper_field_sort(wrapper_ty, *field_idx, *field_ty)?;
+
+        match wrapper.projection.last() {
+            None => Some(Arc::from(self.ssa_base_name(&wrapper))),
+            Some(ProjectionElem::Deref) => {
+                let ref_base = self.ssa_base_name_for_prefix(place, last - 1);
+                self.ref_pointees.get(ref_base.as_str()).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// The CANONICAL ssa base name for a borrow whose referent place starts with
+    /// a `Deref` of a reference local the deref ladder already resolves.
+    ///
+    /// `ssa_base_name` names the referent SYNTACTICALLY, after the reference
+    /// local it was reached through: `&mut (*_98).0` becomes
+    /// `main::local_98_deref_field_0`. Two different reference locals that alias
+    /// the SAME storage (`_98`, `_99`, `_100` are all copies of the same
+    /// `&mut NoCopy<u32>` argument) therefore get three UNRELATED env slots, and a
+    /// store through one is invisible to a load through another — the
+    /// `history/clone_pass` ensures read `ptr.0` from `local_100_deref_field_0`
+    /// while `ptr.0 += 1` had written `local_99_deref_field_0`, so the post-state
+    /// was unconstrained and a TRUE contract was reported FAILED. The same split
+    /// makes the `modifies` footprint (recorded under a third name,
+    /// `local_98_deref_field_0`) uncertifiable against its own store.
+    ///
+    /// The read path ALREADY canonicalizes: `codegen_place_deref_first` looks the
+    /// reference local up in `ref_pointees` and resolves the referent from THAT
+    /// base. This makes the borrow side agree, by rebuilding the name from the
+    /// resolved pointee plus the remaining projections:
+    /// `(*_98).0` with `ref_pointees[_98] = main::local_2` → `main::local_2_field_0`.
+    ///
+    /// SOUNDNESS: this only RENAMES a slot, and renames it to the name the read
+    /// path already uses for the same storage — it merges two aliases of one
+    /// location instead of keeping them separate, which removes stale reads; it
+    /// never merges distinct locations, because the suffix is exactly the
+    /// projection chain and the prefix is the mapping the deref ladder itself
+    /// trusts. Restricted to `Field`/`Downcast` suffixes (a static offset into the
+    /// referent); `Index`/`Subslice`/`OpaqueCast` decline and keep the old
+    /// syntactic name. Declines to `None` whenever `ref_pointees` has no entry, so
+    /// the previous behaviour stands.
+    fn deref_pointee_alias(&mut self, place: &Place) -> Option<Arc<str>> {
+        if !matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
+            return None;
+        }
+        let ref_base = self.ssa_base_name_for_prefix(place, 0);
+        let resolved = self.ref_pointees.get(ref_base.as_str()).cloned()?;
+        let mut base = String::with_capacity(resolved.len() + 16 * place.projection.len());
+        base.push_str(resolved.as_ref());
+        for proj in &place.projection[1..] {
+            match proj {
+                ProjectionElem::Field(field, _) => {
+                    let _ = write!(base, "_field_{field}");
+                }
+                ProjectionElem::Downcast(variant_idx) => {
+                    let _ = write!(base, "_variant_{}", variant_idx.to_index());
+                }
+                _ => return None,
+            }
+        }
+        Some(Arc::from(base))
+    }
+
     /// Track reference pointees for Ref/AddressOf rvalues.
     ///
     /// When we see `_ref = &_pointee`, store the mapping. Also evaluates
@@ -200,7 +287,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return;
         };
         let ref_base: Arc<str> = self.ssa_base_name(lhs).into();
-        let pointee_base: Arc<str> = self.ssa_base_name(pointee_place).into();
+        // #g4-erased-wrapper-payload: `&mut (wrapper.N)` where `.N` reads through
+        // a SORT-ERASED wrapper borrows the wrapper's own storage, so it must
+        // carry the wrapper's own ssa base name. The read side makes that
+        // projection the identity (`apply_projection_chain`); if only the read
+        // side knew, `*r = v` would land under `.._field_N` while the read still
+        // saw the wrapper's slot — a lost write, i.e. a stale read that can PROVE
+        // a false claim.
+        let pointee_base: Arc<str> = match self.erased_wrapper_pointee_alias(pointee_place) {
+            Some(alias) => alias,
+            // #alias-split-on-deref-borrow: name the referent after the storage the
+            // deref ladder resolves, not after the reference local it was reached
+            // through. See `deref_pointee_alias`.
+            None => match self.deref_pointee_alias(pointee_place) {
+                Some(alias) => alias,
+                None => self.ssa_base_name(pointee_place).into(),
+            },
+        };
 
         // #3013: a referent's concrete value normally lives only in the volatile
         // `current_env`; once a later block / phi rebuild / inline boundary
@@ -442,7 +545,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
-    fn propagate_nested_copy_move_ref_pointees(&mut self, dst_base: &Arc<str>, src_base: &str) {
+    pub(super) fn propagate_nested_copy_move_ref_pointees(
+        &mut self,
+        dst_base: &Arc<str>,
+        src_base: &str,
+    ) {
         let mut prefix = String::with_capacity(src_base.len() + 1);
         prefix.push_str(src_base);
         prefix.push('_');

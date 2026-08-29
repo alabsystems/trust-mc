@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "suite": "tests/trust-mc",
+  "denominator": 3,
+  "row_sha256": "7993de238cce08d9e264529bb9f3b1f75eb6caf2dc5f1e4d9b85b599365a0eb8",
+  "rows": [
+    {
+      "file": "zani/example.rs",
+      "harness": "proof_one",
+      "expected": "PROOF",
+      "lane": "tests/zani"
+    },
+    {
+      "file": "zani/example.rs",
+      "harness": "proof_two",
+      "expected": "PROOF",
+      "lane": "tests/zani"
+    },
+    {
+      "file": "zani/non_proof.rs",
+      "harness": "ctrex_one",
+      "expected": "CTREX",
+      "lane": "tests/zani"
+    }
+  ]
+}

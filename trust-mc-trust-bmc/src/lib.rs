@@ -71,8 +71,12 @@ pub use native_bundle::{
 };
 pub use translate::{TranslateOptions, trust_ir_function_to_bmc_vc, trust_ir_to_bmc_vc};
 pub use translate_chc::{
-    ChcTranslationOutput, TrustIrChcDiagnostic, TrustIrChcUnsupportedReason,
-    proof_grade_cast_is_admissible, single_cell_alloca_is_admissible,
+    BlockLocalAllocaReject, ChcTranslationOutput, PromotedAllocaReject, PromotionBlocker,
+    SingleCellAllocaRejection, StackCellAdmission, TrustIrChcDiagnostic,
+    TrustIrChcUnsupportedReason, classify_aggregate_stack_cell, proof_grade_cast_is_admissible,
+    single_cell_alloca_is_admissible, single_cell_alloca_rejection,
+    stack_alloca_cell_accesses_match_type, stack_alloca_pointer_is_non_escaping,
+    stack_cell_is_translator_opaque,
     trust_ir_function_to_chc_translation_output, trust_ir_function_to_chc_vc,
     trust_ir_to_chc_translation_outputs, trust_ir_to_chc_vc,
 };

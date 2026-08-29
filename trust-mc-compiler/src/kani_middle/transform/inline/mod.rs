@@ -39,11 +39,12 @@
 //! - Closures supported via CallableKind enum (#1575)
 
 mod body_inline;
-mod devirtualize;
+pub(crate) mod devirtualize;
 mod handler_boundaries;
 mod remap;
 #[cfg(test)]
 mod stable_atomic_tests;
+mod variadic;
 
 #[cfg(test)]
 mod tests;
@@ -248,12 +249,19 @@ fn body_is_noop_shim(body: &Body) -> bool {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct FunctionInlinePass {
     config: InlineConfig,
+    /// Largest actual-argument count over the `c_variadic` calls this pass
+    /// specialized whose `va_arg` fetches survive into the caller body.
+    ///
+    /// A fetch past the end of that list is UB and its bounds assert fails, so
+    /// no non-failing execution can run a fetching loop body more than that many
+    /// times. `codegen_function` reads it as a construct-derived unwind bound.
+    variadic_actual_bound: Option<usize>,
 }
 
 impl FunctionInlinePass {
     /// Create a new inline pass with the given configuration.
     pub(crate) fn new(config: InlineConfig) -> Self {
-        FunctionInlinePass { config }
+        FunctionInlinePass { config, variadic_actual_bound: None }
     }
 
     /// Find all Call terminators in a MutableBody that should be inlined.
@@ -345,6 +353,14 @@ impl FunctionInlinePass {
                         );
                         return false;
                     }
+                    if marker == "AnyModel" && handler_boundaries::any_model_char(&fn_args) {
+                        debug!("Not inlining kani AnyModel char: {}", fn_def.0.name());
+                        return false;
+                    }
+                    if marker == "AnyModel" && handler_boundaries::any_model_nonzero(&fn_args) {
+                        debug!("Not inlining kani AnyModel NonZero: {}", fn_def.0.name());
+                        return false;
+                    }
                     let should_inline = matches!(
                         marker,
                         "kani_contract_mode"
@@ -373,6 +389,32 @@ impl FunctionInlinePass {
             }
             _ => return false, // external enum: TyKind
         };
+
+        // `<String as BoundedArbitrary>::bounded_any::<N>` must reach codegen
+        // rather than be inlined. Its body runs through `utf8_chunks()` /
+        // `Utf8Chunk::valid()`, which codegen abstracts to unconstrained
+        // symbolics, so inlining discards the one guarantee the API makes --
+        // that the String holds at most N bytes -- and
+        // `bounded_any::<String, 4>().len() <= 4` reported FAILED.
+        //
+        // Match on the GENERIC ARGS, not the name: `fn_def.0.name()` here is the
+        // unmonomorphised trait path `kani::BoundedArbitrary::bounded_any`, with
+        // no mention of String at all. (The fully-qualified
+        // `...<impl BoundedArbitrary for std::string::String>::bounded_any` that
+        // shows up in codegen logs is the resolved instance, a different string.)
+        if fn_name.ends_with("::bounded_any")
+            && fn_args_for_resolve.as_ref().is_some_and(|args| {
+                args.0.iter().any(|arg| {
+                    matches!(arg, rustc_public::ty::GenericArgKind::Type(t)
+                        if matches!(t.kind(),
+                            rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, _))
+                            if def.0.name().ends_with("String")))
+                })
+            })
+        {
+            debug!("Not inlining bounded_any for String (codegen models the bound)");
+            return false;
+        }
 
         // Preserve destructor Calls (`drop_in_place::<T>`) for inline owning
         // containers (ArrayVec/SmallVec) whose ELEMENT type is trivially droppable
@@ -433,9 +475,6 @@ impl FunctionInlinePass {
             // for trait-dispatched calls. Resolve the instance to get the impl-specific
             // name (e.g., `core::iter::adapters::flatten::FlatMap::<I, U, F>::next`)
             // which DOES contain the adapter type name.
-            if fn_name.ends_with("::next") {
-                eprintln!("[4112-INLINE] fn_name ends with ::next: {fn_name}");
-            }
             if fn_name.ends_with("::next") && Self::is_adapter_next_resolved(fn_def, &fn_args) {
                 debug!("Not inlining adapter next() (resolved): {}", fn_name);
                 return false;
@@ -1034,11 +1073,11 @@ impl FunctionInlinePass {
     /// adapter dispatch from producing concrete element constraints.
     fn is_adapter_next_resolved(fn_def: FnDef, fn_args: &GenericArgs) -> bool {
         let Ok(instance) = Instance::resolve(fn_def, fn_args) else {
-            eprintln!("[4112-INLINE] Instance::resolve FAILED for fn_def={:?}", fn_def.0.name());
+            debug!("adapter-next: Instance::resolve failed for {}", fn_def.0.name());
             return false;
         };
         let resolved = instance.name();
-        eprintln!("[4112-INLINE] resolved={resolved}");
+        debug!(%resolved, "adapter-next: resolved");
         if !resolved.ends_with("::next") {
             return false;
         }
@@ -1127,6 +1166,10 @@ impl FunctionInlinePass {
             body.blocks.len()
         );
 
+        // Reset per body: the bound belongs to THIS body's specialized variadic
+        // calls, and the pass is reused across bodies.
+        self.variadic_actual_bound = None;
+
         if !self.config.enabled {
             debug!("FunctionInlinePass: disabled, skipping {}", name);
             return (false, body);
@@ -1135,6 +1178,7 @@ impl FunctionInlinePass {
         let mut mutable_body = MutableBody::from(body);
         let mut ever_changed = false;
         let mut total_inline_count: usize = 0;
+        let mut variadic_actual_bound: Option<usize> = None;
         // Per-body budget. The contract raises below are a property of THIS
         // body's contract machinery, so they must not leak into the next body
         // the (reused, `&mut self`) pass is handed.
@@ -1481,11 +1525,21 @@ impl FunctionInlinePass {
                     let is_alloc_shim_signal =
                         callee_name.contains("__rust_no_alloc_shim_is_unstable_v2");
                     if is_stdlib && !is_alloc_shim_signal {
-                        tracing::warn!(
-                            "Stdlib function MIR unavailable: {}::{} - inlining skipped",
-                            crate_name,
-                            callee_name
-                        );
+                        // Say it once. The inliner reaches the same callee from
+                        // every harness and every pass over a body, so an
+                        // ordinary `for e in v.iter_mut()` reported the same six
+                        // functions four times over -- two dozen identical lines
+                        // between the user's harness and its verdict. The fact
+                        // is worth surfacing (an un-inlined stdlib function is
+                        // stubbed or over-approximated, which bears on what a
+                        // proof covers); the repetition is not.
+                        if first_report_of_missing_stdlib_mir(&crate_name, &callee_name) {
+                            tracing::warn!(
+                                "Stdlib function MIR unavailable: {}::{} - inlining skipped",
+                                crate_name,
+                                callee_name
+                            );
+                        }
                     } else if is_alloc_shim_signal {
                         debug!(
                             "FunctionInlinePass: skip warning for alloc shim marker {}::{}",
@@ -1539,7 +1593,7 @@ impl FunctionInlinePass {
                 );
 
                 // Inline the callee
-                inline_function(
+                let variadic_actuals = inline_function(
                     tcx,
                     callee_instance,
                     &mut mutable_body,
@@ -1550,6 +1604,10 @@ impl FunctionInlinePass {
                     target,
                     call_span,
                 );
+                if let Some(n) = variadic_actuals {
+                    variadic_actual_bound =
+                        Some(variadic_actual_bound.map_or(n, |prev: usize| prev.max(n)));
+                }
 
                 iteration_changed = true;
                 total_inline_count += 1;
@@ -1567,7 +1625,17 @@ impl FunctionInlinePass {
             debug!("FunctionInlinePass: inlined {} function(s) into {}", total_inline_count, name);
         }
 
+        self.variadic_actual_bound = variadic_actual_bound;
         (ever_changed, mutable_body.into())
+    }
+
+    /// Construct-derived unwind bound left by the last body this pass processed.
+    ///
+    /// `Some(n)` when a `c_variadic` call was specialized into that body and its
+    /// `va_arg` fetches survive: no non-failing execution fetches more than `n`
+    /// times, because fetch `n + 1` fails its `cursor < n` bounds obligation.
+    pub(crate) fn variadic_actual_bound(&self) -> Option<usize> {
+        self.variadic_actual_bound
     }
 }
 
@@ -1591,4 +1659,25 @@ impl TransformPass for FunctionInlinePass {
             callee_instance.body()
         })
     }
+}
+
+/// Has this missing-MIR callee already been reported in this run?
+///
+/// Returns true exactly once per distinct `crate::function`, so a diagnostic
+/// the inliner rediscovers on every pass is printed once rather than once per
+/// visit. Process-global because the compiler runs once per crate and the
+/// inliner has no single owner to hang this on.
+fn first_report_of_missing_stdlib_mir(crate_name: &str, callee_name: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static REPORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut key = String::with_capacity(crate_name.len() + callee_name.len() + 2);
+    key.push_str(crate_name);
+    key.push_str("::");
+    key.push_str(callee_name);
+    REPORTED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_or(true, |mut seen| seen.insert(key))
 }

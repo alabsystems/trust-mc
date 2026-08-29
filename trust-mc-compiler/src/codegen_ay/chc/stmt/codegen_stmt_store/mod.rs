@@ -22,7 +22,7 @@
 mod array_update;
 mod coerce;
 pub(in crate::codegen_ay) mod counter;
-mod deref_mem;
+pub(in crate::codegen_ay::chc) mod deref_mem;
 mod deref_mem_mirror;
 mod struct_decompose;
 

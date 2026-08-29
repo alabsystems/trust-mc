@@ -20,6 +20,47 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             match operand {
                 Operand::Copy(src) | Operand::Move(src) => {
                     let src_base = self.ssa_base_name(src);
+                    // Piecewise (#2076-flattened) VALUE propagation into the aggregate
+                    // field. A flattened `Option`-like enum does not live in one env
+                    // slot: `{base}` holds the payload bitvec, `{base}.0` the
+                    // discriminant and `{base}_variant_V_field_F` the variant payload.
+                    // The aggregate constructor only ever reads `{base}` (via
+                    // `codegen_operand`), so building a closure/tuple/struct out of
+                    // such a value USED to drop the discriminant: the later
+                    // `x.i` read resolved `{lhs}_field_{i}` to a bare bitvec and
+                    // `Discriminant` fell through to the "bitvec-stored enum
+                    // discriminant: using symbolic variable (both variants explored)"
+                    // over-approximation, so `Some(v)` and `None` became
+                    // indistinguishable downstream (the `type_annotation_needed`
+                    // `opt.or(Some(T::default()))` contract: `Option::or`'s inlined
+                    // `match self` read a FREE discriminant, so `result.is_some()`
+                    // was falsifiable IN THE MODEL).
+                    //
+                    // Re-key the entries onto `{base_name}_field_{i}`, which is
+                    // exactly the name `ssa_base_name` produces for the `Field(i)`
+                    // read of this aggregate. SOUND: the aggregate field IS a copy of
+                    // `src`, so its components are copies of `src`'s components;
+                    // `apply_flattened_value_entries` declares a fresh SSA var per
+                    // entry and equates it to the source term under the current path
+                    // condition. This strictly REMOVES an over-approximation — it
+                    // fabricates no value and drops no obligation. The tuple
+                    // aggregate path (`try_codegen_flattened_tuple_aggregate`)
+                    // already does the same propagation for the same reason (#3133);
+                    // this is the missing sibling for closure/struct/enum aggregates.
+                    let flattened_entries =
+                        Self::collect_flattened_value_entries(&self.current_env, &src_base);
+                    if !flattened_entries.is_empty() {
+                        let lhs_field_base =
+                            crate::codegen_ay::names::indexed_field_name(base_name, field_idx);
+                        debug!(
+                            "aggregate: propagating {} flattened entries {} (field {}) -> {}",
+                            flattened_entries.len(),
+                            src_base,
+                            field_idx,
+                            lhs_field_base
+                        );
+                        self.apply_flattened_value_entries(&lhs_field_base, flattened_entries);
+                    }
                     // Direct reference propagation: src itself is a reference
                     if let Some(pointee) = self.ref_pointees.get(src_base.as_str()).cloned() {
                         let lhs_field_base =
@@ -369,6 +410,30 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let lhs_base = self.ssa_base_name(lhs);
         let src_base = self.ssa_base_name(src);
+
+        // Carry the pointee metadata across with the values. This path returns
+        // early from `codegen_assign`, so it skips the post-assignment
+        // `track_copy_move_ref_pointees` that would otherwise do this -- and a
+        // tuple holding a reference then arrives with its fields' values copied
+        // but their `ref_pointees` entries left behind. The next deref finds no
+        // pointee and synthesizes a FRESH symbolic one, silently severing the
+        // reference from what it points at.
+        //
+        // That is how `kani::any_where` lost its predicate. Its signature is
+        // `FnOnce(&T) -> bool`, so the RustCall ABI passes the argument as a
+        // one-element tuple `(&value,)`; the inliner copies that tuple whole
+        // into the callee's local, which lands here. `assume(f(&result))` then
+        // constrained an unrelated symbolic value, leaving `result` free:
+        //
+        //     let n: u8 = kani::any_where(|s| *s < 10);
+        //     assert!(n < 10);                       // FAILED, with a
+        //                                            // counterexample of n >= 10
+        //
+        // reported as a genuine counterexample. Over-approximating the input
+        // set keeps proofs sound, but every such harness is a false positive,
+        // and `bounded_any` (built on `any_where`) could not verify at all.
+        let dst_base_arc: std::sync::Arc<str> = std::sync::Arc::from(lhs_base.as_str());
+        self.propagate_nested_copy_move_ref_pointees(&dst_base_arc, &src_base);
 
         for (field_idx, field_ty) in lhs_fields.into_iter().enumerate() {
             let sort = Self::infer_sort_from_ty(field_ty).unwrap_or_else(|| Sort::bitvec(32));

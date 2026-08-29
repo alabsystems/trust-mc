@@ -356,6 +356,121 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         None
     }
 
+    /// The LINK SYMBOL of a FOREIGN item reified into this call's function
+    /// pointer.
+    ///
+    /// `Some(takes_int)` coerces a foreign `extern "C"` item to a fn pointer,
+    /// and calling through it is still a call to that C function — but
+    /// `Instance::body()` is `None` for a foreign item, so the inline path
+    /// above declines and the call used to fall through to the unconstrained
+    /// fallback. `ForeignItems/extern_fn_ptr.rs` asserts that the indirect and
+    /// the direct call agree, which is unprovable while one of them is
+    /// unconstrained.
+    ///
+    /// UNIQUENESS is the soundness condition. A function pointer that could
+    /// designate more than one function must not be resolved to one of them —
+    /// that is a mis-translation, not an approximation. So the local-value
+    /// chain is tried first, and the whole-body fallback is accepted only when
+    /// the body contains EXACTLY ONE fn-pointer coercion of any kind and it
+    /// names a foreign item; every fn-pointer value in such a body comes from
+    /// that single coercion, or the call is UB.
+    pub(in crate::codegen_ay::chc) fn fn_ptr_foreign_link_symbol(
+        &self,
+        dcx: &DispatchCallContext<'_>,
+    ) -> Option<String> {
+        let func_ty = dcx.func.ty(self.body.locals()).ok()?;
+        if !matches!(func_ty.kind(), TyKind::RigidTy(RigidTy::FnPtr(..))) {
+            return None;
+        }
+
+        if let Operand::Copy(p) | Operand::Move(p) = dcx.func
+            && p.projection.is_empty()
+            && let Some(symbol) = self.chain_reified_foreign_symbol(p.local)
+        {
+            return Some(symbol);
+        }
+
+        // Whole-body fallback, under the uniqueness condition.
+        let mut coercions = 0usize;
+        let mut foreign_symbol = None;
+        for bb in &self.body.blocks {
+            for stmt in &bb.statements {
+                let StatementKind::Assign(_, rvalue) = &stmt.kind else { continue };
+                let Rvalue::Cast(
+                    CastKind::PointerCoercion(
+                        PointerCoercion::ReifyFnPointer | PointerCoercion::ClosureFnPointer(_),
+                    ),
+                    operand,
+                    _,
+                ) = rvalue
+                else {
+                    continue;
+                };
+                coercions += 1;
+                foreign_symbol = self.reified_foreign_symbol(operand);
+            }
+        }
+        (coercions == 1).then_some(foreign_symbol).flatten()
+    }
+
+    /// Walk the copy/move chain backwards from `fn_ptr_local` and return the
+    /// foreign link symbol reified into it, when exactly one coercion feeds it.
+    fn chain_reified_foreign_symbol(&self, fn_ptr_local: usize) -> Option<String> {
+        let mut target_locals = std::collections::HashSet::new();
+        target_locals.insert(fn_ptr_local);
+        for _ in 0..5 {
+            let mut new_locals = Vec::new();
+            for bb in &self.body.blocks {
+                for stmt in &bb.statements {
+                    let StatementKind::Assign(place, rvalue) = &stmt.kind else { continue };
+                    if !target_locals.contains(&place.local) {
+                        continue;
+                    }
+                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue
+                        && src.projection.is_empty()
+                    {
+                        new_locals.push(src.local);
+                    }
+                }
+            }
+            if new_locals.is_empty() {
+                break;
+            }
+            target_locals.extend(new_locals);
+        }
+
+        let mut coercions = 0usize;
+        let mut symbol = None;
+        for bb in &self.body.blocks {
+            for stmt in &bb.statements {
+                let StatementKind::Assign(place, rvalue) = &stmt.kind else { continue };
+                if !target_locals.contains(&place.local) {
+                    continue;
+                }
+                let Rvalue::Cast(
+                    CastKind::PointerCoercion(
+                        PointerCoercion::ReifyFnPointer | PointerCoercion::ClosureFnPointer(_),
+                    ),
+                    operand,
+                    _,
+                ) = rvalue
+                else {
+                    continue;
+                };
+                coercions += 1;
+                symbol = self.reified_foreign_symbol(operand);
+            }
+        }
+        (coercions == 1).then_some(symbol).flatten()
+    }
+
+    /// The foreign link symbol of a coerced operand, or `None` when the
+    /// operand is not a direct reference to a foreign item.
+    fn reified_foreign_symbol(&self, operand: &Operand) -> Option<String> {
+        let ty = operand.ty(self.body.locals()).ok()?;
+        crate::codegen_ay::foreign_defs::foreign_link_symbol(self.tcx, ty)
+    }
+
     /// Scan all MIR statements for any `ReifyFnPointer` or `ClosureFnPointer`
     /// cast, regardless of target local. Used by the nested inline handler where
     /// the fn ptr is a parameter (not a local of the harness body).

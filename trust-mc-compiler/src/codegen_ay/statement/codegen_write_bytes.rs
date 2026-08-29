@@ -56,6 +56,37 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             element_size, span, count_const
         );
 
+        // UB when count * size_of::<T>() overflows a usize. Shared with the
+        // copy intrinsics — see `emit_copy_byte_count_overflow_check`.
+        self.emit_copy_byte_count_overflow_check(count, element_size, "write_bytes");
+
+        // `write_bytes` requires `dst` be non-null EVEN WHEN `count == 0`
+        // (std docs: the pointer must be non-null and properly aligned even
+        // if the effectively copied size is zero). This is also the only
+        // obligation a zero-count write leaves behind, so without it such a
+        // harness emitted NO verification conditions and the vacuity gate
+        // refused the proof (corpus: valid-value-checks/write_bytes
+        // check_zero_count_write_to_niche_is_noop reported VACUOUS
+        // no-checks).
+        if let Some(dst_ptr) = self.codegen_operand(dst) {
+            let dst_bv = self.coerce_to_ptr_width(dst_ptr);
+            let zero_ptr = Expr::bitvec_const(0u128, POINTER_WIDTH);
+            self.record_violation_guarded_with_message(
+                dst_bv.eq(zero_ptr),
+                "null_pointer_check",
+                Some("memset destination pointer is null".to_string()),
+            );
+        }
+
+        // write_bytes has only a destination, but the same alignment rule.
+        if let Some(align) = self.pointee_align(dst) {
+            self.emit_copy_alignment_check(dst, count, align, "dst");
+        }
+
+        self.emit_copy_region_validity_check(
+            dst, count, element_size, "memset destination region writeable",
+        );
+
         // Defer location formatting until an error path needs it (Part of #2267).
         let location = || format!("{:?}", span);
 

@@ -93,7 +93,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Trace through Copy/Move assignments to find the original subslice local.
         if let Operand::Copy(place) | Operand::Move(place) = operand {
             // Direct lookup first.
-            if let Some(len_expr) = self.ref_resolution.subslice_len.get(&place.local) {
+            if !self.local_has_multiple_whole_definitions(place.local)
+                && let Some(len_expr) = self.ref_resolution.subslice_len.get(&place.local)
+            {
                 return Some(len_expr.clone());
             }
 

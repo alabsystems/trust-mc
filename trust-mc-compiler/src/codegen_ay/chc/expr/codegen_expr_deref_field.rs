@@ -43,6 +43,33 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.deref_resolve_depth -= 1;
             return None;
         }
+        // Dereferencing a pointer whose target local's STORAGE IS DEAD is
+        // use-after-scope. Stage a violated obligation for it.
+        //
+        // ADDITIVE ON PURPOSE. An earlier attempt REFUSED to resolve here, and
+        // that REGRESSED: the caught cases (`let v = *p;`) were resolving
+        // through this lane, and diverting them dropped the obligation that was
+        // catching them — two detected bugs became clean proofs. Fail-closed is
+        // safe when it drops a PROOF; here it dropped a REFUTATION. So resolve
+        // exactly as before and only ADD the check.
+        //
+        // DEREF ONLY: #112 records that MIR legitimately READS a storage-dead
+        // local as a source operand, so liveness must never gate a value read —
+        // but a pointer INTO dead storage is UB however it is later used.
+        if self.memory_safety_checks
+            && let Some(rt) = self.ref_resolution.ref_targets.get(&local_idx)
+            && self.liveness.dead_locals.contains(&rt.local)
+        {
+            let dead = Expr::bool_const(false);
+            if !self.heap_state.pending_checks.contains(&dead) {
+                self.heap_state.pending_checks.push(dead);
+            }
+            warn!(
+                local_idx,
+                target = rt.local,
+                "CHC: deref through a pointer into DEAD storage (use-after-scope)"
+            );
+        }
         let result =
             self.try_resolve_deref_via_ref_targets_inner(place, local_idx, modified_locals);
         self.deref_resolve_depth -= 1;
@@ -181,6 +208,33 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Rewrite: use target_local with combined projections
         let resolved_place = Place { local: target_local, projection: combined_projs };
+
+        // The rewrite is only legitimate when it names the SAME place. When the
+        // rewritten place has a different type, the chain landed one indirection
+        // short of the original: `*_p` with `_p: &mut u32` rewritten onto
+        // `_box.0.0: NonNull<u32>` reads the POINTER where the program reads the
+        // POINTEE, so the `+= 1` in a contract body adds to the Box's ADDRESS and
+        // the store lands on a cell the read never sees. A place rewrite that
+        // changes the type is not a rewrite of the same place — decline it and let
+        // the memory lane translate the deref through the pointer's value.
+        // No fact is asserted here, so declining cannot fabricate: the caller
+        // falls through to the remaining resolution lanes and finally to the
+        // Mem projection loop, which records its own drop if it too declines.
+        let orig_ty = place.ty(self.body.locals()).ok();
+        let resolved_ty = resolved_place.ty(self.body.locals()).ok();
+        if let (Some(orig_ty), Some(resolved_ty)) = (orig_ty, resolved_ty)
+            && orig_ty != resolved_ty
+        {
+            debug!(
+                orig_local = local_idx,
+                target_local,
+                ?orig_ty,
+                ?resolved_ty,
+                "CHC: declining ref_target deref rewrite — resolved place has a different type"
+            );
+            return None;
+        }
+
         debug!(
             orig_local = local_idx,
             target_local,
@@ -393,7 +447,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     active_variant = None;
                 }
                 ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    let actual_offset = constant_index_offset(*offset, *min_length, *from_end);
+                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                    let Some(actual_offset) =
+                        constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        return None;
+                    };
                     // Part of #3116: Emit bounds check matching translate_place_with_deref.
                     if let Some(ty) = current_ty {
                         if let Some(array_len) = self.get_array_length(ty) {

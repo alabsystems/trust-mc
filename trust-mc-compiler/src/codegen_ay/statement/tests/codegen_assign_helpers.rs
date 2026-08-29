@@ -792,3 +792,90 @@ fn test_codegen_assignment_in_branches_no_panic() {
 // =============================================================================
 // Helper function
 // =============================================================================
+
+// =============================================================================
+// track_aggregate_ref_pointees — flattened (#2076) piecewise VALUE propagation
+// =============================================================================
+
+/// An aggregate field built from a FLATTENED Option-like value must carry that
+/// value's piecewise entries (`{src}.0` discriminant, `{src}_variant_V_field_F`
+/// payload) onto `{lhs}_field_{i}` — the exact name a later `x.i` read resolves.
+///
+/// Without this the aggregate stores only the payload bitvec, the discriminant
+/// is dropped, and `Discriminant(x.i)` degrades to the "bitvec-stored enum
+/// discriminant" symbolic over-approximation (both variants explored), which
+/// makes `Some(v)` and `None` indistinguishable downstream.
+#[test]
+fn test_aggregate_propagates_flattened_option_entries_to_field() {
+    with_test_ay_ctx_for_source(
+        r#"
+        pub fn ident(x: u32) -> u32 { x }
+        "#,
+        |mut ctx| {
+            let instance = find_instance_by_suffix(&ctx, "ident");
+            let body = instance.body().expect("body");
+            ctx.set_current_fn(instance);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+
+            // Seed local_1 as a flattened Some(payload): base payload, `.0`
+            // discriminant, and the variant payload key.
+            let src = Place { local: Local::from(1usize), projection: vec![] };
+            let src_base = codegen.ssa_base_name(&src);
+            let discrim_key = crate::codegen_ay::names::discrim_name(&src_base);
+            let variant_key = crate::codegen_ay::names::base_variant_field_name(&src_base, 1, 0);
+            codegen.env_update(src_base.clone(), Expr::bitvec_const(7u64, 32));
+            codegen.env_update(discrim_key, Expr::bitvec_const(1u64, 32));
+            codegen.env_update(variant_key, Expr::bitvec_const(7u64, 32));
+
+            let lhs_base = "probe::local_99".to_string();
+            codegen.track_aggregate_ref_pointees(&lhs_base, &[Operand::Copy(src.clone())]);
+
+            let field_base = crate::codegen_ay::names::indexed_field_name(&lhs_base, 0);
+            let field_discrim = crate::codegen_ay::names::discrim_name(&field_base);
+            let field_variant =
+                crate::codegen_ay::names::base_variant_field_name(&field_base, 1, 0);
+            assert!(
+                codegen.env_lookup(&field_discrim).is_some(),
+                "aggregate field must carry the flattened discriminant `{field_discrim}`"
+            );
+            assert!(
+                codegen.env_lookup(&field_variant).is_some(),
+                "aggregate field must carry the flattened payload `{field_variant}`"
+            );
+        },
+    );
+}
+
+/// Control (opposite direction): an aggregate field built from a plain scalar
+/// with NO flattened entries must NOT invent any. The propagation is a copy of
+/// what the source actually has, never a fabricated discriminant.
+#[test]
+fn test_aggregate_does_not_invent_flattened_entries_for_scalar() {
+    with_test_ay_ctx_for_source(
+        r#"
+        pub fn ident2(x: u32) -> u32 { x }
+        "#,
+        |mut ctx| {
+            let instance = find_instance_by_suffix(&ctx, "ident2");
+            let body = instance.body().expect("body");
+            ctx.set_current_fn(instance);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+
+            let src = Place { local: Local::from(1usize), projection: vec![] };
+            let src_base = codegen.ssa_base_name(&src);
+            codegen.env_update(src_base, Expr::bitvec_const(7u64, 32));
+
+            let lhs_base = "probe::local_98".to_string();
+            codegen.track_aggregate_ref_pointees(&lhs_base, &[Operand::Copy(src.clone())]);
+
+            let field_base = crate::codegen_ay::names::indexed_field_name(&lhs_base, 0);
+            let field_discrim = crate::codegen_ay::names::discrim_name(&field_base);
+            assert!(
+                codegen.env_lookup(&field_discrim).is_none(),
+                "no flattened entries on the source means none on the aggregate field"
+            );
+        },
+    );
+}

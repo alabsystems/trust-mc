@@ -282,6 +282,56 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// For multi-variant enums, field offsets differ per variant. The `variant_idx`
     /// selects which variant's `FieldsShape` to query.
     /// Part of #3041: Category B fix — variant-aware field offsets for enum address calculation.
+    /// Constant byte offset added by a place's projections AFTER a leading
+    /// `Deref`, or `None` when it cannot be proved constant.
+    ///
+    /// `known_alloc_ids` records an object id with an implicit offset of ZERO,
+    /// so a caller may only inherit provenance across `&(*base).f` when `f`
+    /// genuinely sits at offset 0. Everything this walk cannot fold — an
+    /// `Index`, a `Subslice`, an unknown layout — returns `None` so the caller
+    /// fails closed rather than recording a pointer the map cannot express.
+    pub(in crate::codegen_ay::chc) fn constant_projection_byte_offset(
+        &mut self,
+        place: &rustc_public::mir::Place,
+    ) -> Option<u64> {
+        use rustc_public::mir::ProjectionElem;
+
+        let mut current_ty = self.body.locals().get(place.local)?.ty;
+        let mut offset: u64 = 0;
+        let mut variant: Option<usize> = None;
+
+        for (idx, elem) in place.projection.iter().enumerate() {
+            match elem {
+                ProjectionElem::Deref => {
+                    if idx != 0 {
+                        // A second dereference reads through a POINTER whose
+                        // value this walk does not have. Nothing after it can
+                        // be folded into a byte offset from the original base.
+                        return None;
+                    }
+                    current_ty = crate::codegen_ay::chc::ChcCtx::deref_pointee_ty(current_ty)?;
+                    variant = None;
+                }
+                ProjectionElem::Field(field_idx, field_ty) => {
+                    let this = match variant.take() {
+                        Some(v) => self.get_variant_field_offset(current_ty, v, *field_idx)?,
+                        None => self.get_field_offset(current_ty, *field_idx)?,
+                    };
+                    offset = offset.checked_add(this)?;
+                    current_ty = *field_ty;
+                }
+                ProjectionElem::Downcast(v) => {
+                    variant = Some(crate::rustc_public_bridge::IndexedVal::to_index(v));
+                }
+                // Layout-transparent.
+                ProjectionElem::OpaqueCast(ty) => current_ty = *ty,
+                // Data-dependent or unsupported: not a constant offset.
+                _ => return None,
+            }
+        }
+        Some(offset)
+    }
+
     pub(in crate::codegen_ay::chc) fn get_variant_field_offset(
         &mut self,
         ty: rustc_public::ty::Ty,

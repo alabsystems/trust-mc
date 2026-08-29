@@ -43,14 +43,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if !source.sort().is_array() {
             return None;
         }
-        // Identity case: from=0, to=0 extracts the full array/slice unchanged.
-        // This works even for dynamically-sized slices where get_array_length
-        // returns None. Part of #3306.
-        if from == 0 && to == 0 {
+        // Identity only for `from_end=true`: `[0..len-0]`. With
+        // `from_end=false`, `[0..0]` is EMPTY and returning the source would
+        // grant access to cells that are not in the subslice.
+        if from == 0 && to == 0 && from_end {
             return Some(source.clone());
         }
         let array_len = self.get_array_length(source_ty)?;
-        let end = if from_end { array_len.saturating_sub(to as usize) } else { to as usize };
+        let end = if from_end { array_len.checked_sub(to as usize)? } else { to as usize };
         let start = from as usize;
         if end <= start || end > array_len {
             return None;

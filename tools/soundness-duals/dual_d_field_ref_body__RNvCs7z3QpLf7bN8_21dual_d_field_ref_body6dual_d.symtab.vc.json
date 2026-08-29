@@ -1,0 +1,170 @@
+{
+  "version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "mode": "chc",
+  "harness": {
+    "mangled_name": "dual_d",
+    "pretty_name": "dual_d"
+  },
+  "properties": [
+    {
+      "id": {
+        "id": 0,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p0",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 1,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p1",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 2,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p2",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 3,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p3",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 4,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p4",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 5,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p5",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 6,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p6",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 7,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p7",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 8,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p8",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 9,
+        "description": null
+      },
+      "kind": "assertion",
+      "message": "attempt to add with overflow",
+      "smt_var": "error_p9",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 10,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p10",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 11,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p11",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 12,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p12",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 13,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p13",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 14,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p14",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 15,
+        "description": null
+      },
+      "kind": "memory_safety",
+      "smt_var": "error_p15",
+      "approximation_dependent": false
+    },
+    {
+      "id": {
+        "id": 16,
+        "description": null
+      },
+      "kind": "assertion",
+      "message": "assertion failed: im.x.get() < 101",
+      "smt_var": "error_p16",
+      "approximation_dependent": false
+    }
+  ],
+  "approximation_identity_complete": true
+}

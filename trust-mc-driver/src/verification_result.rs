@@ -204,6 +204,10 @@ pub(crate) struct VerificationResult {
     pub proof_transcript_metadata: Option<serde_json::Value>,
     /// Optional native full-verification verdict with digest-backed evidence.
     pub native_full_verification_verdict: Option<trust_mc_core::FullVerificationVerdict>,
+    /// Whether the harness body was shown to be runnable at all. Consumed only
+    /// by the vacuity classification ([`classify_vacuity`]); `Undetermined` on
+    /// every path that does not probe.
+    pub harness_feasibility: HarnessFeasibility,
 }
 
 impl VerificationResult {
@@ -219,6 +223,31 @@ impl VerificationResult {
         );
         let show_checks = matches!(output_format, OutputFormat::Regular);
 
+        // Kani `--output-format old` parity: a CBMC-style one-line property
+        // listing, e.g. `[main.assertion.1] line 18 assertion failed: false:
+        // FAILURE`. Only `old` gets this — `terse` exists to suppress
+        // per-check noise under `--jobs` and must stay minimal.
+        let old_listing = if matches!(output_format, OutputFormat::Old) {
+            let mut listing = String::new();
+            for prop in results {
+                let name = prop.property_name();
+                let description = &prop.description;
+                let status = &prop.status;
+                match &prop.source_location.line {
+                    Some(line) => {
+                        let _ =
+                            writeln!(listing, "[{name}] line {line} {description}: {status}");
+                    }
+                    None => {
+                        let _ = writeln!(listing, "[{name}] {description}: {status}");
+                    }
+                }
+            }
+            listing
+        } else {
+            String::new()
+        };
+
         let mut result = if let Some(cov_results) = &self.coverage_results {
             format_coverage(
                 results,
@@ -228,6 +257,8 @@ impl VerificationResult {
                 failed_properties,
                 show_checks,
                 validation_status,
+                self.solver_unknown_reason,
+                self.harness_feasibility,
             )
         } else {
             format_result(
@@ -237,8 +268,13 @@ impl VerificationResult {
                 failed_properties,
                 show_checks,
                 validation_status,
+                self.solver_unknown_reason,
+                self.harness_feasibility,
             )
         };
+        if !old_listing.is_empty() {
+            result = format!("{old_listing}{result}");
+        }
         // Part of #3476: qualify PROOF results with sound fallback count.
         if self.sound_fallback_count > 0 && status == VerificationStatus::Success {
             let _ = writeln!(
@@ -255,6 +291,78 @@ impl VerificationResult {
     }
 }
 
+/// Whether the harness body can run at all — i.e. whether the program
+/// constraints ALONE (no violation disjunction) are satisfiable.
+///
+/// This is the one fact that separates the two situations an all-UNREACHABLE
+/// property table can mean, which [`is_unsat_assumption_vacuous`] alone cannot
+/// tell apart. See [`classify_vacuity`].
+///
+/// Answered on the BMC lane by `call_ay::probe_harness_reachable`. The CHC lane
+/// decides the same question structurally, inside the compiler
+/// (`straightline_proof::prove_straightline_safety_detailed`, the exit-block
+/// reachability test), and communicates only the negative answer — as the
+/// vacuous-checks marker that re-statuses every check `Unreachable`. So on that
+/// lane an all-UNREACHABLE table already MEANS `Infeasible`, and
+/// [`Undetermined`](Self::Undetermined) is the right (fail-closed) reading of a
+/// lane that never ran the BMC probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum HarnessFeasibility {
+    /// Never probed, or the probe did not decide. Fail closed: read exactly as
+    /// the code read before the distinction existed.
+    #[default]
+    Undetermined,
+    /// The solver DECIDED the program constraints are satisfiable: some
+    /// execution of this harness exists. Its assumptions are not contradictory.
+    Reachable,
+    /// The solver DECIDED the program constraints are unsatisfiable: no
+    /// execution of this harness exists at all.
+    Infeasible,
+}
+
+/// Which of the two vacuity shapes a harness result has, if either.
+///
+/// The all-UNREACHABLE property table is the SAME table for two opposite
+/// diagnoses, and reporting one for the other is a factual error, not a wording
+/// preference — [`UnsatAssumption`](Self::UnsatAssumption) blames assumptions
+/// the harness may not even have. Every channel that reports vacuity (the
+/// console gate in `harness_runner`, the verdict line in [`format_result`], and
+/// `proof_summary::classify_harness_verdict`) classifies through this one
+/// function so the three cannot drift into disagreeing about the same run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VacuityShape {
+    /// Not the all-unreachable shape at all.
+    None,
+    /// Every check is UNREACHABLE *and* the harness itself cannot run (or we
+    /// could not establish that it can). Nothing was verified.
+    UnsatAssumption,
+    /// Every check is UNREACHABLE, but the harness DEMONSTRABLY runs — the
+    /// solver decided its constraints are satisfiable. The checks sit on dead
+    /// code; the assumptions are fine.
+    DeadChecks,
+}
+
+/// Split the all-UNREACHABLE signature into its two causes (see [`VacuityShape`]).
+///
+/// Only a DECIDED `Reachable` moves a harness out of the `UnsatAssumption` arm.
+/// `Undetermined` — an undecided probe, a solver error, or a lane that never
+/// probes — keeps the pre-existing verdict, so no vacuity that used to fail
+/// closed can escape through an inconclusive answer.
+pub(crate) fn classify_vacuity(
+    properties: &[Property],
+    feasibility: HarnessFeasibility,
+) -> VacuityShape {
+    if !is_unsat_assumption_vacuous(properties) {
+        return VacuityShape::None;
+    }
+    match feasibility {
+        HarnessFeasibility::Reachable => VacuityShape::DeadChecks,
+        HarnessFeasibility::Infeasible | HarnessFeasibility::Undetermined => {
+            VacuityShape::UnsatAssumption
+        }
+    }
+}
+
 /// V4 detection (pure): `true` iff the harness has ≥1 non-cover check and EVERY
 /// non-cover check is `Unreachable`. This is the unsatisfiable-assumption signature:
 /// under contradictory preconditions (`kani::assume(false)`, an over-constrained
@@ -264,6 +372,13 @@ impl VerificationResult {
 /// both break the all-unreachable signature (no false positives on real failures or
 /// inconclusive runs). `code_coverage` (`Covered`/`Uncovered`) and `cover` properties
 /// are not verification checks and are excluded.
+///
+/// SHAPE ONLY — it does NOT establish the cause. The name is historical: the
+/// same table is produced by a harness that cannot run *and* by a harness that
+/// runs fine whose every check sits on dead code (`if x > 200 && x < 100 {
+/// panic!() }`). Callers that report a diagnosis to a user must go through
+/// [`classify_vacuity`], which consults [`HarnessFeasibility`]; this predicate
+/// remains the gate's trigger condition and its answer is unchanged.
 pub(crate) fn is_unsat_assumption_vacuous(properties: &[Property]) -> bool {
     let mut checks = 0usize;
     let mut unreachable = 0usize;
@@ -309,6 +424,8 @@ pub(crate) fn format_result(
     failed_properties: FailedProperties,
     show_checks: bool,
     validation_status: ValidationStatus,
+    solver_unknown_reason: Option<SolverUnknownReason>,
+    harness_feasibility: HarnessFeasibility,
 ) -> String {
     let mut result_str = String::new();
     let mut number_checks_failed = 0;
@@ -450,11 +567,51 @@ pub(crate) fn format_result(
         style("SUCCESSFUL (UNVALIDATED)").yellow()
     } else if effective_success {
         style("SUCCESSFUL").green()
-    } else if !should_panic && is_unsat_assumption_vacuous(properties) {
+    } else if !should_panic
+        && classify_vacuity(properties, harness_feasibility) == VacuityShape::UnsatAssumption
+    {
         // V4 vacuity gate: the harness_runner flipped this to Failure because every
         // check is provably unreachable (unsatisfiable assumptions). Report it as
         // VACUOUS, not FAILED — nothing was actually disproved; nothing was proved.
         style("VACUOUS (proof discharged under unsatisfiable assumptions — nothing verified)").red()
+    } else if !should_panic
+        && classify_vacuity(properties, harness_feasibility) == VacuityShape::DeadChecks
+    {
+        // V4 dead-check arm: the SAME all-unreachable table, but the solver
+        // DECIDED the harness's own constraints are satisfiable, so there is no
+        // contradictory assumption to blame — the checks simply sit on dead
+        // code. Still not a proof: every obligation this harness emitted was
+        // discharged over an empty set of runs, so nothing about the program
+        // was exercised. INCONCLUSIVE says that without inventing a cause.
+        style("INCONCLUSIVE (every check is unreachable — dead code, nothing exercised)").yellow()
+    } else if number_properties == 0
+        && matches!(
+            solver_unknown_reason,
+            Some(SolverUnknownReason::UndecidedModel | SolverUnknownReason::Timeout)
+        )
+    {
+        // "No checks" and "the solver could not decide" both arrive here with an
+        // empty property list, and they are opposite diagnoses: one says the
+        // harness had nothing to prove, the other that it had something and we
+        // could not settle it. Reporting the former for the latter sent users
+        // to look for a missing assertion that was there all along -- on a
+        // bounded symbolic loop, say, where the answer is a different engine:
+        //
+        //     VERIFICATION:- INCONCLUSIVE (no checks)
+        //     [AY:UNKNOWN_REASON:UndecidedModel]      <- the real story
+        //
+        // The marker line already carried the truth; the verdict now agrees
+        // with it, and names the flag that decides this shape.
+        //
+        // Only for the reasons that actually mean "we had something and could
+        // not settle it". A solver reason and an empty property list are NOT
+        // mutually exclusive, which I got wrong first time round and the corpus
+        // caught: tests/expected/slice_c_str pins `SolverError` together with
+        // `(no checks)`, because there the solver fell over BEFORE there was
+        // anything to decide, and "no checks" is the honest description.
+        // Likewise ChcParseError, PreSolveDeadline and FalseProofRejected --
+        // none of them describe an undecided obligation.
+        style("INCONCLUSIVE (solver undecided — try --ay-chc for unbounded proofs)").yellow()
     } else if number_properties == 0 {
         // #4216: A proof with 0 checks (no assertions to verify) is inconclusive,
         // not failed — there is nothing to disprove.
@@ -497,6 +654,21 @@ pub(crate) fn format_result(
     result_str
 }
 
+// NOTE — do not "fix" the doubled quotes in check descriptions.
+//
+// `assert!(cond, "message")` reaches the solver through the std shim as
+// `kani::assert(!!cond, stringify!("message"))`; `stringify!` keeps the quotes
+// and the renderer adds its own, so the line reads
+// `Description: ""message""`. That looks like a bug, and an earlier revision
+// of this file stripped the inner pair.
+//
+// Upstream Kani renders it exactly the same way, and 14 expected files in
+// BOTH corpora encode the doubled form (`grep -rl 'Description: ""' tests/`).
+// `tools/kani-domination` scores trust-mc against Kani's OWN expected files,
+// so unquoting here silently costs parity on those tests — a real, measured
+// loss traded for a cosmetic gain. If the rendering is ever to change, change
+// it upstream first, or accept and record the parity delta deliberately.
+
 pub(crate) fn effective_success_reason(
     status: VerificationStatus,
     should_panic: bool,
@@ -522,6 +694,8 @@ pub(crate) fn format_coverage(
     failed_properties: FailedProperties,
     show_checks: bool,
     validation_status: ValidationStatus,
+    solver_unknown_reason: Option<SolverUnknownReason>,
+    harness_feasibility: HarnessFeasibility,
 ) -> String {
     let (_coverage_checks, non_coverage_checks): (Vec<Property>, Vec<Property>) =
         properties.iter().cloned().partition(|x| x.property_class() == "code_coverage");
@@ -533,6 +707,8 @@ pub(crate) fn format_coverage(
         failed_properties,
         show_checks,
         validation_status,
+        solver_unknown_reason,
+        harness_feasibility,
     );
     let cov_results_intro = "Source-based code coverage results:";
     format!("{verification_output}\n{cov_results_intro}\n\n{cov_results}")

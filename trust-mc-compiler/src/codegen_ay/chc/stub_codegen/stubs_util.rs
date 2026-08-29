@@ -248,6 +248,99 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// Emit the None/Err-panic obligation for an unwrap/expect stub call.
+    ///
+    /// The obligation is `good_variant` (the condition that must hold);
+    /// `emit_error_rule_for_condition_with_kind` negates it and skips the rule
+    /// when it const-folds to `true` (so `Some(7).unwrap()` stays green).
+    pub(in crate::codegen_ay::chc) fn emit_unwrap_expect_panic_obligation(
+        &mut self,
+        cx: &crate::codegen_ay::chc::call::chc_call_context::ChcCallContext<'_>,
+        bb_idx: usize,
+    ) {
+        let Some(good_variant) =
+            self.unwrap_expect_good_variant_predicate(cx.stub, cx.args, cx.modified_locals)
+        else {
+            debug!(?cx.stub, bb_idx, "unwrap/expect: no variant predicate; panic obligation not emitted");
+            return;
+        };
+        let message = match cx.stub {
+            StubKind::OptionUnwrap | StubKind::OptionExpect => {
+                "called `Option::unwrap()` on a `None` value"
+            }
+            StubKind::ResultUnwrapErr => "called `Result::unwrap_err()` on an `Ok` value",
+            _ => "called `Result::unwrap()` on an `Err` value",
+        };
+        self.emit_error_rule_for_condition_with_kind(
+            cx.from_app,
+            good_variant,
+            cx.stmt_constraints,
+            bb_idx,
+            trust_mc_core::violation::PropertyKind::Panic,
+            Some(message.to_string()),
+        );
+    }
+
+    /// SOUNDNESS (None/Err-panic obligation for the CHC lane).
+    ///
+    /// Build the "good variant" predicate for an unwrap/expect stub: the
+    /// condition that MUST HOLD for the call not to panic. `unwrap`/`expect`
+    /// survive `fn_inline` as `Call` terminators
+    /// (`has_special_codegen_handler`), so the library body's
+    /// `unwrap_failed` / `panic_stub` edge never reaches codegen and the panic
+    /// property has to be emitted HERE — exactly as the BMC twin
+    /// `codegen_option_unwrap_impl` does.
+    ///
+    /// `OptionUnwrapUnchecked` is deliberately excluded: reaching it on `None`
+    /// is UB, not a panic (it is in the same `UNWRAP_EXPECT` stub group).
+    pub(in crate::codegen_ay::chc) fn unwrap_expect_good_variant_predicate(
+        &mut self,
+        stub: StubKind,
+        args: &[Operand],
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        if args.is_empty() {
+            return None;
+        }
+        let inverted = match stub {
+            StubKind::OptionUnwrap
+            | StubKind::OptionExpect
+            | StubKind::ResultUnwrap
+            | StubKind::ResultExpect => false,
+            // unwrap_err panics on the Ok variant.
+            StubKind::ResultUnwrapErr => true,
+            _ => return None,
+        };
+        let flip = |e: Expr| if inverted { e.not() } else { e };
+
+        // Flattened (fld0 = discriminant) path — the representation uw.rs /
+        // sym.rs take.
+        if let Some(discr) = self.resolve_flattened_enum_discr_by_value(&args[0], modified_locals) {
+            return discr_to_bool_predicate(discr).map(flip);
+        }
+
+        let self_expr = self.translate_operand_with_modified(&args[0], modified_locals)?;
+
+        if !self_expr.sort().is_datatype() {
+            // Niche-optimized Option<ptr/ref>: None is the null pointer.
+            if matches!(stub, StubKind::OptionUnwrap | StubKind::OptionExpect)
+                && let Some(width) = self_expr.sort().bitvec_width()
+            {
+                return Some(self_expr.ne(Expr::bitvec_const(0u64, width)));
+            }
+            return None;
+        }
+        self.declare_datatype_sort_if_needed(self_expr.sort());
+
+        match stub {
+            StubKind::OptionUnwrap | StubKind::OptionExpect => Some(self.option_is_some(self_expr)),
+            StubKind::ResultUnwrap | StubKind::ResultExpect | StubKind::ResultUnwrapErr => {
+                Some(flip(self.result_variant_tester(self_expr, "Ok", "result_is_ok")))
+            }
+            _ => None,
+        }
+    }
+
     /// Translate Option::unwrap / Option::expect / Result::unwrap / Result::expect /
     /// Result::unwrap_err to value extraction.
     ///

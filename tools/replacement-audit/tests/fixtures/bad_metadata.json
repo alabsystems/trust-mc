@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "report_status": "stale-but-not-declared",
+  "solver": "z3",
+  "tree_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "tree_state": "dirty",
+  "replacement_evidence": false,
+  "commit": "0123456",
+  "z4_pin": "deadbeef",
+  "solver_binary": {
+    "name": "z3",
+    "path": "",
+    "version": "",
+    "commit": "bad"
+  },
+  "summary": {
+    "total": 1,
+    "pass": 1,
+    "proof": 1,
+    "known_fp": 0,
+    "trusted_proof": 1,
+    "ctrex": 0,
+    "fail": 0,
+    "unknown": 0,
+    "error": 0,
+    "bmc": 0,
+    "xfail": 0,
+    "skip": 0
+  },
+  "harnesses": [
+    {
+      "file": "zani/example.rs",
+      "harness": "proof_one",
+      "status": "PASS",
+      "expected": "PROOF",
+      "verdict": "PROOF",
+      "execution_state": "complete",
+      "execution_details": "final_marker=PROOF",
+      "proof_qualifiers": "clean",
+      "sound_fallback_count": 0,
+      "trusted_proof": true,
+      "translation_drop_reasons": {}
+    }
+  ]
+}

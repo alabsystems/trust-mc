@@ -127,8 +127,9 @@ When using trust-mc's CHC backend (the default for unbounded verification), cert
 ### Loops with Symbolic Bounds
 
 Simple symbolic-bound counting loops are no longer a blanket timeout case: the
-checked-in 2026-03-20 tier2 reports record `7/7 PROOF` for
-`tier2_unbounded` and `tier2_loop_for` at `AY@a70a12da`.
+last recorded tier2 run (2026-03-20, `AY@a70a12da`) reported `7/7 PROOF` for
+`tier2_unbounded` and `tier2_loop_for`. That predates the AY pin now in
+`Cargo.toml`; re-run `scripts/ay-bump-canary.sh` before treating it as current.
 
 The remaining CHC timeout risk is symbolic-bound loops whose invariants are
 harder to synthesize, especially when they combine the symbolic bound with
@@ -157,9 +158,9 @@ counting shape above. The usual hard cases are:
 
 1. **Use constant bounds**: If a complex symbolic-bound loop times out, try concrete bounds to verify correctness within that range.
 
-2. **Try BMC mode**: For bounded verification, BMC (Bounded Model Checking) may be faster:
+2. **Drop `--ay-chc`**: bounded model checking is the default lane, and is often faster:
    ```bash
-   trust-mc --ay-emit-bmc --unwind 100 your_file.rs
+   trust-mc --unwind 100 your_file.rs
    ```
 
 3. **Partition the input space**: Split symbolic ranges into multiple proofs with concrete bounds.
@@ -189,9 +190,9 @@ Control how memory operations are modeled with `--ay-chc-track`:
 
 | Level | Description | Use Case |
 |-------|-------------|----------|
-| `reg` | (Default) Register-only: loads havoc, stores no-op | Fast proofs where memory aliasing isn't critical |
+| `reg` | Register-only: loads havoc, stores no-op | Fast proofs where memory aliasing isn't critical |
 | `ptr` | Pointer validity: emits `r_ok` checks | Validating pointer bounds without full memory |
-| `mem` | Full memory: uses select/store | Complete memory modeling (slower) |
+| `mem` | (Default) Full memory: uses select/store | Complete memory modeling (slower) |
 
 Example:
 ```bash

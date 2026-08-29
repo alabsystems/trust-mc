@@ -118,9 +118,13 @@ use decl::codegen_types;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 use decl::codegen_types_adt;
 use decl::codegen_types_adt_sort;
+pub(in crate::codegen_ay) use call::codegen_call_atomic::{AtomicKind, detect_atomic_intrinsic};
+pub(in crate::codegen_ay) use call::codegen_call::codegen_call_sysconf::is_modeled_sysconf_path;
+pub(in crate::codegen_ay) use decl::{frame_narrowing_enabled, frame_narrowing_flattened_enabled};
 pub(in crate::codegen_ay::chc) use decl::{
     reset_dropped_frame_columns, take_dropped_frame_columns,
 };
+pub(in crate::codegen_ay) mod call_uf_table;
 mod dyn_coercion;
 mod dyn_coercion_resolve;
 mod error_property;
@@ -221,6 +225,7 @@ pub(in crate::codegen_ay) use codegen_ctx::globals::get_chc_fallback_count_for_f
 pub(in crate::codegen_ay) use codegen_ctx::globals::set_chc_fallback_count_for_fn;
 pub(in crate::codegen_ay) use codegen_ctx::globals::take_aggregate_encoding_gap_by_fn;
 pub(in crate::codegen_ay) use codegen_ctx::globals::take_aggregate_encoding_gap_count;
+pub(in crate::codegen_ay) use codegen_ctx::globals::take_aggregate_gap_reasons_by_fn;
 pub(in crate::codegen_ay) use codegen_ctx::globals::take_rounding_assertion_bypass_count;
 pub(in crate::codegen_ay) use codegen_ctx::globals::take_stub_approximation_by_fn;
 pub(in crate::codegen_ay) use codegen_ctx::globals::take_stub_approximation_count;
@@ -336,6 +341,14 @@ pub(in crate::codegen_ay) use straightline_proof::{
 #[allow(dead_code)] // Call site wired in W1:4385 INCOMPLETE
 pub(in crate::codegen_ay) fn get_recursive_unwind_count_for_fn(fn_name: &str) -> usize {
     codegen_ctx::globals::get_recursive_unwind_count_for_fn(fn_name)
+}
+
+pub(in crate::codegen_ay) fn get_vacuous_checks_for_fn(fn_name: &str) -> bool {
+    codegen_ctx::globals::get_vacuous_checks_for_fn(fn_name)
+}
+
+pub(in crate::codegen_ay) fn record_vacuous_checks_for_fn(fn_name: &str) {
+    codegen_ctx::globals::record_vacuous_checks_for_fn(fn_name);
 }
 
 #[allow(dead_code)] // Call site wired in W1:4385 INCOMPLETE

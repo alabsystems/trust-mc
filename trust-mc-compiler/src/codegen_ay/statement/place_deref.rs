@@ -269,6 +269,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let zero = Expr::bitvec_const(0, checked_width);
 
             // Record null pointer dereference violation if pointer is zero.
+            // CBMC-flavored wording; the Kani-identical "null pointer
+            // dereference occurred" safety_check comes from the MIR assert
+            // (`AssertMessage::NullPointerDereference` in codegen_sort.rs).
             debug!("  emitting null_pointer_check for ptr width={}", checked_width);
             self.record_violation_guarded(checked.clone().eq(zero.clone()), "null_pointer_check");
 
@@ -283,10 +286,20 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // only remaining `None` means there is no address to ask the heap
             // model about — a representable reason, unlike a width coincidence.
             if let Some(addr) = deref_addr {
-                let access_size = LayoutOf::new(pointee_ty)
-                    .size_of()
-                    .map(|size| Expr::bitvec_const(size as u128, POINTER_WIDTH));
-                let is_allocated = self.ctx.heap_is_allocated(addr.into_expr(), access_size);
+                let size_bytes = LayoutOf::new(pointee_ty).size_of();
+                let access_size =
+                    size_bytes.map(|size| Expr::bitvec_const(size as u128, POINTER_WIDTH));
+                let addr_expr = addr.into_expr();
+
+                // The accessed range must lie inside the object, which
+                // `heap_is_allocated` below cannot decide: it compares 1 MiB
+                // bucket identity, so reading past the end of a small stack
+                // object stays within the same bucket and passes.
+                if let Some(size) = size_bytes {
+                    self.emit_deref_object_bounds_check(&addr_expr, size);
+                }
+
+                let is_allocated = self.ctx.heap_is_allocated(addr_expr, access_size);
                 self.record_violation_guarded(is_allocated.not(), "use_after_free_check");
             }
 
@@ -315,6 +328,53 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             if let Some(pointee_base) = self.ref_pointees.get(ptr_base.as_str()).cloned() {
                 let target_local_idx =
                     Self::resolve_ref_chain_target(&self.ref_pointees, &pointee_base);
+
+                // The ALLOCATION behind this pointer is the resolved local, and
+                // that local's type states its size. Reading a larger type
+                // through a cast pointer escapes the allocation — a `&Zero`
+                // (ZST) cast to `*const Foo` and dereferenced reads size_of::<
+                // Foo>() bytes from a zero-byte object. None of the other
+                // obligations can see this: the object-bounds check reads
+                // slice/Vec constructors (a plain struct local has none), and
+                // `heap_is_allocated` compares 1 MiB buckets. Decided purely
+                // from two static sizes; fires only when BOTH are known and
+                // access exceeds allocation, so an equal-size or shrinking
+                // cast — pinned green by the same corpus file — cannot trip it.
+                if let Some(alloc_size) = self
+                    .body
+                    .locals()
+                    .get(target_local_idx)
+                    .and_then(|decl| LayoutOf::new(decl.ty).size_of())
+                    && let Some(access_size) = LayoutOf::new(pointee_ty).size_of()
+                {
+                    // Emitted UNCONDITIONALLY once both sizes are known, with
+                    // the statically-decided verdict as the violation value: a
+                    // fitting access must show the check present and
+                    // DISCHARGED (Status: SUCCESS), not absent — a discharged
+                    // check and a missing one print the same nothing, and the
+                    // corpus pins the SUCCESS lines for the equal-size and
+                    // shrinking casts precisely to tell those apart.
+                    debug!(
+                        "  pointer_invalid size check: access {} vs allocation {} (local_{})",
+                        access_size, alloc_size, target_local_idx
+                    );
+                    // Guarded by chain SHAPE, not just resolvability: a
+                    // pointee chain that passes through a `_field_` synthetic
+                    // resolved a FIELD's local for a whole-object read inside
+                    // std code (access=16 vs alloc=8, measured), and the
+                    // assert-then-assume side of a spuriously-true violation
+                    // poisons every downstream path — it silenced 4 of 5 cover
+                    // properties in derive-bounded-arbitrary. Only a direct
+                    // whole-object chain is trusted with a statically-decided
+                    // verdict.
+                    if !pointee_base.contains("_field_") {
+                        self.record_violation_guarded(
+                            Expr::bool_const(access_size > alloc_size),
+                            "pointer_invalid",
+                        );
+                    }
+                }
+
                 if self.dead_locals.contains(&target_local_idx)
                     && self.current_path_condition.is_some()
                 {

@@ -41,6 +41,7 @@ use trust_mc_metadata::ArtifactType;
 
 use super::chc::get_chc_fallback_count_for_fn;
 use super::chc::get_recursive_unwind_count_for_fn;
+use super::chc::get_vacuous_checks_for_fn;
 use super::codegen_file_io::{
     ArArchiveBuilderBuilder, JsonOutputStyle, codegen_results, write_file, write_smt2_file,
     write_vc_artifact,
@@ -104,8 +105,15 @@ fn write_harness_smt2_file(
     program: &AYProgram,
     demoted_fallback_count: usize,
     recursive_unwind_count: usize,
+    vacuous_all_checks_unreachable: bool,
 ) -> std::io::Result<()> {
-    write_smt2_file(path, program, demoted_fallback_count, recursive_unwind_count)
+    write_smt2_file(
+        path,
+        program,
+        demoted_fallback_count,
+        recursive_unwind_count,
+        vacuous_all_checks_unreachable,
+    )
 }
 
 impl AYCodegenBackend {
@@ -163,6 +171,26 @@ impl CodegenBackend for AYCodegenBackend {
             super::statement::reset_statement_session_counters();
             super::diagnostics::reset_stub_diagnostics();
             uph::reset_per_harness_accumulator(); // Part of #3080.
+            // Index the `--c-lib` sources once per run: which `extern "C"`
+            // symbols does the user actually supply a definition for? Symbols
+            // nobody supplies keep Kani's fail-closed undefined-function
+            // `error()`; supplied ones become a sound effect frame.
+            super::foreign_defs::init_c_lib_symbols(&queries.args().c_lib);
+            // …and READ them. The restricted C front-end turns each accepted
+            // definition into the same Expr/Rule IR a Rust callee gets, so a
+            // property about the C's VALUES (`takes_int(1) == 3`) becomes
+            // provable instead of merely reachable. Anything outside the
+            // accepted fragment falls back to the effect frame above, per
+            // function. The integer-width model comes from the compilation
+            // TARGET, never an assumption: `long` is 32 bits on LLP64.
+            {
+                let pointer_bits = u32::from(tcx.sess.target.pointer_width);
+                let long_bits = if tcx.sess.target.is_like_windows { 32 } else { pointer_bits };
+                crate::c_ffi::init(
+                    &queries.args().c_lib,
+                    crate::c_ffi::CTarget::new(pointer_bits, long_bits),
+                );
+            }
             check_target(tcx.sess);
             if queries.args().reachability_analysis != ReachabilityType::None
                 && queries.kani_functions().is_empty()
@@ -255,6 +283,17 @@ impl CodegenBackend for AYCodegenBackend {
                                     harness_md.attributes.kind,
                                     trust_mc_metadata::HarnessKind::ProofForContract { .. }
                                 ),
+                                // Kani parity: the driver forwards
+                                // `--assertion-reach-checks` unless the user
+                                // asked for `--no-assertion-reach-checks`. With
+                                // the checks off, no per-assertion reachability
+                                // companion is generated, so an assertion in
+                                // dead code reports SUCCESS rather than
+                                // UNREACHABLE (see AYConfig for the soundness
+                                // argument).
+                                assertion_reach_checks: queries
+                                    .args()
+                                    .check_assertion_reachability,
                                 ..Default::default()
                             };
                             // Apply user's logic override if specified (#621)
@@ -301,11 +340,19 @@ impl CodegenBackend for AYCodegenBackend {
                                 &harness_md.pretty_name,
                             )
                             .max(get_recursive_unwind_count_for_fn(&harness_md.mangled_name));
+                            // CHC lane V4: the straight-line discharge proved
+                            // this harness's checks UNREACHABLE rather than
+                            // safe. The emitted system cannot show that, so
+                            // carry it as a marker for the driver.
+                            let vacuous_all_checks_unreachable =
+                                get_vacuous_checks_for_fn(&harness_md.pretty_name)
+                                    || get_vacuous_checks_for_fn(&harness_md.mangled_name);
                             if let Err(err) = write_harness_smt2_file(
                                 &smt_path,
                                 &program,
                                 demoted_fallback_count,
                                 recursive_unwind_count,
+                                vacuous_all_checks_unreachable,
                             ) {
                                 tcx.sess.dcx().err(format!(
                                     "compilation failed: could not write verification artifact {}: {err}",

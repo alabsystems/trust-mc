@@ -7,7 +7,39 @@
 //! Define arguments that should be common to all subcommands in trust_mc.
 use crate::args::{ValidateArgs, print_stabilized_feature_warning};
 use clap::{ValueEnum, error::Error, error::ErrorKind};
+use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) use trust_mc_metadata::{EnabledUnstableFeatures, UnstableFeature};
+
+/// Process-global mirror of `--quiet`, for the output sites that cannot reach
+/// the parsed arguments.
+///
+/// `--quiet` is documented as "print nothing but the exit code and requested
+/// artifacts", yet the `[AY:*]` marker lines went to stdout through bare
+/// `println!` / `solver_stdout!` calls, so a quiet run still printed
+/// `[AY:PROOF] CHC verification: ...` and `[AY:CTREX_CAT:Genuine]`. Most of
+/// those sites do have a `&KaniSession` and are gated on it directly; the CHC
+/// portfolio's `solver_stdout!` sites do not — several fire from free
+/// functions (`classify_unknown`, `bail_unknown_if_deadline_exhausted`, ...)
+/// that never see the arguments. Threading a flag through all of them would be
+/// a large, mechanical, merge-hostile change for a display-only decision, so
+/// the flag is mirrored here instead: the driver is one process per
+/// invocation, and [`set_quiet_output`] is called once before any harness runs.
+///
+/// It defaults to `false`, so any path that never sets it — unit tests, the
+/// library target — keeps the exact pre-existing output. Only the WRITE is
+/// suppressed; every verdict, classification and exit code is unchanged.
+static QUIET_OUTPUT: AtomicBool = AtomicBool::new(false);
+
+/// Mirror `--quiet` into [`QUIET_OUTPUT`]. Called once from
+/// `HarnessRunner::check_all_harnesses`, before any solver output can happen.
+pub(crate) fn set_quiet_output(quiet: bool) {
+    QUIET_OUTPUT.store(quiet, Ordering::Relaxed);
+}
+
+/// Whether `--quiet` was requested. See [`QUIET_OUTPUT`].
+pub(crate) fn quiet_output() -> bool {
+    QUIET_OUTPUT.load(Ordering::Relaxed)
+}
 
 /// Message formats available for subcommand output.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum, strum_macros::Display)]

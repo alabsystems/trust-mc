@@ -12,6 +12,7 @@
 
 use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
+use super::codegen_call_fn_inline::CallDispatchFnInline;
 use super::codegen_call_kani::CallKani;
 use super::codegen_call_kani_model::CallKaniModel;
 use crate::kani_middle::kani_functions::{KaniHook, KaniModel};
@@ -80,6 +81,19 @@ impl<'tcx, 'body> CallDispatchKani for ChcCtx<'tcx, 'body> {
             // the destination local unconstrained and missing the Mem-level memory
             // mirror store that typed-memory dereferences rely on.
             if callee.contains("kani::Arbitrary") && callee.rsplit("::").next() == Some("any") {
+                // An `Arbitrary::any` BODY carries the type invariant: a
+                // hand-written `any()` ends in `kani::assume(..)`, and a
+                // container impl (`Option<T>`, `Result<T, E>`) builds its
+                // payload from `T::any()`. The raw model below drops all of
+                // that and hands back an unconstrained value, which refutes
+                // assertions the program guarantees. Inline the real body
+                // first; the raw model stays as the fallback for impls with no
+                // usable body, so the destination is never left unconstrained
+                // without its memory mirror.
+                if self.try_dispatch_call_fn_inline(dcx) {
+                    debug!("Arbitrary::any inlined instead of havocked: {callee}");
+                    return true;
+                }
                 debug!("unmarked Arbitrary::any detected: {callee}, routing to KaniModel::Any");
                 self.codegen_call_kani_model(dcx, KaniModel::Any);
                 return true;

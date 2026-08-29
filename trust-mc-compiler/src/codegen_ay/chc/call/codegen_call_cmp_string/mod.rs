@@ -20,7 +20,7 @@ mod fallback_dispatch;
 pub(in crate::codegen_ay::chc) mod fast_math;
 pub(in crate::codegen_ay::chc) mod float_predicates;
 pub(in crate::codegen_ay::chc) mod float_rounding;
-pub(in crate::codegen_ay::chc) mod float_to_int_saturating;
+pub(in crate::codegen_ay) mod float_to_int_saturating;
 pub(crate) mod math;
 mod math_axioms;
 pub(in crate::codegen_ay::chc) mod math_const;

@@ -72,8 +72,9 @@ In the diagram above, two different suites (1 and 2) are both run using two *var
 Benchmark suite 2 requires a totally different command line to suite 1---for example, `suite_1` might contain trust-mc harnesses invoked through `targo trust-mc`, while `suite_2` might contain CBMC harnesses invoked through `run_cbmc_proofs.py`.
 Users would therefore define different variants (`c` and `d`) for invoking `suite_2`, and also specify a different parser to parse the results.
 No matter how different the benchmark suites are, the `collate` stage combines their results so that they can later be compared.
-> **NOTE**: CBMC is not installed by default. For CBMC variants, install it with
-> `./scripts/setup/install_cbmc.sh`.
+> **NOTE**: CBMC is not part of trust-mc and this repository ships no installer
+> for it. A CBMC variant only works if you install CBMC yourself and put it on
+> `PATH`.
 
 ## Example config file
 

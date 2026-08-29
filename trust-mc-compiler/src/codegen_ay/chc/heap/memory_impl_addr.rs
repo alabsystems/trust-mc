@@ -247,9 +247,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let elem_size = self.get_type_size(elem_ty)?;
 
                     let actual_index = if *from_end {
-                        // Need array length to compute actual index = len - offset
+                        // `from_end` counts back from the container's LENGTH.
+                        // `get_array_length` answers for arrays; for a SLICE it
+                        // returns None, and the fat pointer's metadata half is
+                        // structurally present but UNCONSTRAINED (using it as a
+                        // length makes correct programs fail their bounds check).
+                        // Recover a CONCRETE length from the `Unsize` cast that
+                        // produced the slice, the same trace `Rvalue::Len` uses.
                         let array_len = self
                             .get_array_length(current_ty)
+                            .or_else(|| {
+                                self.try_resolve_slice_len_for_local(local_idx).map(|n| n as usize)
+                            })
                             .ok_or_else(|| {
                                 warn!("CHC: from_end ConstantIndex requires known array length");
                             })
@@ -266,7 +275,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     };
 
                     // Part of #1888: Emit bounds check for constant array indexing.
-                    if let Some(array_len) = self.get_array_length(current_ty) {
+                    if let Some(array_len) = self.get_array_length(current_ty).or_else(|| {
+                        self.try_resolve_slice_len_for_local(local_idx).map(|n| n as usize)
+                    }) {
                         let index_expr = Expr::bitvec_const(actual_index as u128, POINTER_WIDTH);
                         let len_expr = Expr::bitvec_const(array_len as u128, POINTER_WIDTH);
                         // unsigned less-than: index < array_length

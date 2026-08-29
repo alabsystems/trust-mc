@@ -317,6 +317,35 @@ fn bmc_kani_assume_assert_fail(x: i32) {
 }
 "#;
 
+/// CBMC/Kani assume ordering: an assume constrains only the SUFFIX. The assert
+/// here fires BEFORE the assume, so `assume(x == 0)` must not mask its
+/// violation — the query must stay `sat` (counterexample: any x != 0). The old
+/// encoding asserted the assume globally, which made this `unsat`: a false
+/// proof of a failing assertion.
+pub(super) const BMC_KANI_ASSERT_BEFORE_ASSUME_SOURCE: &str = r#"#![allow(dead_code)]
+#![feature(register_tool)]
+#![register_tool(kanitool)]
+
+mod kani {
+    #[inline(never)]
+    #[kanitool::fn_marker = "AssumeHook"]
+    pub fn assume(cond: bool) {
+        let _ = cond;
+    }
+
+    #[inline(never)]
+    #[kanitool::fn_marker = "AssertHook"]
+    pub fn assert(cond: bool) {
+        let _ = cond;
+    }
+}
+
+fn bmc_kani_assert_before_assume(x: i32) {
+    kani::assert(x == 0);
+    kani::assume(x == 0);
+}
+"#;
+
 /// SafetyCheckHook via BMC: compiler-inserted safety check (assert + assume).
 /// With x > 0 && x < 50, the safety_check(x + x < 100) holds, and the
 /// subsequent assert(x > 0) also holds.
@@ -607,6 +636,19 @@ fn test_bmc_e2e_kani_assume_assert_fail_finds_sat_counterexample() {
     );
 }
 
+/// Discriminating control for ordered-assume (both directions with the safe
+/// test above): an assume AFTER an assert must not mask it (sat here), while
+/// an assume BEFORE an assert still constrains it (unsat in
+/// `test_bmc_e2e_kani_assume_assert_safe_proves_unsat`).
+#[test]
+fn test_bmc_e2e_assert_before_assume_is_not_masked() {
+    assert_bmc_solver_result(
+        BMC_KANI_ASSERT_BEFORE_ASSUME_SOURCE,
+        "bmc_kani_assert_before_assume",
+        "sat",
+    );
+}
+
 #[test]
 fn test_bmc_e2e_kani_safety_check_safe_proves_unsat() {
     assert_bmc_solver_result(
@@ -711,4 +753,39 @@ fn test_bmc_e2e_kani_write_any_nonzero_preserves_validity() {
         smt.contains("|bmc_kani_write_any_nonzero_preserves_validity::local_1_1| ay_write_any_0"),
         "write_any should update the NonZero local to the fresh havoc value. SMT:\n{smt}"
     );
+}
+
+/// `Box`'s drop glue lowers to `<Global as Allocator>::deallocate(&self, ptr,
+/// layout)`. Reading the pointer positionally from `args[0]` freed the borrowed
+/// `Global` receiver — an unconstrained address — and shifted the `Layout` into
+/// the align slot, so the dealloc size/base-pointer obligations were asked about
+/// garbage and ay could not build a model for them (`0 of 0 failed`,
+/// `INCONCLUSIVE (solver undecided)`). The freed address must be the operand
+/// before the layout.
+pub(super) const BMC_BOX_DROP_SOURCE: &str = r#"#![allow(dead_code)]
+#![feature(register_tool)]
+#![register_tool(kanitool)]
+
+mod kani {
+    #[inline(never)]
+    #[kanitool::fn_marker = "AssertHook"]
+    pub fn assert(cond: bool) {
+        let _ = cond;
+    }
+}
+
+fn bmc_box_drop_frees_own_block(x: u32) {
+    let _ = Box::new(9_usize);
+    kani::assert(x == x);
+}
+"#;
+
+/// Every heap obligation raised by a `Box` allocate/drop round trip is
+/// DISCHARGEABLE: the block the drop glue frees is the block the allocation
+/// created, so `dealloc size mismatch`, `dealloc base pointer` and `double free`
+/// are all unsatisfiable. Before the argument fix this query came back
+/// `unknown` — ay could not model the shape the shifted arguments produced.
+#[test]
+fn test_bmc_e2e_box_drop_frees_its_own_block() {
+    assert_bmc_solver_result(BMC_BOX_DROP_SOURCE, "bmc_box_drop_frees_own_block", "unsat");
 }

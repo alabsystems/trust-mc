@@ -5,6 +5,9 @@
 //! AY Backend for trust_mc Verification.
 
 mod abstraction_boundary;
+/// Guard (b) of the `--c-lib` front-end: check a C prototype against the Rust
+/// `extern` declaration before any C body may speak for a call.
+mod c_ffi_check;
 pub(crate) mod chc;
 mod codegen_file_io;
 mod codegen_function;
@@ -25,7 +28,9 @@ mod float_compare;
 #[allow(dead_code)] // BMC-path functions not yet wired into dispatch
 mod float_math_ops;
 mod float_range_check;
+mod foreign_defs;
 mod loop_invariant;
+mod obligation_free_walk;
 mod loop_unroll;
 mod names;
 mod option_like_eq;
@@ -150,6 +155,7 @@ pub(in crate::codegen_ay) use chc::get_static_init_incomplete_count;
 pub(in crate::codegen_ay) use chc::get_stub_approximation_count;
 pub(in crate::codegen_ay) use chc::take_aggregate_encoding_gap_by_fn;
 pub(in crate::codegen_ay) use chc::take_aggregate_encoding_gap_count;
+pub(in crate::codegen_ay) use chc::take_aggregate_gap_reasons_by_fn;
 pub(in crate::codegen_ay) use chc::take_fp_bitvector_encoding_by_fn;
 pub(in crate::codegen_ay) use chc::take_fp_bitvector_encoding_count;
 pub(in crate::codegen_ay) use chc::take_ptr_metadata_unconstrained_by_fn;

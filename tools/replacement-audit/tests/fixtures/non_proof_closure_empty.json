@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "suite": "tests/trust-mc",
+  "denominator": 0,
+  "source": {
+    "denominator": 2,
+    "row_sha256": "cdbeb76c8e818eeead59b5f5127ff91e98175124dbabd0d81317461b1d547627"
+  },
+  "rows": []
+}

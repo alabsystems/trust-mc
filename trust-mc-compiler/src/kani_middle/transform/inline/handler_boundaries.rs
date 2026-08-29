@@ -4,6 +4,7 @@
 //
 //! Handler-boundary predicates for the function inline pass.
 
+use rustc_public::CrateDef;
 use rustc_public::ty::{FloatTy, GenericArgKind, GenericArgs, IntTy, RigidTy, TyKind, UintTy};
 
 pub(super) fn is_handler_backed_slice_contains(fn_name: &str) -> bool {
@@ -47,6 +48,78 @@ pub(super) fn is_handler_backed_slice_accessor(fn_name: &str) -> bool {
         && !fn_name.contains("HashSet")
         && !fn_name.contains("Vec")
         && !fn_name.contains("String")
+}
+
+/// `kani::any::<char>()` must reach the AY codegen handler, not be inlined.
+///
+/// `Arbitrary for char` is written in Rust as
+///
+/// ```ignore
+/// let val = u32::any();
+/// assume(val <= 0xD7FF || (val >= 0xE000 && val <= 0x10FFFF));
+/// unsafe { char::from_u32_unchecked(val) }
+/// ```
+///
+/// Inlining that hands codegen a `from_u32_unchecked` it does not model, so the
+/// constrained `val` is dropped and the resulting `char` is a free 32-bit
+/// value. Every harness taking a `char` was then explored over impossible
+/// inputs:
+///
+/// ```ignore
+/// let c: char = kani::any();
+/// assert!(c as u32 <= 0x10FFFF);   // FAILED — no char can exceed this
+/// ```
+///
+/// Codegen already knows how to do this correctly: `codegen_kani_any` emits a
+/// fresh symbolic value and `assert_char_validity_for_ty` constrains it to the
+/// two legal ranges — the same constraint the library body states, applied
+/// where it cannot be lost. Keeping the call intact is what lets that run, the
+/// same reason raw-compatible arrays are held back below.
+pub(super) fn any_model_char(fn_args: &GenericArgs) -> bool {
+    fn_args
+        .0
+        .iter()
+        .find_map(|arg| match arg {
+            GenericArgKind::Type(ty) => Some(*ty),
+            _ => None,
+        })
+        .is_some_and(|ty| matches!(ty.kind(), TyKind::RigidTy(RigidTy::Char)))
+}
+
+/// `kani::any::<NonZeroX>()` must reach the AY codegen handler, for the same
+/// reason as [`any_model_char`].
+///
+/// `Arbitrary for NonZeroU8` and friends are written as
+///
+/// ```ignore
+/// let val = u8::any();
+/// assume(val != 0);
+/// unsafe { NonZeroU8::new_unchecked(val) }
+/// ```
+///
+/// Inlining hands codegen a `new_unchecked` it does not model, the `assume` is
+/// dropped with the value it constrained, and the niche type admits the one
+/// value it exists to exclude:
+///
+/// ```ignore
+/// let n: NonZeroU8 = kani::any();
+/// assert!(n.get() != 0);          // FAILED
+/// ```
+///
+/// `assert_nonzero_validity_for_ty` applies exactly this constraint when the
+/// call reaches codegen intact.
+pub(super) fn any_model_nonzero(fn_args: &GenericArgs) -> bool {
+    fn_args
+        .0
+        .iter()
+        .find_map(|arg| match arg {
+            GenericArgKind::Type(ty) => Some(*ty),
+            _ => None,
+        })
+        .is_some_and(|ty| match ty.kind() {
+            TyKind::RigidTy(RigidTy::Adt(def, _)) => def.trimmed_name() == "NonZero",
+            _ => false,
+        })
 }
 
 pub(super) fn any_model_raw_compatible_array(fn_args: &GenericArgs) -> bool {

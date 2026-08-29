@@ -59,9 +59,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         _ => None,
                     };
                     if let Some(src) = src_local {
-                        if let Some(len) = self.ref_resolution.subslice_len.get(&src).cloned() {
-                            self.ref_resolution.subslice_len.insert(dest, len);
-                            debug!(src, dest, "subslice_len: propagated through Use");
+                        if self.path_insensitive_metadata_copy_is_unique(src, dest) {
+                            if let Some(len) = self.ref_resolution.subslice_len.get(&src).cloned() {
+                                self.ref_resolution.subslice_len.insert(dest, len);
+                                debug!(src, dest, "subslice_len: propagated through Use");
+                            }
+                        } else {
+                            self.clear_path_insensitive_ref_metadata(dest);
                         }
                     }
                 }
@@ -112,8 +116,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         _ => None,
                     };
                     if let Some(src) = src_local {
-                        if let Some(len) = self.ref_resolution.subslice_len.get(&src).cloned() {
-                            self.ref_resolution.subslice_len.insert(dest, len);
+                        if self.path_insensitive_metadata_copy_is_unique(src, dest) {
+                            if let Some(len) = self.ref_resolution.subslice_len.get(&src).cloned() {
+                                self.ref_resolution.subslice_len.insert(dest, len);
+                            }
+                        } else {
+                            self.clear_path_insensitive_ref_metadata(dest);
                         }
                     }
                 }
@@ -203,22 +211,36 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Rvalue::Ref(_, borrow_kind, place) => {
                 // Part of #4163: Propagate subslice_len through Ref (including deref reborrows).
                 if let Some(dest) = dest_local {
-                    if let Some(len) = self.ref_resolution.subslice_len.get(&place.local).cloned() {
-                        self.ref_resolution.subslice_len.insert(dest, len);
-                        debug!(src = place.local, dest, proj = ?place.projection,
-                            "subslice_len: propagated through Ref");
+                    if self.path_insensitive_metadata_copy_is_unique(place.local, dest) {
+                        if let Some(len) =
+                            self.ref_resolution.subslice_len.get(&place.local).cloned()
+                        {
+                            self.ref_resolution.subslice_len.insert(dest, len);
+                            debug!(src = place.local, dest, proj = ?place.projection,
+                                "subslice_len: propagated through Ref");
+                        }
+                    } else {
+                        self.clear_path_insensitive_ref_metadata(dest);
                     }
                 }
+                self.register_collection_elem_field_ref(dest_local, place);
                 let is_shared = matches!(borrow_kind, BorrowKind::Shared | BorrowKind::Fake(_));
                 self.translate_ref_or_addressof(place, is_shared, modified_locals)
             }
             Rvalue::AddressOf(raw_ptr_kind, place) => {
                 // Part of #4163: Propagate subslice_len through AddressOf.
                 if let Some(dest) = dest_local {
-                    if let Some(len) = self.ref_resolution.subslice_len.get(&place.local).cloned() {
-                        self.ref_resolution.subslice_len.insert(dest, len);
+                    if self.path_insensitive_metadata_copy_is_unique(place.local, dest) {
+                        if let Some(len) =
+                            self.ref_resolution.subslice_len.get(&place.local).cloned()
+                        {
+                            self.ref_resolution.subslice_len.insert(dest, len);
+                        }
+                    } else {
+                        self.clear_path_insensitive_ref_metadata(dest);
                     }
                 }
+                self.register_collection_elem_field_ref(dest_local, place);
                 let is_shared = matches!(raw_ptr_kind, RawPtrKind::Const);
                 self.translate_ref_or_addressof(place, is_shared, modified_locals)
             }
@@ -448,6 +470,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Operand::Copy(place) | Operand::Move(place) => place.local,
             _ => return,
         };
+
+        if !self.path_insensitive_metadata_copy_is_unique(src_local, dest_local) {
+            self.clear_path_insensitive_ref_metadata(dest_local);
+            return;
+        }
 
         if let Some(len_expr) = self.ref_resolution.subslice_len.get(&src_local).cloned() {
             self.ref_resolution.subslice_len.insert(dest_local, len_expr);

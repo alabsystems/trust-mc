@@ -22,24 +22,26 @@ use trust_mc_metadata::HarnessMetadata;
 
 use crate::args::AYSolver;
 use crate::ay_parse::{
-    build_cover_properties_from_sat_checks, build_coverage_results_from_sat_checks,
-    build_success_properties, determine_failed_from_properties, load_vc_artifact,
-    parse_cover_properties, parse_cover_sat_check_output, parse_coverage_results,
-    parse_kani_any_trace, parse_solver_output, parse_violation_entry_names,
-    parse_violation_properties, vc_artifact_path_for_smt,
+    apply_kani_property_naming, build_cover_properties_from_sat_checks,
+    build_coverage_results_from_sat_checks, build_success_properties,
+    determine_failed_from_properties, load_vc_artifact, parse_cover_properties,
+    parse_cover_sat_check_output, parse_coverage_results, parse_kani_any_trace,
+    parse_solver_output, parse_violation_entry_names, parse_violation_properties,
+    vc_artifact_path_for_smt,
 };
 use crate::coverage::cov_results::CoverageResults;
 use crate::deadline::Deadline;
 use crate::property_model::{CheckStatus, Property, PropertyId, RawSourceLocation};
 use crate::session::{KaniSession, run_piped_with_timeout};
 use crate::smt_io::{
-    SmtLogicClass, build_cover_sat_query, classify_smt_logic_from_content, content_uses_horn_logic,
+    SmtLogicClass, build_cover_sat_query, build_harness_reachability_query,
+    classify_smt_logic_from_content, content_uses_horn_logic,
     extract_cover_declarations_from_content, extract_coverage_declarations_from_content,
     extract_reach_declarations_from_content, extract_violation_declarations_from_content,
 };
 use crate::verification_result::{
-    FailedProperties, LogicTier, ProofCrosscheck, SolverUnknownReason, VerificationResult,
-    VerificationStatus,
+    FailedProperties, HarnessFeasibility, LogicTier, ProofCrosscheck, SolverUnknownReason,
+    VerificationResult, VerificationStatus,
 };
 
 /// Default timeout for SMT solver processes (120 seconds).
@@ -206,6 +208,7 @@ impl KaniSession {
                             proof_qualifiers: Vec::new(),
                             proof_transcript_metadata: None,
                             native_full_verification_verdict: None,
+                            harness_feasibility: HarnessFeasibility::Undetermined,
                         });
                     }
                     Err(e) => {
@@ -239,7 +242,11 @@ impl KaniSession {
                     println!("[AY] Detected HORN logic - using ay-chc portfolio solver");
                 }
                 match self.try_ay_chc_solver(smt_file, harness, demoted_fallback_count, deadline) {
-                    Ok(chc_result) => {
+                    Ok(mut chc_result) => {
+                        // V5-CHC: an UNDECIDED cover(...) is fail-closed under
+                        // --strict-vacuity. See the method for why this lane
+                        // cannot adjudicate a cover at all.
+                        self.apply_chc_cover_witness_fail_close(harness, &mut chc_result);
                         let runtime = start.elapsed();
                         let validation_status = logic_tier.validation_status();
                         return Ok(VerificationResult {
@@ -262,6 +269,7 @@ impl KaniSession {
                             proof_transcript_metadata: chc_result.proof_transcript_metadata,
                             native_full_verification_verdict: chc_result
                                 .native_full_verification_verdict,
+                            harness_feasibility: HarnessFeasibility::Undetermined,
                         });
                     }
                     Err(e) => {
@@ -272,7 +280,13 @@ impl KaniSession {
                                 harness,
                                 deadline,
                             ) {
-                                Ok(Some(chc_result)) => {
+                                Ok(Some(mut chc_result)) => {
+                                    // V5-CHC: same fail-close on the external
+                                    // ay proof-fallback path.
+                                    self.apply_chc_cover_witness_fail_close(
+                                        harness,
+                                        &mut chc_result,
+                                    );
                                     let runtime = start.elapsed();
                                     let validation_status = logic_tier.validation_status();
                                     return Ok(VerificationResult {
@@ -296,6 +310,7 @@ impl KaniSession {
                                             .proof_transcript_metadata,
                                         native_full_verification_verdict: chc_result
                                             .native_full_verification_verdict,
+                                        harness_feasibility: HarnessFeasibility::Undetermined,
                                     });
                                 }
                                 Ok(None) => {}
@@ -351,6 +366,7 @@ impl KaniSession {
                             proof_qualifiers: Vec::new(),
                             proof_transcript_metadata: None,
                             native_full_verification_verdict: None,
+                            harness_feasibility: HarnessFeasibility::Undetermined,
                         });
                     }
                 }
@@ -369,7 +385,9 @@ impl KaniSession {
 
         let ay_available = which::which("ay").is_ok();
 
-        let (status, failed_properties, properties, coverage_results) = match self.args.ay_solver {
+        // Bound in two steps so the arms below keep their original indentation:
+        // the destructuring pattern no longer fits on the `match` line.
+        let solved = match self.args.ay_solver {
             AYSolver::Auto | AYSolver::AY => {
                 // AY is the sole production solver.
                 if ay_available {
@@ -403,6 +421,7 @@ impl KaniSession {
                                 proof_qualifiers: Vec::new(),
                                 proof_transcript_metadata: None,
                                 native_full_verification_verdict: None,
+                                harness_feasibility: HarnessFeasibility::Undetermined,
                             });
                         }
                         Err(err) => return Err(err),
@@ -421,6 +440,8 @@ impl KaniSession {
                 unreachable!("Direct mode should have been handled by ay-direct code path")
             }
         };
+
+        let (status, failed_properties, properties, coverage_results, harness_feasibility) = solved;
 
         let runtime = start.elapsed();
         let validation_status = logic_tier.validation_status();
@@ -462,20 +483,33 @@ impl KaniSession {
             proof_qualifiers: Vec::new(),
             proof_transcript_metadata: None,
             native_full_verification_verdict: None,
+            harness_feasibility,
         })
     }
 
     /// Try to run the native AY solver on an SMT-LIB2 file.
     ///
-    /// Returns (status, failed_properties, properties) on success, error if AY not available.
+    /// Returns (status, failed_properties, properties, coverage, harness feasibility)
+    /// on success, error if AY not available.
+    ///
+    /// The last element is the answer to "can this harness run at all", from the
+    /// vacuity probe below. It is `Undetermined` on every path that does not
+    /// reach the probe (any non-UNSAT verdict, an empty property list, an
+    /// undecided or failed probe), which is the fail-closed reading — see
+    /// `verification_result::classify_vacuity`.
     fn try_ay_solver(
         &self,
         smt_file: &Path,
         smt_content: &str,
         _harness: &HarnessMetadata,
         deadline: Deadline,
-    ) -> Result<(VerificationStatus, FailedProperties, Vec<Property>, Option<CoverageResults>)>
-    {
+    ) -> Result<(
+        VerificationStatus,
+        FailedProperties,
+        Vec<Property>,
+        Option<CoverageResults>,
+        HarnessFeasibility,
+    )> {
         // Check if ay is available
         let ay_path = which::which("ay")
             .map_err(|_| {
@@ -504,18 +538,34 @@ impl KaniSession {
 
         let mut cmd = Command::new(&ay_path);
         cmd.arg(smt_file);
-        // Suppress ay's default proof pipeline: the driver never consumes the
-        // `.alethe` certificate ay writes next to the input on UNSAT, and for
-        // SMT inputs ay's own `--verify-proof` re-check cannot validate Alethe
-        // anyway ("treated as not verified") — yet leaving the default on flips
-        // ay's in-solver clause tracing + per-conflict LRAT materialization,
-        // measured at ~80% of SAT-search time on a 92MB BMC instance (turning
-        // solvable instances into timeouts). Zero verification value, full tax.
-        // ay's independent model-validation battery is deliberately LEFT ON
-        // (no `--no-validate`): it re-checks SAT models against the assertions,
-        // which is genuine soundness value for counterexample classification.
-        cmd.arg("--no-proof");
-        cmd.arg("--no-verify-proof");
+        // `--no-proof --no-verify-proof` used to be passed here, on the belief
+        // that it skipped ay's clause tracing and LRAT materialization and so
+        // saved ~80% of SAT-search time. That belief is now false, and the
+        // flags had become a net TAX:
+        //
+        // * `--no-proof` no longer disables the proof tracker. Since ay
+        //   a786a5cd5, every public solve arms it unless competition-shedding
+        //   is active, which this flag does not set — so in-solver proof
+        //   construction runs either way. What the flag actually removes is the
+        //   THROTTLE: it skips `configure_proof_policy`, leaving the
+        //   reconstruction step budget at `None`, i.e. UNBOUNDED search-time
+        //   proof bookkeeping. ay's own calibration notes name the failure mode.
+        // * `--no-verify-proof` is a strict no-op for `.smt2` input — every
+        //   consumer of it is DIMACS-only.
+        //
+        // Measured over 55 paired corpus queries (110 runs, order alternated,
+        // 3 repeats on the outliers): the pair cost +21% total wall time, with
+        // reproducible pathologies — `box_allocation` 0.45s -> 54s, and
+        // `array_icr_for_loop` 3.80s `sat` -> 54s `unknown`, i.e. a verdict
+        // LOST. Exactly one verdict differed across the whole set, and it
+        // favoured removal; there were no sat<->unsat flips, which is
+        // structural rather than lucky, because ay's model-validation gate and
+        // UNSAT certification funnel are unconditional on this path.
+        //
+        // The cover-check and vacuity sites already omit the pair for the same
+        // reason. ay's model-validation battery stays ON (no `--no-validate`):
+        // it re-checks SAT models against the assertions, which is genuine
+        // soundness value for counterexample classification.
         // Give ay a cooperative deadline slightly inside the hard-kill window so
         // it can return `unknown (:reason-unknown "timeout")` + stats instead of
         // dying by SIGKILL mid-phase with no diagnostics. The subprocess hard
@@ -570,7 +620,7 @@ impl KaniSession {
             // verdict, a check whose guard (path condition ∧ assumption
             // context) is infeasible must be reported UNREACHABLE, matching
             // Kani (e.g. an assertion in dead code).
-            self.classify_unreachable_properties(
+            let decided_reachable = self.classify_unreachable_properties(
                 smt_content,
                 &violation_names,
                 &mut properties,
@@ -578,6 +628,63 @@ impl KaniSession {
                 smt_file,
                 deadline,
             );
+
+            // VACUITY (whole harness): the main query is
+            // `constraints ∧ (violation₁ ∨ … ∨ violationₙ)`, so it is also UNSAT
+            // when `constraints` alone is contradictory — `kani::assume(false)`,
+            // mutually exclusive assumptions, or an unreachable body. Nothing was
+            // verified in that case, yet every check above is SUCCESS and the
+            // run would be reported as a clean proof.
+            //
+            // Per-check `ay_reach_*` flags do not catch it (the compiler emits
+            // them only for checks with a non-trivial guard, and a top-level
+            // contradiction leaves every guard trivial), so probe the harness
+            // itself. On a definitive `unsat` every non-cover check becomes
+            // UNREACHABLE, which is exactly the signature the V4 vacuity gate in
+            // `harness_runner` acts on — it reports
+            // `VERIFICATION:- VACUOUS (…)` and fails closed, or passes with a
+            // loud marker under `--allow-vacuous`.
+            //
+            // Fail-open by construction: only `Some(false)` (a decided `unsat`)
+            // reclassifies anything; `unknown`, a solver error or a timeout
+            // leaves the verdict untouched.
+            //
+            // The probe's OTHER decided answer is carried out too, unused here
+            // but not discarded: `Some(true)` means the constraints are
+            // satisfiable, so any check this harness has already classified
+            // UNREACHABLE is dead CODE and V4 must not blame an assumption for
+            // it. See `verification_result::classify_vacuity`.
+            let harness_feasibility = if properties.is_empty() {
+                HarnessFeasibility::Undetermined
+            } else {
+                match self.probe_harness_reachable(smt_content, &ay_path, smt_file, deadline) {
+                    Some(false) => {
+                        // Fail-closed net for contradictions the per-check reach
+                        // flags cannot see (a top-level contradiction leaves
+                        // trivial guards, hence no flags). But a check whose OWN
+                        // reach probe DECIDED `sat` was verified at a feasible
+                        // site — Kani suffix semantics say a LATER contradictory
+                        // assume does not un-verify it (corpus:
+                        // safety-constraint-attribute/check-invariant) — so only
+                        // checks not positively decided reachable are flipped.
+                        for (i, property) in properties.iter_mut().enumerate() {
+                            if property.status == CheckStatus::Success
+                                && !decided_reachable.contains(&i)
+                            {
+                                property.status = CheckStatus::Unreachable;
+                            }
+                        }
+                        HarnessFeasibility::Infeasible
+                    }
+                    // A DECIDED `sat` is the other half of the answer, and it is
+                    // the half that was being thrown away: it says the program
+                    // constraints hold for some run, so any UNREACHABLE check in
+                    // this harness is dead CODE, not a contradictory assumption.
+                    // The V4 gate needs it to name the right cause.
+                    Some(true) => HarnessFeasibility::Reachable,
+                    None => HarnessFeasibility::Undetermined,
+                }
+            };
 
             // Part of #1162: Compute cover semantics via secondary SAT checks.
             // When covers exist, run a secondary query to determine SATISFIED/UNSATISFIABLE
@@ -600,15 +707,28 @@ impl KaniSession {
                         println!("[AY] Cover check: {} -> {}", name, status_str);
                     }
                 }
-                build_cover_properties_from_sat_checks(
+                let mut covers = build_cover_properties_from_sat_checks(
                     &cover_names,
                     &sat_results,
                     location_map.as_ref(),
-                )
+                );
+                self.classify_unreachable_covers(
+                    smt_content,
+                    &cover_names,
+                    &mut covers,
+                    &ay_path,
+                    smt_file,
+                    deadline,
+                );
+                covers
             } else {
                 Vec::new()
             };
             properties.extend(cover_properties);
+            // Kani-parity display names (`<fn>.<class>.<n>`, 1-based). Must run
+            // after every SMT-name-keyed correlation (location map, cover zips)
+            // and before the list is returned for rendering.
+            apply_kani_property_naming(&mut properties);
             let coverage_results = if self.args.coverage {
                 if coverage_names.is_empty() {
                     Some(CoverageResults::empty())
@@ -629,7 +749,13 @@ impl KaniSession {
             } else {
                 None
             };
-            return Ok((base_status, base_failed, properties, coverage_results));
+            return Ok((
+                base_status,
+                base_failed,
+                properties,
+                coverage_results,
+                harness_feasibility,
+            ));
         }
 
         // For non-success results, check if there are real errors (not model errors)
@@ -641,7 +767,13 @@ impl KaniSession {
             if self.args.common_args.verbose {
                 println!("[AY] ay reported error, treating as inconclusive");
             }
-            return Ok((VerificationStatus::Failure, FailedProperties::Other, vec![], None));
+            return Ok((
+                VerificationStatus::Failure,
+                FailedProperties::Other,
+                vec![],
+                None,
+                HarnessFeasibility::Undetermined,
+            ));
         }
 
         // SAT result - parse get-value output to identify failed properties
@@ -692,8 +824,11 @@ impl KaniSession {
         );
 
         // Part of #922: Also parse cover properties
-        let cover_properties = parse_cover_properties(&stdout, true, Some(&any_trace));
+        let cover_properties =
+            parse_cover_properties(&stdout, true, Some(&any_trace), location_map.as_ref());
         properties.extend(cover_properties);
+        // Kani-parity display names, as on the UNSAT path above.
+        apply_kani_property_naming(&mut properties);
         let coverage_results = if self.args.coverage {
             Some(parse_coverage_results(&stdout, location_map.as_ref()))
         } else {
@@ -742,7 +877,15 @@ impl KaniSession {
             }
         }
 
-        Ok((base_status, failed_props, properties, coverage_results))
+        // The SAT path never probes: the main query already produced a model, so
+        // there is nothing vacuous to adjudicate.
+        Ok((
+            base_status,
+            failed_props,
+            properties,
+            coverage_results,
+            HarnessFeasibility::Undetermined,
+        ))
     }
 
     /// Classify non-failing checks as UNREACHABLE via their reach flags.
@@ -767,6 +910,17 @@ impl KaniSession {
     /// `violation_names[i]` must correspond to `properties[i]` (both the UNSAT
     /// path via declaration order and the SAT path via get-value output order
     /// maintain this alignment).
+    ///
+    /// Returns the indices of checks whose reach flag the solver DECIDED
+    /// satisfiable (`sat`) — checks positively established reachable at their
+    /// own site. The vacuity flip on the UNSAT path must not overwrite these:
+    /// a check whose DOMINATING assumption context is satisfiable was genuinely
+    /// verified even when a LATER assume makes the whole trace infeasible
+    /// (Kani suffix semantics; corpus:
+    /// safety-constraint-attribute/check-invariant pins the pre-contradiction
+    /// check SUCCESS). Only a decided `sat` earns a place in the set — `unsat`
+    /// upgraded the check to UNREACHABLE, and `unknown`/error keeps the check
+    /// eligible for the fail-closed flip.
     fn classify_unreachable_properties(
         &self,
         smt_content: &str,
@@ -775,11 +929,21 @@ impl KaniSession {
         ay_path: &Path,
         smt_file: &Path,
         deadline: Deadline,
-    ) {
+    ) -> std::collections::HashSet<usize> {
+        // Kani parity: `--no-assertion-reach-checks` turns the reachability
+        // instrumentation off, and with it the UNREACHABLE classification — a
+        // check that passes only vacuously is then reported SUCCESS, exactly
+        // as Kani reports it (corpus: assert-location/debug-assert pins
+        // `"This should be unreachable": SUCCESS` under that flag). The V4
+        // vacuity gate is not weakened: a whole-harness contradiction is still
+        // caught by `probe_harness_reachable`, which does not go through here.
+        if !self.args.assertion_reach_checks() {
+            return std::collections::HashSet::new();
+        }
         let reach_decls: std::collections::HashSet<String> =
             extract_reach_declarations_from_content(smt_content).into_iter().collect();
         if reach_decls.is_empty() {
-            return;
+            return std::collections::HashSet::new();
         }
 
         let mut candidate_idxs = Vec::new();
@@ -801,16 +965,19 @@ impl KaniSession {
             }
         }
         if reach_names.is_empty() {
-            return;
+            return std::collections::HashSet::new();
         }
 
         let results =
             self.check_cover_satisfiability(smt_content, &reach_names, ay_path, smt_file, deadline);
+        let mut decided_reachable = std::collections::HashSet::new();
         for (&i, result) in candidate_idxs.iter().zip(results.iter()) {
             // Soundness rule: only a definitive `unsat` from the solver may be
             // upgraded to UNREACHABLE. `unknown` is never upgraded.
             if *result == Some(false) {
                 properties[i].status = CheckStatus::Unreachable;
+            } else if *result == Some(true) {
+                decided_reachable.insert(i);
             }
         }
         if self.args.common_args.verbose {
@@ -823,6 +990,154 @@ impl KaniSession {
                 println!("[AY] Reachability check: {} -> {}", name, status_str);
             }
         }
+        decided_reachable
+    }
+
+    /// Split the UNSATISFIABLE covers into UNSATISFIABLE and UNREACHABLE.
+    ///
+    /// Kani reports two DIFFERENT statuses for a `kani::cover!` that does not
+    /// hold, and the corpus pins both:
+    ///
+    /// * `UNSATISFIABLE` — the cover statement is reachable, but its condition
+    ///   is never true there.
+    /// * `UNREACHABLE` — the cover statement itself is dead code, so the
+    ///   condition was never asked (`expected/cover/cover-unreachable` pins
+    ///   `Status: UNREACHABLE` and the tally `(2 unreachable)`).
+    ///
+    /// The primary cover flag `ay_cover_<n>` is `guard ∧ condition` and is
+    /// `unsat` in BOTH cases, so it cannot tell them apart. The compiler emits
+    /// a companion `ay_reach_cover_<n>` holding the guard alone (see
+    /// `record_cover_property_with_guard`); an `unsat` on the companion is the
+    /// positive evidence that the site is dead.
+    ///
+    /// Soundness:
+    /// - Only covers the first query already decided `UNSATISFIABLE` are
+    ///   considered. A `Satisfied` or `Undetermined` cover is never touched.
+    /// - Only a definitive `unsat` on the companion reclassifies; `sat`,
+    ///   `unknown` and solver errors leave `Unsatisfiable` standing.
+    /// - Both statuses are negative: neither counts toward "N of M cover
+    ///   properties satisfied", and `has_unsatisfiable_cover` accepts both. No
+    ///   cover becomes SATISFIED and no harness verdict can flip through here.
+    ///
+    /// `cover_names[i]` corresponds to `covers[i]` — `build_cover_properties_-
+    /// from_sat_checks` zips the two in order.
+    fn classify_unreachable_covers(
+        &self,
+        smt_content: &str,
+        cover_names: &[String],
+        covers: &mut [Property],
+        ay_path: &Path,
+        smt_file: &Path,
+        deadline: Deadline,
+    ) {
+        // Kani parity: `--no-assertion-reach-checks` removes the reachability
+        // companions Kani attaches to every assert it codegens — `kani::cover!`
+        // lowers to one — and with them the UNREACHABLE classification. The
+        // compiler already withholds the flag under that setting; return early
+        // so no solver time is spent looking for flags that are not there.
+        if !self.args.assertion_reach_checks() {
+            return;
+        }
+        let reach_decls: std::collections::HashSet<String> =
+            extract_reach_declarations_from_content(smt_content).into_iter().collect();
+        if reach_decls.is_empty() {
+            return;
+        }
+
+        let mut candidate_idxs = Vec::new();
+        let mut reach_names = Vec::new();
+        for (i, cover_name) in cover_names.iter().enumerate() {
+            if i >= covers.len() {
+                break;
+            }
+            if covers[i].status != CheckStatus::Unsatisfiable {
+                continue;
+            }
+            let Some(suffix) = cover_name.strip_prefix("ay_cover_") else {
+                continue;
+            };
+            let reach_name = format!("ay_reach_cover_{suffix}");
+            if reach_decls.contains(&reach_name) {
+                candidate_idxs.push(i);
+                reach_names.push(reach_name);
+            }
+        }
+        if reach_names.is_empty() {
+            return;
+        }
+
+        let results =
+            self.check_cover_satisfiability(smt_content, &reach_names, ay_path, smt_file, deadline);
+        for (&i, result) in candidate_idxs.iter().zip(results.iter()) {
+            if *result == Some(false) {
+                covers[i].status = CheckStatus::Unreachable;
+            }
+        }
+        if self.args.common_args.verbose {
+            for (name, result) in reach_names.iter().zip(results.iter()) {
+                let status_str = match result {
+                    Some(true) => "reachable (cover stays UNSATISFIABLE)",
+                    Some(false) => "UNREACHABLE",
+                    None => "undetermined (cover stays UNSATISFIABLE)",
+                };
+                println!("[AY] Cover reachability check: {} -> {}", name, status_str);
+            }
+        }
+    }
+
+    /// Probe whether this harness is reachable at all, i.e. whether the program
+    /// constraints alone are satisfiable.
+    ///
+    /// Returns `Some(true)` when the harness body is feasible, `Some(false)`
+    /// when it is not (every check in it passes vacuously), and `None` when the
+    /// solver could not decide — which is treated as "assume feasible", so an
+    /// undecided probe never invents a vacuity verdict.
+    ///
+    /// Only called after the main query returned UNSAT (a would-be proof); it
+    /// costs one extra solver call on the success path, which is exactly the
+    /// path where a wrong answer is most expensive.
+    fn probe_harness_reachable(
+        &self,
+        smt_content: &str,
+        solver_path: &Path,
+        smt_file: &Path,
+        deadline: Deadline,
+    ) -> Option<bool> {
+        let query = build_harness_reachability_query(smt_content);
+        let probe_path = smt_file.with_extension("vacuity_check.smt2");
+        if let Err(e) = std::fs::write(&probe_path, &query) {
+            if self.args.common_args.verbose {
+                eprintln!("[AY] Failed to write vacuity check SMT file: {e}");
+            }
+            return None;
+        }
+
+        let timeout = deadline.clamp(solver_timeout_duration(self.args.harness_timeout));
+        let mut cmd = Command::new(solver_path);
+        cmd.arg(&probe_path);
+        let output = match run_piped_with_timeout(cmd, timeout) {
+            Ok(output) => output,
+            Err(e) => {
+                if self.args.common_args.verbose {
+                    eprintln!("[AY] Vacuity check solver failed: {e}");
+                }
+                let _ = std::fs::remove_file(&probe_path);
+                return None;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _ = std::fs::remove_file(&probe_path);
+
+        let result = parse_cover_sat_check_output(&stdout, 1).into_iter().next().flatten();
+        if self.args.common_args.verbose {
+            let label = match result {
+                Some(true) => "reachable",
+                Some(false) => "VACUOUS (program constraints are contradictory)",
+                None => "undetermined",
+            };
+            println!("[AY] Harness reachability probe: {label}");
+        }
+        result
     }
 
     /// Run a secondary solver query to determine cover property satisfiability.
@@ -851,45 +1166,123 @@ impl KaniSession {
             return Vec::new();
         }
 
-        let cover_query = build_cover_sat_query(smt_content, cover_names);
+        let total = deadline.clamp(solver_timeout_duration(self.args.harness_timeout));
+        let started = std::time::Instant::now();
+        let n = cover_names.len();
+        let mut results: Vec<Option<bool>> = Vec::with_capacity(n);
 
-        // Write the secondary query to a temp file next to the original
-        let cover_smt_path = smt_file.with_extension("cover_check.smt2");
-        if let Err(e) = std::fs::write(&cover_smt_path, &cover_query) {
+        // One probe per solver process, each with its own slice of the budget.
+        //
+        // The batch shape this replaces put N `check-sat`s in one file under
+        // one budget. ay answers them strictly in file order and `-t` is
+        // GLOBAL, so one divergent probe consumed the whole budget and every
+        // LATER probe was silently lost — measured on a leftover-file corpus
+        // sweep: 35 of 37 batched runs came back truncated. Ground truth on a
+        // real 28-probe instance: solved per-probe, 28/28 decided in ~8s;
+        // batched, 8/28. Per-probe also removes the misalignment surface a
+        // mid-stream `unknown` used to open (one process, one answer, nothing
+        // to shift), and isolates the second truncation cause the batch had —
+        // a mid-file memout kills only that probe's process.
+        //
+        // The guard below is not decoration. Process startup is dominated by
+        // formula CONTENT, not file size (a 52.8 KB prefix measured 0.57s, a
+        // 683 KB one 0.11s), so a byte-size heuristic cannot predict it.
+        // Instead the FIRST probe's measured wall cost stands in for the rest:
+        // if paying it per remaining probe would blow the budget, the rest run
+        // as one batch — which, with the slot-aligned parser, is sound and
+        // merely less precise. Probe counts here reach 104.
+        let mut idx = 0;
+        while idx < n {
+            let probes_left = n - idx;
+            let remaining = total.saturating_sub(started.elapsed());
+
+            // Not enough time to give each remaining probe a meaningful slice:
+            // one batch for whatever is left, or nothing if even that is gone.
+            let per_probe = remaining / probes_left as u32;
+            let batch_rest = per_probe < Duration::from_millis(1000)
+                || (idx == 1
+                    && started.elapsed() > remaining / (probes_left as u32).max(1));
+            if batch_rest {
+                if remaining > Duration::from_millis(200) {
+                    let rest = &cover_names[idx..];
+                    let batched = self.run_cover_probe_file(
+                        smt_content, rest, solver_path, smt_file, idx, remaining,
+                    );
+                    results.extend(batched);
+                } else {
+                    results.resize(n, None);
+                }
+                break;
+            }
+
+            let one = std::slice::from_ref(&cover_names[idx]);
+            let mut got =
+                self.run_cover_probe_file(smt_content, one, solver_path, smt_file, idx, per_probe);
+            results.append(&mut got);
+            idx += 1;
+        }
+        results.resize(n, None);
+        results
+    }
+
+    /// Solve one cover-check file holding `names` probes under `budget`,
+    /// returning one slot per probe. Shared by the per-probe path and its
+    /// batch fallback.
+    fn run_cover_probe_file(
+        &self,
+        smt_content: &str,
+        names: &[String],
+        solver_path: &Path,
+        smt_file: &Path,
+        part: usize,
+        budget: Duration,
+    ) -> Vec<Option<bool>> {
+        let query = build_cover_sat_query(smt_content, names);
+        let path = smt_file.with_extension(format!("cover_check.p{part}.smt2"));
+        if let Err(e) = std::fs::write(&path, &query) {
             if self.args.common_args.verbose {
                 eprintln!("[AY] Failed to write cover check SMT file: {e}");
             }
-            return vec![None; cover_names.len()];
+            return vec![None; names.len()];
         }
 
-        let timeout = deadline.clamp(solver_timeout_duration(self.args.harness_timeout));
-
         let mut cmd = Command::new(solver_path);
-        cmd.arg(&cover_smt_path);
-        let output = match run_piped_with_timeout(cmd, timeout) {
-            Ok(output) => output,
+        cmd.arg(&path);
+        // The cooperative deadline is what bounds an ORPHANED probe: when the
+        // suite's process cap SIGKILLs the driver, the solver — in its own
+        // process group — receives nothing, and without `-t` it runs until
+        // someone notices (observed at 2h22m). Kept slightly inside the hard
+        // kill so ay can report `unknown` with diagnostics instead of dying
+        // mid-phase.
+        //
+        // Deliberately NOT passing `--no-proof --no-verify-proof`: measured a
+        // ~80% cost here (25s -> 45s on a captured 7-probe file). The pair no
+        // longer suppresses in-solver proof construction, only artifact
+        // writing; the main query dropped it for the same reason.
+        let cooperative_ms = budget
+            .as_millis()
+            .saturating_sub(std::cmp::min(10_000, (budget.as_millis() / 10) as u64) as u128);
+        if cooperative_ms > 0 {
+            cmd.arg("-t");
+            cmd.arg(cooperative_ms.to_string());
+        }
+        let out = match run_piped_with_timeout(cmd, budget) {
+            Ok(out) => out,
             Err(e) => {
                 if self.args.common_args.verbose {
                     eprintln!("[AY] Cover check solver failed: {e}");
                 }
-                // Clean up temp file on error
-                let _ = std::fs::remove_file(&cover_smt_path);
-                return vec![None; cover_names.len()];
+                let _ = std::fs::remove_file(&path);
+                return vec![None; names.len()];
             }
         };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
+        let stdout = String::from_utf8_lossy(&out.stdout);
         if self.args.common_args.verbose {
-            println!("[AY] Cover check output:\n{stdout}");
+            println!("[AY] Cover check output (part {part}):\n{stdout}");
         }
-
-        let results = parse_cover_sat_check_output(&stdout, cover_names.len());
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&cover_smt_path);
-
-        results
+        let parsed = parse_cover_sat_check_output(&stdout, names.len());
+        let _ = std::fs::remove_file(&path);
+        parsed
     }
 
     /// Run a secondary solver query to determine cover property satisfiability
@@ -974,7 +1367,33 @@ impl KaniSession {
         // Clean up temp file
         let _ = std::fs::remove_file(&cover_smt_path);
 
+        // SOUNDNESS — the half that merely declaring the vars does not buy.
+        //
+        // `build_cover_sat_query_for_chc` keeps the program's declarations but
+        // NOT its `(rule ...)`s: plain SMT cannot express Horn reachability,
+        // and the emitted cover record carries the cover's condition without
+        // the program point it guards, so nothing in the CHC file ties that
+        // condition to the path constraints and `kani::assume`s bounding it.
+        // The query therefore ranges over ALL states, reachable or not.
+        //
+        // Only `unsat` survives that over-approximation: if NO state at all
+        // satisfies the condition then no reachable one does either, so the
+        // cover really is unsatisfiable — that answer is what lets V5 and
+        // `--strict-vacuity` fire in this lane. A `sat` says only that the
+        // condition is satisfiable in isolation; `assume(x < 10);
+        // cover!(x > 200)` answers sat here, and so does `assume(false);
+        // cover!(true)`. Reporting SATISFIED on it is fail-OPEN — it would
+        // manufacture the mandatory witness `--conformance-harness` demands
+        // out of a program point that may never be reached. Demote it to
+        // UNDETERMINED; `apply_chc_cover_witness_fail_close` then decides what
+        // an undecided cover means for the run.
         results
+            .into_iter()
+            .map(|r| match r {
+                Some(false) => Some(false),
+                _ => None,
+            })
+            .collect()
     }
 }
 

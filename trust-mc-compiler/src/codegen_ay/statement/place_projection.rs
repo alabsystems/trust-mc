@@ -12,6 +12,7 @@
 
 use super::{
     Expr, IndexedVal, IntoOption, Place, ProjectionElem, RigidTy, StatementCodegen, TyKind,
+    constant_index_offset,
 };
 use crate::codegen_ay::provenance::is_transparent_pointer_wrapper_repr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH};
@@ -50,6 +51,41 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return None;
         };
         Some(len_const.eval_target_usize().into_option()? as usize)
+    }
+
+    /// True when the `Field` projection at `proj_idx` in `place` reads *through* a
+    /// wrapper that sort inference ERASED, so the projection is the identity on
+    /// the term we already hold.
+    ///
+    /// The erasure question itself lives in one place —
+    /// [`StatementCodegen::erased_wrapper_field_sort`], which also documents why
+    /// this is type-directed rather than a bitvector-width test, and why the write
+    /// side must agree. Here we add the two facts only the projection walk knows:
+    /// the term we are holding really IS the erased representation (its sort
+    /// matches), and no `Downcast` to a non-zero variant is in flight.
+    ///
+    /// Without this, `ManuallyDrop::into_inner` and `MaybeUninit::assume_init`
+    /// failed closed here, left the assignment's LHS UNCONSTRAINED, and reported a
+    /// FALSE assertion failure on safe code (#g4-erased-wrapper-payload).
+    fn field_reads_erased_wrapper(
+        &self,
+        place: &Place,
+        proj_idx: usize,
+        field_idx: usize,
+        field_ty: rustc_public::ty::Ty,
+        expr: &Expr,
+        active_variant: Option<usize>,
+    ) -> bool {
+        // Same guard the pointer-wrapper arm above uses: a Downcast to any variant
+        // other than 0 means this is not a plain wrapper read.
+        if !(active_variant.is_none() || active_variant == Some(0)) {
+            return false;
+        }
+        let base = Place { local: place.local, projection: place.projection[..proj_idx].to_vec() };
+        let Some(base_ty) = base.ty(self.body.locals()).into_option() else {
+            return false;
+        };
+        Self::erased_wrapper_field_sort(base_ty, field_idx, field_ty).as_ref() == Some(expr.sort())
     }
 
     /// `select(expr, idx)`, but pushed through any `ite` spine first:
@@ -298,7 +334,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     self.ctx.unsupported("Deref projection not tracked", location);
                     return None;
                 }
-                ProjectionElem::Field(field, _ty) => {
+                ProjectionElem::Field(field, field_ty) => {
                     // Part of #944: Handle transparent wrapper encoded as bv64 (NonNull/Unique).
                     // For field 0 projection on a pointer-width bitvector, the value IS the wrapper.
                     //
@@ -370,6 +406,29 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         // Single-constructor: variant 0 is the only valid index.
                         Some(_) => active_variant.unwrap_or(0),
                         None => {
+                            // #g4-erased-wrapper-payload: the sort is not a
+                            // datatype because sort inference ERASED this wrapper
+                            // to its payload, so `Field` through it must be the
+                            // identity, not a fail-closed. Type-directed, so it
+                            // cannot fire on a term that merely happens to share
+                            // the payload's sort — everything else still fails
+                            // closed just below.
+                            if self.field_reads_erased_wrapper(
+                                place,
+                                proj_idx,
+                                *field,
+                                *field_ty,
+                                &expr,
+                                active_variant,
+                            ) {
+                                debug!(
+                                    "Field {} through sort-erased wrapper {:?} - identity",
+                                    field,
+                                    expr.sort()
+                                );
+                                active_variant = None;
+                                continue;
+                            }
                             let location = format!("{:?}", place);
                             self.ctx.unsupported("Place field projection sort", location);
                             return None;
@@ -545,11 +604,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // ConstantIndex projection: arr[N] where N is a constant.
                     // Used in slice patterns and constant array indexing. For slice
                     // datatypes, select backing `fld_data` first.
-                    // Part of #3186: parity with CHC ConstantIndex from_end handling.
-                    // from_end means count from end: actual_index = min_length - offset.
-                    // MIR guarantees min_length >= offset when from_end is true.
-                    let actual_offset =
-                        if *from_end { min_length.saturating_sub(*offset) } else { *offset };
+                    let Some(actual_offset) =
+                        constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        self.ctx.unsupported(
+                            "Place ConstantIndex from_end requires runtime slice length",
+                            format!("offset={offset}, min_length={min_length}"),
+                        );
+                        return None;
+                    };
                     let indexed_base = self.ssa_base_name_for_prefix(place, proj_idx);
                     if let Some((elem_expr, len)) =
                         self.repeat_array_values.get(indexed_base.as_str()).cloned()

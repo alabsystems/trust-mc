@@ -346,16 +346,18 @@ fn test_rust_realloc_align_failure_still_invalidates_old_ptr_3723() {
         );
 
         // Verify heap_realloc ran (not early-returned): old_ptr must be invalidated
-        // via heap_dealloc_valid false-store. The align parameter is unused by the
-        // heap model (_align in heap_alloc), so realloc_align_* won't appear in
-        // constraints — the key invariant is that deallocation happened.
+        // via a heap_dealloc_valid FREED-bit store. The align parameter is unused
+        // by the heap model (_align in heap_alloc), so realloc_align_* won't appear
+        // in constraints — the key invariant is that deallocation happened.
+        // The liveness range is `(_ BitVec 1)`, so freed is `#b0` — see
+        // `AYCtx::heap_valid_bit` for why it is not `Bool`.
         let new_constraints = &codegen.ctx.bmc_vc.constraints[constraints_before..];
         let rendered: Vec<String> = new_constraints.iter().map(ToString::to_string).collect();
         let rendered_constraints = rendered.join("\n");
         assert!(
             rendered_constraints.contains("heap_dealloc_valid")
-                && rendered_constraints.contains("false"),
-            "expected realloc constraints to invalidate old obj_valid via heap_dealloc_valid false-store, got {rendered_constraints}"
+                && rendered_constraints.contains("#b0"),
+            "expected realloc constraints to invalidate old obj_valid via a heap_dealloc_valid freed-bit store, got {rendered_constraints}"
         );
     });
 }

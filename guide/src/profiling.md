@@ -10,17 +10,17 @@ First, install `samply` using [the instructions](https://github.com/mstange/samp
 1. First, build trust-mc from source with `cargo build-dev --profile profiling` to ensure you are getting all release mode optimizations without stripping useful debug info.
 2. Then, you can profile the trust-mc compiler on a crate of your choice by [exporting trust-mc to your local PATH](build-from-source.md#adding-trust-mc-to-your-path) and  running `FLAMEGRAPH=[OPTION] targo trust-mc` within the crate.
 
-The `FLAMEGRAPH` environment variable can be set to `driver` (to profile the complete driver execution) or `compiler` (to profile each time the compiler is called).
+The `FLAMEGRAPH` environment variable is read in exactly one place (`FLAMEGRAPH_ENV_VAR` in [`session/cargo.rs`](../../trust-mc-driver/src/session/cargo.rs)), and the only value acted on is `compiler`, which profiles each time the compiler is called. Nothing instruments the driver itself today, so `FLAMEGRAPH=driver` does nothing.
 
 We have to instrument the driver and compiler separately because samply's instrumentation usually cannot handle detecting the subprocess the driver uses to call the compiler.
 
-Our default sampling rate is *8000 Hz*, but you can change it yourself in [`session.rs`](../../trust-mc-driver/src/session.rs) for the compiler or the [cargo-trust-mc](../../scripts/cargo-trust-mc) script for the driver.
+Our default sampling rate is *8000 Hz*, set by `FLAMEGRAPH_SAMPLING_RATE` in [`session/cargo.rs`](../../trust-mc-driver/src/session/cargo.rs); change it there.
 
 > Note: Specifically when profiling the compiler, ensure you are running `cargo clean` immediately before `targo trust-mc`, or parts of the workspace may not be recompiled by the trust-mc compiler.
 
 
 ## Displaying profiling output
-This will create a new `flamegraphs` directory in the crate which will contain a single `driver.json.gz` output file and one `compiler-{crate_name}.json.gz` file for each crate in the workspace. Run `samply load flamegraphs/XXX.json.gz` on any of these to open a local server that will display the file's flamegraph.
+This will create a new `flamegraphs` directory in the crate, containing one `compiler-{crate_name}-{timestamp}.json.gz` file for each crate in the workspace. Run `samply load flamegraphs/XXX.json.gz` on any of these to open a local server that will display the file's flamegraph.
 
 Once the server has opened, you'll see a display with the list of threads in rows at the top, and a flamegraph for the currently selected thread at the bottom. There is typically only one process when profiling the driver. When profiling the compiler, the process that runs the compiler and handles all codegen is usually at the very bottom of the thread window.
 

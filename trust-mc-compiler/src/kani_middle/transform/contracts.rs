@@ -45,6 +45,15 @@ pub(crate) struct AnyModifiesPass {
     kani_write_any_slice: Option<FnDef>,
     kani_write_any_str: Option<FnDef>,
     target_fn: Option<String>,
+    /// Whether the unit's harness stubs any function by its contract
+    /// (`#[kani::stub_verified(...)]`). The REPLACE closure of a verified
+    /// stub havocs its modifies footprint via `write_any`/`any_modifies`,
+    /// so this pass must run for such harnesses even without a
+    /// `proof_for_contract` target — otherwise the havoc calls keep their
+    /// `unreachable!()` placeholder bodies, the replace path is cut, and the
+    /// assumed ensures contradicts the un-havocked state (corpus:
+    /// function-contract/modifies/mistake_condition_return reported VACUOUS).
+    has_stub_verified: bool,
 }
 
 impl TransformPass for AnyModifiesPass {
@@ -59,11 +68,14 @@ impl TransformPass for AnyModifiesPass {
     where
         Self: Sized,
     {
-        // Only enable for contract verification harnesses (proof_for_contract).
-        // This prevents applying contract-specific transformations to non-contract harnesses.
+        // Only enable for contract harnesses: proof_for_contract, or a plain
+        // proof harness that stubs some function by its contract
+        // (stub_verified). This prevents applying contract-specific
+        // transformations to non-contract harnesses, while still rewriting
+        // the verified stub's havoc calls (see `has_stub_verified`).
         query_db.args().unstable_features.iter().any(|f| f == "function-contracts")
             && self.kani_any.is_some()
-            && self.target_fn.is_some()
+            && (self.target_fn.is_some() || self.has_stub_verified)
     }
 
     /// Transform the function body by replacing it with the stub body.
@@ -94,13 +106,15 @@ impl AnyModifiesPass {
         let kani_write_any_slim = kani_fns.get(&KaniModel::WriteAnySlim.into()).copied();
         let kani_write_any_slice = kani_fns.get(&KaniModel::WriteAnySlice.into()).copied();
         let kani_write_any_str = kani_fns.get(&KaniModel::WriteAnyStr.into()).copied();
-        let target_fn = if let Some(harness) = unit.harnesses.first() {
+        let (target_fn, has_stub_verified) = if let Some(harness) = unit.harnesses.first() {
             let attributes = KaniAttributes::for_instance(tcx, *harness);
-            attributes
+            let target_fn = attributes
                 .proof_for_contract()
-                .map(|symbol| symbol.expect("proof_for_contract symbol").as_str().to_string())
+                .map(|symbol| symbol.expect("proof_for_contract symbol").as_str().to_string());
+            let has_stub_verified = !attributes.interpret_stub_verified_attribute().is_empty();
+            (target_fn, has_stub_verified)
         } else {
-            None
+            (None, false)
         };
         AnyModifiesPass {
             kani_any,
@@ -110,6 +124,7 @@ impl AnyModifiesPass {
             kani_write_any_slice,
             kani_write_any_str,
             target_fn,
+            has_stub_verified,
         }
     }
 
@@ -902,6 +917,7 @@ pub fn probe_write_any_slice() {
                 kani_write_any_slim: Some(find_fn_def_by_marker("WriteAnySlimModel")),
                 kani_write_any_slice: Some(find_fn_def_by_marker("WriteAnySliceModel")),
                 kani_write_any_str: Some(find_fn_def_by_marker("WriteAnyStrModel")),
+                has_stub_verified: false,
             };
 
             let (changed, transformed) = pass.replace_any_modifies(body);

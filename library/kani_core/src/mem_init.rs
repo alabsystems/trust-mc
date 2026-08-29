@@ -37,7 +37,19 @@ macro_rules! kani_mem_init {
         // thread-local storage).
 
         /// Global object for tracking memory initialization state.
-        #[rustc_diagnostic_item = "KaniMemoryInitializationState"]
+        //
+        // The `#[rustc_diagnostic_item = "KaniMemoryInitializationState"]` that
+        // used to sit here is REMOVED: rustc no longer permits that attribute on
+        // a static ("`#[rustc_diagnostic_item]` attribute cannot be used on
+        // statics" -- it is accepted on consts, fns, types, traits and impl
+        // blocks, but not statics), so it stopped the `kani` crate compiling
+        // outright under a current compiler.
+        //
+        // Nothing was reading it. A diagnostic item exists so the compiler can
+        // look a definition up BY NAME, and `KaniMemoryInitializationState`
+        // appeared exactly once in this tree -- on this line. It was also the
+        // only `rustc_diagnostic_item` in kani_core at all, so there is no
+        // sibling lookup convention it belonged to.
         static mut MEM_INIT_STATE: MemoryInitializationState = MemoryInitializationState::new();
 
         /// Global object for tracking union initialization state across function boundaries.

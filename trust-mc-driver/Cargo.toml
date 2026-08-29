@@ -5,7 +5,7 @@
 
 [package]
 name = "trust-mc-driver"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Build a project with trust-mc and run all proof harnesses"
 license = "MIT OR Apache-2.0"
@@ -69,8 +69,8 @@ ay-sys = { workspace = true, optional = true }
 # Required for source location mapping from .vc.json sidecar files
 trust-mc-core = { path = "../trust-mc-core" }
 # Optional native trust_ir bundle embedding path for compiler integrations.
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab", optional = true }
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab", optional = true }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea", optional = true }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea", optional = true }
 trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", optional = true }
 
 # Unix SIGPIPE handling (#663)
@@ -81,8 +81,8 @@ trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab", features = ["serde"] }
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab" }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea", features = ["serde"] }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea" }
 ay_bindings = { workspace = true }
 trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc" }
 
@@ -90,7 +90,18 @@ trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc" }
 workspace = true
 
 [features]
-default = ["cli", "native-typed-chc-pdr", "ay-memory-limit"]
+# `native-trust-ir-bundle` is DEFAULT because src/native.rs -- the TRUST-NATIVE
+# lane, and trust-mc's first-priority surface -- is built on trust_ir: 317
+# references, of which only 25 sit behind a cfg, and `pub mod native;` is
+# declared unconditionally in lib.rs. The dependency was therefore effectively
+# mandatory while being declared optional.
+#
+# It compiled only by accident: `trust-mc-compiler` used to be in the workspace's
+# default-members, and building it activated `dep:trust_ir` through feature
+# unification. Dropping the Kani driver from that list (so a plain `cargo build`
+# works on the Trust pin) removed the accident and exposed the real wiring --
+# `cargo build -p trust-mc-driver` alone had been broken all along.
+default = ["cli", "native-typed-chc-pdr", "ay-memory-limit", "native-trust-ir-bundle"]
 cli = [
     "dep:anyhow",
     "dep:cargo_metadata",

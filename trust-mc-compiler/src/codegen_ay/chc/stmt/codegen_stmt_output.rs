@@ -246,43 +246,111 @@ pub(in crate::codegen_ay) fn mir_to_chc_with_instance<'tcx>(
 /// variable and its constraints turn trivially satisfiable — a spurious
 /// counterexample. Measured unguarded: 50 tests moved parity -> false_positive.
 ///
-/// So the narrowing is treated as a speculative optimization and validated on the
-/// emitted VC, which is the only place those channels are observable. On any
-/// violation the harness is encoded a second time with the full frame, exactly as
-/// the `MemPromoteAction::Promote` path above re-encodes. Cost is one extra
-/// translate for the harnesses that need it; the ones that validate keep the win.
+/// So the narrowing is treated as a speculative optimization, and the ORDER is
+/// full frame first: the full-frame VC is the one that is always encoded, and the
+/// narrowed one is attempted afterwards and kept only if it survives every guard
+/// below. That ordering is what makes the fallback free — the full VC is already
+/// in hand, so rejecting a narrowed encode costs no third translate — and it is
+/// what lets GUARD 1 observe whether the full VC was straight-line discharged,
+/// which is not predictable from MIR.
 fn narrow_or_reencode<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body,
     current_instance: Option<Instance>,
     fn_name: &Arc<str>,
     cfg: super::ChcConfig,
-    vc: ChcVc,
+    full_vc: ChcVc,
 ) -> ChcVc {
     if !cfg.frame_narrowing {
-        return vc;
+        return full_vc;
     }
-    let dropped = crate::codegen_ay::chc::take_dropped_frame_columns();
-    let offenders = crate::codegen_ay::chc::constraint_vars_outside_relation_frames(&vc, &dropped);
-    if offenders.is_empty() {
-        return vc;
+
+    // GUARD 1 — never narrow a VC the straight-line discharge already proved.
+    //
+    // This is the whole of the recorded tail risk, and it is not the solver's
+    // doing. Measured on `expected/loop-backedge/test.rs`: the full-frame VC is
+    // discharged syntactically in 0.002 s; narrowing removes 772 of 9,499
+    // columns (8%) and the discharge then bails, the VC goes to ay, and ay
+    // returns `unknown` after 38 s — a SUCCESSFUL half-second harness turned
+    // into a 44 s FAILED one for an 8% frame reduction. `prusti/Selection_sort.rs`
+    // and `bounded-arbitrary/hash.rs` behave the same way.
+    //
+    // The reason is structural, not incidental. The discharge works by
+    // enumerating CONCRETE relation frames, so it needs every column whose value
+    // it must know; a narrowed column is exactly a column whose value the
+    // enumeration no longer receives, and it turns the enumerated term symbolic.
+    // Narrowing therefore cannot help this class — a discharged VC never reaches
+    // the solver, so its frame width costs nothing — and can only take the proof
+    // away. Deciding it AFTER the full translate is what makes the guard exact:
+    // `trivially_safe_discharged` is an observation of the emitted VC, not a
+    // prediction from MIR.
+    if full_vc.trivially_safe_discharged {
+        debug!(
+            fn_name = %fn_name,
+            "CHC: frame narrowing skipped — full-frame VC discharged syntactically"
+        );
+        return full_vc;
     }
-    warn!(
-        fn_name = %fn_name,
-        offenders = offenders.len(),
-        first = %offenders.first().map(String::as_str).unwrap_or(""),
-        "CHC: frame narrowing dropped a column the encoding still reads; \
-         re-encoding with the full frame"
-    );
-    let full_cfg = super::ChcConfig { frame_narrowing: false, ..cfg };
+
+    // GUARD 2 — width threshold.
+    //
+    // Narrowing pays for itself only through solver latency, and latency tracks
+    // frame WIDTH: measured median relation arity is 16-19 on fast-parity
+    // harnesses against 28/39/57 on the slow unknown ones. Below the threshold
+    // the second translate below costs more than the columns it could remove.
+    let max_arity = full_vc.relations.iter().map(|r| r.arg_sorts.len()).max().unwrap_or(0);
+    if max_arity < MIN_ARITY_TO_NARROW {
+        debug!(
+            fn_name = %fn_name,
+            max_arity,
+            "CHC: frame narrowing skipped — frames already narrow"
+        );
+        return full_vc;
+    }
+
+    // Speculative narrowed encode. `reset` must sit immediately before it: the
+    // validator compares against the columns THIS translate dropped.
+    crate::codegen_ay::chc::reset_dropped_frame_columns();
     let ctx = if let Some(instance) = current_instance {
-        ChcCtx::new_with_instance(tcx, body, instance, Arc::clone(fn_name), full_cfg)
+        ChcCtx::new_with_instance(tcx, body, instance, Arc::clone(fn_name), cfg)
     } else {
-        ChcCtx::new(tcx, body, Arc::clone(fn_name), full_cfg)
+        ChcCtx::new(tcx, body, Arc::clone(fn_name), cfg)
     };
-    let (full_vc, _) = ctx.translate();
-    full_vc
+    let (narrow_vc, _) = ctx.translate();
+
+    // GUARD 3 — free-variable validator on the EMITTED VC.
+    let dropped = crate::codegen_ay::chc::take_dropped_frame_columns();
+    let offenders =
+        crate::codegen_ay::chc::constraint_vars_outside_relation_frames(&narrow_vc, &dropped);
+    if !offenders.is_empty() {
+        warn!(
+            fn_name = %fn_name,
+            offenders = offenders.len(),
+            first = %offenders.first().map(String::as_str).unwrap_or(""),
+            "CHC: frame narrowing dropped a column the encoding still reads; \
+             keeping the full frame"
+        );
+        return full_vc;
+    }
+
+    // Accepted. Note what the guards leave: `full_vc` was NOT discharged (guard
+    // 1), so this VC was always going to the solver, and a narrower frame there
+    // is the only thing narrowing was ever for. If the narrowed VC now happens to
+    // discharge, that is a strict improvement — the straight-line prover fails
+    // closed on every symbolic shape a dropped column can produce, so it cannot
+    // be talked into a proof by the narrowing.
+    debug!(
+        fn_name = %fn_name,
+        dropped = dropped.len(),
+        "CHC: frame narrowing accepted"
+    );
+    narrow_vc
 }
+
+/// Widest relation a VC must have before frame narrowing is attempted at all.
+///
+/// See GUARD 2 in [`narrow_or_reencode`].
+const MIN_ARITY_TO_NARROW: usize = 24;
 
 fn mir_to_chc_internal<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -315,10 +383,17 @@ fn mir_to_chc_internal<'tcx>(
 
     crate::codegen_ay::chc::reset_dropped_frame_columns();
     let resolved_cfg = super::ChcConfig { step_mode: effective_step_mode, ..cfg };
+    // The FIRST translate is always full-frame. Narrowing is attempted only
+    // afterwards, by `narrow_or_reencode`, against this VC — see its GUARD 1.
+    let full_cfg = super::ChcConfig {
+        frame_narrowing: false,
+        frame_narrowing_flattened: false,
+        ..resolved_cfg
+    };
     let ctx = if let Some(instance) = current_instance {
-        ChcCtx::new_with_instance(tcx, body, instance, fn_name_str.clone(), resolved_cfg)
+        ChcCtx::new_with_instance(tcx, body, instance, fn_name_str.clone(), full_cfg)
     } else {
-        ChcCtx::new(tcx, body, fn_name_str.clone(), resolved_cfg)
+        ChcCtx::new(tcx, body, fn_name_str.clone(), full_cfg)
     };
     let (vc, action) = ctx.translate();
 
@@ -343,11 +418,16 @@ fn mir_to_chc_internal<'tcx>(
             step_mode: effective_step_mode,
             ..cfg
         };
+        let promoted_full_cfg = super::ChcConfig {
+            frame_narrowing: false,
+            frame_narrowing_flattened: false,
+            ..promoted_cfg
+        };
         let fn_name_str_retry: Arc<str> = Arc::clone(&fn_name_str);
         let ctx = if let Some(instance) = current_instance {
-            ChcCtx::new_with_instance(tcx, body, instance, fn_name_str, promoted_cfg)
+            ChcCtx::new_with_instance(tcx, body, instance, fn_name_str, promoted_full_cfg)
         } else {
-            ChcCtx::new(tcx, body, fn_name_str, promoted_cfg)
+            ChcCtx::new(tcx, body, fn_name_str, promoted_full_cfg)
         };
         let (vc, _) = ctx.translate();
         return narrow_or_reencode(

@@ -56,6 +56,10 @@ pub(in crate::codegen_ay) struct ChcConfig {
     /// through channels MIR cannot see, so a harness whose VC ends up naming a
     /// dropped column is re-encoded with the full frame.
     pub frame_narrowing: bool,
+    /// Level 2: also narrow FLATTENED aggregate groups (`TRUST_MC_FRAME_NARROWING=2`).
+    /// Only meaningful when `frame_narrowing` is set; cleared with it by the
+    /// free-variable retry.
+    pub frame_narrowing_flattened: bool,
     /// Emit arithmetic overflow error rules.
     pub overflow_checks: bool,
     /// Emit NaN-generation obligations for float binops (`--nan-check`).
@@ -95,7 +99,11 @@ impl Default for ChcConfig {
             extra_pointer_checks: false,
             prove_safety_only: false,
             memory_safety_checks: true,
-            frame_narrowing: false,
+            // The env opt-in is resolved HERE, once, so that every later
+            // consumer — the liveness restriction and the free-variable retry
+            // that must be able to turn it back OFF — reads one flag.
+            frame_narrowing: crate::codegen_ay::chc::frame_narrowing_enabled(),
+            frame_narrowing_flattened: crate::codegen_ay::chc::frame_narrowing_flattened_enabled(),
             overflow_checks: true,
             nan_checks: false,
             undefined_function_checks: true,
@@ -438,6 +446,32 @@ pub(in crate::codegen_ay::chc) struct CollectionMutRef {
     /// local and `field_projections` contains the Field projection to the Vec.
     /// Part of #3439: struct-projected collection IndexMut.
     pub(in crate::codegen_ay::chc) field_projections: Vec<ProjectionElem>,
+}
+
+/// A reference that points INTO a collection ELEMENT, not at the element itself:
+/// `_r = &((*_e).f1.f2…)` where `_e` is an `Index::index` / `IndexMut::index_mut`
+/// destination recorded in `collection_index_refs` / `collection_mut_refs`.
+///
+/// Such an `_r` has NO `ref_target` and no `mir_provable_referent_local` — `_e`
+/// is a CALL destination, which the decl-time `collect_numeric_ref_targets` pass
+/// cannot resolve — so without this record the Mem-level ref lane minted a fresh
+/// symbolic address for it and every read through `_r` landed in a type-indexed
+/// memory array that `Vec::push` never wrote (push stores into the Vec
+/// datatype's `fld_data`). The compared value was then a free variable, which
+/// refuted true assertions: `v[0].base == GuestAddress(0)` reported a
+/// counterexample on a one-element Vec.
+///
+/// A reference into a collection element is a LOCATION IN THE COLLECTION'S VALUE
+/// LANE, never a fresh address; this record is what lets the use site rebuild
+/// that location as `field_f2(field_f1(select(fld_data(c), i)))`.
+#[derive(Clone, Debug)]
+pub(in crate::codegen_ay::chc) struct CollectionElemFieldRef {
+    /// The `Index`/`IndexMut` destination local this reference was projected
+    /// from — the key into `collection_index_refs` / `collection_mut_refs`.
+    pub(in crate::codegen_ay::chc) base_ref_local: usize,
+    /// Field projections INSIDE the element, outermost first, as
+    /// `(field_idx, cons_idx)` pairs for `datatype_field_select`.
+    pub(in crate::codegen_ay::chc) elem_fields: Vec<(usize, Option<usize>)>,
 }
 
 /// Classification of collection/iterator types that are projected into

@@ -202,7 +202,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         promoted_obj_id: u32,
     ) -> Option<Expr> {
         let sort = Self::translate_ty(inner_ty)?;
-        let expr = Self::read_composite_from_allocation(target_alloc, 0, &sort)?;
+        // Layout-aware: a tuple's ABI order is not its declaration order
+        // (`(u8, u64)` puts the u64 first), so read each element at
+        // `field_offset(i)` rather than at a declaration-order cursor.
+        let expr = Self::read_adt_composite_from_allocation(target_alloc, 0, inner_ty, &sort)?;
 
         // Seed flattened tuple value for statement-level field-ref lowering.
         Self::seed_flattened_memory_init(

@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use ay_bindings::{Expr, SortInner};
-use rustc_public::mir::{Place, ProjectionElem, Rvalue};
+use ay_bindings::{Expr, ExprValue, SortInner};
+use rustc_public::mir::{BorrowKind, Place, ProjectionElem, Rvalue};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
@@ -267,7 +267,57 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
         let cons = dt.constructors.first()?;
         let meta_sort = cons.fields.get(1).map_or_else(ptr_sort, |field| field.sort.clone());
-        let meta = if let Some(cached_meta) = self.addr_metadata_symbols.get(base_name) {
+        // Prefer the REAL length over a fabricated one. When the pointee's env
+        // value resolves to a constructor of this same fat sort — a `&str`
+        // literal, a slice the caller already holds — its `fld_len` is the true
+        // metadata, and a slice's length cannot change through a reference, so
+        // a length snapshot cannot go stale. A fresh unconstrained variable
+        // here is what made every fat-pointer view's extent unknowable: the
+        // bounds check could never fire through `as_ptr` on a `&str`, and the
+        // solver was free to pick any length at all.
+        //
+        // The value's DATA array is reused only for a SHARED borrow. While a
+        // `&T` lives, Rust's aliasing rules forbid every write to the pointee
+        // through any alias, so a data snapshot taken here cannot go stale for
+        // the reads this pointer can perform. Through a `&mut` the snapshot CAN
+        // go stale — later writes through the reference would not update it,
+        // and a stale concrete array proves assertions about overwritten
+        // values, which is a false-proof shape — so `&mut` keeps the
+        // fabricated over-approximating array.
+        let is_shared_borrow = matches!(
+            rvalue,
+            Rvalue::Ref(_, BorrowKind::Shared, _)
+        ) || matches!(
+            ref_ty.kind(),
+            TyKind::RigidTy(RigidTy::Ref(_, _, rustc_public::mir::Mutability::Not))
+        );
+        let (real_len, real_data) = self
+            .env_lookup(base_name)
+            .cloned()
+            .map(|v| self.follow_ssa(&v, 64))
+            .and_then(|v| match v.value() {
+                ExprValue::DatatypeConstructor { args, .. } if *v.sort() == fat_sort => {
+                    let fields = &sort_ref.datatype_sort()?.constructors.first()?.fields;
+                    let len_idx = fields.iter().position(|f| f.name == "fld_len")?;
+                    let len = args.get(len_idx)?;
+                    let len_ok = (*len.sort() == meta_sort).then(|| len.clone());
+                    let data_ok = if is_shared_borrow {
+                        fields
+                            .iter()
+                            .position(|f| f.name == "fld_data")
+                            .and_then(|i| args.get(i))
+                            .cloned()
+                    } else {
+                        None
+                    };
+                    Some((len_ok, data_ok))
+                }
+                _ => None,
+            })
+            .unwrap_or((None, None));
+        let meta = if let Some(len) = real_len {
+            len
+        } else if let Some(cached_meta) = self.addr_metadata_symbols.get(base_name) {
             cached_meta.clone()
         } else {
             let meta_name = crate::codegen_ay::names::meta_name(base_name);
@@ -277,7 +327,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
         let mut args = vec![self.coerce_to_ptr_width(addr.clone()), meta];
         if let Some(data_field) = cons.fields.get(2) {
-            let data = if let Some(array_sort) = data_field.sort.array_sort() {
+            let real = real_data.filter(|d| *d.sort() == data_field.sort);
+            let data = if let Some(real) = real {
+                real
+            } else if let Some(array_sort) = data_field.sort.array_sort() {
                 let default_name = self.ctx.fresh_name("slice_default");
                 let default_elem =
                     self.ctx.declare_var(&default_name, array_sort.element_sort.clone());

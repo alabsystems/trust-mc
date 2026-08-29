@@ -287,6 +287,88 @@ fn test_record_cover_property_with_location_and_message() {
     });
 }
 
+// -------------------------------------------------------------------------
+// Cover reachability companion (`ay_reach_cover_<n>`)
+//
+// The companion is what lets the driver split a not-holding cover into Kani's
+// two statuses: UNSATISFIABLE (site reachable, condition never true) and
+// UNREACHABLE (the cover statement is dead code). Both directions are pinned
+// below — emitted under a real guard, withheld when there is nothing to guard
+// and when the user turned the reach checks off.
+// -------------------------------------------------------------------------
+
+#[test]
+fn test_cover_with_guard_emits_reach_companion() {
+    with_test_ay_ctx(|mut ctx| {
+        let pc = ctx.declare_var("test_path_cond", bool_sort());
+        let id = ctx.record_cover_property_with_guard(Expr::bool_const(true), Some(pc), None, None);
+        let smt = smt_text(&ctx);
+        assert!(
+            smt.contains(&format!("ay_reach_cover_{id}")),
+            "a cover under a path condition must carry its reachability companion:\n{smt}"
+        );
+        assert_eq!(
+            ctx.cover_metadata[0].reach_var.as_deref(),
+            Some(format!("ay_reach_cover_{id}").as_str()),
+            "the companion name must reach the VC artifact so the driver can pair them"
+        );
+    });
+}
+
+#[test]
+fn test_cover_without_guard_emits_no_reach_companion() {
+    with_test_ay_ctx(|mut ctx| {
+        // No path condition and no assumption context: the cover site is
+        // trivially reachable, so there is nothing for the driver to probe and
+        // a missing flag already means "reachable".
+        let _id = ctx.record_cover_property_with_guard(Expr::bool_const(true), None, None, None);
+        let smt = smt_text(&ctx);
+        assert!(
+            !smt.contains("ay_reach_cover_"),
+            "an unguarded cover must not pay for a companion:\n{smt}"
+        );
+        assert!(ctx.cover_metadata[0].reach_var.is_none());
+    });
+}
+
+#[test]
+fn test_cover_reach_companion_withheld_when_reach_checks_off() {
+    with_test_ay_ctx(|mut ctx| {
+        // Discriminating control for the `--no-assertion-reach-checks` gate:
+        // the SAME guarded cover that emits a companion above must emit none
+        // here, so the flag is what governs it and not the guard's shape.
+        ctx.config.assertion_reach_checks = false;
+        let pc = ctx.declare_var("test_path_cond", bool_sort());
+        let _id =
+            ctx.record_cover_property_with_guard(Expr::bool_const(true), Some(pc), None, None);
+        let smt = smt_text(&ctx);
+        assert!(
+            !smt.contains("ay_reach_cover_"),
+            "--no-assertion-reach-checks must withhold the cover companion:\n{smt}"
+        );
+        assert!(ctx.cover_metadata[0].reach_var.is_none());
+    });
+}
+
+#[test]
+fn test_cover_flag_still_conjoins_guard_and_condition() {
+    with_test_ay_ctx(|mut ctx| {
+        // SOUNDNESS: splitting the guard out of the cover condition must not
+        // change what `ay_cover_<n>` means. Both operands still appear in its
+        // definition.
+        let pc = ctx.declare_var("test_path_cond", bool_sort());
+        let cond = ctx.declare_var("test_cover_cond", bool_sort());
+        let id = ctx.record_cover_property_with_guard(cond, Some(pc), None, None);
+        let smt = smt_text(&ctx);
+        let defn = smt
+            .lines()
+            .find(|l| l.contains(&format!("ay_cover_{id}")) && l.contains("assert"))
+            .unwrap_or_else(|| panic!("no assert defining ay_cover_{id}:\n{smt}"));
+        assert!(defn.contains("test_path_cond"), "cover flag lost its guard: {defn}");
+        assert!(defn.contains("test_cover_cond"), "cover flag lost its condition: {defn}");
+    });
+}
+
 #[test]
 fn test_add_get_value_for_covers_empty_is_noop() {
     with_test_ay_ctx(|mut ctx| {

@@ -5,200 +5,132 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 
 # replacement-inventory
 
-Deterministic harness-inventory generator for the **trust-mc** model-checking
-test corpus (ay / trust-mc).
+These tools maintain and audit trust-mc's frozen public replacement corpus.
+The corpus is historical authority: current source is not allowed to shrink the
+denominator merely because a harness was renamed, feature-gated, or disabled.
 
-`generate_inventory.py` reads the frozen public corpus
-(`tools/replacement-inventory/public-corpus.json`) — one row per
-`#[kani::proof]` harness across the included verification suites — classifies
-each harness's expected verification disposition, and emits a frozen JSON
-inventory, a PROOF-only subset, and the non-PROOF closure. (The corpus file is
-the surveyed source of truth; the generator does not re-walk the `tests/`
-directories at generation time.)
+## Canonical artifacts
 
-## Output
+`generate_inventory.py` reads
+`tools/replacement-inventory/public-corpus.json` and deterministically emits:
 
-| Path | Contents |
-| --- | --- |
-| `tests/trust-mc/replacement-harness-inventory.json` | Full inventory — every harness across both suites. |
-| `tests/trust-mc/replacement-harness-inventory.proof.json` | Subset whose rows all have `expected == "PROOF"`. |
+| Path | Rows | Purpose |
+| --- | ---: | --- |
+| `tests/trust-mc/replacement-harness-inventory.json` | 818 | Mixed public replacement denominator. |
+| `tests/trust-mc/replacement-harness-inventory.proof.json` | 504 | Rows whose expected verdict is `PROOF`. |
+| `tests/trust-mc/non-proof-closure.json` | 314 | Checked justifications for negative expectations. |
 
-Both files share an identical shape:
+Each artifact contains a `row_sha256` over its canonical rows array. Generation
+is sorted and byte-deterministic. `--check` regenerates in memory, compares the
+committed bytes, writes nothing, and exits nonzero on drift.
 
-```jsonc
-{
-  "schema_version": 1,                 // int, always 1
-  "suite": "tests/trust-mc",           // inventory home suite
-  "denominator": <int>,                // == len(rows)
-  "row_sha256": "<hex>",               // sha256 of the rows array
-  "rows": [
-    {
-      "file":     "trust-mc/Foo/bar.rs",  // suite-relative POSIX path
-      "harness":  "module::check_thing",  // fully-qualified harness name
-      "expected": "PROOF",                // PROOF | CTREX | UNKNOWN | ERROR | BMC_SAFE
-      "lane":     "tests/trust-mc"        // tests/<suite> the row came from
-    }
-  ]
-}
+The generator does not walk the current `tests/` tree. Source binding is a
+separate fail-closed step:
+
+```bash
+source scripts/ay_python.sh
+"$AY_PYTHON_BIN" scripts/replacement_harness_dispositions.py --check
 ```
 
-### Determinism
+That command validates
+`tests/trust-mc/replacement-harness-dispositions.json`. Every historical row
+must resolve to one exact active driver harness, one unambiguous qualified
+alias, an enabled cargo feature, or a source-proved `#[cfg(disabled)]` harness.
+Disabled rows remain in the denominator with zero execution and proof credit;
+unknown or ambiguous changes are errors.
 
-- Files are visited in sorted order; rows are sorted by `(file, harness)`.
-- `denominator` is exactly `len(rows)`.
-- `row_sha256` is the SHA-256 of `json.dumps(rows, sort_keys=True,
-  separators=(",", ":"))` — the compact, key-sorted encoding of the rows array.
-- Files are rendered with `json.dumps(..., indent=2, sort_keys=True)` plus a
-  trailing newline.
+Cargo rows additionally require a reachable conventional Rust module path and
+default-enabled whole-file feature gates. Every owning package must have a
+committed lockfile. The current active plan contains 720 direct rows and 66
+Cargo rows. Each Cargo identity is fully qualified and unique within its
+package; runtime execution adds `--locked --exact` and accepts one matching
+driver selection marker, so dependency drift, a prefix, zero match, or multiple
+match cannot receive credit.
 
-Re-running the generator therefore reproduces byte-identical files.
+## Inventory CLI
 
-### Expected-disposition classification
-
-Each harness defaults to `PROOF`. A file may override this with header
-directives in the first 50 lines:
-
-```rust
-// kani-expect: CTREX                       // file-wide default for every harness
-// kani-expect: my_module::check_foo=UNKNOWN // per-harness override (wins)
+```text
+generate_inventory.py [--corpus PATH] [--suite NAME ...]
+                      [--output PATH] [--proof-output PATH]
+                      [--non-proof-output PATH]
+                      [--no-proof-subset] [--no-non-proof-closure] [--check]
 ```
 
-Valid outcomes: `PROOF`, `CTREX`, `UNKNOWN`, `ERROR`, `BMC_SAFE`. A per-harness
-`HARNESS=OUTCOME` directive takes precedence over a bare file-wide directive.
+Generate the three artifacts only after an intentional corpus change:
 
-## CLI
-
-```
-generate_inventory.py [--suite NAME ...] [--output PATH] [--proof-output PATH]
-                      [--no-proof-subset] [--check]
+```bash
+source scripts/ay_python.sh
+"$AY_PYTHON_BIN" tools/replacement-inventory/generate_inventory.py
 ```
 
-| Flag | Effect |
-| --- | --- |
-| `--suite NAME` | Suite directory under `tests/` to walk. Repeatable. Default: `trust-mc`, `ay`. |
-| `--output PATH` | Full-inventory output path. Default: `tests/trust-mc/replacement-harness-inventory.json`. |
-| `--proof-output PATH` | PROOF-subset output path. Default: `tests/trust-mc/replacement-harness-inventory.proof.json`. |
-| `--no-proof-subset` | Skip writing/checking the PROOF subset. |
-| `--check` | Verify mode — regenerate in memory, diff against the committed file(s), exit nonzero on drift. Writes nothing. |
+The normal CI/review operation is read-only:
 
-### Generate
-
-```sh
-python3 tools/replacement-inventory/generate_inventory.py
+```bash
+"$AY_PYTHON_BIN" tools/replacement-inventory/generate_inventory.py --check
+"$AY_PYTHON_BIN" scripts/generate_non_proof_closure.py --check
+"$AY_PYTHON_BIN" scripts/replacement_harness_dispositions.py --check
 ```
 
-Writes (or refreshes) both inventory files and prints the `denominator` and
-`row_sha256` for each.
+## Public execution
 
-### Check
+The checked source-bound plan is the only supported route for running the
+historical denominator:
 
-```sh
-python3 tools/replacement-inventory/generate_inventory.py --check
+```bash
+AY_SELF_CONTAINED=1 \
+AY_SOLVER=ay \
+AY_EXPECTED_HARNESSES=818 \
+./scripts/ay-compiletest.sh --replacement-public
 ```
 
-`--check` regenerates each inventory **into memory** and compares it byte-for-byte
-against the committed file. On a match it prints `OK` and exits `0`. On any drift
-(or a missing inventory file) it writes a regenerated copy to a temp path, prints
-a unified diff to stderr, and exits `1`. It never modifies the committed files,
-so it is safe to run in CI as a staleness gate.
+The runner validates its exact runtime record set against the disposition
+artifact before producing the schema-v2 aggregate report. At the current
+source state, 786 rows execute and 32 cfg-disabled `PROOF` rows are emitted as
+inactive-accounted `SKIP` records. Those 32 rows receive zero credit and keep
+the strict proof red.
 
----
+Before executing a row, the runner requires the exact driver binary to emit a
+single valid `--version-authority` line for the current clean TrustMC commit and
+linked AY authority. The report and run manifest record that binary's resolved
+path and SHA-256. The strict proof command re-hashes and re-attests the same
+binary, so a stale, dirty, or replaced driver fails closed.
+It also requires a clean tree before and after the run and an unchanged
+measurement fingerprint, preventing generated or modified Cargo locks from
+being reported as clean evidence.
 
-# replacement_progress.py — replacement progress & audit
+See `replacement-proof.md` for the authority tuple, proof extraction, strict
+AY audit, exact digests, and activation plan.
 
-`replacement_progress.py` cross-references the frozen inventory (above) against
-a **fresh** compiletest per-harness report and computes replacement progress.
+## `replacement_progress.py`
 
-It answers two questions per row:
+`replacement_progress.py` is a triage/audit view over the frozen mixed
+inventory and a fresh proof-summary or ay-compiletest report. It classifies:
 
-- **PROOF rows** — is the harness *actually proven*? (verifier `SUCCESS`,
-  **zero** soundness fallback). A `SUCCESS` reached only via a sound
-  over-approximation/fallback is **not** counted as proven.
-- **non-PROOF rows** (`CTREX` / `UNKNOWN` / `ERROR` / `BMC_SAFE`) — is the
-  observed outcome *justified*, i.e. does it match the recorded expectation?
+- `PROOF` rows as proven only for a schema-v2 `PASS`/`PROOF`, complete
+  execution, clean proof qualifier, trusted-proof marker, and zero soundness
+  fallback;
+- non-`PROOF` rows as closed only when the observed verdict matches the frozen
+  expectation; and
+- source-inactive `SKIP` rows as `INACTIVE`, never as proof progress.
 
-It never fabricates progress: with no fresh report it prints
-`MEASUREMENT MISSING -- no fresh run` and exits nonzero.
+```bash
+source scripts/ay_python.sh
+"$AY_PYTHON_BIN" tools/replacement-inventory/replacement_progress.py \
+  --report reports/compiletest-per-harness-latest-trust-mc.json \
+  --verbose
 
-## Inputs
+"$AY_PYTHON_BIN" tools/replacement-inventory/replacement_progress.py \
+  --report reports/compiletest-per-harness-latest-trust-mc.json \
+  --format json
 
-1. **Inventory** (`--inventory`, default
-   `tests/trust-mc/replacement-harness-inventory.json`) — the
-   `{schema_version, suite, denominator, row_sha256, rows[]}` file documented
-   above; `expected` ∈ `PROOF | CTREX | UNKNOWN | ERROR | BMC_SAFE`.
-
-2. **Fresh report** (`--report`). Either shape is auto-detected:
-   - the canonical trust-mc **proof-summary** artifact
-     (`trust-mc-driver/src/proof_summary.rs`, `artifact_kind:
-     "trust_mc.proof_summary_pointer"`, with a `harnesses[]` array of
-     `{harness, crate_name, status, effective_success, validation_status,
-     proof_qualifiers[], property_counts{...}}`), or
-   - a `scripts/ay-compiletest.sh` per-harness report — records carrying the
-     verifier markers `[AY:CTREX_CAT:...]` (→ `ctrex_category`),
-     `[AY:SOUND_FALLBACK:n]` (→ `sound_fallback`) and
-     `[AY:EFFECTIVE_SUCCESS:reason]` (→ `effective_success`).
-
-   Soundness fallback is read from `proof_qualifiers` entries of the form
-   `sound_fallback=N` (proof-summary) or a `sound_fallback` field
-   (ay-compiletest).
-
-## Usage
-
-```sh
-# 1. Produce a fresh report by running compiletest under the AY backend,
-#    e.g. for the trust-mc suite:
-cargo build-dev
-compiletest --suite trust-mc --mode trust_mc \
-    --src-base tests/trust-mc --build-base build/tests/trust-mc \
-    --timeout 60 --no-fail-fast --trust_mc-flag=--ay-chc
-#    (the proof-summary / ay-compiletest report JSON is produced by the
-#     ay-compiletest wrapper; point --report at it below.)
-
-# 2. Audit progress (human-readable, list every outstanding row):
-python3 tools/replacement-inventory/replacement_progress.py \
-    --report build/tests/trust-mc/proof-summary.json --verbose
-
-# 3. Machine-readable:
-python3 tools/replacement-inventory/replacement_progress.py \
-    --report build/tests/trust-mc/proof-summary.json --format json
-
-# 4. CI gate — fail unless replacement is 100% accounted for:
-python3 tools/replacement-inventory/replacement_progress.py \
-    --report build/tests/trust-mc/proof-summary.json --require-complete
-
-# 5. No report yet — prints MEASUREMENT MISSING and exits nonzero:
-python3 tools/replacement-inventory/replacement_progress.py
+"$AY_PYTHON_BIN" tools/replacement-inventory/replacement_progress.py \
+  --report reports/compiletest-per-harness-latest-trust-mc.json \
+  --require-complete
 ```
 
-## Flags
-
-| Flag | Effect |
-| --- | --- |
-| `--inventory PATH` | Inventory JSON. Default: `tests/trust-mc/replacement-harness-inventory.json`. |
-| `--report PATH` | Fresh proof-summary / ay-compiletest report. Omit → `MEASUREMENT MISSING`. |
-| `--format {text,json}` | Output format. Default: `text`. |
-| `--verbose` | List each outstanding (unproven / unclosed) row. |
-| `--require-complete` | Exit nonzero unless 100% replacement accounting is reached. |
-
-## `--require-complete` completion criterion
-
-The suite is **complete** iff **every** inventory row was measured against the
-fresh report **and**:
-
-- every **PROOF** row is `SUCCESS` with **zero** soundness fallback
-  (`proof_proven == proof_total`, `proof_fallback == 0`, `proof_regressed == 0`), **and**
-- every **non-PROOF** row is justified — observed outcome equals the recorded
-  expectation (`nonproof_closed == nonproof_total`, `nonproof_unjustified == 0`), **and**
-- no row is missing from the report (`rows_missing == 0`).
-
-Any missing measurement, any PROOF that passed only on fallback, any PROOF
-regression, or any unjustified non-PROOF row makes the suite **incomplete**.
-
-## Exit codes
-
-| Code | Meaning |
-| --- | --- |
-| `0` | Report consumed; (with `--require-complete`) replacement is complete. |
-| `1` | `--require-complete` set and replacement is **incomplete**. |
-| `2` | Inventory could not be loaded. |
-| `3` | `MEASUREMENT MISSING` — no / unparseable / empty fresh report. |
+Without `--report`, the tool prints `MEASUREMENT MISSING` and exits nonzero.
+`--require-complete` is green only if all 818 rows are measured, every proof row
+is clean and fallback-free, every negative verdict matches, and no row is
+missing. This progress tool does not by itself establish current-head or solver
+authority; use the strict flow in `replacement-proof.md` for a replacement
+claim.

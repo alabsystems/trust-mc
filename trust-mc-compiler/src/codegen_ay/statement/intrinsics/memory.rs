@@ -156,6 +156,71 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
         }
 
+        // Slice pointee with a foldable length: the size is len * elem_size,
+        // and Rust defines the checked result as None when that product
+        // exceeds isize::MAX. The length lives in the fat pointer we were
+        // handed — the same fld_len the extent machinery reads — so for a
+        // constant-length slice this is decidable at codegen time. Without
+        // this arm the symbolic fallback made `size.is_none()` unprovable for
+        // a slice deliberately built with len = isize::MAX + 1.
+        if is_size
+            && let Some(arg) = args.first()
+            && let Some(ty) = arg.ty(self.body.locals()).into_option()
+            && let TyKind::RigidTy(RigidTy::RawPtr(pointee, _) | RigidTy::Ref(_, pointee, _)) =
+                ty.kind()
+            && let TyKind::RigidTy(RigidTy::Slice(elem_ty)) = pointee.kind()
+            && let Some(elem_size) = LayoutOf::new(elem_ty).size_of()
+            && let Some(fat) = self.codegen_operand(arg)
+        {
+            let built = self.follow_ssa(&fat, 64);
+            if let ay_bindings::ExprValue::DatatypeConstructor { args: cargs, .. } = built.value()
+                && let Some(dt) = built.sort().datatype_sort()
+                && let Some(cons) = dt.constructors.first()
+                && let Some(len_idx) = cons.fields.iter().position(|f| f.name == "fld_len")
+                && let Some(len) = cargs.get(len_idx).and_then(|a| self.const_i128(a))
+                && len >= 0
+            {
+                let product = (len as u128).saturating_mul(elem_size as u128);
+                if product > i64::MAX as u128 {
+                    // None: the empty-fields constructor of Option<usize>.
+                    let option_sort = self.make_option_sort(ptr_sort());
+                    self.ctx.ensure_datatype_declared(&option_sort);
+                    if let Some(dt) = option_sort.datatype_sort()
+                        && let Some(none_ctor) =
+                            dt.constructors.iter().find(|c| c.fields.is_empty())
+                    {
+                        let none_val = Expr::datatype_constructor(
+                            &dt.name,
+                            &none_ctor.name,
+                            vec![],
+                            option_sort.clone(),
+                        );
+                        let name = self.ssa_name_from_base(&base_name, true);
+                        let var = self.ctx.declare_var(&name, option_sort);
+                        self.assert_ssa_def(var.clone(), none_val, &base_name);
+                        self.env_update(base_name, var);
+                        debug!("codegen_checked_size: None (slice size exceeds isize::MAX)");
+                        return;
+                    }
+                } else {
+                    // Some(product), in the flat representation the sized arm uses.
+                    let val_expr = Expr::bitvec_const(product, POINTER_WIDTH);
+                    let lhs_name = self.ssa_name_from_base(&base_name, true);
+                    let lhs_var = self.ctx.declare_var(&lhs_name, ptr_sort());
+                    self.assert_ssa_def(lhs_var.clone(), val_expr.clone(), &base_name);
+                    self.env_update(base_name.clone(), lhs_var);
+                    let field_key =
+                        crate::codegen_ay::names::base_variant_field_name(&base_name, 1, 0);
+                    let field_name = self.ssa_name_from_base(&field_key, true);
+                    let field_var = self.ctx.declare_var(&field_name, ptr_sort());
+                    self.assert_ssa_def(field_var.clone(), val_expr, &field_key);
+                    self.env_update(field_key, field_var);
+                    debug!("codegen_checked_size: Some({product}) from slice fld_len");
+                    return;
+                }
+            }
+        }
+
         // Fallback: symbolic Option<usize> for unsized/foreign types
         let option_sort = self.make_option_sort(ptr_sort());
         self.ctx.ensure_datatype_declared(&option_sort);

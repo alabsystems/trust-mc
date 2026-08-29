@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort};
 use rustc_public::{
-    mir::Operand,
+    mir::{Operand, Place},
     ty::{RigidTy, TyKind},
 };
 use tracing::debug;
@@ -350,16 +350,143 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         operand: &Operand,
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
-        if let Ok(ty) = operand.ty(self.body.locals())
-            && matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(..)))
-            && let Some(expr) = self.resolve_ref_operand(operand, modified_locals)
-        {
-            return Some(expr);
+        let is_ref = operand
+            .ty(self.body.locals())
+            .is_ok_and(|ty| matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(..))));
+
+        if is_ref {
+            // `HashMap::get`/`contains_key`/`remove` take `&Q`, so the key
+            // arrives as a REFERENCE. The map is indexed by the key VALUE, so
+            // the reference has to be followed.
+            if let Some(expr) = self.resolve_ref_operand(operand, modified_locals) {
+                return Some(expr);
+            }
+            // `ref_targets` only knows references the ref-resolution pass
+            // tracked. A `&1` built from a promoted constant is not in it, so
+            // fall back to reading the pointee through an explicit Deref place.
+            if let Some(expr) = self.translate_key_through_deref(operand, modified_locals) {
+                return Some(expr);
+            }
+            // SOUNDNESS (do not "simplify" this into the fallback below): if
+            // the pointee cannot be read, the only thing left to translate is
+            // the POINTER, and using it as the key silently indexes the wrong
+            // slot. `convert_key_to_array_index` then truncates the address to
+            // the key width, so `&1` became index 0 and every lookup answered
+            // for key 0 — `m.insert(0,5); assert!(m.get(&2) == Some(&5))` was
+            // PROVED under --ay-chc. Decline instead, so the caller emits its
+            // untranslatable-stub rule and the harness fails closed.
+            debug!("translate_hashmap_key: reference key not resolvable — declining");
+            return None;
         }
+
         if let Some(expr) = self.translate_operand_with_modified(operand, modified_locals) {
             return Some(expr);
         }
         self.resolve_ref_operand(operand, modified_locals)
+    }
+
+    /// Read a reference key's POINTEE, for the `&constant` shape that
+    /// `ref_resolution.ref_targets` does not track.
+    ///
+    /// Two attempts, in order of precision:
+    ///
+    /// 1. An explicit `Deref` place — works when the place machinery already
+    ///    knows the referent.
+    /// 2. A walk back through the MIR: find the single definition of the
+    ///    reference local, and if it is `_r = &_t`, the single definition of
+    ///    `_t`. `m.get(&1)` lowers to `_t = const 1; _r = &_t; get(_m, _r)`,
+    ///    so the key the user wrote is still there to be read.
+    ///
+    /// The SINGLE-definition requirement is what makes (2) sound: a local
+    /// defined once cannot hold a different value on a different path, so its
+    /// constant can be read without knowing the path condition. A local
+    /// assigned twice is refused. (Same argument, and the same shape, as
+    /// `quantifier_bound_from_mir`.)
+    fn translate_key_through_deref(
+        &mut self,
+        operand: &Operand,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        let place = match operand {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Constant(_) => return None,
+        };
+        if !place.projection.is_empty() {
+            return None;
+        }
+        let deref = Place {
+            local: place.local,
+            projection: vec![rustc_public::mir::ProjectionElem::Deref],
+        };
+        if let Some(expr) = self.translate_place_with_modified(&deref, modified_locals) {
+            return Some(expr);
+        }
+        // `&1` can lower to a reference into a PROMOTED constant, so the
+        // referenced place may carry projections. Translate that place as it
+        // stands rather than insisting on a bare local.
+        let referent = self.sole_ref_referent(place.local)?;
+        if let Some(expr) = self.translate_place_with_modified(&referent, modified_locals) {
+            return Some(expr);
+        }
+        if referent.projection.is_empty()
+            && let Some(key_operand) = self.sole_constant_definition(referent.local)
+        {
+            return self.translate_operand_with_modified(&key_operand, modified_locals);
+        }
+        None
+    }
+
+    /// The place a reference local points at, when the reference has EXACTLY
+    /// one definition and that definition is `&place`.
+    fn sole_ref_referent(&self, ref_local: usize) -> Option<Place> {
+        let mut found: Option<Place> = None;
+        for block in &self.body.blocks {
+            for stmt in &block.statements {
+                let rustc_public::mir::StatementKind::Assign(lhs, rhs) = &stmt.kind else {
+                    continue;
+                };
+                if lhs.local != ref_local || !lhs.projection.is_empty() {
+                    continue;
+                }
+                if found.is_some() {
+                    return None; // path-dependent: refuse
+                }
+                match rhs {
+                    rustc_public::mir::Rvalue::Ref(_, _, target)
+                    | rustc_public::mir::Rvalue::AddressOf(_, target) => {
+                        found = Some(target.clone());
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        found
+    }
+
+    /// The constant a local is assigned, when it has EXACTLY one definition
+    /// and that definition is a constant.
+    fn sole_constant_definition(&self, local: usize) -> Option<Operand> {
+        let mut found: Option<Operand> = None;
+        for block in &self.body.blocks {
+            for stmt in &block.statements {
+                let rustc_public::mir::StatementKind::Assign(lhs, rhs) = &stmt.kind else {
+                    continue;
+                };
+                if lhs.local != local || !lhs.projection.is_empty() {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                match rhs {
+                    rustc_public::mir::Rvalue::Use(c @ Operand::Constant(_)) => {
+                        found = Some(c.clone());
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        found
     }
     // extract_hashmap_sorts moved to stubs_hashmap_sorts.rs per #3199.
 }

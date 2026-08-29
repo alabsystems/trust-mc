@@ -35,7 +35,9 @@ use trust_ir_build::ModuleBuilder;
 use trust_mc_core::chc::ChcVc;
 use trust_mc_core::chc_const_prop::eval::try_eval_to_bool;
 use trust_mc_trust_bmc::{
-    TranslateOptions, TrustIrChcDiagnostic, trust_ir_function_to_chc_translation_output,
+    TranslateOptions, TrustIrChcDiagnostic, single_cell_alloca_rejection,
+    stack_alloca_cell_accesses_match_type, stack_alloca_pointer_is_non_escaping,
+    trust_ir_function_to_chc_translation_output,
 };
 
 /// How the pointer stored through is derived from the `s` alloca.
@@ -54,6 +56,12 @@ enum Target {
     /// A pointer with no provenance into the alloca and no escape anywhere: it
     /// provably cannot reach the cell, so the cell must stay precise.
     UnknownWithNoEscape,
+    /// `sink(&mut s.a)` and NOTHING after it — the interior address escapes into a
+    /// call and no store follows. The callee may write through it, so the readback
+    /// must NOT see the seeded value. This is the pure call-invalidation case:
+    /// `UnknownAfterEscape` above always appends a store, which is what triggered
+    /// the only pre-existing consumer of `escaped_cell_bases`.
+    CallEscapeNoStore,
 }
 
 struct Probe {
@@ -145,6 +153,13 @@ fn probe(target: Target, written: i128, valid_borrow: bool) -> Probe {
         Target::UnknownWithNoEscape => {
             let opaque = fb.null_ptr();
             fb.store_proven(Ty::U32, opaque, k, proofs);
+        }
+        Target::CallEscapeNoStore => {
+            // `sink(&mut s.a)` — and deliberately NO store afterwards.
+            let lane = fb.const_value(Ty::I64, Constant::Int(0));
+            let field_ptr = fb.gep(Ty::U32, slot, vec![lane]);
+            let borrow = fb.borrow_mut(field_ptr);
+            fb.call_void(sink_id, vec![borrow]);
         }
     }
 
@@ -546,6 +561,30 @@ fn unknown_store_with_no_escape_leaves_the_cell_precise() {
     );
 }
 
+/// THE CALL-INVALIDATION ORACLE. `sink(&mut s.a)` with no store after it. The callee
+/// may write any value through the escaped interior pointer, so the readback of `s.a`
+/// must be a havoc and `s.a != 0` must NOT prove.
+///
+/// If this reads `Some(false)`, the translator proved the assertion from the value that
+/// was in the cell BEFORE the call — a stale read, and a completed false proof.
+///
+/// THIS ORACLE IS LOAD-BEARING, AND THAT IS MEASURED, NOT ASSUMED. It was vacuous while
+/// `translate_alloca`'s coarse whole-function escape guard demoted every escaping cell —
+/// the havoc came from the guard. Now that the guard is narrowed to admit
+/// `StackCellEscape::IntoCallsOnly`, commenting out the single
+/// `invalidate_cells_escaping_into_call` call in `translate_node` makes THIS test, and
+/// only this test, fail: 12 passed / 1 failed. That failure is the translator proving
+/// `s.a != 0` from the value the cell held BEFORE the call — the exact false proof the
+/// narrowing would have shipped had the two halves been landed in the other order.
+#[test]
+fn call_escape_without_a_following_store_invalidates_the_cell() {
+    assert_eq!(
+        error_reachability(&probe(Target::CallEscapeNoStore, 0, true).vc),
+        None,
+        "the callee may write through the escaped `&mut s.a`, so `s.a` must be havoced"
+    );
+}
+
 /// `ValidBorrow` asserts the BORROW is valid, never that the WRITE was modeled.
 /// Whether it is present must not change what the cell holds afterwards.
 #[test]
@@ -561,4 +600,152 @@ fn valid_borrow_annotation_does_not_change_the_modeled_write() {
             );
         }
     }
+}
+
+// ===========================================================================
+// THE CROSS-BLOCK PROJECTED-READ ORACLE
+//
+// `aggregate_cell_hazards_stay_fail_closed` pins that a `FieldProjected` cell is REFUSED
+// by both admission lanes, which is what keeps the 181-row aggregate slice of the
+// `store_/load_in_other_block` bucket (221 rows at R59) unpromotable. But that pin checks
+// REJECTION only, and its fixture DISCARDS the GEP result (`let _addr = fb.gep(..)`), so
+// nothing anywhere exercises a projected READ or checks what the model would COMPUTE if
+// the cell were promoted.
+//
+// Widening promotion therefore cannot be justified by the existing suite — it would swap
+// a conservative alias rule for an unverified correctness claim. These are the missing
+// oracles. They are TESTS, so they cannot introduce a false proof; they can only reveal
+// whether the hazard is modelled.
+//
+// The shape is the hazard itself, not a weaker cousin: the cell is written in BOTH arms
+// of a branch and read back THROUGH A GEP in the join — the block that CONSUMES the
+// threaded value. That is exactly where a stale or fabricated leaf would surface.
+// ===========================================================================
+
+/// `{ u64, u64 }` written in both arms, field 0 read back via `GEP` in the join block.
+/// `then_a`/`else_a` are what each arm stores into field 0.
+fn cross_block_projected(then_a: i128, else_a: i128) -> ChcVc {
+    let pair = Ty::Tuple(vec![Ty::U64, Ty::U64]);
+    let mut mb = ModuleBuilder::new("cross_block_projected_read");
+    let ft = mb.add_func_type(vec![Ty::Bool], vec![Ty::U64]);
+    let mut fb = mb.function("projected_join", ft);
+
+    let entry = fb.create_block();
+    let then_block = fb.create_block();
+    let else_block = fb.create_block();
+    let join = fb.create_block();
+    fb.set_entry(entry);
+
+    fb.switch_to_block(entry);
+    let cond = fb.add_block_param(entry, Ty::Bool);
+    let cell = fb.alloca(pair.clone());
+    fb.condbr(cond, then_block, vec![], else_block, vec![]);
+
+    for (blk, a) in [(then_block, then_a), (else_block, else_a)] {
+        fb.switch_to_block(blk);
+        let av = fb.const_value(Ty::U64, Constant::Int(a));
+        let bv = fb.const_value(Ty::U64, Constant::Int(7));
+        let undef = fb.undef(pair.clone());
+        let p0 = fb.insert_field(pair.clone(), undef, 0, av);
+        let p1 = fb.insert_field(pair.clone(), p0, 1, bv);
+        fb.store(pair.clone(), cell, p1);
+        fb.br(join, vec![]);
+    }
+
+    // THE JOIN: field 0 read back THROUGH a GEP, in the block consuming the threaded
+    // value. This is the `FieldProjected` hazard actually exercised.
+    fb.switch_to_block(join);
+    let lane = fb.const_value(Ty::I64, Constant::Int(0));
+    let field_ptr = fb.gep(Ty::U64, cell, vec![lane]);
+    let a = fb.load(Ty::U64, field_ptr);
+    let zero = fb.const_value(Ty::U64, Constant::Int(0));
+    let is_zero = fb.icmp(ICmpOp::Eq, Ty::U64, a, zero);
+    let f = fb.const_value(Ty::Bool, Constant::Bool(false));
+    let ok = fb.icmp(ICmpOp::Eq, Ty::Bool, is_zero, f);
+    fb.assert(ok);
+    fb.ret(vec![a]);
+    fb.build();
+
+    let module = mb.build();
+    // This builder makes exactly ONE function, so it is id 0 — unlike `probe()` above,
+    // whose `sink` callee occupies 0 and whose subject is 1.
+    trust_ir_function_to_chc_translation_output(&module, FuncId::new(0), &TranslateOptions::default())
+        .expect("projected_join translates")
+        .vc
+}
+
+/// BASELINE / ACCEPTANCE TARGET. Field 0 is the SAME nonzero constant on both paths, so
+/// `a != 0` is genuinely TRUE. Today the cell is unpromoted (its pointer feeds a `GEP`),
+/// the join's projected read havocs, and the obligation is NOT proved.
+///
+/// A correct widening must turn this into `Some(false)` — WITHOUT changing the tripwire
+/// below. That pair is the acceptance criterion for touching
+/// `aggregate_cell_hazards_stay_fail_closed`.
+#[test]
+fn cross_block_projected_read_is_unproved_while_the_cell_is_unpromoted() {
+    assert_eq!(
+        error_reachability(&cross_block_projected(1, 1)),
+        None,
+        "baseline: unpromoted cell => the join's projected read havocs => not proved"
+    );
+}
+
+/// THE FALSE-PROOF TRIPWIRE, and why the target above is not sufficient alone.
+///
+/// The `else` arm stores ZERO into field 0, so `a != 0` is genuinely FALSE on that path.
+/// No model may prove it — not today's havoc, not a future promoted per-leaf model. A
+/// widening that makes this report `Some(false)` is threading only ONE arm's leaf into
+/// the join and is UNSOUND.
+#[test]
+fn a_zero_storing_arm_must_never_let_the_projected_read_prove() {
+    assert_ne!(
+        error_reachability(&cross_block_projected(1, 0)),
+        Some(false),
+        "FALSE PROOF: else arm stores 0 into field 0, so `a != 0` must not be provable"
+    );
+}
+
+/// DIAGNOSTIC for the 181-row cross-block bucket: WHICH condition refuses the oracle's
+/// cell? Lifting the GEP disqualification alone left the projected read unproved, so a
+/// further blocker exists and this names it rather than leaving it to inference.
+#[test]
+fn why_is_the_cross_block_projected_cell_refused() {
+    let pair = Ty::Tuple(vec![Ty::U64, Ty::U64]);
+    let mut mb = ModuleBuilder::new("diag");
+    let ft = mb.add_func_type(vec![Ty::Bool], vec![Ty::U64]);
+    let mut fb = mb.function("projected_join", ft);
+    let (entry, t, e, join) =
+        (fb.create_block(), fb.create_block(), fb.create_block(), fb.create_block());
+    fb.set_entry(entry);
+    fb.switch_to_block(entry);
+    let cond = fb.add_block_param(entry, Ty::Bool);
+    let cell = fb.alloca(pair.clone());
+    fb.condbr(cond, t, vec![], e, vec![]);
+    for blk in [t, e] {
+        fb.switch_to_block(blk);
+        let av = fb.const_value(Ty::U64, Constant::Int(1));
+        let bv = fb.const_value(Ty::U64, Constant::Int(7));
+        let u = fb.undef(pair.clone());
+        let p0 = fb.insert_field(pair.clone(), u, 0, av);
+        let p1 = fb.insert_field(pair.clone(), p0, 1, bv);
+        fb.store(pair.clone(), cell, p1);
+        fb.br(join, vec![]);
+    }
+    fb.switch_to_block(join);
+    let lane = fb.const_value(Ty::I64, Constant::Int(0));
+    let fp = fb.gep(Ty::U64, cell, vec![lane]);
+    let a = fb.load(Ty::U64, fp);
+    fb.ret(vec![a]);
+    fb.build();
+    let module = mb.build();
+    let function = &module.functions[0];
+
+    let rejection = single_cell_alloca_rejection(&module, function, cell, &pair);
+    println!(
+        "CROSS-BLOCK DIAGNOSTIC: lane1={:?} lane2={:?}  non_escaping={} ty_match={}",
+        rejection.as_ref().map(|r| r.block_local.kind()),
+        rejection.as_ref().map(|r| r.promoted.kind()),
+        stack_alloca_pointer_is_non_escaping(function, cell),
+        stack_alloca_cell_accesses_match_type(function, cell, &pair),
+    );
 }

@@ -15,6 +15,7 @@ use anyhow::{Error, Result, anyhow, bail};
 use rayon::prelude::*;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use trust_mc_metadata::{HarnessKind, HarnessMetadata};
 
 use crate::args::NumThreads;
@@ -28,8 +29,8 @@ use crate::session::KaniSession;
 use crate::unknown_quality::classify_unknown_quality;
 use crate::unsoundness_counts::UnsoundnessCounts;
 use crate::verification_result::{
-    CtrexCategory, FailedProperties, ProofCrosscheck, VerificationResult, VerificationStatus,
-    has_satisfied_cover, has_unsatisfiable_cover, is_unsat_assumption_vacuous,
+    CtrexCategory, FailedProperties, ProofCrosscheck, VacuityShape, VerificationResult,
+    VerificationStatus, classify_vacuity, has_satisfied_cover, has_unsatisfiable_cover,
 };
 
 /// A HarnessRunner is responsible for checking all proof harnesses. The data in this structure represents
@@ -48,6 +49,33 @@ pub(crate) struct HarnessRunner<'sess, 'pr> {
 pub(crate) struct HarnessResult<'pr> {
     pub harness: &'pr HarnessMetadata,
     pub result: VerificationResult,
+}
+
+/// Print a machine-readable marker line on stdout unless `--quiet` was asked
+/// for.
+///
+/// `--quiet` promises "nothing but the exit code and requested artifacts", but
+/// every `[AY:*]` marker below went out through a bare `println!`, so a quiet
+/// run still printed `[AY:CTREX_CAT:Genuine]`, `[AY:VACUOUS:...]`,
+/// `[AY:DEMOTION_REASONS:...]` and the rest. `process_output` already gated
+/// `[AY:PROOF_QUALIFIERS:...]` on the same flag; this brings the runner's
+/// markers in line with it.
+///
+/// Only the PRINTING is conditional. Every call site keeps its surrounding
+/// logic — the demotion, the vacuity fail-close, the CTREX classification —
+/// so `--quiet` changes what you see and never what the tool concluded or what
+/// it exits with. With `--quiet` absent the text is byte-identical to before,
+/// which matters because `scripts/ay-compiletest.sh` parses these exact lines.
+///
+/// Deliberately stdout-only: the `warning:`/`eprintln!` diagnostics stay on
+/// stderr as they are, the same way the compiler's `UNSOUND:` warnings do.
+/// Silencing a soundness warning is a worse failure than a chatty `--quiet`.
+macro_rules! marker_println {
+    ($session:expr, $($arg:tt)*) => {
+        if !$session.args.common_args.quiet {
+            println!($($arg)*);
+        }
+    };
 }
 
 #[derive(Debug)]
@@ -71,6 +99,11 @@ impl<'pr> HarnessRunner<'_, 'pr> {
         &self,
         harnesses: &'pr [&HarnessMetadata],
     ) -> Result<Vec<HarnessResult<'pr>>> {
+        // Mirror `--quiet` where the CHC portfolio's `solver_stdout!` can see
+        // it: those sites print from free functions with no session in reach.
+        // Set once, here, because every solver print happens underneath this
+        // call. See `args::common::QUIET_OUTPUT`.
+        crate::args::common::set_quiet_output(self.sess.args.common_args.quiet);
         let sorted_harnesses = crate::metadata::sort_harnesses_by_loc(harnesses);
         let unsoundness_counts = UnsoundnessCounts::from_project(self.project);
         let pool = {
@@ -88,52 +121,100 @@ impl<'pr> HarnessRunner<'_, 'pr> {
             builder.build()?
         };
 
-        let results = pool.install(|| -> Result<Vec<HarnessResult<'pr>>> {
-            sorted_harnesses
-                .par_iter()
-                .enumerate()
-                .map(|(idx, harness)| -> Result<HarnessResult<'pr>> {
-                    let binary = self.resolve_harness_input(harness)?;
-                    let crate_counts =
-                        unsoundness_counts.get_for_crate(harness.crate_name.as_str());
+        // Harnesses that finished before any `--fail-fast` abort, keyed by their
+        // position in `sorted_harnesses`.
+        //
+        // The obvious shape here is `.map(..).collect::<Result<Vec<_>>>()`, but
+        // that silently loses work: a short-circuiting collect keeps the first
+        // `Err` and DISCARDS every `Ok` already produced. With `--fail-fast` the
+        // summary then contradicted the transcript it was printing under --
+        // three harnesses, one bad, reported the success and then denied it:
+        //
+        //     Checking harness c_ok...   VERIFICATION:- SUCCESSFUL
+        //     Checking harness b_bad...  VERIFICATION:- FAILED
+        //     Complete - 0 successfully verified harnesses, 1 failures, 1 total.
+        //
+        // `c_ok` was verified, was reported as verified, and was then counted as
+        // neither verified nor attempted. Collecting into a keyed side channel
+        // keeps those results; sorting by the key on the way out reproduces the
+        // ordering `collect` used to give.
+        //
+        // Only SUCCESSES are preserved, never the concurrent failures. Under
+        // `--jobs N` several harnesses can fail in the same instant, and which
+        // ones did is a race; reporting all of them would make the failure count
+        // nondeterministic. `--fail-fast` promises to stop at *a* failure, so
+        // exactly the one that triggered the abort is reported.
+        let completed: Mutex<Vec<(usize, HarnessResult<'pr>)>> = Mutex::new(Vec::new());
 
-                    let result = self.sess.check_harness(&binary, harness, &crate_counts)?;
-                    if self.sess.args.fail_fast && result.status == VerificationStatus::Failure {
-                        Err(Error::new(FailFastHarnessInfo {
-                            index_to_failing_harness: idx,
-                            result,
-                        }))
-                    } else {
-                        Ok(HarnessResult { harness, result })
-                    }
-                })
-                .collect::<Result<Vec<_>>>()
+        let outcome = pool.install(|| -> Result<()> {
+            sorted_harnesses.par_iter().enumerate().try_for_each(|(idx, harness)| -> Result<()> {
+                let binary = self.resolve_harness_input(harness)?;
+                let crate_counts = unsoundness_counts.get_for_crate(harness.crate_name.as_str());
+
+                let result = self.sess.check_harness(&binary, harness, &crate_counts)?;
+                if self.sess.args.fail_fast && result.status == VerificationStatus::Failure {
+                    Err(Error::new(FailFastHarnessInfo { index_to_failing_harness: idx, result }))
+                } else {
+                    completed
+                        .lock()
+                        .expect("harness result collector poisoned")
+                        .push((idx, HarnessResult { harness, result }));
+                    Ok(())
+                }
+            })
         });
-        match results {
-            Ok(results) => Ok(results),
-            Err(err) => {
-                if err.is::<FailFastHarnessInfo>() {
-                    let failed = err.downcast::<FailFastHarnessInfo>()?;
-                    Ok(vec![HarnessResult {
+
+        let mut results = completed.into_inner().expect("harness result collector poisoned");
+        match outcome {
+            Ok(()) => {}
+            Err(err) if err.is::<FailFastHarnessInfo>() => {
+                let failed = err.downcast::<FailFastHarnessInfo>()?;
+                results.push((
+                    failed.index_to_failing_harness,
+                    HarnessResult {
                         harness: sorted_harnesses[failed.index_to_failing_harness],
                         result: failed.result,
-                    }])
-                } else {
-                    Err(err)
-                }
+                    },
+                ));
             }
+            Err(err) => return Err(err),
         }
+        results.sort_by_key(|(idx, _)| *idx);
+        Ok(results.into_iter().map(|(_, result)| result).collect())
     }
 
     fn resolve_harness_input(&self, harness: &HarnessMetadata) -> Result<PathBuf> {
         // AY backend uses SMT files produced by codegen, not goto binaries.
-        find_smt_file(&harness.model_file, &self.project.outdir).map_err(|e| {
+        let smt_file = find_smt_file(&harness.model_file, &self.project.outdir).map_err(|e| {
             anyhow!(
                 "{} for harness {}. Ensure compilation succeeded with --backend=ay.",
                 e,
                 harness.pretty_name
             )
-        })
+        })?;
+
+        // Register the per-harness codegen output for cleanup, but ONLY for a
+        // single-file run. `Project::try_new` records no artifacts for the AY
+        // backend, so without this a plain `trust-mc file.rs` leaves
+        // `<crate>__<mangled>.symtab.smt2` and its `.vc.json` sidecar next to the
+        // user's source — two files per harness, every run, in whatever directory
+        // they happened to be in. `--keep-temps` still keeps them (the session's
+        // `Drop` honors it), which the debugging workflows in `explain flags` need.
+        //
+        // A cargo run must NOT delete them: its outputs live under
+        // `target/kani/…`, a build directory rather than the user's source tree,
+        // and cargo CACHES the build. Deleting the query there makes the NEXT
+        // `cargo trust-mc` fail with "SMT-LIB2 file not found", because the cached
+        // build is a no-op and never regenerates it. A standalone run recompiles
+        // unconditionally, so removal is safe there.
+        if self.project.input.is_some() {
+            self.sess.record_temporary_file(&smt_file);
+            self.sess.record_temporary_file(
+                &crate::ay_parse::vc_artifact::vc_artifact_path_for_smt(&smt_file),
+            );
+        }
+
+        Ok(smt_file)
     }
 }
 
@@ -166,6 +247,21 @@ fn find_smt_file(model_file: &Path, outdir: &Path) -> Result<PathBuf> {
 
     let tried = candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ");
     bail!("SMT-LIB2 file not found (tried: {})", tried)
+}
+
+/// The BMC unwind bound was exhausted: some loop asked for an iteration past
+/// `--unwind N` / `#[kani::unwind(N)]`, so the unwinding assertion the unroller
+/// planted on the cut back-edge is among the FAILED checks (class `"unwind"`,
+/// see `classify_violation`).
+///
+/// This is the one counterexample shape that says nothing whatsoever about the
+/// program: the search was truncated, not a bug found. Every consumer that would
+/// otherwise present it as a bug — the CTREX category, the not-certified caveat,
+/// concrete playback — keys off this predicate.
+fn unwind_bound_exhausted(results: &[crate::property_model::Property]) -> bool {
+    results.iter().any(|p| {
+        p.status == crate::property_model::CheckStatus::Failure && p.property_id.class == "unwind"
+    })
 }
 
 fn demotion_reasons_marker(result: &VerificationResult) -> Option<String> {
@@ -523,7 +619,8 @@ impl KaniSession {
             return category; // no evidence → stay tainted (fail-closed)
         };
         if ctrex_certifiable_genuine(&categories, &ev, results) {
-            println!(
+            marker_println!(
+                self,
                 "[AY:CTREX_CAT:Genuine:certified independent of {} freed var(s) (was {})]",
                 ev.approximated_vars.len(),
                 category.label()
@@ -531,6 +628,129 @@ impl KaniSession {
             CtrexCategory::Genuine
         } else {
             category
+        }
+    }
+
+    /// Answer a loop contract's TWO questions with the strongest sound method
+    /// for each, when this harness's single lane could not answer both.
+    ///
+    /// Obligations lane: rule ON + `--prove-safety-only` -> base / step /
+    /// decreases. Properties lane: rule OFF + bounded unroll -> assertions and
+    /// memory safety. Both are CHILD PROCESSES: the unsoundness counters are
+    /// process-global and accumulate, so an in-process second lane would trip
+    /// markers this lane never trips and demote a clean proof to a failure.
+    ///
+    /// Only ever upgrades a verdict, and only when BOTH lanes discharge what
+    /// they own; on any doubt the original verdict stands untouched.
+    fn maybe_two_lane_retry(
+        &self,
+        binary: &Path,
+        harness: &HarnessMetadata,
+        result: &mut VerificationResult,
+    ) {
+        use crate::loop_two_lane as lanes;
+
+        // `binary` is already the resolved `.smt2` for this harness (see the
+        // call site) — the artifact sits beside it.
+        let vc_path = crate::ay_parse::vc_artifact::vc_artifact_path_for_smt(binary);
+        if !lanes::harness_is_eligible(&vc_path) {
+            return;
+        }
+
+        // One clock for the WHOLE retry: the parent's watchdog kills it at
+        // ~80s (harness_timeout*5+5), and a kill degrades this row to a
+        // timeout — which would make the feature a regression.
+        let retry_start = std::time::Instant::now();
+        // `--harness` is a filter over PRETTY names; passing the mangled name
+        // yields "no harnesses matched the harness filter" and a silent no-op.
+        let harness_name = harness.pretty_name.as_str();
+
+        // RUN THE LANES CONCURRENTLY. They are INDEPENDENT — the obligations
+        // lane proves base/step/decreases, the properties lane proves the user
+        // assertions — so sequencing them cost `sum` where `max` suffices.
+        // MEASURED: obligations ~44s, properties ~20s. Sequential 64s left only
+        // ~6s of headroom under the parent's 80s watchdog, and under the
+        // corpus's `--jobs 3` contention that overran the retry budget: the row
+        // reported false_positive at exactly the 70s cap while the SAME harness
+        // proved in 64.4s on an idle machine. A feature that only works on an
+        // unloaded machine is not working.
+        let budget = match lanes::lane_budget(retry_start.elapsed()) {
+            Some(b) => b,
+            None => return,
+        };
+        let (o_res, p_res) = std::thread::scope(|scope| {
+            let o = scope.spawn(|| {
+                lanes::lane_o_command(harness_name)
+                    .and_then(|c| crate::session::run_piped_with_timeout(c, budget).ok())
+            });
+            let p = scope.spawn(|| {
+                lanes::lane_p_command(harness_name, lanes::LANE_P_DEPTHS[0])
+                    .and_then(|c| crate::session::run_piped_with_timeout(c, budget).ok())
+            });
+            (o.join().ok().flatten(), p.join().ok().flatten())
+        });
+
+        let Some(out_o) = o_res else {
+            println!("[AY:LOOP_TWO_LANE] obligations lane did not run");
+            return;
+        };
+        let o_stdout = String::from_utf8_lossy(&out_o.stdout).into_owned();
+        if !lanes::child_proved(&o_stdout) {
+            let tail: Vec<&str> = o_stdout
+                .lines()
+                .filter(|l| l.starts_with("VERIFICATION") || l.starts_with("error"))
+                .collect();
+            println!("[AY:LOOP_TWO_LANE] obligations lane did not prove: {tail:?}");
+            return;
+        }
+        println!("[AY:LOOP_TWO_LANE] obligations lane discharged");
+
+        let mut p_proved = p_res
+            .as_ref()
+            .is_some_and(|o| lanes::child_proved(&String::from_utf8_lossy(&o.stdout)));
+
+        // Deepen only if the first depth did not answer AND time remains.
+        if !p_proved {
+            for depth in &lanes::LANE_P_DEPTHS[1..] {
+                let Some(b) = lanes::lane_budget(retry_start.elapsed()) else {
+                    println!("[AY:LOOP_TWO_LANE] out of retry budget before depth {depth}");
+                    break;
+                };
+                let Some(cmd) = lanes::lane_p_command(harness_name, *depth) else { break };
+                let Ok(out) = crate::session::run_piped_with_timeout(cmd, b) else { continue };
+                if lanes::child_proved(&String::from_utf8_lossy(&out.stdout)) {
+                    p_proved = true;
+                    break;
+                }
+            }
+        }
+
+        match lanes::merge(true, &o_stdout, p_proved) {
+            lanes::TwoLaneOutcome::Proved => {
+                println!(
+                    "[AY:LOOP_TWO_LANE] obligations and properties discharged in separate lanes"
+                );
+                // Every check this lane could not discharge WAS discharged —
+                // the obligations in Lane O, the user properties in Lane P.
+                // Leaving them marked FAILURE would print "Failed Checks: ..."
+                // directly above a SUCCESSFUL verdict: contradictory output that
+                // misleads a reader and any tool parsing the check list. Record
+                // WHERE each one was discharged rather than silently flipping it.
+                for prop in &mut result.results {
+                    if prop.status == crate::property_model::CheckStatus::Failure {
+                        prop.status = crate::property_model::CheckStatus::Success;
+                        prop.description = std::borrow::Cow::Owned(format!(
+                            "{} [discharged in the two-lane loop-contract retry]",
+                            prop.description
+                        ));
+                    }
+                }
+                result.status = VerificationStatus::Success;
+                result.failed_properties = FailedProperties::None;
+            }
+            lanes::TwoLaneOutcome::Inconclusive(why) => {
+                println!("[AY:LOOP_TWO_LANE] not proved: {why}");
+            }
         }
     }
 
@@ -588,8 +808,40 @@ impl KaniSession {
         )?;
         demote_for_all_unsoundness(&mut result, harness, unsoundness_counts);
         if let Some(marker) = demotion_reasons_marker(&result) {
-            println!("{marker}");
+            marker_println!(self, "{marker}");
+            // Say what the marker means, for the same reason
+            // `[AY:CTREX_NOT_CERTIFIED]` exists — and this case needs it MORE.
+            //
+            // A demoted result was originally a PROOF (see the classification
+            // guard directly below: CTREX runs only when `demotion_reasons` is
+            // empty). Nothing was disproved; the proof was downgraded because it
+            // leaned on an approximation. But it renders as
+            //
+            //     VERIFICATION:- FAILED
+            //
+            // identical to a real counterexample, with the explanation sitting
+            // in a marker line that means nothing unless you know the
+            // vocabulary. `HashMap::len()` after two inserts lands here, so it
+            // is not an exotic path — and a reader would go hunting for a bug
+            // that was never found.
+            //
+            // The CTREX caveat cannot cover this: these two are mutually
+            // exclusive by that same guard.
+            marker_println!(
+                self,
+                "[AY:DEMOTED_NOT_A_COUNTEREXAMPLE] {}: no counterexample was found — this \
+                 harness was PROVED and then downgraded because the encoding approximated {}. \
+                 There is nothing here to debug in your code; the proof simply could not be \
+                 certified.",
+                harness.pretty_name,
+                result.demotion_reasons.join(", ")
+            );
         }
+
+        // Was the verdict produced by running out of unwind budget rather than by
+        // finding anything? Computed once and consulted twice: here (category)
+        // and at the marker block below (the caveat line).
+        let unwind_exhausted = unwind_bound_exhausted(&result.results);
 
         // Classify CTREX verdicts after demotion (#3128). Only non-demoted failures
         // are actual counterexamples — demoted results were originally PROOF.
@@ -605,7 +857,26 @@ impl KaniSession {
                 p.status == crate::property_model::CheckStatus::Failure
                     && p.property_id.class != "chc"
             });
-            if matches!(result.failed_properties, FailedProperties::Other) && !has_non_chc_violation
+            if unwind_exhausted {
+                // The unwind budget ran out, so the search was TRUNCATED. Nothing
+                // was disproved: the paths that would have decided the harness
+                // were never explored. That is exactly `Unknown` ("no actual
+                // counterexample exists" — the sibling case of a solver UNKNOWN),
+                // and emphatically not `Genuine`.
+                //
+                // Deliberately whole-harness, not per-check, and this is the
+                // conservative direction: a check that failed on a path the
+                // unroller did NOT cut is still a real failure, but the query is
+                // one `(or viol_0 … viol_n)` and the model that satisfied it may
+                // have used the cut edge, so we cannot tell which checks the
+                // truncation implicates. Upstream Kani takes the same position —
+                // `tests/expected/unwind-recursion-fail` pins every sibling check
+                // as UNDETERMINED once an unwinding assertion fails. Costs at
+                // worst a "raise the bound, then look again"; the alternative
+                // costs someone a day hunting a bug that was never found.
+                result.ctrex_category = Some(CtrexCategory::Unknown);
+            } else if matches!(result.failed_properties, FailedProperties::Other)
+                && !has_non_chc_violation
             {
                 result.ctrex_category = Some(CtrexCategory::Unknown);
             } else {
@@ -624,32 +895,121 @@ impl KaniSession {
         // harness is originally a non-counterexample SUCCESS, so the block above left
         // its `ctrex_category` as None and never mislabeled it as a counterexample.
         //
-        // V4 (unsatisfiable assumption): EVERY non-cover check is provably UNREACHABLE,
-        // so the assumption context is contradictory (`kani::assume(false)` / an
-        // over-constrained precondition) and the assertions "passed" only vacuously.
-        // `should_panic` harnesses are exempt (their verdict is panic-shaped, handled by
-        // `is_effective_manual_success`). On by default; `--allow-vacuous` relaxes it,
-        // always with a loud marker so the relaxation is never silent.
+        // V4 (every check unreachable): EVERY non-cover check is provably UNREACHABLE,
+        // so no obligation this harness emitted was discharged over a run that can
+        // happen. `should_panic` harnesses are exempt (their verdict is panic-shaped,
+        // handled by `is_effective_manual_success`). On by default; `--allow-vacuous`
+        // relaxes it, always with a loud marker so the relaxation is never silent.
+        //
+        // That table has TWO causes and they are opposite diagnoses, so the gate
+        // splits on `classify_vacuity` (BMC's harness-reachability probe / the CHC
+        // lane's exit-block test) rather than reporting one cause for both:
+        //
+        //   UnsatAssumption — the harness cannot run: `kani::assume(false)`, mutually
+        //     exclusive assumptions, an infeasible body. The case V4 was written for.
+        //   DeadChecks — the harness DEMONSTRABLY runs (the solver decided its
+        //     constraints satisfiable) and its checks sit on dead code, e.g.
+        //     `if x > 200 && x < 100 { panic!() }`. Naming "contradictory
+        //     assumptions" here was wrong on both clauses: there are none, and the
+        //     panic-freedom of that branch WAS settled.
+        //
+        // Both still fail closed, and deliberately so. What the dead-check harness
+        // established is that its assertions cannot be *reached* — never that the
+        // code under them is right — and "every obligation is unreachable" is also
+        // the shape a mis-encoded guard produces, which is how a false proof hides.
+        // Downgrading only the CLAIM, not the verdict, fixes the misattribution
+        // without moving anything from fail-closed to fail-open; promoting the
+        // dead-check arm to a pass is a separate decision that needs its own corpus
+        // run (see docs/findings/2026-08-23-v4-fires-on-a-dead-check.md).
+        let vacuity_shape = classify_vacuity(&result.results, result.harness_feasibility);
         if !harness.attributes.should_panic
             && result.status != VerificationStatus::Failure
-            && is_unsat_assumption_vacuous(&result.results)
+            && vacuity_shape != VacuityShape::None
         {
-            if self.args.allow_vacuous {
-                println!(
-                    "[AY:VACUOUS:allowed] {}: every check is provably UNREACHABLE \
-                     (unsatisfiable assumptions) — relaxed to a pass by --allow-vacuous",
-                    harness.pretty_name
-                );
-            } else {
-                println!(
-                    "[AY:VACUOUS:unsat-assumption] {}: every check is provably UNREACHABLE — \
-                     the proof is vacuous (contradictory assumptions; nothing was verified). \
-                     Pass --allow-vacuous to relax.",
-                    harness.pretty_name
-                );
-                result.status = VerificationStatus::Failure;
-                result.failed_properties = FailedProperties::Other;
+            match (self.args.allow_vacuous, vacuity_shape) {
+                (true, VacuityShape::UnsatAssumption) => {
+                    marker_println!(
+                        self,
+                        "[AY:VACUOUS:allowed] {}: every check is provably UNREACHABLE \
+                         (unsatisfiable assumptions) — relaxed to a pass by --allow-vacuous",
+                        harness.pretty_name
+                    );
+                }
+                (true, VacuityShape::DeadChecks) => {
+                    marker_println!(
+                        self,
+                        "[AY:VACUOUS:allowed] {}: every check is provably UNREACHABLE \
+                         (dead code; the harness itself is reachable) — relaxed to a pass \
+                         by --allow-vacuous",
+                        harness.pretty_name
+                    );
+                }
+                (false, VacuityShape::UnsatAssumption) => {
+                    marker_println!(
+                        self,
+                        "[AY:VACUOUS:unsat-assumption] {}: every check is provably UNREACHABLE — \
+                         the proof is vacuous (contradictory assumptions; nothing was verified). \
+                         Pass --allow-vacuous to relax.",
+                        harness.pretty_name
+                    );
+                    result.status = VerificationStatus::Failure;
+                    result.failed_properties = FailedProperties::Other;
+                }
+                (false, VacuityShape::DeadChecks) => {
+                    marker_println!(
+                        self,
+                        "[AY:VACUOUS:dead-checks] {}: the harness IS reachable — its \
+                         assumptions are satisfiable — but every check it emitted is provably \
+                         UNREACHABLE, so no obligation was exercised. This is not a proof of \
+                         the code under those checks; look for a guard that can never hold. \
+                         Pass --allow-vacuous to relax.",
+                        harness.pretty_name
+                    );
+                    result.status = VerificationStatus::Failure;
+                    result.failed_properties = FailedProperties::Other;
+                }
+                (_, VacuityShape::None) => unreachable!("guarded by vacuity_shape != None"),
             }
+        }
+
+        // V4b (nothing to verify): the harness produced NO checks at all, yet the
+        // status is Success — so the run is reported as a clean proof of nothing.
+        //
+        // `is_unsat_assumption_vacuous` above cannot see this case: it requires at
+        // least one check to compare against (`checks > 0`). Zero checks arise when
+        // codegen emitted no obligation for the body — an empty harness, or a body
+        // whose only failure path was folded away before it became a violation (the
+        // observed instance: `Option::<u32>::None.unwrap()`, which panics
+        // unconditionally at runtime yet yields an obligation-free query).
+        //
+        // A proof of zero obligations is not a proof. Fail closed so it renders as
+        // `VERIFICATION:- INCONCLUSIVE (no checks)` — the verdict
+        // `verification_result` already defines for this shape but could never
+        // reach while the status stayed Success — and exits non-zero. Cover-only
+        // harnesses are exempt: their covers ARE the obligation, and V5 below
+        // adjudicates them.
+        // A body with NO obligation site (no Call, no Assert terminator) cannot
+        // have had an obligation dropped — zero checks there is the
+        // `fn check() {}` shape Kani reports as a clean `0 of 0 failed`.
+        // Certified by the compiler, which is the only side that sees the MIR;
+        // absent or unreadable evidence keeps the fail-closed path.
+        let body_has_no_obligation_site = crate::ay_parse::vc_artifact::
+            artifact_body_is_obligation_free(
+                &crate::ay_parse::vc_artifact::vc_artifact_path_for_smt(binary),
+            );
+        if !harness.attributes.should_panic
+            && result.status != VerificationStatus::Failure
+            && result.results.is_empty()
+            && !body_has_no_obligation_site
+        {
+            marker_println!(
+                self,
+                "[AY:VACUOUS:no-checks] {}: the harness produced no verification \
+                 conditions — there was nothing to prove, so this is not a proof.",
+                harness.pretty_name
+            );
+            result.status = VerificationStatus::Failure;
+            result.failed_properties = FailedProperties::Other;
         }
 
         // V5 (mandatory witness): a declared `cover(...)` the solver PROVED unsatisfiable
@@ -658,7 +1018,8 @@ impl KaniSession {
         // still hold); `--strict-vacuity` escalates it to a hard failure.
         if has_unsatisfiable_cover(&result.results) {
             if self.args.strict_vacuity {
-                println!(
+                marker_println!(
+                    self,
                     "[AY:VACUOUS:cover] {}: a declared cover(...) is provably \
                      unsatisfiable/unreachable — failing under --strict-vacuity.",
                     harness.pretty_name
@@ -687,7 +1048,8 @@ impl KaniSession {
             && self.args.conformance_harnesses.iter().any(|h| h == &harness.pretty_name)
             && !has_satisfied_cover(&result.results)
         {
-            println!(
+            marker_println!(
+                self,
                 "[AY:VACUOUS:conformance] {}: a conformance harness with NO satisfied \
                  cover(...) — it never demonstrably reached the behavior it claims to \
                  exercise, so it proves nothing. Marking VACUOUS (failure).",
@@ -718,10 +1080,128 @@ impl KaniSession {
                 CtrexCategory::Unknown => ("Unknown", String::new()),
             };
             if details.is_empty() {
-                println!("[AY:CTREX_CAT:{label}]");
+                marker_println!(self, "[AY:CTREX_CAT:{label}]");
             } else {
-                println!("[AY:CTREX_CAT:{label}:{details}]");
+                marker_println!(self, "[AY:CTREX_CAT:{label}:{details}]");
             }
+
+            // The bound, not the program. Same reason the caveats below exist —
+            // `VERIFICATION:- FAILED` reads as "your code is broken" whatever the
+            // category marker says — but this shape needs it most: there is not
+            // even a candidate bug behind it, only a search that stopped early,
+            // and the fix is a flag rather than a code change. Named here in the
+            // CTREX vocabulary so the same reader/tooling that trusts
+            // `[AY:CTREX_NOT_CERTIFIED]` sees it; `verification_result` also
+            // appends the raise-the-bound tip off the check description.
+            if unwind_exhausted {
+                println!(
+                    "[AY:CTREX_NOT_CERTIFIED] {}: NOT a counterexample — a loop hit the unwind \
+                     bound, so the search was truncated before it could decide this harness. \
+                     Nothing in your program was disproved. Raise the bound (--unwind N, \
+                     --default-unwind N, or #[kani::unwind(N)]) and re-run; if the loop has no \
+                     constant bound, use --ay-chc for unbounded proofs.",
+                    harness.pretty_name
+                );
+            }
+
+            // Say in words what the marker says in shorthand.
+            //
+            // A counterexample the classifier could NOT certify as genuine still
+            // renders as `VERIFICATION:- FAILED`, identical to a real bug. The
+            // only signal was the word "EncodingGap" inside a line reading
+            // "CTREX breakdown: 1 EncodingGap, 0 OverApproximation, ..." -- which
+            // tells you nothing unless you already know the vocabulary, and
+            // costs an hour hunting a bug that is not there.
+            //
+            // `kani::bounded_any::<String, 4>()` is the everyday case: the
+            // failure comes from `utf8_chunks` being abstracted, not from the
+            // harness. Name the categories so the reader can tell which of their
+            // code, if any, is implicated -- and say plainly that this one is
+            // not certified as theirs.
+            match cat {
+                CtrexCategory::EncodingGap { categories } => {
+                    marker_println!(
+                        self,
+                        "[AY:CTREX_NOT_CERTIFIED] {}: this counterexample was NOT certified as \
+                         a genuine bug — the encoding fell back for {}, so the failing values \
+                         may be ones your program cannot produce. It may still be a real bug: \
+                         the check says only that the fallback makes it uncertain. The \
+                         `warning:` lines name the constructs involved.",
+                        harness.pretty_name,
+                        if categories.is_empty() {
+                            "an unmodelled construct".to_string()
+                        } else {
+                            categories.join(", ")
+                        }
+                    );
+                }
+                CtrexCategory::OverApproximation { categories } => {
+                    marker_println!(
+                        self,
+                        "[AY:CTREX_NOT_CERTIFIED] {}: this counterexample was NOT certified as \
+                         a genuine bug — over-approximation in {} may have admitted values the \
+                         real program never produces. It may still be a real bug; the check \
+                         says only that the approximation makes it uncertain.",
+                        harness.pretty_name,
+                        if categories.is_empty() {
+                            "the encoding".to_string()
+                        } else {
+                            categories.join(", ")
+                        }
+                    );
+                }
+                CtrexCategory::Genuine | CtrexCategory::Unknown => {}
+            }
+        }
+
+        // V6 (should_panic + an UNCERTIFIED counterexample): fail closed.
+        //
+        // For an ordinary harness a counterexample is the bad news either way,
+        // so an uncertified one needs no more than the caveat printed above.
+        // For `#[kani::should_panic]` the counterexample IS the proof
+        // obligation: `is_effective_manual_success` turns `PanicsOnly` into
+        //
+        //     VERIFICATION:- SUCCESSFUL (encountered one or more panics as expected)
+        //
+        // and exit 0, and the harness counts as verified. So a panic the driver
+        // had just declined to certify -- one it described in the very previous
+        // line as values "your program cannot produce" -- was accepted AS the
+        // proof. Observed with `kani::bounded_any::<String, 4>()` under
+        // --ay-chc, where the panic comes entirely from the over-approximated
+        // call and the real program cannot panic at all:
+        //
+        //     [AY:CTREX_CAT:OverApproximation:chc_sound_havoc_drop=4]
+        //     [AY:CTREX_NOT_CERTIFIED] sp_chc_gap: ... NOT certified ...
+        //     VERIFICATION:- SUCCESSFUL (encountered one or more panics as expected)
+        //
+        // Demoting `failed_properties` (rather than `status`, which is already
+        // `Failure` here) is what every channel reads: the console verdict, the
+        // exit code, SARIF and the proof summary all route through
+        // `is_effective_manual_success`, so one flip fails them all closed
+        // together.
+        //
+        // NARROW on purpose -- only the two categories that printed
+        // `[AY:CTREX_NOT_CERTIFIED]` just above. `Genuine` is a real panic and
+        // still passes (that is the feature working), and `Unknown` cannot
+        // reach here: it is only ever set on the `FailedProperties::Other`
+        // branch, which is not an effective success in the first place.
+        if harness.attributes.should_panic
+            && matches!(result.failed_properties, FailedProperties::PanicsOnly)
+            && matches!(
+                result.ctrex_category,
+                Some(CtrexCategory::EncodingGap { .. } | CtrexCategory::OverApproximation { .. })
+            )
+        {
+            println!(
+                "[AY:SHOULD_PANIC_NOT_CERTIFIED] {}: the expected panic is a counterexample \
+                 the classifier could NOT certify as genuine, so it cannot stand as the proof \
+                 this should_panic harness asks for. Failing closed -- nothing was verified. \
+                 (The verdict line below reads `other than panics` because the certified-panic \
+                 count is now zero.)",
+                harness.pretty_name
+            );
+            result.status = VerificationStatus::Failure;
+            result.failed_properties = FailedProperties::Other;
         }
 
         // Set kani::mem over-approximation count for result/audit bookkeeping.
@@ -739,7 +1219,7 @@ impl KaniSession {
         // Emit sound fallback marker for shell-script consumption (Part of #3476).
         // Parsed by ay-compiletest.sh to include in per-harness JSON reports.
         if result.sound_fallback_count > 0 {
-            println!("[AY:SOUND_FALLBACK:{}]", result.sound_fallback_count);
+            marker_println!(self, "[AY:SOUND_FALLBACK:{}]", result.sound_fallback_count);
         }
 
         // Classify UNKNOWN quality and emit marker (Part of #2985).
@@ -748,33 +1228,64 @@ impl KaniSession {
             let quality = classify_unknown_quality(harness, unsoundness_counts);
             let label = quality.label();
             if let Some(details) = quality.details() {
-                println!("[AY:UNKNOWN_QUALITY:{label}:{details}]");
+                marker_println!(self, "[AY:UNKNOWN_QUALITY:{label}:{details}]");
             } else {
-                println!("[AY:UNKNOWN_QUALITY:{label}]");
+                marker_println!(self, "[AY:UNKNOWN_QUALITY:{label}]");
             }
             result.unknown_quality = Some(quality);
         }
 
         if let Some(reason) = result.solver_unknown_reason {
-            println!("[AY:UNKNOWN_REASON:{}]", reason.label());
+            marker_println!(self, "[AY:UNKNOWN_REASON:{}]", reason.label());
         }
 
         if let Some(marker) = proof_crosscheck_marker(&result.proof_crosscheck) {
-            println!("{marker}");
+            marker_println!(self, "{marker}");
         }
 
         if let Some(marker) = proof_transcript_metadata_marker(&result) {
-            println!("{marker}");
+            marker_println!(self, "{marker}");
         }
         if let Some(marker) = trust_trust_mc_chc_pdr_evidence_marker(&result) {
-            println!("{marker}");
+            marker_println!(self, "{marker}");
         }
         if let Some(marker) = native_proof_grade_marker(&result) {
-            println!("{marker}");
+            marker_println!(self, "{marker}");
+        }
+
+        // ── Two-lane retry for loop-contract harnesses ──────────────────
+        // A loop contract asks two independent questions and this single lane
+        // had to answer both, so a VALID but WEAK invariant made a CORRECT
+        // program report FAILED. Only reached when THIS lane did not already
+        // succeed, so a passing harness is never re-adjudicated — that is the
+        // no-regression net. See loop_two_lane.rs for the soundness argument.
+        if !crate::demotion::is_effective_manual_success(
+            result.status,
+            harness.attributes.should_panic,
+            result.failed_properties,
+        ) {
+            self.maybe_two_lane_retry(binary, harness, &mut result);
         }
 
         self.process_output(&result, harness, thread_index)?;
-        self.gen_and_add_concrete_playback(harness, &mut result)?;
+        // A concrete-playback `#[test]` asserts "these inputs reproduce the
+        // failure". Once a loop has hit the unwind bound we cannot honour that
+        // claim: the satisfying model was free to use the cut back-edge, so the
+        // emitted test may reproduce nothing at all. `extract_harness_values`
+        // already skips the class-"unwind" check itself; this covers the sibling
+        // checks in the same truncated run, which are `Unknown` for the reason
+        // recorded at the classification site above. Narrow on purpose — it fires
+        // only when an unwinding assertion actually FAILED.
+        if unwind_exhausted && self.args.concrete_playback.is_some() {
+            println!(
+                "WARNING: no concrete playback for `{}`: a loop hit the unwind bound, so the \
+                 counterexample may depend on a truncated path and the generated test could \
+                 fail to reproduce. Raise the bound and re-run.",
+                harness.pretty_name
+            );
+        } else {
+            self.gen_and_add_concrete_playback(harness, &mut result)?;
+        }
         Ok(result)
     }
 }

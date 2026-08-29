@@ -527,6 +527,38 @@ pub(in crate::codegen_ay::chc) fn try_inline_nested_call<'tcx, 'body>(
         }
         _ => return None,
     };
+    // `kani_force_fn_once(f) -> f` is the IDENTITY — resolve it here instead of
+    // spending an inline-depth level on its body.
+    //
+    // `const fn kani_force_fn_once<T, F: FnOnce() -> T>(f: F) -> F { f }`
+    // (library/kani_macros/src/sysroot/contracts). The non-nested lane already
+    // relies on that exactness (codegen_call_closure/mod.rs, "This is EXACT, not
+    // a guess"), but the NESTED walker had no case for it, so it fell through to
+    // a generic body inline costing one depth level — and
+    // `try_inline_register_contract` costs another.
+    //
+    // That matters because `#[kani::recursion]` lowering stacks
+    // recursion-closure -> force_fn_once -> register_contract -> check-closure ->
+    // force_fn_once -> body per USER frame. Two wasted levels per frame reaches
+    // MAX_INLINE_DEPTH sooner, and depth exhaustion is precisely the branch that
+    // havocs the callee result AND books a demoting fallback
+    // (terminator_exec.rs, `inline_depth >= MAX_INLINE_DEPTH`).
+    //
+    // EXACT, not an approximation: destination and argument denote the SAME
+    // closure value, so returning the argument's expression removes a level of
+    // indirection and nothing else. Anything without one of the two markers, or
+    // with no first argument, falls through unchanged.
+    if matches!(
+        attributes::fn_marker(fn_def).as_deref(),
+        Some("kani_force_fn_once" | "kani_force_fn_once_with_args")
+    ) && let Some(arg) = args.first()
+        && let Some(expr) =
+            inline_operand_to_expr(ctx, arg, local_exprs, resolver, outer_body.locals())
+    {
+        debug!("nested call: kani_force_fn_once identity -> argument expression");
+        return Some(InlineReturn::value_only(expr));
+    }
+
     if attributes::fn_marker(fn_def).as_deref() == Some("kani_register_contract") {
         return try_inline_register_contract(
             ctx,

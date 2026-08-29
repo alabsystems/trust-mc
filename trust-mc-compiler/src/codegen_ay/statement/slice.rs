@@ -254,9 +254,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let (slice_arg, index_arg) = self.split_slice_index_args(args)?;
 
         if self.is_range_full_index_operand(index_arg) {
-            let slice_expr = self
-                .get_value_through_ref(slice_arg)
-                .or_else(|| self.codegen_operand(slice_arg))?;
+            let slice_expr = self.range_full_identity_value(slice_arg)?;
             self.assign_reference_to_place(destination, slice_expr);
             return target;
         }
@@ -563,13 +561,114 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target
     }
 
+    /// The slice VALUE that `<[T] as Index<RangeFull>>::index(s, ..)` returns.
+    ///
+    /// `s[..]` is the IDENTITY on `s`, so the result must alias BOTH halves of
+    /// `s`'s fat pointer. The previous code resolved only `get_value_through_ref`,
+    /// which unwraps a `&[T]` to its BACKING ARRAY — an SMT `Array` carries no
+    /// length, so the destination became a `&[T]` whose `fld_len` was never
+    /// constrained. `.len()` and every bounds check through it then read a FRESH
+    /// symbol, which is why `s.len() == 4` and `s.len() == 99` were BOTH
+    /// satisfiable for `let s = &[0u8; 4][..]`.
+    ///
+    /// Prefer the receiver's own fat-pointer value when it carries metadata —
+    /// the `&[T; N] -> &[T]` unsize cast (`try_construct_slice_datatype_from_cast`)
+    /// builds it with the EXACT static `N` and the tracked backing array — and
+    /// splice the referent's backing array into `fld_data` when one is tracked,
+    /// so neither half is lost. Falls back to the previous resolution order
+    /// whenever the receiver has no fat-pointer value, so nothing that used to
+    /// resolve stops resolving.
+    fn range_full_identity_value(&mut self, slice_arg: &Operand) -> Option<Expr> {
+        let through_ref = self.get_value_through_ref(slice_arg);
+        let own = self.codegen_operand(slice_arg);
+
+        if let Some(fat) = own.clone().filter(|e| super::extract_fat_ptr_metadata(e).is_some()) {
+            if let Some(backing) = through_ref.clone().filter(|e| e.sort().is_array())
+                && let Some(spliced) = Self::replace_fat_ptr_backing(&fat, &backing)
+            {
+                return Some(spliced);
+            }
+            return Some(fat);
+        }
+
+        through_ref.or(own)
+    }
+
+    /// Rebuild a fat-pointer datatype value with `fld_data` replaced by `backing`,
+    /// every other field projected out of the original. Returns None (caller keeps
+    /// the original untouched) unless `fat` really is a single-constructor datatype
+    /// carrying a `fld_data` field whose sort matches `backing`.
+    fn replace_fat_ptr_backing(fat: &Expr, backing: &Expr) -> Option<Expr> {
+        let sort = fat.sort().clone();
+        let dt = sort.datatype_sort()?;
+        if dt.constructors.len() != 1 {
+            return None;
+        }
+        let ctor = dt.constructors.first()?;
+        if !ctor.fields.iter().any(|f| &*f.name == "fld_data") {
+            return None;
+        }
+        let dt_name = dt.name.to_string();
+        let ctor_name = ctor.name.to_string();
+        let mut fields = Vec::with_capacity(ctor.fields.len());
+        for field in &ctor.fields {
+            if &*field.name == "fld_data" {
+                if &field.sort != backing.sort() {
+                    return None;
+                }
+                fields.push(backing.clone());
+            } else {
+                fields.push(fat.clone().field_select(
+                    dt_name.as_str(),
+                    &*field.name,
+                    field.sort.clone(),
+                ));
+            }
+        }
+        Some(Expr::datatype_constructor(dt_name.as_str(), ctor_name.as_str(), fields, sort.clone()))
+    }
+
+    /// Fat-pointer metadata (the slice LENGTH) read off the REFERENT of a
+    /// `&[T]` / `&str` operand, rather than off the pointer variable itself.
+    ///
+    /// `assign_reference_to_place` declares the destination of a reference
+    /// assignment with the destination's SORT and leaves it UNCONSTRAINED — it
+    /// constrains the pointee instead. For a thin pointer that is harmless (the
+    /// variable is just an address), but a slice reference's sort is the fat
+    /// pointer `Slice_T{fld_ptr, fld_len, fld_data}`, so selecting `fld_len`
+    /// straight off that variable yields a fresh unconstrained symbol. The slice
+    /// VALUE reached through `ref_pointees` is the constrained one, so read the
+    /// metadata there first.
+    ///
+    /// Returns None — caller keeps its existing fallback — unless the operand is
+    /// a pointer to a slice/str AND its referent is a datatype carrying `fld_len`
+    /// (a raw backing `Array` referent has no length and falls through).
+    pub(in crate::codegen_ay::statement) fn slice_len_through_ref(
+        &mut self,
+        operand: &Operand,
+    ) -> Option<Expr> {
+        let ty = operand.ty(self.body.locals()).into_option()?;
+        let pointee = match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _))
+            | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
+            _ => return None, // external enum: TyKind
+        };
+        if !matches!(
+            pointee.kind(),
+            TyKind::RigidTy(RigidTy::Slice(_)) | TyKind::RigidTy(RigidTy::Str)
+        ) {
+            return None;
+        }
+        let value = self.get_value_through_ref(operand)?;
+        let sort = value.sort().clone();
+        let dt = sort.datatype_sort()?;
+        let ctor = dt.constructors.first()?;
+        let len_sort = ctor.fields.iter().find(|f| &*f.name == "fld_len")?.sort.clone();
+        Some(value.field_select(&*dt.name, "fld_len", len_sort))
+    }
+
     fn is_range_full_index_operand(&self, operand: &Operand) -> bool {
-        operand.ty(self.body.locals()).into_option().is_some_and(|ty| {
-            matches!(
-                ty.kind(),
-                TyKind::RigidTy(RigidTy::Adt(def, _)) if def.trimmed_name() == "RangeFull"
-            )
-        })
+        self.is_exact_core_range_full_operand(operand)
     }
 
     /// True when the index operand is a non-full range (`a..b`, `..n`, `n..`,

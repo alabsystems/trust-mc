@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Copyright Kani Contributors
+# Modifications Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+set -eu
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+REPO_DIR="$(dirname $SCRIPT_DIR)"
+EXEC_NAME="$(basename "$0")"
+if [[ "${EXEC_NAME}" != "kani" ]]; then
+    EXEC_NAME="trust-mc"
+fi
+
+shopt -s nullglob
+
+# Look for trust-mc-driver in multiple locations
+# Part of #3149: Also search CARGO_TARGET_DIR for per-worker target directories.
+TRUST_MC_DRIVER=""
+_CARGO_TD="${CARGO_TARGET_DIR:-}"
+for candidate in \
+    "$REPO_DIR/target/trust-mc/bin/trust-mc-driver" \
+    ${_CARGO_TD:+"$REPO_DIR/$_CARGO_TD/release/trust-mc-driver"} \
+    "$REPO_DIR/target/release/trust-mc-driver" \
+    "$REPO_DIR/target/debug/trust-mc-driver"
+do
+    if [[ -x "$candidate" ]]; then
+        TRUST_MC_DRIVER="$candidate"
+        break
+    fi
+done
+
+if [[ -z "${TRUST_MC_DRIVER}" ]]
+then
+    echo "ERROR: Could not find trust-mc-driver binary."
+    echo "Looked in:"
+    echo "  - $REPO_DIR/target/trust-mc/bin/trust-mc-driver"
+    [[ -n "$_CARGO_TD" ]] && echo "  - $REPO_DIR/$_CARGO_TD/release/trust-mc-driver"
+    echo "  - $REPO_DIR/target/release/trust-mc-driver"
+    echo "  - $REPO_DIR/target/debug/trust-mc-driver"
+    echo "Was trust-mc successfully built first? (cargo build -p trust-mc-driver --release)"
+    exit 1
+fi
+
+exec -a "${EXEC_NAME}" "${TRUST_MC_DRIVER}" "$@"

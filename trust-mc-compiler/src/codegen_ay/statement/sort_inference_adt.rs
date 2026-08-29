@@ -244,6 +244,171 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         None // Not a well-known type; fall through to infer_adt_sort
     }
 
+    /// The sort a *sort-erased wrapper* was flattened to, when `Field` through it
+    /// is the IDENTITY on the term.
+    ///
+    /// [`Self::infer_wellknown_adt_from_ty`] deliberately maps a family of
+    /// single-payload wrappers — `ManuallyDrop<T>`, `MaybeUninit<T>`, `NonZero<T>`,
+    /// and the interior-mutable `UnsafeCell<T>`/`Cell<T>`/`Mutex<T>` that the gate
+    /// below then excludes — straight to the sort of the payload. The term for
+    /// such a local is therefore the payload term, not a one-field datatype, and
+    /// MIR's `Field(N)` through the wrapper (`ManuallyDrop::into_inner` is
+    /// literally `slot.value`) has nothing to select: it must be the identity.
+    /// Returns `Some(erased_sort)` exactly when all four hold for `base_ty`'s
+    /// field `field_idx` of type `field_ty`:
+    ///
+    /// 1. `base_ty` is a `struct`/`union` ADT — single variant, so there is no
+    ///    variant to get wrong;
+    /// 2. it has exactly one non-ZST field and `field_idx` IS that field, so the
+    ///    wrapper really is single-payload;
+    /// 3. sort inference gives it a NON-datatype sort, i.e. it really was erased
+    ///    (an ordinary `struct S(u8)` gets a datatype and is handled by the normal
+    ///    field-select path, never here); and
+    /// 4. the field being projected is represented by that SAME sort, i.e. it is
+    ///    the slot the wrapper was erased to.
+    ///
+    /// (2) and (4) together are what keep a union honest. `MaybeUninit<u8>` erases
+    /// to `bv8`; its field `value: ManuallyDrop<u8>` is its only non-ZST field and
+    /// also erases to `bv8`, so it passes. Its `uninit: ()` is a ZST and is not the
+    /// payload, so reading *that* field is refused. A user-written `union` is
+    /// refused by (3): [`Self::infer_adt_sort`] gives `AdtKind::Union` no sort.
+    ///
+    /// # Not a width test
+    ///
+    /// Unlike `provenance::is_transparent_pointer_wrapper_repr` — which accepts any
+    /// `bv64`, a plain `u64` included, and whose docs put widening it out of scope
+    /// — this is TYPE-directed and re-derives the erasure decision from the MIR
+    /// types. Pointer-width wrappers are deliberately EXCLUDED here so that
+    /// `NonNull`/`Unique`/`Box` keep their existing, separately-documented
+    /// treatment: this predicate answers only for the wrappers that previously
+    /// fell through to a fail-closed.
+    ///
+    /// # One definition, both directions
+    ///
+    /// The read side (`apply_projection_chain`) uses it to make the projection the
+    /// identity; the write side (`track_ref_pointees`) uses it to give
+    /// `&mut (wrapper.N)` the wrapper's OWN ssa base name, because that borrow
+    /// refers to the very same storage. If only one side knew, a write would land
+    /// in a different slot than the read — the misalignment shape that fabricates
+    /// proofs.
+    #[must_use]
+    pub(super) fn erased_wrapper_field_sort(
+        base_ty: rustc_public::ty::Ty,
+        field_idx: usize,
+        field_ty: rustc_public::ty::Ty,
+    ) -> Option<Sort> {
+        let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, args)) =
+            base_ty.kind()
+        else {
+            return None;
+        };
+        if !matches!(def.kind(), AdtKind::Struct | AdtKind::Union) {
+            return None;
+        }
+        // The wrapper must be genuinely SINGLE-PAYLOAD, and `field_idx` must BE
+        // that payload. Sort inference also models some MULTI-field ADTs as a
+        // scalar — `BigInt { sign, data }` and `Ratio { numer, denom }` are each
+        // one `Int` — and through those `Field` is emphatically not the identity:
+        // reading `Ratio.numer` would hand back the whole ratio. Counting the
+        // non-ZST fields is what separates "erased because it IS its payload"
+        // from "modelled as a scalar".
+        let mut payload = None;
+        for (idx, f) in def.variants().first()?.fields().iter().enumerate() {
+            if Self::layout_is_zst(f.ty_with_args(&args)) {
+                continue;
+            }
+            if payload.is_some() {
+                return None;
+            }
+            payload = Some(idx);
+        }
+        if payload != Some(field_idx) {
+            return None;
+        }
+        let base_sort = Self::infer_sort_from_ty(base_ty)?;
+        if base_sort.is_datatype()
+            || crate::codegen_ay::provenance::is_transparent_pointer_wrapper_repr(&base_sort)
+        {
+            return None;
+        }
+        // INTERIOR MUTABILITY IS EXCLUDED, and that is a soundness gate, not
+        // conservatism. `Cell<T>`/`UnsafeCell<T>` are erased wrappers too, but
+        // their payload is written through a RAW pointer minted by
+        // `UnsafeCell::get` — a path that never goes through the borrow whose name
+        // `track_ref_pointees` aligns. Make the read an identity there and
+        // `c.set(9); c.get()` reads the pre-`set` value, so `v == 7` PROVES.
+        // Measured, not assumed. These therefore keep failing closed, as before.
+        if Self::contains_unsafe_cell(base_ty, 0) {
+            return None;
+        }
+        if Self::infer_sort_from_ty(field_ty)? != base_sort {
+            return None;
+        }
+        Some(base_sort)
+    }
+
+    /// Whether `ty` occupies no bytes. The same layout test `infer_adt_sort` uses
+    /// to collapse a ZST struct, so the two agree; unlike `is_zst_type` it also
+    /// sees `PhantomData` and other all-ZST composites. A type whose layout
+    /// cannot be computed answers `false`, which only ever makes the caller
+    /// refuse.
+    fn layout_is_zst(ty: rustc_public::ty::Ty) -> bool {
+        ty.layout().ok().is_some_and(|l| l.shape().is_sized() && l.shape().size.bytes() == 0)
+    }
+
+    /// Whether `ty` may contain an `UnsafeCell` — the sole primitive of interior
+    /// mutability — anywhere in its own representation. FAIL-CLOSED: any type this
+    /// cannot fully inspect (generic param, alias, `dyn`, closure, foreign, or a
+    /// walk deeper than the bound) answers `true`.
+    ///
+    /// Deliberately distinct from `codegen_assign_ref`'s `definitely_freeze`, which
+    /// answers a stricter question for the durable-snapshot publish and refuses
+    /// EVERY union outright. Here a union is exactly what must be looked inside:
+    /// `MaybeUninit<T>` is a union with no interior mutability at all, and refusing
+    /// it would leave `assume_init` failing closed for no reason.
+    fn contains_unsafe_cell(ty: rustc_public::ty::Ty, depth: u32) -> bool {
+        use rustc_public::ty::{RigidTy, TyKind};
+        if depth > 16 {
+            return true;
+        }
+        let TyKind::RigidTy(rigid) = ty.kind() else {
+            return true; // generic param / alias / bound: not certain
+        };
+        match rigid {
+            RigidTy::Bool
+            | RigidTy::Char
+            | RigidTy::Int(_)
+            | RigidTy::Uint(_)
+            | RigidTy::Float(_)
+            | RigidTy::Str
+            | RigidTy::Never
+            | RigidTy::FnDef(..)
+            | RigidTy::FnPtr(_)
+            // Pointer-like: the pointer's own bytes carry no interior mutability;
+            // the pointee is a separate allocation, not part of this representation.
+            | RigidTy::RawPtr(..)
+            | RigidTy::Ref(..) => false,
+            RigidTy::Array(elem, _) | RigidTy::Slice(elem) | RigidTy::Pat(elem, _) => {
+                Self::contains_unsafe_cell(elem, depth + 1)
+            }
+            RigidTy::Tuple(tys) => {
+                tys.into_iter().any(|t| Self::contains_unsafe_cell(t, depth + 1))
+            }
+            RigidTy::Adt(def, args) => {
+                if def.trimmed_name() == "UnsafeCell" {
+                    return true;
+                }
+                def.variants().into_iter().any(|v| {
+                    v.fields()
+                        .into_iter()
+                        .any(|f| Self::contains_unsafe_cell(f.ty_with_args(&args), depth + 1))
+                })
+            }
+            // Foreign / Closure / Coroutine* / Dynamic / CoroutineWitness: opaque.
+            _ => true,
+        }
+    }
+
     /// Infer AY sort for ADT (enum/struct) types.
     ///
     /// For unit enums (all variants have no fields), encodes as bitvector representing

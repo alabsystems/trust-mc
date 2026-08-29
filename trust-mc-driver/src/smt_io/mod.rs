@@ -23,7 +23,8 @@ pub(crate) use classifier::{
     SmtLogicClass, classify_smt_logic_from_content, content_uses_horn_logic,
 };
 pub(crate) use declarations::{
-    build_cover_sat_query, build_cover_sat_query_for_chc, extract_cover_declarations_from_content,
-    extract_coverage_declarations_from_content, extract_reach_declarations_from_content,
-    extract_violation_declarations_from_content, strip_cover_assertions_for_chc_solver,
+    build_cover_sat_query, build_cover_sat_query_for_chc, build_harness_reachability_query,
+    extract_cover_declarations_from_content, extract_coverage_declarations_from_content,
+    extract_reach_declarations_from_content, extract_violation_declarations_from_content,
+    strip_cover_assertions_for_chc_solver,
 };

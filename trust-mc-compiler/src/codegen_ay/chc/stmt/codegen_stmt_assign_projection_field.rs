@@ -138,7 +138,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     coerce_bitvec_width_safe(raw, POINTER_WIDTH, SignExtension::ZeroExtend)
                 }
                 ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    let actual_index = constant_index_offset(*offset, *min_length, *from_end);
+                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                    let Some(actual_index) = constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        return false;
+                    };
                     Expr::bitvec_const(actual_index as u128, POINTER_WIDTH)
                 }
                 _ => return false,
@@ -225,7 +229,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 coerce_bitvec_width_safe(raw, POINTER_WIDTH, SignExtension::ZeroExtend)
             }
             ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                let actual = constant_index_offset(*offset, *min_length, *from_end);
+                // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                let Some(actual) = constant_index_offset(*offset, *min_length, *from_end) else {
+                    return false;
+                };
                 Expr::bitvec_const(actual as u128, POINTER_WIDTH)
             }
             _ => return false,

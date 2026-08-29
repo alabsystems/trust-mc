@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use ay::chc::engines;
 use ay::chc::{
-    AdaptiveConfig, AdaptivePortfolio, BmcConfig, ChcExpr, ChcParser, ChcSort, ChcStatistics,
-    InvariantModel, LemmaHint, PredicateId,
+    AdaptiveConfig, AdaptivePortfolio, BmcConfig, CancellationToken, ChcExpr, ChcParser, ChcSort,
+    ChcStatistics, InvariantModel, LemmaHint, PredicateId,
 };
 use ay_chc::ChcPdrProofRun;
 use regex::Regex;
@@ -32,12 +32,34 @@ use super::smt_analysis::{
 };
 use super::{ChcSolverResult, acyclicity, auto_invariants, loop_hints, proof_core};
 
+/// How long a guard waits for a cancelled solve lane to wind down.
+///
+/// Cancellation in ay-chc is cooperative: the token is polled at stage
+/// boundaries and inside the engine loops, so a lane stops promptly but not
+/// instantly. Waiting bounds the CPU overlap between an abandoned lane and
+/// whatever runs next; the bound keeps a wedged engine from turning the guard
+/// into a hang. Exceeding it is not an error — we log it and move on, which is
+/// exactly the old orphaning behaviour, so this can only ever be an improvement
+/// on it.
+const GUARD_CANCEL_DRAIN_SECS: u64 = 3;
+
 macro_rules! solver_stdout {
     ($($arg:tt)*) => {{
-        use std::io::Write;
-        let stdout = std::io::stdout();
-        let mut handle = stdout.lock();
-        let _ = writeln!(handle, $($arg)*);
+        // Honor `--quiet` ("no output, just an exit code and requested
+        // artifacts"): this macro used to write straight to stdout, so a quiet
+        // run still printed `[AY:PROOF] CHC verification: ...` and the other
+        // solver markers. The gate lives in the macro rather than at the ~70
+        // call sites because several of them are free functions with no
+        // `&KaniSession` in reach. Only the WRITE is skipped — the verdict and
+        // the exit code are untouched — and with `--quiet` absent the bytes
+        // are identical to before, which is what `scripts/ay-compiletest.sh`
+        // parses.
+        if !crate::args::common::quiet_output() {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            let _ = writeln!(handle, $($arg)*);
+        }
     }};
 }
 
@@ -362,9 +384,9 @@ fn ay_chc_proof_run_artifact_descriptor(
     artifact: &ay_chc::ChcProofRunArtifact,
 ) -> serde_json::Value {
     serde_json::json!({
-        "schema": artifact.schema,
-        "role": artifact.role,
-        "digest": artifact.digest.to_json_value(),
+        "schema": artifact.schema(),
+        "role": artifact.role(),
+        "digest": artifact.digest().to_json_value(),
     })
 }
 
@@ -373,14 +395,14 @@ fn pdr_proof_run_verdict(
     problem: &ay_chc::ChcProblem,
     obligation_id: &str,
 ) -> trust_mc_core::FullVerificationVerdict {
-    let metadata = run.metadata.to_json_value();
-    if !run.accepted_as_proof() || !run.metadata.accepted_as_proof {
+    let metadata = run.metadata().to_json_value();
+    if !run.accepted_as_proof() || !run.metadata().accepted_as_proof() {
         return trust_mc_core::FullVerificationVerdict::Unknown {
             reason: "ay ChcPdrProofRun was not accepted_as_proof".to_string(),
         };
     }
 
-    match &run.result {
+    match &run.result() {
         ay_chc::VerifiedChcResult::Safe(verified_inv) => {
             let normalized_input = ay_chc::normalized_chc_input(problem);
             let obligation = trust_mc_core::MirDerivedChcPdrObligation::new(
@@ -388,7 +410,7 @@ fn pdr_proof_run_verdict(
                 trust_mc_core::MirObligationKind::Assertion,
                 &normalized_input,
             );
-            if obligation.normalized_input_hash.value != run.metadata.normalized_input_sha256 {
+            if obligation.normalized_input_hash.value != run.metadata().normalized_input_sha256() {
                 return trust_mc_core::FullVerificationVerdict::Unknown {
                     reason: "ay normalized input hash does not match trust-mc evidence hash"
                         .to_string(),
@@ -399,9 +421,9 @@ fn pdr_proof_run_verdict(
                 relation_count: problem.predicates().len(),
                 clause_count: problem.clauses().len(),
             };
-            let proof_run_artifacts = run.proof_run_artifacts(problem);
+            let proof_run_artifacts = run.proof_run_artifacts();
             let Some(invariant_model_artifact) =
-                proof_run_artifacts.quantifier_free_invariant_model.as_ref()
+                proof_run_artifacts.quantifier_free_invariant_model()
             else {
                 return trust_mc_core::FullVerificationVerdict::Unknown {
                     reason:
@@ -409,15 +431,15 @@ fn pdr_proof_run_verdict(
                             .to_string(),
                 };
             };
-            let transcript_bytes = proof_run_artifacts.replay_transcript.bytes().to_vec();
+            let transcript_bytes = proof_run_artifacts.replay_transcript().bytes().to_vec();
             let transcript_hash = trust_mc_core::EvidenceHash::sha256_bytes(&transcript_bytes);
             let invariant_model_bytes = invariant_model_artifact.bytes().to_vec();
-            let consumer_evidence = run.consumer_evidence(problem).to_json_value();
+            let consumer_evidence = run.consumer_evidence().to_json_value();
             let replay = serde_json::json!({
                 "schema": "trust_mc.chc-pdr-proof-replay/v3",
                 "source": "ay_chc::ChcPdrProofRun::proof_run_artifacts",
                 "ay_candidate_accepted": run.accepted_as_proof(),
-                "normalized_input_sha256": run.metadata.normalized_input_sha256,
+                "normalized_input_sha256": run.metadata().normalized_input_sha256(),
                 "referenced_solver_transcript": {
                     "kind": "solver_transcript",
                     "algorithm": transcript_hash.algorithm,
@@ -428,10 +450,10 @@ fn pdr_proof_run_verdict(
                         invariant_model_artifact
                     ),
                     "diagnostic_model_metadata": ay_chc_proof_run_artifact_descriptor(
-                        &proof_run_artifacts.model
+                        &proof_run_artifacts.model()
                     ),
                     "replay_transcript": ay_chc_proof_run_artifact_descriptor(
-                        &proof_run_artifacts.replay_transcript
+                        &proof_run_artifacts.replay_transcript()
                     ),
                 },
                 "ay_consumer_evidence": consumer_evidence.clone(),
@@ -443,8 +465,8 @@ fn pdr_proof_run_verdict(
                 "schema": "trust_mc.chc-pdr-checked-proof-report/v3",
                 "ay_candidate_accepted": run.accepted_as_proof(),
                 "problem_kind": "chc-pdr",
-                "proof_status": run.metadata.proof_status,
-                "result": run.metadata.result,
+                "proof_status": run.metadata().proof_status(),
+                "result": run.metadata().result(),
                 "replay_check_status": {
                     "replay": "not-run-by-private-consumer",
                     "check": "unknown",
@@ -456,10 +478,10 @@ fn pdr_proof_run_verdict(
                         invariant_model_artifact
                     ),
                     "diagnostic_model_metadata": ay_chc_proof_run_artifact_descriptor(
-                        &proof_run_artifacts.model
+                        &proof_run_artifacts.model()
                     ),
                     "replay_transcript": ay_chc_proof_run_artifact_descriptor(
-                        &proof_run_artifacts.replay_transcript
+                        &proof_run_artifacts.replay_transcript()
                     ),
                     "replay_log": {
                         "algorithm": replay_log_hash.algorithm,
@@ -851,11 +873,15 @@ impl KaniSession {
                 );
             }
 
+            // Cancellable so the guard below can stop this lane instead of
+            // orphaning it (see the twin comment on the portfolio guard).
+            let bmc_cancel = CancellationToken::new();
             let bmc_config = BmcConfig::default()
                 .with_max_depth(depth)
                 .with_acyclic_safe(true)
                 .with_time_budget(full_timeout)
                 .with_per_depth_timeout(native_bmc_per_depth_timeout(full_timeout))
+                .with_cancellation(bmc_cancel.clone())
                 .with_verbose(self.args.common_args.verbose);
 
             // Clone the problem so we can fall through to portfolio when BMC
@@ -866,42 +892,63 @@ impl KaniSession {
             // through to the portfolio solver instead of crashing the driver.
             // Part of #4184.
             //
-            // Run on a guarded thread with a recv timeout: ay's BMC engine can
-            // ignore its time budget during exact/polynomial DAG encoding
-            // construction (ay bug — confirmed unbounded >150s hang on
+            // Run on a guarded thread with a recv timeout. The guard is belt
+            // and braces: the original reason was an ay bug where the BMC
+            // engine ignored its time budget during exact/polynomial DAG
+            // encoding construction (confirmed unbounded >150s hang on
             // coroutine-shaped acyclic problems, e.g. Coroutines
-            // iterator-count), and an unguarded in-process call would run past
-            // the per-harness deadline until the process watchdog hard-exits
-            // the driver (a DriverTimeout wall-kill instead of an honest
-            // per-harness UNKNOWN). KNOWN-UNCANCELLABLE: same abandonment
-            // policy as the portfolio guard below — the orphaned thread keeps
-            // burning CPU until its internal budgets expire or the process
-            // exits. On guard timeout, fall through to the (guarded)
-            // portfolio; fail-closed, since abandoning BMC only skips a
-            // shortcut and never asserts a verdict.
+            // iterator-count). That bug is FIXED upstream — the inference
+            // fixpoints and per-clause compile loops now poll the lane deadline
+            // and bail (`ay-chc bmc/mod.rs`, `solve_acyclic_polynomial_dag_once`
+            // and the `budget_exhausted` returns). We keep the guard because it
+            // also covers panics and any future budget escape, not because the
+            // lane is known to run away.
+            //
+            // The lane is cancellable (`BmcConfig::with_cancellation`), so on
+            // guard timeout we cancel and briefly drain rather than orphan a
+            // CPU-burning thread into the portfolio's lap. Falling through is
+            // still fail-closed: abandoning BMC only skips a shortcut and never
+            // asserts a verdict.
             let problem_for_bmc = problem.clone();
             let (bmc_tx, bmc_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    let result = engines::solve_bmc_only(problem_for_bmc.clone(), bmc_config);
-                    let proof_transcript_metadata = match &result {
-                        ay::chc::VerifiedChcResult::Safe(_)
-                        | ay::chc::VerifiedChcResult::Unsafe(_) => Some(
-                            // Item-7 swap: run the budget-capped CHECKED
-                            // replay pass so a genuine proof emits the full
-                            // Route-B admission fields instead of the
-                            // always-rejected metadata-only stub. Fail-closed
-                            // to the old metadata on any replay shortfall
-                            // (see checked_replay_budget).
-                            result
-                                .checked_proof_transcript_metadata(
-                                    &problem_for_bmc,
-                                    "bmc-acyclic",
-                                    checked_replay_budget(full_timeout),
-                                )
-                                .to_json_value(),
+                    // AY now binds a proof run to the problem it solved
+                    // (`ChcPdrProofRun`), and its constructor is crate-private,
+                    // so evidence can no longer be minted from a free-floating
+                    // `VerifiedChcResult` — which is the point of the change: a
+                    // certificate cannot describe a problem other than the one
+                    // solved.
+                    //
+                    // `solve_bmc_proof_with_checked_replay` is AY's own
+                    // replacement for the old
+                    // `checked_proof_transcript_metadata(problem, "bmc-acyclic",
+                    // budget)` one-shot: it runs BMC-only evidence mode and then
+                    // the budget-capped CHECKED replay pass, failing closed to
+                    // metadata-only exactly as before.
+                    let bound = engines::solve_bmc_proof_with_checked_replay(
+                        problem_for_bmc.clone(),
+                        bmc_config.clone(),
+                        checked_replay_budget(full_timeout),
+                    );
+                    let (result, proof_transcript_metadata) = match bound {
+                        Ok(run) => {
+                            let metadata = match run.result() {
+                                ay::chc::VerifiedChcResult::Safe(_)
+                                | ay::chc::VerifiedChcResult::Unsafe(_) => {
+                                    Some(run.metadata().to_json_value())
+                                }
+                                _ => None,
+                            };
+                            (run.result().clone(), metadata)
+                        }
+                        // Only an internal panic reaches here (the call is
+                        // panic-caught). Keep the pre-existing behaviour for
+                        // that case: take the BMC verdict, publish no evidence.
+                        Err(_) => (
+                            engines::solve_bmc_only(problem_for_bmc.clone(), bmc_config),
+                            None,
                         ),
-                        _ => None,
                     };
                     (result, proof_transcript_metadata)
                 }));
@@ -911,10 +958,23 @@ impl KaniSession {
             let bmc_result = match bmc_rx.recv_timeout(bmc_guard_timeout) {
                 Ok(outcome) => Some(outcome),
                 Err(RecvTimeoutError::Timeout) => {
+                    // Cancel before falling through: the portfolio is about to
+                    // start, and an orphaned BMC lane would compete with it for
+                    // the same cores on the same problem.
+                    bmc_cancel.cancel();
+                    let wound_down = bmc_rx
+                        .recv_timeout(Duration::from_secs(GUARD_CANCEL_DRAIN_SECS))
+                        .is_ok();
                     solver_stdout!(
                         "[AY-chc] Acyclic BMC lane exceeded guard timeout ({:?}) — \
-                         abandoning BMC shortcut, falling through to portfolio",
-                        bmc_guard_timeout
+                         cancelled ({}), abandoning BMC shortcut, falling through \
+                         to portfolio",
+                        bmc_guard_timeout,
+                        if wound_down {
+                            "wound down"
+                        } else {
+                            "still winding down"
+                        }
                     );
                     None
                 }
@@ -1163,27 +1223,46 @@ impl KaniSession {
         pdr_proof_config.user_hints = adaptive_config.user_hints.clone();
         let pdr_proof_obligation_id = _harness.pretty_name.clone();
         let solver = AdaptivePortfolio::new(problem, adaptive_config);
-        // KNOWN-UNCANCELLABLE: the native CHC solve below runs in-process on
-        // a detached thread with no cancellation token — ay's engine APIs
-        // expose none. When the guard timeout fires we abandon the thread
-        // (rx times out, the thread's eventual `tx.send` is dropped) and
-        // convert the harness to UNKNOWN; the orphaned thread keeps burning
-        // CPU/memory until the engines' own internal budgets expire or the
-        // driver process exits. The driver itself stays responsive (the
-        // suite never hangs on it), and the wall-clock watchdog remains the
-        // final backstop if the orphan starves the rest of the run.
+        // COOPERATIVELY CANCELLABLE: the native CHC solve below runs in-process
+        // on a detached thread, but we hold a cancellation handle for it, so
+        // the guard-timeout path cancels instead of orphaning.
+        //
+        // This previously read KNOWN-UNCANCELLABLE ("ay's engine APIs expose
+        // none"), which is stale: `AdaptivePortfolio::cancellation_handle`
+        // exists and its own doc names *this* guard path as the motivating use
+        // case. The token is observed by the adaptive stage scheduler at every
+        // stage-boundary budget check and is linked upstream into the per-lane
+        // engine tokens, so the running engine bails cooperatively too.
+        //
+        // Why it matters beyond tidiness: an orphaned solve keeps burning
+        // CPU/memory until its internal budgets expire, *while* the driver goes
+        // on to run the portfolio and then the next harness. Under `--jobs N`
+        // that double-spend starves sibling harnesses, which is how a SHORTER
+        // per-harness budget can cost more wall clock than a longer one.
+        //
+        // Cancellation can only degrade a verdict to Unknown, never flip
+        // Safe/Unsafe, and we bail to UNKNOWN on this path regardless — so this
+        // cannot change any answer, only stop paying for one we discarded.
+        let portfolio_cancel = solver.cancellation_handle();
         let guard_timeout = timeout + Duration::from_secs(5);
         let bmc_verbose = self.args.common_args.verbose;
         let (tx, rx) = std::sync::mpsc::channel();
         let solver_thread = std::thread::spawn(move || {
             let solve_result = ay::catch_ay_panics(
                 std::panic::AssertUnwindSafe(|| {
-                    let (verified, report) = match solve_mode {
+                    let (verified, report, bound_run) = match solve_mode {
                         NativeSolveMode::AdaptivePortfolio => {
                             // Match the production ay CLI validation path. The budget-report
                             // route has separate prepasses and must not be treated as the
                             // authoritative proof result for replacement evidence.
-                            (solver.solve(), None::<ay_chc::BudgetReport>)
+                            //
+                            // `solve_proof_run` is the problem-BOUND form: AY
+                            // seals the solved problem into the run so evidence
+                            // cannot describe a different one. It replaces
+                            // minting metadata from a loose `VerifiedChcResult`,
+                            // which AY no longer permits.
+                            let run = solver.solve_proof_run();
+                            (run.result().clone(), None::<ay_chc::BudgetReport>, Some(run))
                         }
                         NativeSolveMode::PrimaryEngineOnly => {
                             let run = match ay_chc::engines::solve_pdr_proof(
@@ -1200,9 +1279,9 @@ impl KaniSession {
                                 &pdr_proof_problem,
                                 &pdr_proof_obligation_id,
                             );
-                            let proof_transcript_metadata = Some(run.metadata.to_json_value());
+                            let proof_transcript_metadata = Some(run.metadata().to_json_value());
                             return Ok((
-                                run.result,
+                                run.result().clone(),
                                 None,
                                 proof_transcript_metadata,
                                 Some(native_full_verification_verdict),
@@ -1214,23 +1293,29 @@ impl KaniSession {
                                 full_timeout,
                                 bmc_verbose,
                             );
-                            (solver.solve_bmc_only(bmc_config), None)
+                            match ay_chc::engines::solve_bmc_proof_with_checked_replay(
+                                solver.problem().clone(),
+                                bmc_config.clone(),
+                                checked_replay_budget(timeout),
+                            ) {
+                                Ok(run) => (run.result().clone(), None, Some(run)),
+                                // Panic-caught internally; keep the verdict and
+                                // publish no evidence, as before.
+                                Err(_) => (solver.solve_bmc_only(bmc_config), None, None),
+                            }
                         }
                     };
-                    let proof_transcript_metadata = match &verified {
-                        ay::chc::VerifiedChcResult::Safe(_)
-                        | ay::chc::VerifiedChcResult::Unsafe(_) => Some(
-                            // Item-7 swap (portfolio path): same budget-capped
-                            // CHECKED replay as the acyclic-BMC lane above;
-                            // fail-closed to metadata-only on any shortfall.
-                            verified
-                                .checked_proof_transcript_metadata(
-                                    solver.problem(),
-                                    solve_mode.label(),
-                                    checked_replay_budget(timeout),
-                                )
-                                .to_json_value(),
-                        ),
+                    // Item-7 (portfolio path): the CHECKED replay pass now runs
+                    // inside the bound solve, so the metadata read here is
+                    // already the upgraded one, and is metadata-only whenever
+                    // the replay fell short — the same fail-closed outcome the
+                    // one-shot call used to produce.
+                    let proof_transcript_metadata = match (&verified, &bound_run) {
+                        (
+                            ay::chc::VerifiedChcResult::Safe(_)
+                            | ay::chc::VerifiedChcResult::Unsafe(_),
+                            Some(run),
+                        ) => Some(run.metadata().to_json_value()),
                         _ => None,
                     };
                     Ok((verified, report, proof_transcript_metadata, None))
@@ -1270,11 +1355,24 @@ impl KaniSession {
                 }
             },
             Err(RecvTimeoutError::Timeout) => {
+                // Stop paying for a solve whose answer we have already decided
+                // to discard, before the next harness starts competing for the
+                // same cores. Bounded drain so a wedged engine cannot convert
+                // this into a hang; the drained result is deliberately unused.
+                portfolio_cancel.cancel();
+                let wound_down = rx
+                    .recv_timeout(Duration::from_secs(GUARD_CANCEL_DRAIN_SECS))
+                    .is_ok();
                 solver_stdout!(
                     "[AY-chc] {} exceeded guard timeout ({:?}) — \
-                     returning UNKNOWN",
+                     cancelled ({}), returning UNKNOWN",
                     solve_mode.label(),
-                    guard_timeout
+                    guard_timeout,
+                    if wound_down {
+                        "wound down"
+                    } else {
+                        "still winding down"
+                    }
                 );
                 solver_stdout!("[AY:UNKNOWN] CHC verification: solver returned unknown");
                 // No budget_report available on guard-timeout; still emit
@@ -1515,10 +1613,11 @@ mod pdr_proof_run_tests {
         )
         .expect("test CHC should solve");
 
-        let metadata = run
-            .result
-            .checked_proof_transcript_metadata(&problem, "pdr", Duration::ZERO)
-            .to_json_value();
+        // `checked_proof_transcript_metadata` on a loose result is gone: AY now
+        // seals the solved problem into the run. A zero replay budget cannot
+        // upgrade the transcript, so the run's own metadata is exactly what the
+        // old call produced here — metadata-only, not admissible.
+        let metadata = run.metadata().to_json_value();
 
         assert_eq!(metadata["trust_full_verifier_admissible"], false);
         assert_ne!(metadata["replay"]["status"], "replayable");
@@ -1548,13 +1647,12 @@ mod pdr_proof_run_tests {
         .expect("test CHC should solve");
 
         assert!(run.accepted_as_proof());
-        let proof_run_artifacts = run.proof_run_artifacts(&problem);
+        let proof_run_artifacts = run.proof_run_artifacts();
         let expected_transcript_hash = trust_mc_core::EvidenceHash::sha256_bytes(
-            proof_run_artifacts.replay_transcript.bytes(),
+            proof_run_artifacts.replay_transcript().bytes(),
         );
         let expected_invariant = proof_run_artifacts
-            .quantifier_free_invariant_model
-            .as_ref()
+            .quantifier_free_invariant_model()
             .expect("Safe PDR run must carry its actual QF invariant");
         let expected_model_hash =
             trust_mc_core::EvidenceHash::sha256_bytes(expected_invariant.bytes());
@@ -1585,11 +1683,11 @@ mod pdr_proof_run_tests {
         assert_eq!(transcript.digest.as_ref(), Some(&expected_transcript_hash));
         assert_eq!(
             transcript.byte_len,
-            Some(proof_run_artifacts.replay_transcript.bytes().len() as u64)
+            Some(proof_run_artifacts.replay_transcript().bytes().len() as u64)
         );
         assert_eq!(
             transcript.materialized_bytes(),
-            Some(proof_run_artifacts.replay_transcript.bytes())
+            Some(proof_run_artifacts.replay_transcript().bytes())
         );
         let replay = proof
             .artifacts

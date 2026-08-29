@@ -116,6 +116,14 @@ pub(crate) struct Arguments {
     /// Turn off undefined foreign function checks.
     #[arg(long)]
     pub no_undefined_function_checks: bool,
+    /// C source/library files supplied with `--c-lib` (requires `-Z c-ffi`).
+    ///
+    /// The encoder uses these only to answer a GATING question: does a
+    /// definition for an `extern "C"` symbol exist somewhere on this run? A
+    /// symbol nobody supplied keeps Kani's fail-closed `assert(false)`; a
+    /// symbol the user did supply is modelled with a sound effect frame.
+    #[arg(long = "c-lib", num_args(1), value_name = "C_LIB")]
+    pub c_lib: Vec<String>,
     /// Emit NaN-generation obligations for float arithmetic (opt-in).
     ///
     /// OFF by default, matching Kani: producing a NaN is DEFINED behaviour in

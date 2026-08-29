@@ -1,0 +1,462 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn test_cmp_equal() -> () {
+    let mut _0: ();
+    let _1: u8;
+    let mut _4: &u8;
+    let _5: &u8;
+    let _6: ();
+    let mut _7: bool;
+    let mut _8: &std::cmp::Ordering;
+    let mut _9: &std::cmp::Ordering;
+    scope 1 {
+        debug a => _1;
+        let _2: u8;
+        scope 2 {
+            debug b => _2;
+            let _3: std::cmp::Ordering;
+            scope 3 {
+                debug result => _3;
+            }
+        }
+    }
+
+    bb0: {
+        StorageLive(_1);
+        _1 = const 5_u8;
+        StorageLive(_2);
+        _2 = const 5_u8;
+        StorageLive(_3);
+        StorageLive(_4);
+        _4 = &_1;
+        _5 = &_2;
+        _3 = <u8 as std::cmp::Ord>::cmp(move _4, copy _5) -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        StorageDead(_4);
+        StorageLive(_7);
+        StorageLive(_8);
+        _8 = &_3;
+        StorageLive(_9);
+        _9 = const test_cmp_equal::promoted[0];
+        _7 = <std::cmp::Ordering as std::cmp::PartialEq>::eq(move _8, move _9) -> [return: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        StorageDead(_9);
+        StorageDead(_8);
+        _6 = kani::assert(move _7, const "cmp(5, 5) should be Equal") -> [return: bb3, unwind unreachable];
+    }
+
+    bb3: {
+        StorageDead(_7);
+        StorageDead(_3);
+        StorageDead(_2);
+        StorageDead(_1);
+        return;
+    }
+}
+
+alloc1 (size: 25, align: 1) {
+    0x00 │ 63 6d 70 28 35 2c 20 35 29 20 73 68 6f 75 6c 64 │ cmp(5, 5) should
+    0x10 │ 20 62 65 20 45 71 75 61 6c                      │  be Equal
+}
+
+const test_cmp_equal::promoted[0]: &std::cmp::Ordering = {
+    let mut _0: &std::cmp::Ordering;
+    let mut _1: std::cmp::Ordering;
+
+    bb0: {
+        _1 = std::cmp::Ordering::Equal;
+        _0 = &_1;
+        return;
+    }
+}
+
+fn test_cmp_less() -> () {
+    let mut _0: ();
+    let _1: u8;
+    let mut _4: &u8;
+    let _5: &u8;
+    let _6: ();
+    let mut _7: bool;
+    let mut _8: &std::cmp::Ordering;
+    let mut _9: &std::cmp::Ordering;
+    scope 1 {
+        debug a => _1;
+        let _2: u8;
+        scope 2 {
+            debug b => _2;
+            let _3: std::cmp::Ordering;
+            scope 3 {
+                debug result => _3;
+            }
+        }
+    }
+
+    bb0: {
+        StorageLive(_1);
+        _1 = const 3_u8;
+        StorageLive(_2);
+        _2 = const 7_u8;
+        StorageLive(_3);
+        StorageLive(_4);
+        _4 = &_1;
+        _5 = &_2;
+        _3 = <u8 as std::cmp::Ord>::cmp(move _4, copy _5) -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        StorageDead(_4);
+        StorageLive(_7);
+        StorageLive(_8);
+        _8 = &_3;
+        StorageLive(_9);
+        _9 = const test_cmp_less::promoted[0];
+        _7 = <std::cmp::Ordering as std::cmp::PartialEq>::eq(move _8, move _9) -> [return: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        StorageDead(_9);
+        StorageDead(_8);
+        _6 = kani::assert(move _7, const "cmp(3, 7) should be Less") -> [return: bb3, unwind unreachable];
+    }
+
+    bb3: {
+        StorageDead(_7);
+        StorageDead(_3);
+        StorageDead(_2);
+        StorageDead(_1);
+        return;
+    }
+}
+
+alloc4 (size: 24, align: 1) {
+    0x00 │ 63 6d 70 28 33 2c 20 37 29 20 73 68 6f 75 6c 64 │ cmp(3, 7) should
+    0x10 │ 20 62 65 20 4c 65 73 73                         │  be Less
+}
+
+const test_cmp_less::promoted[0]: &std::cmp::Ordering = {
+    let mut _0: &std::cmp::Ordering;
+    let mut _1: std::cmp::Ordering;
+
+    bb0: {
+        _1 = std::cmp::Ordering::Less;
+        _0 = &_1;
+        return;
+    }
+}
+
+fn test_cmp_greater() -> () {
+    let mut _0: ();
+    let _1: u8;
+    let mut _4: &u8;
+    let _5: &u8;
+    let _6: ();
+    let mut _7: bool;
+    let mut _8: &std::cmp::Ordering;
+    let mut _9: &std::cmp::Ordering;
+    scope 1 {
+        debug a => _1;
+        let _2: u8;
+        scope 2 {
+            debug b => _2;
+            let _3: std::cmp::Ordering;
+            scope 3 {
+                debug result => _3;
+            }
+        }
+    }
+
+    bb0: {
+        StorageLive(_1);
+        _1 = const 10_u8;
+        StorageLive(_2);
+        _2 = const 2_u8;
+        StorageLive(_3);
+        StorageLive(_4);
+        _4 = &_1;
+        _5 = &_2;
+        _3 = <u8 as std::cmp::Ord>::cmp(move _4, copy _5) -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        StorageDead(_4);
+        StorageLive(_7);
+        StorageLive(_8);
+        _8 = &_3;
+        StorageLive(_9);
+        _9 = const test_cmp_greater::promoted[0];
+        _7 = <std::cmp::Ordering as std::cmp::PartialEq>::eq(move _8, move _9) -> [return: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        StorageDead(_9);
+        StorageDead(_8);
+        _6 = kani::assert(move _7, const "cmp(10, 2) should be Greater") -> [return: bb3, unwind unreachable];
+    }
+
+    bb3: {
+        StorageDead(_7);
+        StorageDead(_3);
+        StorageDead(_2);
+        StorageDead(_1);
+        return;
+    }
+}
+
+alloc7 (size: 28, align: 1) {
+    0x00 │ 63 6d 70 28 31 30 2c 20 32 29 20 73 68 6f 75 6c │ cmp(10, 2) shoul
+    0x10 │ 64 20 62 65 20 47 72 65 61 74 65 72             │ d be Greater
+}
+
+const test_cmp_greater::promoted[0]: &std::cmp::Ordering = {
+    let mut _0: &std::cmp::Ordering;
+    let mut _1: std::cmp::Ordering;
+
+    bb0: {
+        _1 = std::cmp::Ordering::Greater;
+        _0 = &_1;
+        return;
+    }
+}
+
+fn test_cmp_symbolic() -> () {
+    let mut _0: ();
+    let _1: u8;
+    let _3: ();
+    let mut _4: bool;
+    let mut _6: &u8;
+    let _7: &u8;
+    let _8: ();
+    let mut _9: bool;
+    let mut _10: &std::cmp::Ordering;
+    let mut _11: &std::cmp::Ordering;
+    scope 1 {
+        debug a => _1;
+        let _2: u8;
+        scope 2 {
+            debug b => _2;
+            let _5: std::cmp::Ordering;
+            scope 3 {
+                debug result => _5;
+            }
+        }
+    }
+
+    bb0: {
+        _1 = kani::any::<u8>() -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        _2 = kani::any::<u8>() -> [return: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        StorageLive(_4);
+        _4 = Lt(copy _1, copy _2);
+        _3 = kani::assume(move _4) -> [return: bb3, unwind unreachable];
+    }
+
+    bb3: {
+        StorageDead(_4);
+        StorageLive(_5);
+        StorageLive(_6);
+        _6 = &_1;
+        _7 = &_2;
+        _5 = <u8 as std::cmp::Ord>::cmp(move _6, copy _7) -> [return: bb4, unwind unreachable];
+    }
+
+    bb4: {
+        StorageDead(_6);
+        StorageLive(_9);
+        StorageLive(_10);
+        _10 = &_5;
+        StorageLive(_11);
+        _11 = const test_cmp_symbolic::promoted[0];
+        _9 = <std::cmp::Ordering as std::cmp::PartialEq>::eq(move _10, move _11) -> [return: bb5, unwind unreachable];
+    }
+
+    bb5: {
+        StorageDead(_11);
+        StorageDead(_10);
+        _8 = kani::assert(move _9, const "cmp(a, b) should be Less when a < b") -> [return: bb6, unwind unreachable];
+    }
+
+    bb6: {
+        StorageDead(_9);
+        StorageDead(_5);
+        return;
+    }
+}
+
+alloc10 (size: 35, align: 1) {
+    0x00 │ 63 6d 70 28 61 2c 20 62 29 20 73 68 6f 75 6c 64 │ cmp(a, b) should
+    0x10 │ 20 62 65 20 4c 65 73 73 20 77 68 65 6e 20 61 20 │  be Less when a 
+    0x20 │ 3c 20 62                                        │ < b
+}
+
+const test_cmp_symbolic::promoted[0]: &std::cmp::Ordering = {
+    let mut _0: &std::cmp::Ordering;
+    let mut _1: std::cmp::Ordering;
+
+    bb0: {
+        _1 = std::cmp::Ordering::Less;
+        _0 = &_1;
+        return;
+    }
+}
+
+fn test_cast_enum_cmp() -> () {
+    let mut _0: ();
+    let _1: ();
+    let mut _2: bool;
+    let mut _3: &std::cmp::Ordering;
+    let _4: std::cmp::Ordering;
+    let mut _5: &u8;
+    let _6: u8;
+    let _7: Level;
+    let mut _8: isize;
+    let _9: &u8;
+    let mut _10: &std::cmp::Ordering;
+    scope 1 {
+        debug left => const Level::Error;
+    }
+
+    bb0: {
+        StorageLive(_2);
+        StorageLive(_3);
+        StorageLive(_4);
+        StorageLive(_5);
+        StorageLive(_6);
+        _8 = discriminant(_7);
+        _6 = move _8 as u8 (IntToInt);
+        _5 = &_6;
+        _9 = const test_cast_enum_cmp::promoted[1];
+        _4 = <u8 as std::cmp::Ord>::cmp(move _5, copy _9) -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        _3 = &_4;
+        StorageDead(_5);
+        StorageLive(_10);
+        _10 = const test_cast_enum_cmp::promoted[0];
+        _2 = <std::cmp::Ordering as std::cmp::PartialEq>::eq(move _3, move _10) -> [return: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        StorageDead(_10);
+        StorageDead(_3);
+        _1 = kani::assert(move _2, const "cast enum cmp should be Equal") -> [return: bb3, unwind unreachable];
+    }
+
+    bb3: {
+        StorageDead(_2);
+        StorageDead(_6);
+        StorageDead(_4);
+        return;
+    }
+}
+
+alloc13 (size: 29, align: 1) {
+    0x00 │ 63 61 73 74 20 65 6e 75 6d 20 63 6d 70 20 73 68 │ cast enum cmp sh
+    0x10 │ 6f 75 6c 64 20 62 65 20 45 71 75 61 6c          │ ould be Equal
+}
+
+const test_cast_enum_cmp::promoted[0]: &std::cmp::Ordering = {
+    let mut _0: &std::cmp::Ordering;
+    let mut _1: std::cmp::Ordering;
+
+    bb0: {
+        _1 = std::cmp::Ordering::Equal;
+        _0 = &_1;
+        return;
+    }
+}
+
+const test_cast_enum_cmp::promoted[1]: &u8 = {
+    let mut _0: &u8;
+    let mut _1: u8;
+
+    bb0: {
+        _1 = const 0_u8;
+        _0 = &_1;
+        return;
+    }
+}
+
+fn test_signed_cmp_negative() -> () {
+    let mut _0: ();
+    let _1: i32;
+    let mut _4: &i32;
+    let _5: &i32;
+    let _6: ();
+    let mut _7: bool;
+    let mut _8: &std::cmp::Ordering;
+    let mut _9: &std::cmp::Ordering;
+    scope 1 {
+        debug a => _1;
+        let _2: i32;
+        scope 2 {
+            debug b => _2;
+            let _3: std::cmp::Ordering;
+            scope 3 {
+                debug result => _3;
+            }
+        }
+    }
+
+    bb0: {
+        StorageLive(_1);
+        _1 = const -5_i32;
+        StorageLive(_2);
+        _2 = const 3_i32;
+        StorageLive(_3);
+        StorageLive(_4);
+        _4 = &_1;
+        _5 = &_2;
+        _3 = <i32 as std::cmp::Ord>::cmp(move _4, copy _5) -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        StorageDead(_4);
+        StorageLive(_7);
+        StorageLive(_8);
+        _8 = &_3;
+        StorageLive(_9);
+        _9 = const test_signed_cmp_negative::promoted[0];
+        _7 = <std::cmp::Ordering as std::cmp::PartialEq>::eq(move _8, move _9) -> [return: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        StorageDead(_9);
+        StorageDead(_8);
+        _6 = kani::assert(move _7, const "cmp(-5, 3) should be Less") -> [return: bb3, unwind unreachable];
+    }
+
+    bb3: {
+        StorageDead(_7);
+        StorageDead(_3);
+        StorageDead(_2);
+        StorageDead(_1);
+        return;
+    }
+}
+
+alloc18 (size: 25, align: 1) {
+    0x00 │ 63 6d 70 28 2d 35 2c 20 33 29 20 73 68 6f 75 6c │ cmp(-5, 3) shoul
+    0x10 │ 64 20 62 65 20 4c 65 73 73                      │ d be Less
+}
+
+const test_signed_cmp_negative::promoted[0]: &std::cmp::Ordering = {
+    let mut _0: &std::cmp::Ordering;
+    let mut _1: std::cmp::Ordering;
+
+    bb0: {
+        _1 = std::cmp::Ordering::Less;
+        _0 = &_1;
+        return;
+    }
+}

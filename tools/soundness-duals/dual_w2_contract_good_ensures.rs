@@ -1,3 +1,6 @@
+// Oracle: NOT-GENUINE — a SAFE program: must PASS, or fail only via a
+// DEMOTION, never with a Genuine counterexample.
+//
 // Wall-2 dual twin: same contract with a CORRECT ensures — must PASS (or
 // demote honestly), proving the bad-ensures FAIL above is a real check.
 // kani-flags: -Zfunction-contracts

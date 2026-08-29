@@ -353,10 +353,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } else if variants.len() == 1 && !variants[0].fields().is_empty() {
             // Part of #3470: Multi-field struct constant extraction.
             // Single-variant ADTs with fields (e.g., RangeInclusive<u32>) are
-            // translated by reading each field from the allocation bytes using
-            // the Datatype sort's field layout.
+            // translated by reading each field from the allocation bytes.
+            //
+            // The field offsets come from rustc's LAYOUT, not from
+            // declaration-order packing: `repr(Rust)` reorders fields, and
+            // `RangeInclusive<u8>` really is laid out `start@0, exhausted@1,
+            // end@2`, so the sequential reader decoded `0..=1` as
+            // `start=0, end=0, exhausted=true`.
             let sort = Self::translate_ty(ty)?;
-            Self::read_composite_from_allocation(alloc, 0, &sort)
+            Self::read_adt_composite_from_allocation(alloc, 0, ty, &sort)
         } else if let Some(sort) = Self::translate_ty(ty)
             && let Some(width) = sort.bitvec_width()
         {

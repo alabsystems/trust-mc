@@ -1,7 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
-// kani-verify-fail
+//
+// NOTE: no `kani-verify-fail` header here — that directive belongs to the
+// trust_mc suite and compiletest refuses it (by panicking on the whole test
+// thread) in `expected` mode, where the FAILURE expectation lives in the
+// sibling `expected` file instead.
 
 //! Checks that `simd_insert` triggers an out-of-bounds failure when the
 //! index is >= the number of lanes in the SIMD vector.

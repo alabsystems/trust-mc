@@ -11,7 +11,20 @@ use crate::coverage::cov_results::{CoverageCheck, CoverageRegion, CoverageResult
 use crate::property_model::{CheckStatus, Property, PropertyId, RawSourceLocation, TraceItem};
 use crate::verification_result::{FailedProperties, VerificationStatus};
 
-use super::vc_artifact::VcLocationMap;
+use super::vc_artifact::{
+    LOOP_INVARIANT_BASE_CLASS, LOOP_INVARIANT_BASE_REPORT_TEXT, LOOP_INVARIANT_STEP_CLASS,
+    LOOP_INVARIANT_STEP_REPORT_TEXT, VcLocationMap,
+};
+
+/// Mirrors `trust-mc-compiler`'s
+/// `kani_middle::transform::loop_contracts::rule::{LOOP_INVARIANT_BASE_MSG,
+/// LOOP_INVARIANT_STEP_MSG, LOOP_ID_MARKER}`; the two crates share no code, so
+/// the stems are duplicated here on purpose (as `LOOP_CONTRACT_OBLIGATION_PREFIXES`
+/// already duplicates their prefixes).
+const LOOP_INVARIANT_BASE_MSG: &str = "loop invariant base case: invariant must hold on loop entry";
+const LOOP_INVARIANT_STEP_MSG: &str =
+    "loop invariant inductive step: invariant must be re-established by the loop body";
+const LOOP_ID_MARKER: &str = "(loop ";
 
 /// Parse SMT solver output and extract verification results.
 ///
@@ -163,10 +176,13 @@ pub(crate) fn build_cover_properties_from_sat_checks(
             let id =
                 name.strip_prefix("ay_cover_").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
 
-            let source_location =
-                location_map.and_then(|map| map.get(name)).map(|i| i.location.clone()).unwrap_or(
-                    RawSourceLocation { column: None, file: None, function: None, line: None },
-                );
+            let info = location_map.and_then(|map| map.get(name));
+            let source_location = info.map(|i| i.location.clone()).unwrap_or(RawSourceLocation {
+                column: None,
+                file: None,
+                function: None,
+                line: None,
+            });
 
             let status = match sat_result {
                 Some(true) => CheckStatus::Satisfied,
@@ -174,8 +190,16 @@ pub(crate) fn build_cover_properties_from_sat_checks(
                 None => CheckStatus::Undetermined,
             };
 
+            // Kani parity: the artifact message carries the text the user wrote
+            // (`cover condition: <expr>` from `kani::cover!(expr)`, or the custom
+            // message). Only without one fall back to the numbered placeholder.
+            let description = info
+                .and_then(|i| i.message.clone())
+                .map(Cow::Owned)
+                .unwrap_or_else(|| Cow::Owned(format!("cover property {}", id)));
+
             Property {
-                description: Cow::Owned(format!("cover property {}", id)),
+                description,
                 property_id: PropertyId { fn_name: None, class: Cow::Borrowed("cover"), id },
                 source_location,
                 status,
@@ -203,6 +227,19 @@ pub(crate) fn parse_cover_sat_check_output(output: &str, num_covers: usize) -> V
             results.push(Some(true));
         } else if trimmed == "unsat" {
             results.push(Some(false));
+        } else if trimmed == "unknown" {
+            // An undecided probe must occupy its OWN slot. Skipping it and
+            // padding `None` at the end is correct only when every `unknown`
+            // is at the tail, which is the truncation case. It is not the only
+            // case: ay also answers `unknown` from incompleteness mid-file
+            // (`(:reason-unknown incomplete)`) and then decides later probes.
+            // Dropping the slot shifts every later verdict up by one, and the
+            // shifted values are acted on — `Some(false)` promotes a check to
+            // CheckStatus::Unreachable, which is treated as dead code and NOT
+            // verified. That is a wrong answer in the direction that hides
+            // work, so a probe that was never decided must never inherit a
+            // neighbour's verdict.
+            results.push(None);
         }
         // Skip other lines (errors, warnings, empty lines)
 
@@ -523,6 +560,7 @@ pub(crate) fn parse_cover_properties(
     output: &str,
     is_sat: bool,
     any_trace: Option<&[TraceItem]>,
+    location_map: Option<&VcLocationMap>,
 ) -> Vec<Property> {
     let mut properties = Vec::new();
 
@@ -545,16 +583,27 @@ pub(crate) fn parse_cover_properties(
         // concrete values to replay
         let trace = if is_satisfied { any_trace.map(|items| items.to_vec()) } else { None };
 
+        // Kani parity: prefer the artifact's message (`cover condition: <expr>`
+        // or the user's custom message) and location over the numbered
+        // placeholder, exactly as build_cover_properties_from_sat_checks does.
+        let full_var_name = format!("ay_cover_{}", id);
+        let info = location_map.and_then(|map| map.get(&full_var_name));
+        let source_location = info.map(|i| i.location.clone()).unwrap_or(RawSourceLocation {
+            column: None,
+            file: None,
+            function: None,
+            line: None,
+        });
+        let description = info
+            .and_then(|i| i.message.clone())
+            .map(Cow::Owned)
+            .unwrap_or_else(|| Cow::Owned(format!("cover property {}", id)));
+
         // Create the cover property
         let property = Property {
-            description: Cow::Owned(format!("cover property {}", id)),
+            description,
             property_id: PropertyId { fn_name: None, class: Cow::Borrowed("cover"), id },
-            source_location: RawSourceLocation {
-                column: None,
-                file: None,
-                function: None,
-                line: None,
-            },
+            source_location,
             status,
 
             trace,
@@ -564,6 +613,97 @@ pub(crate) fn parse_cover_properties(
     }
 
     properties
+}
+
+/// Kani-parity naming for the two loop-invariant obligations.
+///
+/// The instrumentation registers both through `hook_safety_check`, so they
+/// reach the driver as class `assertion` carrying the compiler's internal
+/// message stem plus a `(loop N)` suffix (see
+/// `trust-mc-compiler`'s `loop_contracts::rule::LOOP_INVARIANT_BASE_MSG`).
+/// Kani/CBMC lists them under their own classes with a different description:
+///
+/// ```text
+/// main.loop_invariant_base.1
+///  - Status: SUCCESS
+///  - Description: "Check invariant before entry for loop main.0"
+/// ```
+///
+/// Display only: nothing maps these ids back to solver variables (the
+/// SMT-name correlation is finished by the time this runs), and the STATUS is
+/// never touched — an UNREACHABLE base case stays UNREACHABLE under its new
+/// name. The function name in the description is taken from the check's own
+/// source location, the same source `apply_kani_property_naming` uses for the
+/// check-id prefix, so the two can never disagree.
+///
+/// A property whose message lacks the `(loop N)` suffix is left ALONE: without
+/// the index there is no honest loop id to print, and a made-up one would be
+/// worse than the internal wording.
+///
+/// REQUIRES: runs before `apply_kani_property_naming` (it renumbers per class)
+/// ENSURES: `prop.status` is unchanged for every property
+pub(crate) fn apply_loop_contract_naming(properties: &mut [Property]) {
+    for prop in properties.iter_mut() {
+        let (stem, class, text) = if prop.description.starts_with(LOOP_INVARIANT_BASE_MSG) {
+            (LOOP_INVARIANT_BASE_MSG, LOOP_INVARIANT_BASE_CLASS, LOOP_INVARIANT_BASE_REPORT_TEXT)
+        } else if prop.description.starts_with(LOOP_INVARIANT_STEP_MSG) {
+            (LOOP_INVARIANT_STEP_MSG, LOOP_INVARIANT_STEP_CLASS, LOOP_INVARIANT_STEP_REPORT_TEXT)
+        } else {
+            continue;
+        };
+        // `<stem> (loop N)` -> N. Anything else keeps the internal wording.
+        let Some(idx) = prop.description[stem.len()..]
+            .trim_start()
+            .strip_prefix(LOOP_ID_MARKER)
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(fn_name) = prop
+            .property_id
+            .fn_name
+            .clone()
+            .or_else(|| prop.source_location.function.clone())
+        else {
+            continue;
+        };
+        prop.description = Cow::Owned(format!("{text}{fn_name}.{idx}"));
+        prop.property_id.class = Cow::Borrowed(class);
+    }
+}
+
+/// Kani-parity check naming: rewrite each property id to
+/// `<function>.<class>.<counter>` with a 1-based counter per
+/// (function, class) pair, in listing order.
+///
+/// Kani (via CBMC) names every check after the function that contains it and
+/// numbers checks 1-based within that function and class
+/// (e.g. `main.assertion.1`, `check_foo.cover.2`). Our AY-native properties
+/// arrive with a harness-global 0-based id parsed from the SMT variable name
+/// and no function prefix (`assertion.0`). The SMT-name correlation (location
+/// map lookups, cover sat-check zips) is finished by the time the property
+/// list is assembled, so this is a display-only rename: nothing maps the
+/// rewritten ids back to solver variables.
+///
+/// Runs `apply_loop_contract_naming` first: that step MOVES the two
+/// loop-invariant obligations out of the `assertion` class, and the per-class
+/// counters below have to see the final classes or every id is wrong.
+///
+/// ENSURES: fn_name is populated from the source location's function when absent
+/// ENSURES: ids are 1-based and consecutive per (fn_name, class), in input order
+pub(crate) fn apply_kani_property_naming(properties: &mut [Property]) {
+    apply_loop_contract_naming(properties);
+    let mut counters: BTreeMap<(Option<String>, String), u32> = BTreeMap::new();
+    for prop in properties.iter_mut() {
+        if prop.property_id.fn_name.is_none() {
+            prop.property_id.fn_name = prop.source_location.function.clone();
+        }
+        let key = (prop.property_id.fn_name.clone(), prop.property_id.class.to_string());
+        let counter = counters.entry(key).or_insert(0);
+        *counter += 1;
+        prop.property_id.id = *counter;
+    }
 }
 
 /// Determine the FailedProperties classification from a list of properties.
@@ -624,23 +764,93 @@ fn parse_violation_name(name: &str) -> (&str, u32) {
 fn classify_violation(label: &str) -> (&'static str, &'static str) {
     match label {
         "kani_assert" => ("assertion", "assertion failed"),
-        "panic" | "panic_stub" | "unreachable" => ("assertion", "panic reached"),
-        "div_by_zero_check" | "mod_by_zero_check" | "division_by_zero" | "bigint_div_by_zero"
-        | "bigint_mod_by_zero" => ("division-by-zero", "division by zero"),
-        "overflow_check_add" => ("overflow", "arithmetic overflow on addition"),
-        "overflow_check_sub" => ("overflow", "arithmetic overflow on subtraction"),
-        "overflow_check_mul" => ("overflow", "arithmetic overflow on multiplication"),
-        "overflow_check_neg" => ("overflow", "arithmetic overflow on negation"),
-        "bounds_check" => ("array_bounds", "index out of bounds"),
-        "simd_extract" | "simd_insert" => ("array_bounds", "SIMD index out of bounds"),
+        "panic" | "panic_stub" => ("assertion", "panic reached"),
+        // TerminatorKind::Unreachable — reaching it is UB, and Kani reports it
+        // as class `unreachable` with description "unreachable code" (e.g.
+        // `test_trivial_bounds.unreachable.1`). Rendering it as a panic hid
+        // which kind of check fired. `determine_failed_from_properties` already
+        // counts class "unreachable" in the panic family for should_panic.
+        "unreachable" => ("unreachable", "unreachable code"),
+        // BMC loop-unrolling bound. The unroller plants this check on the cut
+        // back-edge of the last unrolled copy, so a FAILURE means the loop asked
+        // for an iteration past `--unwind N` / `#[kani::unwind(N)]`. That is a
+        // statement about the BOUND, never about the program, so it deliberately
+        // does NOT join the panic classes above — three consumers key off that:
+        //   * `determine_failed_from_properties` counts it as a non-panic
+        //     failure, so a `should_panic` harness cannot bank an exhausted
+        //     bound as "panicked as expected";
+        //   * `extract_harness_values` already skips class "unwind", so no
+        //     concrete-playback `#[test]` is minted for a bug that was never
+        //     found;
+        //   * `has_unwinding_assertion_failures` matches the "unwinding
+        //     assertion loop" prefix of this description and appends the
+        //     raise-the-bound tip (`UNWINDING_ASSERT_DESC`) — keep that prefix
+        //     verbatim if this wording is ever revised.
+        // Worded neutrally on purpose: when the bound IS sufficient this very
+        // string renders as a SUCCESS check in the RESULTS listing, so it has to
+        // read as an obligation rather than as a complaint. The "raise it"
+        // advice lives in the tip and in `[AY:CTREX_NOT_CERTIFIED]`, both of
+        // which fire only on the failing case.
+        "unwind_assert" => {
+            ("unwind", "unwinding assertion loop: the loop must exit within the --unwind bound")
+        }
+        // Kani-identical descriptions (commit c6746cbd6 direction): these render
+        // in RESULTS listings and `Failed Checks:` lines, and the corpus expected
+        // files pin Kani's exact wording. `div` vs `mod` matters: Rust (and Kani)
+        // word `%` by zero as a remainder error, not a division error.
+        "div_by_zero_check" => ("division-by-zero", "attempt to divide by zero"),
+        "mod_by_zero_check" => {
+            ("division-by-zero", "attempt to calculate the remainder with a divisor of zero")
+        }
+        // Generic/SIMD/bigint division-by-zero sites keep the neutral wording:
+        // they are not the scalar `/` or `%` operator, so Kani's operator-specific
+        // phrasing would be a false claim (and simd expected files pin this text).
+        "division_by_zero" | "bigint_div_by_zero" | "bigint_mod_by_zero" => {
+            ("division-by-zero", "division by zero")
+        }
+        "overflow_check_add" => ("overflow", "attempt to add with overflow"),
+        "overflow_check_sub" => ("overflow", "attempt to subtract with overflow"),
+        "overflow_check_mul" => ("overflow", "attempt to multiply with overflow"),
+        "overflow_check_neg" => ("overflow", "attempt to negate with overflow"),
+        // Signed INT_MIN / -1 overflow — Kani words `/` and `%` differently
+        // (rustc's AssertKind texts), and the corpus pins both wordings.
+        "overflow_check_div" => ("overflow", "attempt to divide with overflow"),
+        "overflow_check_rem" => {
+            ("overflow", "attempt to calculate the remainder with overflow")
+        }
+        "bounds_check" => {
+            ("array_bounds", "index out of bounds: the length is less than or equal to the given index")
+        }
+        // Name WHICH intrinsic went out of bounds. The corpus expected files
+        // (intrinsics/simd-{extract,insert}-out-of-bounds) pin the intrinsic
+        // name on the line after `Status: FAILURE`, i.e. in this description —
+        // and a user staring at a lane-index CTREX needs the callee, since the
+        // check's Location points at the call site of an opaque intrinsic.
+        "simd_extract" => ("array_bounds", "simd_extract: SIMD index out of bounds"),
+        "simd_insert" => ("array_bounds", "simd_insert: SIMD index out of bounds"),
         "null_pointer_check" => ("pointer_dereference", "dereference failure: pointer NULL"),
         "alignment_check" => ("pointer_dereference", "dereference failure: pointer misaligned"),
+        // Raw-pointer dereference validity — Kani instruments `*ptr` / `&*ptr`
+        // with its own `safety_check`-class checks and these exact texts
+        // (rustc's AssertKind wordings); the corpus pins them (zst, issue-3571,
+        // ptr_to_ref_cast/alignment). The CBMC-flavored labels above keep their
+        // "dereference failure: ..." texts for every other site.
+        "raw_ptr_deref_null" => ("safety_check", "null pointer dereference occurred"),
+        "raw_ptr_deref_misaligned" => (
+            "safety_check",
+            "misaligned pointer dereference: address must be a multiple of its type's alignment",
+        ),
         "pointer_invalid" => ("pointer_dereference", "dereference failure: pointer invalid"),
         "dead_object" => ("pointer_dereference", "dereference failure: dead object"),
         "use_after_free_check" => ("pointer_dereference", "dereference failure: use after free"),
         // Part of #2740: Heap deallocation safety labels from context/heap.
+        // The freed pointer is not the base of a live heap allocation — freeing
+        // a stack address, an interior pointer, or a foreign address. CBMC (and
+        // so Kani) words this "free argument must be dynamic object", and the
+        // corpus pins that text (dealloc/stack, vec, vecdq); nothing pinned the
+        // old "dealloc base pointer mismatch" wording.
         "dealloc_base_pointer_check" => {
-            ("pointer_dereference", "dereference failure: dealloc base pointer mismatch")
+            ("pointer_dereference", "free argument must be dynamic object")
         }
         "dealloc_size_mismatch" => {
             ("pointer_dereference", "dereference failure: dealloc size mismatch")
@@ -663,6 +873,10 @@ fn classify_violation(label: &str) -> (&'static str, &'static str) {
             ("overflow", "euclidean division signed overflow")
         }
         "step_unchecked_overflow" => ("overflow", "step unchecked overflow"),
+        // FC-06 (BMC): contract modifies-clause enforcement. The class name
+        // must contain "assigns" — corpus expectations match the CBMC DFCC
+        // check-id line ("assigns") immediately above the FAILURE status.
+        "assigns_check" => ("assigns", "assigns clause violation"),
         "enum_check" => ("enum-range-check", "enum range check"),
         "coroutine_check" | "ctlz_nonzero_ub" | "cttz_nonzero_ub" | "biguint_neg_positive" => {
             ("undefined-behavior", "undefined behavior")
@@ -694,6 +908,10 @@ fn classify_violation(label: &str) -> (&'static str, &'static str) {
         "unsupported_cfg_cycle" | "unsupported_check" | "unsupported_shadow_memory" => {
             ("unsupported_construct", "unsupported construct")
         }
+        "unsupported_oversized_object" => (
+            "unsupported_construct",
+            "unsupported construct: object larger than the 1MB heap region stride",
+        ),
         _ if label.ends_with("_non_finite_lhs") || label.ends_with("_non_finite_rhs") => {
             ("undefined-behavior", "fast-math operand is non-finite")
         }
@@ -793,11 +1011,11 @@ mod tests {
         assert_eq!(classify_violation("kani_assert"), ("assertion", "assertion failed"));
         assert_eq!(
             classify_violation("div_by_zero_check"),
-            ("division-by-zero", "division by zero")
+            ("division-by-zero", "attempt to divide by zero")
         );
         assert_eq!(
             classify_violation("mod_by_zero_check"),
-            ("division-by-zero", "division by zero")
+            ("division-by-zero", "attempt to calculate the remainder with a divisor of zero")
         );
         assert_eq!(
             classify_violation("division_by_zero"),
@@ -805,9 +1023,12 @@ mod tests {
         );
         assert_eq!(
             classify_violation("overflow_check_add"),
-            ("overflow", "arithmetic overflow on addition")
+            ("overflow", "attempt to add with overflow")
         );
-        assert_eq!(classify_violation("bounds_check"), ("array_bounds", "index out of bounds"));
+        assert_eq!(
+            classify_violation("bounds_check"),
+            ("array_bounds", "index out of bounds: the length is less than or equal to the given index")
+        );
         assert_eq!(
             classify_violation("null_pointer_check"),
             ("pointer_dereference", "dereference failure: pointer NULL")
@@ -917,7 +1138,7 @@ mod tests {
             }),
         }];
 
-        let props = parse_cover_properties(output, true, Some(&trace_items));
+        let props = parse_cover_properties(output, true, Some(&trace_items), None);
         assert_eq!(props.len(), 2);
 
         // First cover is satisfied - should have trace
@@ -939,7 +1160,7 @@ mod tests {
     fn test_parse_cover_properties_no_trace() {
         // Test that cover properties work without trace (backwards compatibility)
         let output = "sat\n((ay_cover_0 true))\n";
-        let props = parse_cover_properties(output, true, None);
+        let props = parse_cover_properties(output, true, None, None);
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].status, CheckStatus::Satisfied);
         assert!(props[0].trace.is_none(), "Cover without trace param should have no trace");
@@ -949,7 +1170,7 @@ mod tests {
     fn test_parse_cover_properties_unsat() {
         // UNSAT case: cover properties cannot be determined
         let output = "unsat\n";
-        let props = parse_cover_properties(output, false, None);
+        let props = parse_cover_properties(output, false, None, None);
         assert!(props.is_empty(), "UNSAT should return no cover properties");
     }
 
@@ -958,7 +1179,7 @@ mod tests {
         // Empty trace slice should still attach (empty) trace to satisfied covers
         let output = "sat\n((ay_cover_0 true))\n";
         let empty_trace: Vec<TraceItem> = vec![];
-        let props = parse_cover_properties(output, true, Some(&empty_trace));
+        let props = parse_cover_properties(output, true, Some(&empty_trace), None);
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].status, CheckStatus::Satisfied);
         // Empty trace is still Some([]), not None
@@ -970,7 +1191,7 @@ mod tests {
     fn test_parse_cover_properties_single_line_multiple_entries() {
         // Single-line get-value output should still parse all cover entries.
         let output = "sat\n((ay_cover_0 true) (ay_cover_1 false) (ay_cover_2 true))\n";
-        let props = parse_cover_properties(output, true, None);
+        let props = parse_cover_properties(output, true, None, None);
         assert_eq!(props.len(), 3);
         assert_eq!(props[0].status, CheckStatus::Satisfied);
         assert_eq!(props[1].status, CheckStatus::Unsatisfiable);
@@ -1048,6 +1269,108 @@ mod tests {
         assert_eq!(props.len(), 2, "should parse both violations from single line");
         assert_eq!(props[0].status, CheckStatus::Failure);
         assert_eq!(props[1].status, CheckStatus::Success);
+    }
+
+    /// Build one property as `hook_safety_check` delivers it: class
+    /// `assertion`, description = the instrumentation's message.
+    fn loop_obligation(desc: &'static str, function: Option<&str>, status: CheckStatus) -> Property {
+        Property {
+            description: Cow::Borrowed(desc),
+            property_id: PropertyId { fn_name: None, class: Cow::Borrowed("assertion"), id: 0 },
+            source_location: RawSourceLocation {
+                column: None,
+                file: None,
+                function: function.map(str::to_string),
+                line: None,
+            },
+            status,
+            trace: None,
+        }
+    }
+
+    /// The rename, end to end: Kani's class and Kani's description text, with
+    /// the loop id read from the `(loop N)` suffix and the function name spliced
+    /// from the check's own location.
+    #[test]
+    fn loop_contract_naming_renders_the_kani_text() {
+        let mut props = vec![
+            loop_obligation(
+                "loop invariant base case: invariant must hold on loop entry (loop 0)",
+                Some("f"),
+                CheckStatus::Success,
+            ),
+            loop_obligation(
+                "loop invariant inductive step: invariant must be re-established by the loop \
+                 body (loop 1)",
+                Some("f"),
+                CheckStatus::Success,
+            ),
+        ];
+        apply_loop_contract_naming(&mut props);
+        assert_eq!(props[0].property_id.class, "loop_invariant_base");
+        assert_eq!(props[0].description, "Check invariant before entry for loop f.0");
+        assert_eq!(props[1].property_id.class, "loop_invariant_step");
+        assert_eq!(props[1].description, "Check invariant after step for loop f.1");
+    }
+
+    /// The rename is DISPLAY ONLY. An UNREACHABLE base case keeps its status;
+    /// silently promoting one would be a fabricated proof.
+    #[test]
+    fn loop_contract_naming_never_touches_status() {
+        let mut props = vec![loop_obligation(
+            "loop invariant base case: invariant must hold on loop entry (loop 0)",
+            Some("f"),
+            CheckStatus::Unreachable,
+        )];
+        apply_loop_contract_naming(&mut props);
+        assert_eq!(props[0].status, CheckStatus::Unreachable);
+    }
+
+    /// No `(loop N)` suffix means no honest loop id to print, so the property is
+    /// left exactly as it arrived rather than renamed with a made-up index.
+    #[test]
+    fn loop_contract_naming_leaves_a_message_without_a_loop_id_alone() {
+        let raw = "loop invariant base case: invariant must hold on loop entry";
+        let mut props = vec![loop_obligation(raw, Some("f"), CheckStatus::Success)];
+        apply_loop_contract_naming(&mut props);
+        assert_eq!(props[0].property_id.class, "assertion");
+        assert_eq!(props[0].description, raw);
+    }
+
+    /// Every other check is untouched — the pass must not reclassify user
+    /// assertions that happen to sit next to a loop obligation.
+    #[test]
+    fn loop_contract_naming_ignores_unrelated_checks() {
+        let mut props = vec![loop_obligation(
+            "assertion failed: x == 2",
+            Some("f"),
+            CheckStatus::Success,
+        )];
+        apply_loop_contract_naming(&mut props);
+        assert_eq!(props[0].property_id.class, "assertion");
+        assert_eq!(props[0].description, "assertion failed: x == 2");
+    }
+
+    /// The renamed checks leave the `assertion` class, so the per-class counters
+    /// must number what REMAINS from 1 — the corpus pins `main.assertion.1` for
+    /// the user assertion that used to be numbered after the obligations.
+    #[test]
+    fn kani_naming_numbers_the_remaining_assertions_after_the_rename() {
+        let mut props = vec![
+            loop_obligation("panic reached", Some("f"), CheckStatus::Success),
+            loop_obligation(
+                "loop invariant base case: invariant must hold on loop entry (loop 0)",
+                Some("f"),
+                CheckStatus::Success,
+            ),
+            loop_obligation("assertion failed: x == 2", Some("f"), CheckStatus::Success),
+        ];
+        apply_kani_property_naming(&mut props);
+        assert_eq!(props[0].property_id.id, 1);
+        assert_eq!(props[1].property_id.class, "loop_invariant_base");
+        assert_eq!(props[1].property_id.id, 1);
+        assert_eq!(props[2].property_id.class, "assertion");
+        assert_eq!(props[2].property_id.id, 2);
     }
 
     #[test]
@@ -1158,6 +1481,34 @@ mod tests {
     // Part of #1162: Tests for cover satisfiability check parsing
 
     #[test]
+    /// An undecided probe must not hand its slot to the next one.
+    ///
+    /// The parser used to count only `sat`/`unsat` lines and pad `None` at the
+    /// end, which is right only when every `unknown` sits at the tail. A
+    /// mid-stream `unknown` — which ay emits from incompleteness, not just on a
+    /// deadline — shifted every later verdict up by one. Probe 1 then inherited
+    /// probe 2's answer, and `Some(false)` promotes a check to UNREACHABLE,
+    /// i.e. dead code that is never verified. Wrong answer, in the direction
+    /// that hides work.
+    #[test]
+    fn an_undecided_probe_keeps_its_own_slot() {
+        let out = "sat\nunknown\nunsat\n";
+        assert_eq!(
+            parse_cover_sat_check_output(out, 3),
+            vec![Some(true), None, Some(false)],
+            "a mid-stream `unknown` must occupy slot 1, not be skipped"
+        );
+    }
+
+    /// The tail case the old code did handle stays handled.
+    #[test]
+    fn a_truncated_batch_still_pads_undecided() {
+        assert_eq!(
+            parse_cover_sat_check_output("unsat\nunsat\n", 4),
+            vec![Some(false), Some(false), None, None]
+        );
+    }
+
     fn test_parse_cover_sat_check_output_all_sat() {
         let output = "sat\nsat\nsat\n";
         let results = parse_cover_sat_check_output(output, 3);

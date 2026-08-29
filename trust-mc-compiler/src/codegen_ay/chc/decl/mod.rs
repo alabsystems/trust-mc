@@ -48,6 +48,9 @@ pub(in crate::codegen_ay::chc) mod codegen_types;
 pub(in crate::codegen_ay::chc) mod codegen_types_adt;
 pub(in crate::codegen_ay::chc) mod codegen_types_adt_sort;
 
+pub(in crate::codegen_ay) use codegen_decl_liveness::{
+    frame_narrowing_enabled, frame_narrowing_flattened_enabled,
+};
 pub(in crate::codegen_ay::chc) use codegen_decl_liveness::{
     reset_dropped_frame_columns, take_dropped_frame_columns,
 };

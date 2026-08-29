@@ -145,7 +145,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     active_variant = None;
                 }
                 ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    let actual_offset = constant_index_offset(*offset, *min_length, *from_end);
+                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                    let Some(actual_offset) =
+                        constant_index_offset(*offset, *min_length, *from_end)
+                    else {
+                        return None;
+                    };
                     if let Some(ty) = current_ty
                         && let Some(array_len) = self.get_array_length(ty)
                     {

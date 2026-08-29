@@ -166,17 +166,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target
     }
 
-    /// Codegen `Option::unwrap(self) -> T`.
+    /// Codegen `Option::unwrap(self) -> T` / `Option::expect(self, msg) -> T`.
     ///
     /// Extracts the inner value from `Option<T>`. Supports both:
     /// - Flattened representation: value in field `.1` (from checked_arith)
     /// - Native SMT datatype: use field_select with "value" selector
     ///
-    /// Note: unwrap on None is UB in Rust - we just extract the value field without
-    /// runtime panic since verification typically uses assume(is_some()) first.
+    /// Emits the None-panic check (see `codegen_option_unwrap_impl`).
     ///
     /// REQUIRES: `args[0]` is an `Option<T>` value (by value, not reference)
-    /// REQUIRES: Caller assumes Option is Some (unwrap on None is UB)
     /// ENSURES: Stores inner `T` value to destination
     /// ENSURES: Returns target on success, None if Option layout not found
     pub(super) fn codegen_option_unwrap(
@@ -184,6 +182,45 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         args: &[Operand],
         destination: &Place,
         target: Option<BasicBlockIdx>,
+    ) -> Option<BasicBlockIdx> {
+        self.codegen_option_unwrap_impl(args, destination, target, true)
+    }
+
+    /// Codegen `Option::unwrap_unchecked(self) -> T`.
+    ///
+    /// Same value extraction as `codegen_option_unwrap`, but the library body
+    /// has no panic branch — reaching it on `None` is UB, not a panic — so no
+    /// "panic reached" property is emitted here.
+    pub(super) fn codegen_option_unwrap_unchecked(
+        &mut self,
+        args: &[Operand],
+        destination: &Place,
+        target: Option<BasicBlockIdx>,
+    ) -> Option<BasicBlockIdx> {
+        self.codegen_option_unwrap_impl(args, destination, target, false)
+    }
+
+    /// Shared `unwrap`/`expect`/`unwrap_unchecked` value extraction.
+    ///
+    /// SOUNDNESS: `Option::unwrap`/`expect` panic when the receiver is `None`.
+    /// The inliner deliberately keeps these calls as `Call` terminators
+    /// (`has_special_codegen_handler`, `kani_middle/transform/inline/mod.rs`),
+    /// so the library body's `unwrap_failed`/`panic_stub` path never reaches
+    /// codegen. The panic property therefore has to be emitted HERE, or a
+    /// harness that unwraps a `None` produces no verification condition at all
+    /// and is (falsely) reported as proved. When `panic_on_none` is set and the
+    /// representation exposes a discriminant, record `is_none` as a `panic`
+    /// violation guarded by the current path condition.
+    ///
+    /// REQUIRES: `args[0]` is an `Option<T>` value (by value, not reference)
+    /// ENSURES: Stores inner `T` value to destination
+    /// ENSURES: Returns target on success, None if Option layout not found
+    fn codegen_option_unwrap_impl(
+        &mut self,
+        args: &[Operand],
+        destination: &Place,
+        target: Option<BasicBlockIdx>,
+        panic_on_none: bool,
     ) -> Option<BasicBlockIdx> {
         // Contract enforcement (#695): args[0] must be an Option value
         debug_assert!(!args.is_empty(), "codegen_option_unwrap: REQUIRES args.len() > 0");
@@ -196,6 +233,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let option_base = self
             .get_option_base_direct(&args[0])
             .or_else(|| self.get_option_base_from_ref(&args[0]))?;
+
+        // The None-panic property (see the SOUNDNESS note above).
+        if panic_on_none {
+            match self.option_none_predicate(option_base.as_ref()) {
+                Some(is_none) => {
+                    debug!("Option::unwrap: recording None-panic check for {}", option_base);
+                    self.record_violation_guarded(is_none, "panic");
+                }
+                None => {
+                    debug!(
+                        "Option::unwrap: no discriminant for {} - None-panic check not emitted",
+                        option_base
+                    );
+                }
+            }
+        }
 
         // Infer the result sort from the destination place
         let result_sort = self.infer_sort_from_place(destination)?;

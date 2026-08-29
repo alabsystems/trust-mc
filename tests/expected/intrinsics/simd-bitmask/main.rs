@@ -3,7 +3,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 //
 // kani-flags: --harness check_simd_bitmask_model
-// kani-expect: PROOF
+//
+// NOTE: this is an `expected`-suite test — the expectation lives in the
+// sibling `expected` file. (It shipped with a `kani-expect: PROOF` header,
+// which is the tests/ay suite's directive, and WITHOUT an `expected` file,
+// so compiletest panicked with `NotFound` before running the driver at all.)
 
 //! Part of #2285: regression for simd_bitmask CHC encoding.
 //! Previously returned CTREX because the model call left the return value

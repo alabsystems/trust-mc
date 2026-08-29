@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "suite": "tests/trust-mc",
+  "denominator": 1,
+  "source": {
+    "denominator": 3,
+    "row_sha256": "7993de238cce08d9e264529bb9f3b1f75eb6caf2dc5f1e4d9b85b599365a0eb8"
+  },
+  "rows": [
+    {
+      "file": "zani/non_proof.rs",
+      "harness": "ctrex_one",
+      "expected": "CTREX",
+      "disposition": "expected_non_proof",
+      "justification": "Inventory expects CTREX; closure records this counterexample outcome, not a proof.",
+      "review_marker": "non-proof-closure-audit-v1"
+    }
+  ]
+}

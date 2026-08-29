@@ -1,5 +1,14 @@
 // Copyright Andrew Yates. Apache-2.0 OR MIT
 //
+// kani-flags: --nan-check
+// NOTE: `simd_float_div_congruent` fails ONLY through the NaN-generation
+// obligation (0/0), which requires --nan-check. Without it the obligation is
+// never emitted and this tripwire passes VACUOUSLY.
+//
+// Oracle (per harness):
+//   simd_float_div_congruent -> VERIFICATION:- FAILED
+//   simd_float_div_wrong_key -> VERIFICATION:- FAILED
+//
 // Soundness duals for the SIMD float congruent-table lanes
 // (codegen_call_simd_ops.rs apply_simd_binop -> float_binop_chc_term).
 //

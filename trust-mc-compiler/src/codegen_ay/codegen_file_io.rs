@@ -78,9 +78,11 @@ fn format_smt2_with_markers(
     program: &AYProgram,
     demoted_fallback_count: usize,
     recursive_unwind_count: usize,
+    vacuous_all_checks_unreachable: bool,
 ) -> String {
     let mut smt = program.to_string();
-    if demoted_fallback_count == 0 && recursive_unwind_count == 0 {
+    if demoted_fallback_count == 0 && recursive_unwind_count == 0 && !vacuous_all_checks_unreachable
+    {
         return smt;
     }
 
@@ -92,6 +94,9 @@ fn format_smt2_with_markers(
     }
     for _ in 0..recursive_unwind_count {
         smt.push_str("; RECURSIVE_UNWIND_ASSERTION: chc_recursive_unwind\n");
+    }
+    if vacuous_all_checks_unreachable {
+        smt.push_str("; VACUOUS_ALL_CHECKS_UNREACHABLE: chc_vacuous\n");
     }
     smt
 }
@@ -133,6 +138,7 @@ pub(in crate::codegen_ay) fn write_smt2_file(
     program: &AYProgram,
     demoted_fallback_count: usize,
     recursive_unwind_count: usize,
+    vacuous_all_checks_unreachable: bool,
 ) -> std::io::Result<()> {
     // Fail-closed serialization budget (OOM guard). Estimate the program's
     // serialized size in DISTINCT term nodes BEFORE materializing it; if it hits
@@ -157,7 +163,12 @@ pub(in crate::codegen_ay) fn write_smt2_file(
     write!(
         writer,
         "{}",
-        format_smt2_with_markers(program, demoted_fallback_count, recursive_unwind_count)
+        format_smt2_with_markers(
+            program,
+            demoted_fallback_count,
+            recursive_unwind_count,
+            vacuous_all_checks_unreachable
+        )
     )?;
     info!(?path, "Wrote SMT-LIB2 file");
     Ok(())
@@ -195,7 +206,7 @@ mod tests {
         let path = dir.join("test_output.smt2");
 
         let program = AYProgram::new();
-        write_smt2_file(&path, &program, 0, 0).unwrap();
+        write_smt2_file(&path, &program, 0, 0, false).unwrap();
 
         assert!(path.exists());
         // Verify file is readable (read_to_string succeeds)
@@ -230,7 +241,7 @@ mod tests {
         let program = AYProgram::new();
 
         // Writing to a directory path should return Err (#3257).
-        assert!(write_smt2_file(&dir, &program, 0, 0).is_err());
+        assert!(write_smt2_file(&dir, &program, 0, 0, false).is_err());
         assert!(dir.is_dir());
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -239,29 +250,50 @@ mod tests {
     #[test]
     fn test_format_smt2_markers_skips_clean_program() {
         let program = AYProgram::new();
-        assert_eq!(format_smt2_with_markers(&program, 0, 0), "");
+        assert_eq!(format_smt2_with_markers(&program, 0, 0, false), "");
     }
 
     #[test]
     fn test_format_smt2_markers_demoted_repeats_once_per_site() {
         let program = AYProgram::new();
-        let smt = format_smt2_with_markers(&program, 2, 0);
+        let smt = format_smt2_with_markers(&program, 2, 0, false);
         assert_eq!(smt, "; DEMOTED_FALLBACK: chc_fallback\n; DEMOTED_FALLBACK: chc_fallback\n");
     }
 
     #[test]
     fn test_format_smt2_markers_recursive_unwind() {
         let program = AYProgram::new();
-        let smt = format_smt2_with_markers(&program, 0, 1);
+        let smt = format_smt2_with_markers(&program, 0, 1, false);
         assert_eq!(smt, "; RECURSIVE_UNWIND_ASSERTION: chc_recursive_unwind\n");
     }
 
     #[test]
     fn test_format_smt2_markers_both() {
         let program = AYProgram::new();
-        let smt = format_smt2_with_markers(&program, 1, 1);
+        let smt = format_smt2_with_markers(&program, 1, 1, false);
         assert!(smt.contains("; DEMOTED_FALLBACK:"));
         assert!(smt.contains("; RECURSIVE_UNWIND_ASSERTION:"));
+    }
+
+    #[test]
+    fn vacuous_flag_emits_its_own_marker() {
+        // The marker is the ONLY channel carrying "proved unreachable, not
+        // safe" past the discharge, which rewrites the system to
+        // `false => error` for proofs and vacuous runs alike.
+        let program = AYProgram::new();
+        assert_eq!(
+            format_smt2_with_markers(&program, 0, 0, true),
+            "; VACUOUS_ALL_CHECKS_UNREACHABLE: chc_vacuous\n"
+        );
+        assert!(
+            !format_smt2_with_markers(&program, 0, 0, false)
+                .contains("VACUOUS_ALL_CHECKS_UNREACHABLE")
+        );
+        // It must survive alongside the other markers.
+        let both = format_smt2_with_markers(&program, 1, 1, true);
+        assert!(both.contains("; DEMOTED_FALLBACK:"), "{both}");
+        assert!(both.contains("; RECURSIVE_UNWIND_ASSERTION:"), "{both}");
+        assert!(both.contains("; VACUOUS_ALL_CHECKS_UNREACHABLE:"), "{both}");
     }
 
     // --- write_vc_artifact ---

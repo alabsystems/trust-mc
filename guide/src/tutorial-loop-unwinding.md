@@ -1,7 +1,7 @@
 <!-- dscan:allow(volatile_numbers) -->
 # Loops, unwinding, and bounds
 
-Consider code like this (available [here](https://github.com/model-checking/kani/blob/main/docs/src/tutorial/loops-unwinding/src/lib.rs)):
+Consider code like this (available [here](https://github.com/alabsystems/trust-mc/blob/main/guide/src/tutorial/loops-unwinding/src/lib.rs)):
 
 ```rust
 {{#include tutorial/loops-unwinding/src/lib.rs:code}}
@@ -20,7 +20,7 @@ When we run `targo trust-mc` on this code as we have written it, we see an odd v
 ```
 SUMMARY:
  ** 1 of 67 failed (66 undetermined)
-Failed Checks: unwinding assertion loop 0
+Failed Checks: unwinding assertion loop: the loop must exit within the --unwind bound
 
 VERIFICATION:- FAILED
 ```
@@ -115,6 +115,38 @@ You can do this by putting this into your `Cargo.toml` file:
 [workspace.metadata.kani.flags]
 default-unwind = "1"
 ```
+
+## Bounds trust-mc derives for itself
+
+You do not always have to supply the bound.
+When a loop's trip count is *statically computable* — its state starts from constants, each iteration updates it with a constant step, and the loop's exit test compares against a constant — trust-mc evaluates that recurrence at compile time and unrolls to exactly that many iterations, with no annotation and no `--default-unwind`:
+
+```rust
+#[kani::proof]
+fn sum_to_ten() {
+    let mut a = 0;
+    let mut i = 10;
+    while i != 0 {
+        a += i;
+        i -= 1;
+    }
+    assert!(a == 55); // a real verdict, with no unwind annotation
+}
+```
+
+Three things deliberately bound this:
+
+* **An explicit bound always wins.**
+  Supply `--unwind`, `--default-unwind`, or `#[kani::unwind(N)]` and trust-mc uses exactly your number — nothing is derived.
+  That is what lets you keep reproducing an unwinding-assertion failure on purpose.
+* **Nothing is guessed.**
+  If any part of the recurrence is not concrete — a symbolic loop bound, a value reached through a pointer, a call trust-mc cannot evaluate — then no bound is derived and you get the behaviour above: the unwinding assertion fails and asks you for a bound.
+  Iterator-driven loops (`for x in ..`) are in this category today; their state lives inside the iterator.
+* **Unwinding assertions stay on.**
+  A derived bound is checked like any other: were it ever too small, the unwinding assertion FAILS rather than quietly truncating the search, so a derived bound can never turn an undecided harness into a silent pass.
+  Running with `--no-unwinding-checks` disables that check, so in that mode no bound is derived at all.
+
+Derived bounds are also capped, so a concrete loop with a very large trip count still asks you for an explicit bound instead of generating an enormous query.
 
 ## Bounded proof
 

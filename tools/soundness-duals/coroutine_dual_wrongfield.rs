@@ -1,6 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
+// Oracle (per harness):
+//   dual_wrongfield_safe        -> VERIFICATION:- SUCCESSFUL
+//   dual_wrongfield_buggy       -> VERIFICATION:- FAILED
+//   dual_wrongfield_upvar_safe  -> VERIFICATION:- SUCCESSFUL
+//   dual_wrongfield_upvar_buggy -> VERIFICATION:- FAILED
+//
 // Adversarial guard for coroutine Fix B (by-name field select/update).
 //
 // Coroutine view datatypes order fields by increasing byte OFFSET while MIR

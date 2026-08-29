@@ -28,7 +28,8 @@ use super::{
     get_bmc_iterator_unsound_skip_count, get_chc_assume_dropped_transition_count,
     get_chc_bigint_unsound_skip_count, get_chc_iterator_unsound_skip_count,
     get_chc_store_dropped_transition_count, take_aggregate_encoding_gap_by_fn,
-    take_aggregate_encoding_gap_count, take_chc_coerce_eq_dropped_constraint_count,
+    take_aggregate_encoding_gap_count, take_aggregate_gap_reasons_by_fn,
+    take_chc_coerce_eq_dropped_constraint_count,
     take_chc_coerce_eq_dropped_constraint_counts_by_fn, take_chc_diverging_call_drop_count,
     take_chc_offset_provenance_unresolved_count, take_fp_bitvector_encoding_by_fn,
     take_fp_bitvector_encoding_count, take_inferable_predicate_count,
@@ -424,13 +425,29 @@ pub(crate) fn collect_unsoundness_fields() -> UnsoundnessFields {
 
     let agg_gap_count = take_aggregate_encoding_gap_count();
     let agg_gap_per_fn = take_aggregate_encoding_gap_by_fn();
-    let mut aggregate_encoding_gap = (agg_gap_count > 0 || !agg_gap_per_fn.is_empty()).then(|| {
+    // Drained unconditionally and BEFORE the gate. These reasons carry the
+    // callee for the nested-call lane, and `Ctx::note_gap_reason` deliberately
+    // records them WITHOUT incrementing `aggregate_encoding_gap` (that counter
+    // feeds CTREX classification, so labelling must not touch it). Gating the
+    // struct on the counter alone therefore threw every reason away — the
+    // reasons must be part of the "is there anything to report" test, not just
+    // its payload.
+    let agg_gap_reasons = take_aggregate_gap_reasons_by_fn();
+    let mut aggregate_encoding_gap = (agg_gap_count > 0
+        || !agg_gap_per_fn.is_empty()
+        || !agg_gap_reasons.is_empty())
+    .then(|| {
         debug!(
             agg_gap_count,
             per_fn_entries = agg_gap_per_fn.len(),
+            reason_entries = agg_gap_reasons.len(),
             "Aggregate/discriminant encoding gap (sound over-approximation)"
         );
-        AggregateEncodingGapInfo { count: agg_gap_count, per_harness: agg_gap_per_fn }
+        AggregateEncodingGapInfo {
+            count: agg_gap_count,
+            per_harness: agg_gap_per_fn,
+            per_harness_reasons: agg_gap_reasons,
+        }
     });
     merge_ph(&mut aggregate_encoding_gap, ph.aggregate_encoding_gap);
 

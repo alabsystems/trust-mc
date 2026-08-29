@@ -1,3 +1,7 @@
+// Oracle (per harness) — the 'bad twin'/'good twin' below, by name:
+//   check_violated_ensures_walked -> VERIFICATION:- FAILED
+//   check_correct_ensures_walked  -> VERIFICATION:- SUCCESSFUL
+//
 // DUAL for the transformed-body walker keystone:
 // With RAW callee bodies, kani_contract_mode() inside a walker-inlined contract
 // fn is the macro dummy ORIGINAL=0, so the ensures check arm (ASSERT=4) is

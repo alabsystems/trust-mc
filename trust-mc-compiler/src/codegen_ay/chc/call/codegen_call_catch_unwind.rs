@@ -132,7 +132,7 @@ impl<'tcx, 'body> CallDispatchCatchUnwind for ChcCtx<'tcx, 'body> {
         // Handle the raw intrinsic: MIR monomorphization inlines the
         // std::panicking::catch_unwind wrapper so by the time CHC sees
         // the call, it's std::intrinsics::catch_unwind directly.
-        // Model as "always returns 0" (no unwind) — the inlined wrapper
+        // Nondeterministic unwind outcome — the inlined wrapper
         // MIR reads data.r and produces Ok(r) on the 0 path.
         if is_catch_unwind_intrinsic_path(callee_path) {
             return self.dispatch_catch_unwind_intrinsic(dcx);
@@ -147,7 +147,7 @@ impl<'tcx, 'body> CallDispatchCatchUnwind for ChcCtx<'tcx, 'body> {
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
-    /// Handle std::intrinsics::catch_unwind: model as "always returns 0" (no unwind).
+    /// Handle std::intrinsics::catch_unwind: NONDETERMINISTIC unwind outcome.
     /// The inlined wrapper MIR checks the return value and reads data.r on the 0 path.
     fn dispatch_catch_unwind_intrinsic(&mut self, dcx: &DispatchCallContext<'_>) -> bool {
         let Some(target) = dcx.target else {
@@ -161,9 +161,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         let dest_local: usize = dcx.destination.local;
         // catch_unwind intrinsic returns i32: 0 = no unwind, 1 = caught.
-        // Model as always 0 (no unwind) — sound over-approximation.
-        let result_value = Expr::bitvec_const(0, 32);
-        debug!(bb_idx = dcx.bb_idx, dest_local, "catch_unwind intrinsic: returning 0 (no unwind)");
+        //
+        // A CONSTANT 0 here is NOT a sound over-approximation, despite what this
+        // comment used to claim: it DELETES the unwind outcome, so
+        // `catch_unwind(|| panic!("oh no!")).is_ok()` was PROVED and no check was
+        // emitted for the swallowed panic. A real over-approximation is
+        // NONDETERMINISTIC — both continuations must stay reachable.
+        //
+        // See tools/soundness-duals/catch_unwind_dual.rs.
+        let unwound = declare_pending_var(chc_fresh_name("__catch_unwind_unwound"), Sort::bool());
+        let result_value = Expr::ite(unwound, Expr::bitvec_const(1, 32), Expr::bitvec_const(0, 32));
+        debug!(
+            bb_idx = dcx.bb_idx,
+            dest_local, "catch_unwind intrinsic: nondeterministic unwind outcome"
+        );
         self.emit_catch_unwind_rule(dcx, dest_local, result_value, *target)
     }
 

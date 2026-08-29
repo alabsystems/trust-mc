@@ -105,6 +105,24 @@ pub(super) fn build_nested_call_fallback_expr(
     }
 }
 
+/// The `__nested_call_overapprox` SMT variable inside a fallback expression.
+///
+/// The thin-pointer arm wraps the fresh var in `bvor`/`concat`, so the name is
+/// not always the whole expression. Task #78's dependence analysis keys on the
+/// freed var's IDENTITY, so it has to be dug out rather than assumed.
+pub(super) fn nested_call_fallback_freed_var(expr: &Expr) -> Option<String> {
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        if let ay_bindings::ExprValue::Var { name } = e.value()
+            && name.contains("__nested_call_overapprox")
+        {
+            return Some(name.to_string());
+        }
+        stack.extend(e.value().children());
+    }
+    None
+}
+
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 pub(super) fn build_nested_call_fallback_expr_for_test(
     effective_sort: ay_bindings::Sort,

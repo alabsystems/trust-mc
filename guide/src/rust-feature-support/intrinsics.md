@@ -137,8 +137,8 @@ copy | Yes | |
 copy_nonoverlapping | Yes | |
 copysignf32 | Yes | |
 copysignf64 | Yes | |
-cosf32 | Partial | Results are overapproximated; [this test](https://github.com/model-checking/kani/blob/main/tests/kani/Intrinsics/Math/Trigonometry/cosf32.rs) explains how |
-cosf64 | Partial | Results are overapproximated; [this test](https://github.com/model-checking/kani/blob/main/tests/kani/Intrinsics/Math/Trigonometry/cosf64.rs) explains how |
+cosf32 | Partial | Results are overapproximated |
+cosf64 | Partial | Results are overapproximated |
 ctlz | Yes | |
 ctlz_nonzero | Yes | |
 ctpop | Partial | Supported for covered cases; edge-case proof coverage is incomplete |
@@ -205,8 +205,8 @@ roundf64 | Partial | BMC_SAFE coverage exists, but this is not a proof of full r
 rustc_peek | No | |
 saturating_add | Yes | |
 saturating_sub | Yes | |
-sinf32 | Partial | Results are overapproximated; [this test](https://github.com/model-checking/kani/blob/main/tests/kani/Intrinsics/Math/Trigonometry/sinf32.rs) explains how |
-sinf64 | Partial | Results are overapproximated; [this test](https://github.com/model-checking/kani/blob/main/tests/kani/Intrinsics/Math/Trigonometry/sinf64.rs) explains how |
+sinf32 | Partial | Results are overapproximated |
+sinf64 | Partial | Results are overapproximated |
 size_of | Yes | |
 size_of_val | Yes | |
 sqrtf32 | Partial | Results are overapproximated |
@@ -219,8 +219,8 @@ try | No | [#1550](https://github.com/alabsystems/trust-mc/issues/1550) |
 type_id | Yes | |
 type_name | Yes | |
 typed_swap_nonoverlapping | Yes | |
-unaligned_volatile_load | No | See [Notes - Concurrency](#concurrency) |
-unaligned_volatile_store | No | See [Notes - Concurrency](#concurrency) |
+unaligned_volatile_load | No | See [Notes - Concurrency](../rust-feature-support.md#concurrency) |
+unaligned_volatile_store | No | See [Notes - Concurrency](../rust-feature-support.md#concurrency) |
 unchecked_add | Yes | |
 unchecked_div | Yes | |
 unchecked_mul | Yes | |
@@ -231,11 +231,11 @@ unchecked_sub | Yes | |
 unlikely | Yes | |
 unreachable | Yes | |
 variant_count | Yes | |
-volatile_copy_memory | No | See [Notes - Concurrency](#concurrency) |
-volatile_copy_nonoverlapping_memory | No | See [Notes - Concurrency](#concurrency) |
-volatile_load | Partial | See [Notes - Concurrency](#concurrency) |
-volatile_set_memory | No | See [Notes - Concurrency](#concurrency) |
-volatile_store | Partial | See [Notes - Concurrency](#concurrency) |
+volatile_copy_memory | No | See [Notes - Concurrency](../rust-feature-support.md#concurrency) |
+volatile_copy_nonoverlapping_memory | No | See [Notes - Concurrency](../rust-feature-support.md#concurrency) |
+volatile_load | Partial | See [Notes - Concurrency](../rust-feature-support.md#concurrency) |
+volatile_set_memory | No | See [Notes - Concurrency](../rust-feature-support.md#concurrency) |
+volatile_store | Partial | See [Notes - Concurrency](../rust-feature-support.md#concurrency) |
 wrapping_add | Yes | |
 wrapping_mul | Yes | |
 wrapping_sub | Yes | |
@@ -244,7 +244,7 @@ write_bytes | Yes | |
 #### Atomics
 
 All atomic intrinsics are compiled as an atomic block where the operation is
-performed. But as noted in [Notes - Concurrency](#concurrency), trust-mc support for
+performed. But as noted in [Notes - Concurrency](../rust-feature-support.md#concurrency), trust-mc support for
 concurrent verification is limited and not used by default. Verification on code
 containing atomic intrinsics should not be trusted given that trust-mc assumes the
 code to be sequential.

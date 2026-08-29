@@ -5,7 +5,7 @@
 
 [package]
 name = "trust-mc"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A bit-precise model checker for Rust."
 readme = "README.md"
@@ -26,6 +26,12 @@ anyhow = "1"
 home = "0.5"
 libc = "0.2"
 os_info = { version = "3", default-features = false }
+
+[dev-dependencies]
+# `tests/cli.rs` asserts on the SARIF report the CLI writes. That report is the
+# machine-readable channel CI gates on, so the test reads it the way a consumer
+# would -- as JSON -- rather than by matching substrings.
+serde_json = { workspace = true }
 
 [[bin]]
 name = "trust-mc"
@@ -123,10 +129,27 @@ members = [
 ]
 
 # This indicates what package to e.g. build with 'cargo build' without --workspace
+#
+# `trust-mc-compiler` is DELIBERATELY not here, for the same reason
+# tools/kani-domination is not a member at all: it is a rustc DRIVER
+# (#![feature(rustc_private)], links librustc_driver, ~540K LOC) and so it can
+# only build on a toolchain that ships the rustc-dev closure. Having it in the
+# default set meant a bare `cargo build` dragged that requirement into every
+# build of this repo, including the Trust lane.
+#
+# It serves the KANI-COMPATIBILITY path: Rust source -> rustc internals -> AY.
+# The TRUST path does not go through it at all --
+#   tRust/tSwift/tC -> trust_ir::Module -> trust-mc-trust-bmc -> BmcVc/ChcVc -> ay
+# -- and trust-mc-driver depends on `trust-mc-trust-bmc` as a real crate
+# (native.rs) while only LOCATING `trust-mc-compiler` as a separate executable at
+# runtime (session/install.rs). Trust's own bootstrap builds trust-mc-core,
+# trust-mc-driver and trust-mc-trust-bmc, and never trust-mc-compiler.
+#
+# Build the Kani lane explicitly, on a toolchain with rustc-dev:
+#   cargo build -p trust-mc-compiler
 default-members = [
   ".",
   "trust-mc-driver",
-  "trust-mc-compiler",
 ]
 
 exclude = [
@@ -333,38 +356,54 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # TrustIR and trust-vc authorities declared by member manifests, plus the Clean
 # kernel authority consumed transitively by the canonical TrustIR checkout.
 #
+# TWO TIERS, DELIBERATELY DIFFERENT — do not "unify" them without reading this.
+#   * ALWAYS-ON (`trust-mc-driver::version`, checked on every `cargo test` and
+#     every `--version-authority` print): the linked AY must CONTAIN the declared
+#     pin (`git merge-base --is-ancestor`). Exact equality is NOT enforceable
+#     here: with the [patch] below, the linked commit is ../ay's HEAD at AY build
+#     time, and ../ay is a shared checkout this repo does not own — a second
+#     agent working there moves it, which is why the equality form of this guard
+#     failed nondeterministically. Ancestry still forbids linking an AY older
+#     than, or off the history of, the declared pin, and the guard additionally
+#     rejects a [patch] that Cargo SILENTLY DECLINED (see the findings doc at
+#     docs/findings/2026-08-19-the-ay-patch-was-silently-version-rejected.md).
+#   * PRE-MEASUREMENT (`scripts/check-ay-pin.sh`, run deliberately before a
+#     corpus run): ../ay must be clean AND at the exact declared rev, so a
+#     published number names the commit it was produced by. Align ../ay first.
+#
 # For local co-development:
 # 1. Keep ../ay checkout at the desired revision.
 # 2. The active [patch] table below redirects the pinned source to that checkout.
 #
-# To bump AY: change the shared rev on every ay-* entry below to the new
-# 40-char commit, align ../ay to it, run `scripts/check-ay-pin.sh`, then run
-# `cargo update -p ay-chc` plus locked metadata and re-run the corpus measurement
-# (scripts/ay-compiletest.sh) so the authority tuple is refreshed. With the path
-# patch, a no-op lockfile update is expected when AY's package graph and versions
-# are unchanged.
+# To bump AY: align ../ay to the new pushed 40-char commit, then run
+# `scripts/bump-ay-pin.py <rev> <version>`. The helper updates every declaration,
+# refreshes Cargo.lock before locked validation, and restores both files if any
+# authority check fails. Then run `scripts/check-ay-pin.sh` and re-run the corpus
+# measurement (scripts/ay-compiletest.sh) so the authority tuple is refreshed.
+# With the path patch, a no-op lockfile update is expected when AY's package graph
+# and versions are unchanged.
 [workspace.dependencies]
 # Keep all AY workspace dependencies pinned to the SAME 40-char rev. The
 # replacement-proof standard (replacement-proof.md at the repo root) requires a pinned
 # 40-character ay revision for reproducible measurements; a floating
 # `branch = "main"` does not satisfy it. Cargo.lock intentionally records the
 # path-patched packages; this manifest rev records the exact upstream commit.
-ay-dpll = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
-ay-core = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
-ay-frontend = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
-ay-chc = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
-ay_bindings = { version = "0.10.0", package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
+ay-dpll = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
+ay-core = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
+ay-frontend = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
+ay-chc = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
+ay_bindings = { version = "0.19.0", package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
 # Trust: default-features = false drops ay's GMP-backed LRA path (`rug` +
 # `gmp-mpfr-sys`). trust-mc-driver links ay in-process; the pure-Rust
 # num_rational fallback is functionally identical and adds no native `-lgmp`
 # link, so the Trust rustc_driver link has no undefined `___gmpq_*` symbols.
-ay = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60", default-features = false }
-ay-sys = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
+ay = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32", default-features = false }
+ay-sys = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
 # Shared AY encoding/invocation surface — consumed from its canonical home in
 # the ay repo (NOT vendored). Because all ay-family deps above use the same
 # pinned rev, ay-encode's own ay-chc/ay-bindings/ay-core resolve to the same
 # rev — one shared copy of ChcProblem/VerifiedChcResult/etc.
-ay-encode = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
+ay-encode = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
 num-bigint = "0.4"
 
 # Common dependencies centralized for version consistency across workspace members.
@@ -449,3 +488,11 @@ ay-encode = { path = "../ay/crates/ay-encode" }
 # needs the rustc-dev component and is not relocatable.
 expose = ["trust-mc-cov"]
 build-args = ["-p", "trust-mc-cov"]
+# The paragraph above is a rule a human must read, and on 2026-08-21 a packer
+# run did not: a bulk dual-arch pass sent trust-mc through atpkg-pack.sh with
+# every other program, and this `expose` line — correct for THIS lane — became
+# the whole published surface. `trust-mc-driver` vanished from the manifest, and
+# because atpkg prunes shims a newer build drops, it was deleted from the PATH
+# of every user who updated. So the rule is data now, not prose: aterm's
+# atpkg-pack.sh refuses a program that sets this, and names the bundle lane.
+bundle-only = true

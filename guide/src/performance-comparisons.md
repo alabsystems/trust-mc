@@ -1,6 +1,11 @@
 # Performance comparisons with `benchcomp`
 
-While trust-mc includes a [performance regression suite](https://github.com/model-checking/kani/tree/main/tests/perf), you may wish to test trust-mc's performance using your own benchmarks or with particular versions of trust-mc.
+> **NOTE**: `benchcomp` is not checked into this repository — there is no
+> `tools/benchcomp` directory. This page (and the `benchcomp` reference pages)
+> describes the tool as inherited from upstream Kani; the commands below will
+> not run until it is vendored back in.
+
+While trust-mc includes a performance regression suite under `tests/perf`, you may wish to test trust-mc's performance using your own benchmarks or with particular versions of trust-mc.
 You can use the `benchcomp` tool in the trust-mc repository to run several 'variants' of a command on one or more benchmark suites; automatically parse the results of each of those suites; and take actions or emit visualizations based on those results.
 
 ## Example use-cases
@@ -23,7 +28,7 @@ Benchcomp provides the following features to support your performance-comparison
 
 ## Quick start
 
-Here's how to run trust-mc's performance suite twice, comparing the last released version of Kani with the current HEAD.
+Here's how the suite would be run twice, comparing the last release tag with the current HEAD.
 
 ```
 cd $TRUST_MC_SRC_DIR
@@ -33,8 +38,8 @@ git worktree add old $(git describe --tags --abbrev=0)
 tools/benchcomp/bin/benchcomp --config tools/benchcomp/configs/perf-regression.yaml
 ```
 
-This uses the [`perf-regression.yaml` configuration file](https://github.com/model-checking/kani/blob/main/tools/benchcomp/configs/perf-regression.yaml) that we use in continuous integration.
+This uses a `perf-regression.yaml` configuration file.
 After running the suite twice, the configuration file terminates `benchcomp` with a return code of 1 if any of the benchmarks regressed on metrics such as `success` (a boolean), `solver_runtime`, and `number_vccs` (numerical).
-Additionally, the config file directs benchcomp to print out a Markdown table that GitHub's CI summary page renders in to a table.
+Additionally, the config file directs benchcomp to print out a Markdown table.
 
 The rest of this documentation describes how to modify `benchcomp` for your own use cases, including writing a configuration file; writing a custom parser for your benchmark suite; and writing a custom visualization to examine the results of a performance comparison.

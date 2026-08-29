@@ -20,6 +20,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ENSURES: Sets current_env to merged entry environment
     /// ENSURES: Sets current_path_condition from block_path_conditions
     pub(in crate::codegen_ay) fn initialize_block_entry_env(&mut self, bb_idx: usize) {
+        // Which block we are on. Recorded FIRST so the bb0 early-return below
+        // does not skip it. Read only by the unwinding-assertion sentinel lookup
+        // in the `Unreachable` terminator arm.
+        self.current_bb = bb_idx;
+
         // SwitchInt→variant bridge (#3017): a `Discriminant(P)` read and the `SwitchInt`
         // that consumes it live in the SAME basic block, so the discriminant-scrutinee
         // table is block-local. Clearing it at every block entry prevents a discriminant

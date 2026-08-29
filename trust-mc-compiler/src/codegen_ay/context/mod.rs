@@ -70,6 +70,22 @@ pub(in crate::codegen_ay) struct AYCtx<'tcx, 't> {
     pub(in crate::codegen_ay) queries: QueryDb,
     /// Backend configuration (unwind depth, CHC mode, logic).
     pub(in crate::codegen_ay) config: AYConfig,
+    /// The harness body has no obligation SITE at all — no `Call`, no `Assert`
+    /// terminator. Recorded during codegen (the artifact builder has no
+    /// `Instance` to fetch a body with) and surfaced to the driver so its
+    /// vacuity refusal can tell "nothing to prove" from "we dropped it".
+    /// Per-HARNESS obligation-free certificates, keyed by the name
+    /// `build_artifact` is called with.
+    ///
+    /// This was a single `bool`, which one `AYCtx` serving several harnesses in
+    /// one file made meaningless: `codegen_function_with_body` runs per
+    /// function, so whichever ran LAST decided the answer for every artifact.
+    /// A file whose second harness has no obligation could hand its
+    /// certificate to a first harness that does — a false-Safe channel — and
+    /// the reverse cost parity. Measured on `obligation_free_walk_dual_safe.rs`,
+    /// where both safe twins went VACUOUS.
+    pub(in crate::codegen_ay) obligation_free_body_by_fn:
+        std::collections::HashMap<String, bool>,
     /// The AY program being constructed (holds SMT commands).
     pub(in crate::codegen_ay) program: AYProgram,
     /// Abstract BMC verification condition (dual-write for migration).
@@ -239,6 +255,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             tcx,
             queries,
             config,
+            obligation_free_body_by_fn: std::collections::HashMap::new(),
             program,
             bmc_vc,
             chc_vc: None,
@@ -268,6 +285,16 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         }
     }
 
+    /// This codegen unit's stub map, empty when there is no transformer.
+    pub(in crate::codegen_ay) fn transformer_stub_map(
+        &self,
+    ) -> crate::codegen_ay::obligation_free_walk::StubMap {
+        self.transformer
+            .as_ref()
+            .map(|t| t.stub_map_for_walk())
+            .unwrap_or_default()
+    }
+
     /// Get the MIR body for an instance.
     ///
     /// # Panics
@@ -286,7 +313,10 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         instance: Instance,
     ) -> Option<rustc_public::mir::Body> {
         if let Some(transformer) = self.transformer.as_mut() {
-            return Some(transformer.body(self.tcx, instance));
+            // `try_body`, not `body`: the latter panics on an instance with no
+            // MIR, which made this function's `Option` a promise it could not
+            // keep on the transformer path. Callers already handle `None`.
+            return transformer.try_body(self.tcx, instance);
         }
         instance.body()
     }
@@ -522,6 +552,9 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// Populates model queries with any_raw variables for concrete playback.
     /// Note: emit_bmc automatically adds violation predicates to get-value.
     pub(in crate::codegen_ay) fn finalize_emit_bmc(&mut self) {
+        // The vacuity probe needs the whole-trace assumption conjunction
+        // (dual-written, so the emit_bmc lane carries it too).
+        self.emit_assume_final_flag();
         // Populate model queries for concrete playback.
         // emit_bmc automatically handles violation predicates (ay_viol_*),
         // so we only need to add the kani::any_raw symbolic variables here.

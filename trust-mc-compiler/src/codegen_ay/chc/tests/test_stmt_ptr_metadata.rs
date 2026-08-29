@@ -332,7 +332,7 @@ fn test_ptr_metadata_thin_pointer_returns_zero() {
                 .expect("thin pointer metadata should translate");
             let after = chc_ctx.diagnostics.ptr_metadata_unconstrained.get();
 
-            assert_ptr_metadata_const(&expr, 0);
+            assert_ptr_metadata_const(expr.as_expr(), 0);
             assert_eq!(after, before, "{entry} should not increment ptr_metadata_unconstrained");
         });
     }
@@ -368,11 +368,11 @@ fn test_ptr_metadata_unresolved_wide_pointer_increments_counter() {
                 // Concrete resolution fired (flattened fld1 or BV128 extraction).
                 // The expr should NOT be a ptr_metadata_* symbolic.
                 assert!(
-                    !matches!(expr.value(), ExprValue::Var { name } if name.starts_with("ptr_metadata_")),
+                    !matches!(expr.as_expr().value(), ExprValue::Var { name } if name.starts_with("ptr_metadata_")),
                     "counter unchanged but got unconstrained symbolic"
                 );
             } else {
-                assert_ptr_metadata_fallback_var(&expr);
+                assert_ptr_metadata_fallback_var(expr.as_expr());
                 assert_eq!(
                     after,
                     before + 1,
@@ -402,7 +402,7 @@ fn test_ptr_metadata_subslice_range_prefers_dynamic_len_over_array_extent() {
                 .translate_ptr_metadata(&source_operand, &HashSet::new())
                 .expect("range subslice metadata should recover dynamic len");
 
-            assert_ptr_metadata_dynamic_subslice_len(&expr, false);
+            assert_ptr_metadata_dynamic_subslice_len(expr.as_expr(), false);
             assert_eq!(
                 chc_ctx.diagnostics.ptr_metadata_unconstrained.get(),
                 0,
@@ -431,7 +431,7 @@ fn test_ptr_metadata_subslice_range_inclusive_adds_one() {
                 .translate_ptr_metadata(&source_operand, &HashSet::new())
                 .expect("range-inclusive subslice metadata should recover dynamic len");
 
-            assert_ptr_metadata_dynamic_subslice_len(&expr, true);
+            assert_ptr_metadata_dynamic_subslice_len(expr.as_expr(), true);
             assert_eq!(
                 chc_ctx.diagnostics.ptr_metadata_unconstrained.get(),
                 0,
@@ -463,7 +463,7 @@ fn test_ptr_metadata_boxed_str_raw_ptr_uses_len_state_trace() {
                 .translate_ptr_metadata(&operand, &HashSet::new())
                 .expect("boxed str raw pointer metadata should resolve through MIR trace");
 
-            match expr.value() {
+            match expr.as_expr().value() {
                 ExprValue::Var { name } => {
                     assert!(
                         known_len_vars.iter().any(|tracked| tracked.as_ref() == name),
@@ -514,7 +514,7 @@ fn test_ptr_metadata_vec_backed_tuple_wrapper_uses_struct_embedded_len() {
                 .translate_ptr_metadata(&source_operand, &HashSet::new())
                 .expect("tuple-wrapper slice metadata should resolve through slice_to_vec_local");
 
-            assert_ptr_metadata_var_named(&expr, &len_var_name);
+            assert_ptr_metadata_var_named(expr.as_expr(), &len_var_name);
             assert_eq!(
                 chc_ctx.diagnostics.ptr_metadata_unconstrained.get(),
                 0,
@@ -545,7 +545,7 @@ fn test_ptr_metadata_dyn_trait_prefers_dyn_vtable_ids() {
                 .expect("dyn PtrMetadata should resolve through dyn_vtable_ids");
 
             assert_eq!(
-                expr.to_string(),
+                expr.as_expr().to_string(),
                 expected.to_string(),
                 "dyn_vtable_ids should win over path-sensitive state vars when both exist"
             );
@@ -577,12 +577,12 @@ fn test_ptr_metadata_dyn_trait_uses_input_state_var_when_path_sensitive() {
                 .translate_ptr_metadata(&source_operand, &HashSet::new())
                 .expect("dyn PtrMetadata should resolve through vtable_state_vars");
 
-            assert_ptr_metadata_var_named(&expr, &in_name);
+            assert_ptr_metadata_var_named(expr.as_expr(), &in_name);
             assert_eq!(
-                expr.sort().bitvec_width(),
+                expr.as_expr().sort().bitvec_width(),
                 Some(crate::codegen_ay::types::POINTER_WIDTH),
                 "path-sensitive dyn PtrMetadata should stay at pointer-width sort: {:?}",
-                expr.sort()
+                expr.as_expr().sort()
             );
             assert_eq!(
                 chc_ctx.diagnostics.ptr_metadata_unconstrained.get(),
@@ -614,7 +614,7 @@ fn test_ptr_metadata_custom_dst_unsize_destination_uses_subslice_len_side_table(
         let after = chc_ctx.diagnostics.ptr_metadata_unconstrained.get();
 
         assert_eq!(
-            expr.to_string(),
+            expr.as_expr().to_string(),
             seeded_len.to_string(),
             "custom-DST Unsize destination should resolve PtrMetadata from the seeded subslice_len side table"
         );
@@ -623,8 +623,9 @@ fn test_ptr_metadata_custom_dst_unsize_destination_uses_subslice_len_side_table(
             "custom-DST Unsize destination should not increment ptr_metadata_unconstrained"
         );
         assert!(
-            !matches!(expr.value(), ExprValue::Var { name } if name.starts_with("ptr_metadata_")),
-            "custom-DST Unsize destination should not fall back to a fresh ptr_metadata_* symbolic: {expr}"
+            !matches!(expr.as_expr().value(), ExprValue::Var { name } if name.starts_with("ptr_metadata_")),
+            "custom-DST Unsize destination should not fall back to a fresh ptr_metadata_* symbolic: {}",
+            expr.as_expr()
         );
     });
 }

@@ -26,10 +26,8 @@ use crate::kani_middle::transform::TransformationType;
 use crate::kani_queries::QueryDb;
 use lazy_static::lazy_static;
 use rustc_middle::ty::TyCtxt;
-use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{BasicBlockIdx, Body};
-use rustc_public::rustc_internal;
 use rustc_public::ty::{FnDef, RigidTy};
 use rustc_span::Symbol;
 use std::collections::HashMap;
@@ -143,6 +141,15 @@ pub(crate) struct LoopContractPass {
     /// obligation at the loop latch. `None` when the unit has no harnesses;
     /// decreases instrumentation is then skipped (fail-closed at CHC codegen).
     safety_check_type: Option<super::body::CheckType>,
+    /// Safety-check WITHOUT the assume half, used for the loop-invariant
+    /// base/step obligations (#47). Those two sit on the loop-entry /
+    /// post-iteration edge with a `SwitchInt(_v)` immediately after, so the
+    /// `¬inv` continuation is already cut structurally (it goes to the
+    /// `assume(false)` sink). Emitting the assume half as well would add an
+    /// ordered `assume(inv)` to every contracted loop for no semantic gain —
+    /// measured cost on `memchar_naive`: 54s (over its retry budget) with the
+    /// assume, well inside it without.
+    safety_check_no_assume_type: Option<super::body::CheckType>,
     /// `kani::assume` (AssumeHook) — used by the loop-contract proof rule for
     /// `assume(inv)` on the havocked state and the back-edge cut (#47).
     assume_fn: Option<FnDef>,
@@ -150,19 +157,19 @@ pub(crate) struct LoopContractPass {
     /// primitive for loop-modified locals (#47). No trait bounds, so it
     /// resolves for any sized `T`; codegen lowers it to a nondet destination.
     any_modifies_fn: Option<FnDef>,
-    /// #47 scope gate: the body being transformed belongs to (or is a closure
-    /// chain under) a fn carrying kani contract attributes. The proof rule is
-    /// skipped there — contract instrumentation interleaves its own
-    /// closures/havoc with the loop and the combined obligations regress
-    /// tests the legacy encoding proves (function_with_loop_no_assertion,
-    /// contract_proof_function_with_loop). Legacy behavior is kept verbatim.
-    enclosing_has_contract: bool,
-    /// Decreases interplay (#47): `(old_snapshot_local, measure_source_local)`
-    /// recorded by `instrument_loop_decreases`' identity fast path so the
-    /// proof rule can re-snapshot `old = src` after the havoc (the ranking
-    /// check must compare within the symbolic iteration, not against the
-    /// concrete entry state).
-    decreases_snapshot: Option<(usize, usize)>,
+    /// Decreases interplay (#47): the `(old_snapshot_local, source_local)`
+    /// pairs recorded by `instrument_loop_decreases` so the proof rule can
+    /// re-snapshot them after the havoc (the ranking check must compare
+    /// within the symbolic iteration, not against the concrete entry state).
+    ///
+    /// One pair for an identity measure (`x`); one pair PER COMPONENT for a
+    /// compound measure (`hi - lo` snapshots `hi` and `lo` separately). The
+    /// components are snapshotted rather than the difference on purpose: a
+    /// havocked state can make `hi < lo`, and snapshotting the difference
+    /// would wrap it to a huge value, letting `new < old` hold spuriously —
+    /// a fabricated termination proof. Recomputing the difference from
+    /// freshly-snapshotted components keeps the underflow guard meaningful.
+    decreases_snapshot: Option<Vec<(usize, usize)>>,
 }
 
 impl TransformPass for LoopContractPass {
@@ -185,18 +192,6 @@ impl TransformPass for LoopContractPass {
         self.new_loop_latches = HashMap::new();
         self.extracted_invariants = Vec::new();
         self.decreases_snapshot = None;
-        // #47 scope gate: walk closure parents to the owning item and check
-        // for kani contract attributes (mirrors is_contract_machinery_def).
-        self.enclosing_has_contract = {
-            let mut def_id = rustc_internal::internal(tcx, instance.def.def_id());
-            while tcx.is_closure_like(def_id) {
-                match tcx.opt_parent(def_id) {
-                    Some(parent) => def_id = parent,
-                    None => break,
-                }
-            }
-            KaniAttributes::for_item(tcx, def_id).has_contract()
-        };
         let result = match instance.ty().kind().rigid().expect("instance type should be rigid") {
             RigidTy::FnDef(_func, args) => {
                 if KaniAttributes::for_instance(tcx, instance).fn_marker()
@@ -242,9 +237,11 @@ impl LoopContractPass {
                 safety_check_type: Some(super::body::CheckType::new_safety_check_assert_assume(
                     queries,
                 )),
+                safety_check_no_assume_type: Some(
+                    super::body::CheckType::new_safety_check_assert_no_assume(queries),
+                ),
                 assume_fn: kani_fns.get(&KaniHook::Assume.into()).copied(),
                 any_modifies_fn: kani_fns.get(&KaniIntrinsic::AnyModifies.into()).copied(),
-                enclosing_has_contract: false,
                 decreases_snapshot: None,
             }
         } else {

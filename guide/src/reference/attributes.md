@@ -167,12 +167,12 @@ As we mentioned, trying to verify this harness causes an unwinding failure:
 ```
 SUMMARY:
  ** 1 of 187 failed (186 undetermined)
-Failed Checks: unwinding assertion loop 0
+Failed Checks: unwinding assertion loop: the loop must exit within the --unwind bound
  File: "/home/ubuntu/devices/src/main.rs", line 32, in my_sum
 
 VERIFICATION:- FAILED
-[trust-mc] info: Verification output shows one or more unwinding failures.
-[trust-mc] tip: Consider increasing the unwinding value or disabling `--unwinding-assertions`.
+[trust_mc] info: Verification output shows one or more unwinding failures.
+[trust_mc] tip: Consider increasing the unwinding value or disabling `--unwinding-assertions`.
 ```
 
 trust-mc cannot verify the harness because there is at least one unwinding assertion failure.

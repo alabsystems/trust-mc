@@ -28,10 +28,11 @@ fn resolve_inline_index_expr(
 ) -> Option<Expr> {
     let raw = match projection {
         ProjectionElem::Index(index_local) => local_exprs.get(index_local).cloned(),
-        ProjectionElem::ConstantIndex { offset, min_length, from_end } => Some(Expr::bitvec_const(
-            constant_index_offset(*offset, *min_length, *from_end) as u128,
-            POINTER_WIDTH,
-        )),
+        ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
+            // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+            constant_index_offset(*offset, *min_length, *from_end)
+                .map(|i| Expr::bitvec_const(i as u128, POINTER_WIDTH))
+        }
         _ => None,
     }?;
     Some(coerce_bitvec_width_safe(raw, POINTER_WIDTH, SignExtension::ZeroExtend))

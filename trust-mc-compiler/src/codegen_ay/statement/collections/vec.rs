@@ -575,10 +575,27 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             VecExtendFromSlice => self.codegen_vec_extend_from_slice(args, destination, target),
             SliceIntoVec => self.codegen_slice_into_vec(args, destination, target),
             VecFromSlice => {
-                // <Vec<T> as From<&[T]>>::from — sound over-approximation (#3673).
-                // Leave destination unconstrained (symbolic Vec). BMC parity.
-                debug!("VecFromSlice: symbolic Vec over-approximation (BMC)");
-                target
+                // `<Vec<T> as From<&[T]>>::from` and `From<[T; N]>`.
+                //
+                // This used to leave the destination entirely unconstrained. The
+                // DATA genuinely is an over-approximation here, but the LENGTH is
+                // not an approximation at all -- a Vec built from a slice has
+                // exactly that slice's length, and from `[T; N]` exactly N.
+                // Leaving it symbolic was strictly weaker than what we know, and
+                // it made obviously-true facts unprovable:
+                //
+                //     Vec::from([1u8, 2, 3, 4]).len() == 4      // FAILED
+                //
+                // which in turn sank `<Vec<T> as BoundedArbitrary>::bounded_any`,
+                // since that builds its vector this way before truncating.
+                //
+                // `codegen_slice_into_vec` already resolves the length correctly
+                // -- concrete when it can recover N from the argument's type,
+                // else the slice's length expression, else a fresh symbol -- and
+                // keeps the data array symbolic, so routing here refines the
+                // length without weakening anything about the contents.
+                debug!("VecFromSlice: precise length, symbolic data (BMC)");
+                self.codegen_slice_into_vec(args, destination, target)
             }
 
             VecSplice => {

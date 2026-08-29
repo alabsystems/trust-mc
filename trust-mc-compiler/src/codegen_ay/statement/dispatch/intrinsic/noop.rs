@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 //
-//! No-op intrinsic dispatch: forget, black_box, likely/unlikely, is_val_statically_known.
+//! No-op intrinsic dispatch: forget, black_box, likely/unlikely,
+//! is_val_statically_known, breakpoint, caller_location.
 
 use ay_bindings::Expr;
 use rustc_public::mir::{BasicBlockIdx, Operand, Place};
@@ -30,6 +31,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if fn_name.contains("likely") || fn_name.contains("unlikely") {
             debug!("AY codegen: handling likely/unlikely (identity)");
             return self.codegen_identity_intrinsic(args, destination, target);
+        }
+        // `breakpoint` emits a debugger trap and has no effect on program
+        // state or control flow. Modelled as a no-op so it does not fall
+        // through to the unsupported-call path, which would demote the whole
+        // harness for an intrinsic that cannot affect a proof.
+        if fn_name.contains("breakpoint") {
+            debug!("AY codegen: handling breakpoint (no-op)");
+            return target;
+        }
+        // `caller_location` returns a &Location describing the call site. It is
+        // pure metadata: nothing a harness can assert on depends on its
+        // contents, and leaving it unmodelled demotes the harness. The
+        // destination is left unbound, which is the same over-approximation the
+        // unsupported path would apply, minus the demotion.
+        if fn_name.contains("caller_location") {
+            debug!("AY codegen: handling caller_location (opaque location)");
+            return target;
         }
         if fn_name.contains("is_val_statically_known") {
             debug!("AY codegen: handling is_val_statically_known (return false)");

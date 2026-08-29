@@ -364,3 +364,124 @@ fn test_track_ref_pointees_ignores_non_ref_rvalues() {
         );
     });
 }
+
+// =============================================================================
+// deref_pointee_alias — canonical referent naming for `&(*r).field`
+// =============================================================================
+
+const DEREF_BORROW_SOURCE: &str = r#"
+pub struct Pair { pub a: u32, pub b: u32 }
+
+pub fn borrow_first(p: &mut Pair) -> &mut u32 {
+    &mut p.a
+}
+"#;
+
+/// `&mut (*_r).0` must name the referent after the STORAGE the deref ladder
+/// resolves (`ref_pointees[_r]` + `_field_0`), not after the reference local it
+/// was reached through (`local_{r}_deref_field_0`).
+///
+/// Two reference locals that alias the same place otherwise get two unrelated
+/// env slots, so a store through one is invisible to a load through the other
+/// (`history/clone_pass`: the ensures read `ptr.0` from one slot while `ptr.0 +=
+/// 1` had written another, and a TRUE contract was reported FAILED).
+#[test]
+fn test_track_ref_pointees_canonicalizes_deref_field_borrow() {
+    with_test_ay_ctx_for_source(DEREF_BORROW_SOURCE, |mut ctx| {
+        let instance = find_instance_by_suffix(&ctx, "borrow_first");
+        let body = instance.body().expect("body");
+        ctx.set_current_fn(instance);
+        let tuple_usage = TupleUsageAnalysis::run(&body);
+        let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+        seed_args(&mut codegen, &body);
+
+        // The deref ladder resolves `_1` to a canonical storage base.
+        let arg = Place { local: Local::from(1usize), projection: vec![] };
+        let arg_base = codegen.ssa_base_name(&arg);
+        codegen.ref_pointees.insert(Arc::from(arg_base.as_str()), Arc::from("canon::local_2"));
+
+        let mut found = false;
+        for bb in &body.blocks {
+            for stmt in &bb.statements {
+                let StatementKind::Assign(lhs, rvalue) = &stmt.kind else {
+                    continue;
+                };
+                let (Rvalue::Ref(_, _, pointee) | Rvalue::AddressOf(_, pointee)) = rvalue else {
+                    continue;
+                };
+                if !matches!(pointee.projection.first(), Some(ProjectionElem::Deref)) {
+                    continue;
+                }
+                let ref_base = codegen.ssa_base_name(lhs);
+                codegen.track_ref_pointees(lhs, rvalue);
+                let mapped = codegen
+                    .ref_pointees
+                    .get(ref_base.as_str())
+                    .expect("borrow must record a pointee")
+                    .to_string();
+                assert_eq!(
+                    mapped, "canon::local_2_field_0",
+                    "`&mut (*_1).0` must resolve to the canonical storage name"
+                );
+                found = true;
+                break;
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(found, "borrow_first MIR should contain `&mut (*_1).0`");
+    });
+}
+
+/// Control (opposite direction): with NO `ref_pointees` entry for the reference
+/// local there is nothing to canonicalize against, so the borrow keeps the old
+/// syntactic name. The alias is derived, never invented.
+#[test]
+fn test_track_ref_pointees_keeps_syntactic_name_without_resolution() {
+    with_test_ay_ctx_for_source(DEREF_BORROW_SOURCE, |mut ctx| {
+        let instance = find_instance_by_suffix(&ctx, "borrow_first");
+        let body = instance.body().expect("body");
+        ctx.set_current_fn(instance);
+        let tuple_usage = TupleUsageAnalysis::run(&body);
+        let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+        seed_args(&mut codegen, &body);
+        // Drop every resolution, INCLUDING the `arg_pointee_*` seeds
+        // `StatementCodegen::new` installs for reference arguments, so the
+        // canonicalization has nothing to derive from.
+        codegen.ref_pointees.clear();
+
+        let mut found = false;
+        for bb in &body.blocks {
+            for stmt in &bb.statements {
+                let StatementKind::Assign(lhs, rvalue) = &stmt.kind else {
+                    continue;
+                };
+                let (Rvalue::Ref(_, _, pointee) | Rvalue::AddressOf(_, pointee)) = rvalue else {
+                    continue;
+                };
+                if !matches!(pointee.projection.first(), Some(ProjectionElem::Deref)) {
+                    continue;
+                }
+                let ref_base = codegen.ssa_base_name(lhs);
+                let syntactic = codegen.ssa_base_name(pointee);
+                codegen.track_ref_pointees(lhs, rvalue);
+                let mapped = codegen
+                    .ref_pointees
+                    .get(ref_base.as_str())
+                    .expect("borrow must record a pointee")
+                    .to_string();
+                assert_eq!(
+                    mapped, syntactic,
+                    "with no resolution available the syntactic name must stand"
+                );
+                found = true;
+                break;
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(found, "borrow_first MIR should contain `&mut (*_1).0`");
+    });
+}

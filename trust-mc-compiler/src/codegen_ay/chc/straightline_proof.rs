@@ -14,6 +14,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use ay_bindings::{Expr, ExprValue, rebuild_with_children};
 use trust_mc_core::chc::{ChcVc, RelationApp, RelationDecl, Rule, RuleBody};
 
+// Budgets that stop the bounded enumeration. MEASURED, do not raise blind:
+// raising MAX_RULES 256 -> 1024 and the frame caps 64/512 -> 256/4096 unlocked
+// enumeration for `Intrinsics/Count/ctpop` (frame-bound) and three rule-bound
+// harnesses (`function-contract/modifies/vec_pass` 296 rules,
+// `Coroutines/.../control-flow` 272, `function-contract/gcd_replacement_pass`
+// 601) — and every one of them STILL bailed, having first spent the node-visit
+// budget getting there: ctpop 114.7 s -> 122.6 s, vec_pass 81.3 s -> 85.1 s of
+// verification time, with zero verdicts gained. The reach these caps withhold
+// is not there to be had; they stay where they are.
 const MAX_RULES: usize = 256;
 const MAX_FRAMES_PER_RELATION: usize = 64;
 const MAX_TOTAL_FRAMES: usize = 512;
@@ -33,9 +42,53 @@ const MAX_TOTAL_FRAMES: usize = 512;
 /// proof; it only forgoes a syntactic shortcut.
 const MAX_STRAIGHTLINE_RECURSION_DEPTH: usize = 512;
 
+/// Total Expr-node visits allowed inside ONE [`prove_straightline_safety`] call.
+///
+/// [`MAX_STRAIGHTLINE_RECURSION_DEPTH`] bounds how DEEP the walkers go; it does
+/// not bound how MANY nodes they visit, and the cost that matters here is width,
+/// not depth. `substitute` expands a variable to its defining expression, so a
+/// chain `x1 = f(x0, x0); x2 = f(x1, x1); ...` re-walks each level twice per
+/// occurrence — 2^k node visits at depth k, all of it under the depth budget.
+/// Measured: `bounded-arbitrary/hash.rs` spent 95 s at 100% CPU with NO solver
+/// child process, every sampled stack inside `substitute_inner`; the driver
+/// reported it as `translation/cleanup hang suspected`.
+///
+/// Memoization (see [`SubstState`] / [`SimplifyMemoScope`]) removes that blowup on
+/// every shape observed so far. This budget is the belt-and-braces stop for the
+/// shapes that were not: exceeding it makes `enter()` return `None`, which the
+/// walkers propagate to `prove_straightline_safety -> false`, so the VC goes to
+/// ay UNCHANGED. Sound for exactly the reason the depth bail is: declining a
+/// syntactic shortcut never turns a bug into a proof.
+///
+/// Sized against measured cost, not intuition: 4e6 visits took ~4 s of compiler
+/// time on `loop-backedge`, and this budget is spent at most twice per harness
+/// (once per encode), against a 15 s solver budget. 2e6 keeps the worst case
+/// near 2 s while leaving orders of magnitude of headroom over what a normal
+/// discharge uses — the ones that succeed finish in milliseconds.
+const MAX_STRAIGHTLINE_NODE_VISITS: usize = 2_000_000;
+
+/// Entries after which a memo stops growing.
+///
+/// The memo is an optimization, so refusing an insert only costs speed. The cap
+/// is what keeps it from becoming a memory problem in the pathological case: one
+/// entry per distinct node, and the node budget alone would allow millions.
+/// Past the cap the walker degrades to the unmemoized behaviour and
+/// [`MAX_STRAIGHTLINE_NODE_VISITS`] takes over as the stop.
+const MAX_MEMO_ENTRIES: usize = 200_000;
+
 thread_local! {
     static STRAIGHTLINE_RECURSION_DEPTH: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+
+    /// Remaining node visits for the in-flight straight-line proof attempt.
+    /// Re-armed at the top of every [`prove_straightline_safety`] call.
+    static STRAIGHTLINE_NODE_BUDGET: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MAX_STRAIGHTLINE_NODE_VISITS) };
+}
+
+/// Re-arm the per-attempt node budget.
+fn reset_straightline_node_budget() {
+    STRAIGHTLINE_NODE_BUDGET.with(|b| b.set(MAX_STRAIGHTLINE_NODE_VISITS));
 }
 
 /// RAII depth counter for the straight-line prover's recursive Expr walkers.
@@ -47,6 +100,23 @@ struct StraightlineDepthGuard;
 
 impl StraightlineDepthGuard {
     fn enter() -> Option<Self> {
+        // Width budget first: it is the one that fires on the exponential
+        // re-walk shapes, and it must fire before any deep descent is started.
+        let budget_left = STRAIGHTLINE_NODE_BUDGET.with(|b| {
+            let left = b.get();
+            if left == 0 {
+                return false;
+            }
+            b.set(left - 1);
+            true
+        });
+        if !budget_left {
+            tracing::debug!(
+                limit = MAX_STRAIGHTLINE_NODE_VISITS,
+                "straightline proof bailed: node-visit budget exhausted"
+            );
+            return None;
+        }
         STRAIGHTLINE_RECURSION_DEPTH.with(|depth| {
             let current = depth.get();
             if current >= MAX_STRAIGHTLINE_RECURSION_DEPTH {
@@ -75,10 +145,42 @@ struct Frame {
     facts: PathFacts,
 }
 
+/// Facts a path established, carried along inside [`Frame`].
+///
+/// REJECTED EXTENSION — do not re-add without a different design. Remembering
+/// the residual boolean path conditions VERBATIM (a `known_true` / `known_false`
+/// term store, so `assume(P)` folds a later `!(P)` and the error edge it guards
+/// disappears) looks like the obvious next fact shape and MEASURED AS A
+/// FABRICATED PROOF: with it, `tools/soundness-duals/fastmath_dual_nan.rs::main`
+/// and all three `fastmath_dual_mul_div.rs` harnesses — which genuinely produce
+/// NaN and must report FAILED — verified SUCCESSFUL, and reverted to FAILED both
+/// at HEAD and with `TRUST_MC_NO_STRAIGHTLINE_DISCHARGE=1`, pinning the
+/// discharge as the cause.
+///
+/// The reason is the frame carry, which is exactly what makes such a store
+/// useful: a fact is recorded post-substitution, so it names the free variables
+/// of the frame that produced it, and a block-relation ARGUMENT NAME is not a
+/// stable identity across the VC — the same name is a fresh unconstrained value
+/// again at every program point where no constraint binds it. A term recorded
+/// under the old value then matches, and silently decides, a syntactically
+/// identical term about the new one. The two fact shapes below survive only
+/// because they are narrow enough never to have hit that; widening the shape
+/// widens the exposure, so any future fact must either be provably tied to the
+/// value (not the name) or stay rule-local and out of [`Frame`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 struct PathFacts {
     disequalities: Vec<(Expr, Expr)>,
     unsigned_upper_bounds: Vec<(Expr, u128, u32)>,
+    /// INCLUSIVE lower bounds (`expr >=u bound`), the mirror of
+    /// [`Self::unsigned_upper_bounds`]'s exclusive upper bounds.
+    ///
+    /// Recorded for one purpose: noticing that a path's own guards cannot all
+    /// hold. `kani::assume(x > 10); kani::assume(x < 5)` encodes as two edge
+    /// guards, and with only upper bounds the enumeration recorded `x <u 5`,
+    /// never saw `x >u 10`, and walked on into a block no execution reaches —
+    /// then proved the error edge unreachable from `x <u 5` alone and called it
+    /// safe. That is a vacuous proof reported as a clean one.
+    unsigned_lower_bounds: Vec<(Expr, u128, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +225,33 @@ impl PathFacts {
         self.unsigned_upper_bounds.push((expr, bound, width));
     }
 
+    fn add_unsigned_lower_bound(&mut self, expr: Expr, bound: u128, width: u32) {
+        if let Some((_, existing_bound, _)) =
+            self.unsigned_lower_bounds.iter_mut().find(|(existing_expr, _, existing_width)| {
+                existing_expr == &expr && *existing_width == width
+            })
+        {
+            // Keep the TIGHTEST lower bound, mirroring the upper-bound `min`.
+            *existing_bound = (*existing_bound).max(bound);
+            return;
+        }
+        self.unsigned_lower_bounds.push((expr, bound, width));
+    }
+
+    /// Whether some expression carries a lower bound at or above its exclusive
+    /// upper bound — i.e. this path's guards cannot all hold.
+    ///
+    /// Sound: both bounds come from constraints on THIS path, so `lower <= e`
+    /// and `e < upper` both hold wherever the rule fires; `lower >= upper`
+    /// makes that pair unsatisfiable and the edge untakeable.
+    fn bounds_contradict(&self) -> bool {
+        self.unsigned_lower_bounds.iter().any(|(expr, lower, width)| {
+            self.unsigned_upper_bounds.iter().any(|(other, upper, other_width)| {
+                other == expr && other_width == width && lower >= upper
+            })
+        })
+    }
+
     fn unsigned_upper_bound(&self, expr: &Expr) -> Option<(u128, u32)> {
         self.unsigned_upper_bounds
             .iter()
@@ -133,14 +262,40 @@ impl PathFacts {
 }
 
 /// Prove safety for bounded, scalarized, straight-line VCs.
+/// Why the bounded enumeration found no reachable `error` edge.
+///
+/// "No error is reachable" has two causes that are indistinguishable once the
+/// discharge replaces the system with `false => error`, and they mean opposite
+/// things to a user:
+///
+/// * [`Safe`](StraightlineOutcome::Safe) — check sites were reached and their
+///   error edges evaluated to infeasible. The program is proved.
+/// * [`VacuousUnreachableChecks`](StraightlineOutcome::VacuousUnreachableChecks)
+///   — no check site was reached AT ALL, because every path into it was pruned
+///   infeasible. Nothing was proved; the assumptions are contradictory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::codegen_ay) enum StraightlineOutcome {
+    /// The enumeration declined; the real CHC solver must run.
+    NotProven,
+    /// Error edges were evaluated and are unreachable — a genuine proof.
+    Safe,
+    /// No check site was reachable; the "proof" is vacuous.
+    VacuousUnreachableChecks,
+}
+
 pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
+    prove_straightline_safety_detailed(vc) != StraightlineOutcome::NotProven
+}
+
+pub(in crate::codegen_ay) fn prove_straightline_safety_detailed(vc: &ChcVc) -> StraightlineOutcome {
+    reset_straightline_node_budget();
     if vc.rules.len() > MAX_RULES {
         tracing::debug!(
             rules = vc.rules.len(),
             limit = MAX_RULES,
             "straightline proof bailed: rule budget exceeded"
         );
-        return false;
+        return StraightlineOutcome::NotProven;
     }
     // #47 FAIL-CLOSE: HAVOC edges (nondet rebinds marked by `__havoc_*`
     // binding vars, e.g. the loop-contract rule's modified-set havoc) make
@@ -168,13 +323,13 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
                 head = %rule.head.name,
                 "straightline proof bailed: VC contains havoc edges (fail-closed)"
             );
-            return false;
+            return StraightlineOutcome::NotProven;
         }
     }
     let has_error_rule = vc.rules.iter().any(|rule| rule.head.name.as_str() == "error");
     if !has_error_rule {
         tracing::debug!("straightline proof skipped: no error-headed rule");
-        return false;
+        return StraightlineOutcome::NotProven;
     }
     let relation_sorts = relation_sorts(vc);
     // Relations that lie on a loop (a nontrivial SCC / self-loop) in the
@@ -207,12 +362,20 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
                         head = %rule.head.name,
                         "straightline proof bailed: non-variable body relation argument"
                     );
-                    return false;
+                    return StraightlineOutcome::NotProven;
                 };
                 let mut facts = frame.facts.clone();
                 match apply_constraints(&rule.body.constraints, &mut env, &mut facts) {
                     ConstraintStatus::Feasible => {}
-                    ConstraintStatus::Infeasible => continue,
+                    ConstraintStatus::Infeasible => {
+                        tracing::debug!(
+                            head = %rule.head.name,
+                            body = ?rule.body.relation.as_ref().map(|r| &r.name),
+                            constraints = ?rule.body.constraints,
+                            "straightline proof: edge pruned INFEASIBLE"
+                        );
+                        continue;
+                    }
                     ConstraintStatus::Unsupported => {
                         tracing::debug!(
                             head = %rule.head.name,
@@ -220,7 +383,7 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
                             constraints = ?rule.body.constraints,
                             "straightline proof bailed: unsupported body constraints"
                         );
-                        return false;
+                        return StraightlineOutcome::NotProven;
                     }
                 }
 
@@ -229,7 +392,7 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
                         ?rule.body.constraints,
                         "straightline proof bailed: reachable error edge"
                     );
-                    return false;
+                    return StraightlineOutcome::NotProven;
                 }
 
                 let mut head_args = Vec::with_capacity(rule.head.args.len());
@@ -240,14 +403,14 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
                             ?arg,
                             "straightline proof bailed: unsupported head argument substitution"
                         );
-                        return false;
+                        return StraightlineOutcome::NotProven;
                     };
                     let Some(simplified) = simplify_with_facts(&substituted, &facts) else {
                         tracing::debug!(
                             head = %rule.head.name,
                             "straightline proof bailed: unsupported head argument simplification"
                         );
-                        return false;
+                        return StraightlineOutcome::NotProven;
                     };
                     head_args.push(simplified);
                 }
@@ -256,7 +419,7 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
                         head = %rule.head.name,
                         "straightline proof bailed: head argument sort mismatch"
                     );
-                    return false;
+                    return StraightlineOutcome::NotProven;
                 }
                 let head_frame = Frame { args: head_args, facts };
                 let frames = reachable.entry(rule.head.name.to_string()).or_default();
@@ -267,7 +430,7 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
                             frames = frames.len(),
                             "straightline proof bailed: relation frame budget exceeded"
                         );
-                        return false;
+                        return StraightlineOutcome::NotProven;
                     }
                     total_frames += 1;
                     if total_frames > MAX_TOTAL_FRAMES {
@@ -275,7 +438,7 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
                             total_frames,
                             "straightline proof bailed: total frame budget exceeded"
                         );
-                        return false;
+                        return StraightlineOutcome::NotProven;
                     }
                     worklist.push_back(rule.head.name.to_string());
                     changed = true;
@@ -301,10 +464,64 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
             "straightline proof bailed: loop body not fully reached (possible \
              mis-evaluated loop exit); deferring to CHC solver"
         );
-        return false;
+        return StraightlineOutcome::NotProven;
     }
 
-    true
+    // VACUITY (the CHC lane's V4): the enumeration reached here because no
+    // `error` edge was derivable. That is the signature of a proof — and the
+    // IDENTICAL signature of a harness whose paths are all infeasible, where
+    // every rule was dropped at `ConstraintStatus::Infeasible` and no frame
+    // ever arrived at the block holding a check.
+    //
+    // BMC separates the two by re-solving the emitted query without its
+    // violation disjunction (`build_harness_reachability_query`). This lane
+    // cannot: `replace_with_unsat_error_obligation` is about to discard the
+    // whole system for `false => error`, after which a real proof and a
+    // vacuous one are byte-identical. Decide it now, while the block graph
+    // still exists.
+    //
+    // The harness "runs" when some EXIT block is reachable: a non-error
+    // relation that is the head of a rule but never the body of one, i.e. a
+    // sink in the block graph. If no exit is reachable, no execution of this
+    // harness exists — its own guards cannot all hold — and every obligation
+    // was discharged over an empty set of runs.
+    //
+    // This is the same question BMC's `build_harness_reachability_query` asks
+    // (are the program constraints satisfiable at all), decided structurally
+    // instead of with a second solver call.
+    //
+    // Note it is deliberately NOT "no check site was reachable". A check that
+    // sits BEFORE the contradiction is reachable in the block graph, but the
+    // run it belongs to still cannot complete, so the proof is vacuous all the
+    // same — which is exactly how BMC reads it, since a `kani::assume`
+    // constrains the whole harness rather than the suffix after it.
+    //
+    // Harnesses with no sink at all (a diverging loop) yield an empty `sinks`
+    // and are left alone. A loop that the enumeration did not fully walk has
+    // already returned NotProven at the `loop_rels` check above.
+    let mut body_relations: HashSet<&str> = HashSet::new();
+    for rule in &vc.rules {
+        if let Some(body) = &rule.body.relation {
+            body_relations.insert(body.name.as_str());
+        }
+    }
+    let sinks: HashSet<&str> = vc
+        .rules
+        .iter()
+        .map(|rule| rule.head.name.as_str())
+        .filter(|head| !is_error_reachable_head(head) && !body_relations.contains(head))
+        .collect();
+    let any_exit_reachable =
+        sinks.iter().any(|sink| reachable.get(*sink).is_some_and(|frames| !frames.is_empty()));
+    if !sinks.is_empty() && !any_exit_reachable {
+        tracing::debug!(
+            ?sinks,
+            "straightline proof: no harness exit is reachable — vacuous, not safe"
+        );
+        return StraightlineOutcome::VacuousUnreachableChecks;
+    }
+
+    StraightlineOutcome::Safe
 }
 
 /// Relation names that lie on a loop in the block-relation graph: a relation `r`
@@ -420,8 +637,36 @@ pub(in crate::codegen_ay) fn straightline_discharge_disabled() -> bool {
 /// non-empty `error` obligation for downstream proof-quality accounting.
 pub(in crate::codegen_ay) fn discharge_straightline_safety(vc: &mut ChcVc) -> bool {
     if has_error_rule(vc) {
-        if !prove_straightline_safety(vc) {
-            return false;
+        match prove_straightline_safety_detailed(vc) {
+            StraightlineOutcome::NotProven => return false,
+            StraightlineOutcome::Safe => {}
+            // Proved unreachable, not safe. Still discharge — the system is
+            // genuinely unsat and re-solving it would only burn time on the
+            // same answer — but carry the reason across, so the driver reports
+            // it through the same V4 vacuity gate BMC uses instead of printing
+            // a clean proof of a harness that checked nothing.
+            StraightlineOutcome::VacuousUnreachableChecks => {
+                vc.vacuous_all_checks_unreachable = true;
+                // Record against the harness now, while the block relations
+                // that name it still exist: `replace_with_unsat_error_obligation`
+                // below clears the rules, and the emit-time orphan prune drops
+                // the relations with them, so after this point nothing in the
+                // artifact identifies the function.
+                let fn_name = vc
+                    .relations
+                    .iter()
+                    .find_map(|rel| {
+                        let name: &str = rel.name.as_ref();
+                        name.split_once("__bb").map(|(f, _)| f.to_string())
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                tracing::warn!(
+                    fn_name = %fn_name,
+                    "CHC: straight-line discharge proved checks UNREACHABLE, not safe — \
+                     marking the harness vacuous"
+                );
+                super::record_vacuous_checks_for_fn(&fn_name);
+            }
         }
     } else if !has_error_relation(vc) {
         return false;
@@ -573,6 +818,14 @@ fn apply_constraint(
                 return status;
             }
         }
+        ExprValue::BvULe(_, _) | ExprValue::BvUGt(_, _) | ExprValue::BvUGe(_, _) => {
+            if let Some(status) = record_unsigned_upper_bound_from_cmp(&simplified, false, facts) {
+                return status;
+            }
+            if let Some(status) = record_unsigned_lower_bound_from_cmp(&simplified, false, facts) {
+                return status;
+            }
+        }
         ExprValue::Not(inner) => {
             if let ExprValue::Eq(lhs, rhs) = inner.value() {
                 facts.add_disequality(lhs.clone(), rhs.clone());
@@ -582,6 +835,12 @@ fn apply_constraint(
                 && inner.sort().is_bool()
             {
                 return bind_env_var(env, name, Expr::bool_const(false));
+            }
+            if let Some(status) = record_unsigned_upper_bound_from_cmp(inner, true, facts) {
+                return status;
+            }
+            if let Some(status) = record_unsigned_lower_bound_from_cmp(inner, true, facts) {
+                return status;
             }
         }
         _ => {}
@@ -602,10 +861,19 @@ fn record_unsigned_upper_bound(
         return Some(ConstraintStatus::Infeasible);
     }
     facts.add_unsigned_upper_bound(lhs.clone(), bound, width);
+    if facts.bounds_contradict() {
+        return Some(ConstraintStatus::Infeasible);
+    }
     Some(ConstraintStatus::Feasible)
 }
 
 fn bind_env_var(env: &mut HashMap<String, Expr>, name: &str, value: Expr) -> ConstraintStatus {
+    // A tautological binding is REFINED by the constraint, not reported as a
+    // conflict with it.
+    if is_tautological_self_binding(env, name, &value) {
+        env.insert(name.to_string(), value);
+        return ConstraintStatus::Feasible;
+    }
     if let Some(existing) = env.get(name) {
         let Some(eq) = simplify(&existing.clone().eq(value)) else {
             return ConstraintStatus::Unsupported;
@@ -620,26 +888,104 @@ fn bind_env_var(env: &mut HashMap<String, Expr>, name: &str, value: Expr) -> Con
     ConstraintStatus::Feasible
 }
 
-fn substitute(expr: &Expr, env: &HashMap<String, Expr>) -> Option<Expr> {
-    substitute_inner(expr, env, &mut HashSet::new())
+/// Is `env`'s binding for `name` the tautology `name -> name`?
+///
+/// [`initial_env`] binds each body-relation argument NAME to the corresponding
+/// frame VALUE. For a pass-through column the frame value IS that same
+/// variable, so `env` holds `x -> x` — a binding that asserts nothing
+/// (`substitute` resolves it straight back to `x` via the occurs check, so it
+/// carries exactly zero information). A body constraint `x = 0` then looked
+/// like a CONFLICT with it: `simplify(x == 0)` cannot fold, the residual `Eq`
+/// fell into [`bind_env_var`]'s `_ => Unsupported` arm, and the WHOLE proof
+/// bailed over a tautology. Measured over a 50-harness census: 90 of the 108
+/// `unsupported body constraints` bails were such a binding conflict, and 100%
+/// of those were this shape (`old = Var{same name}`).
+///
+/// Sound: the only fact in play is the constraint itself, which asserts
+/// `x = value` wherever the rule fires, so adopting `value` as the binding is
+/// justified BY that constraint — a refinement of a vacuous binding, not a
+/// relaxation of anything. The sort must match (a mismatch means the
+/// substitution invariant is already broken, which stays a bail), and `value`
+/// must not mention `name` (the callers guard with `expr_mentions_var`; this
+/// re-checks so no self-referential binding can be created here). Nothing else
+/// is trusted: every fail-closed refusal — havoc edges, loop coverage, the #67
+/// lost-error-rules refusal, every sort gate — is untouched, and a genuine
+/// conflict between two DIFFERENT known values still folds to `BoolConst(false)`
+/// and prunes the path as `Infeasible`.
+fn is_tautological_self_binding(env: &HashMap<String, Expr>, name: &str, value: &Expr) -> bool {
+    let Some(existing) = env.get(name) else {
+        return false;
+    };
+    let ExprValue::Var { name: bound_name } = existing.value() else {
+        return false;
+    };
+    bound_name == name && existing.sort() == value.sort() && !expr_mentions_var(value, name)
 }
 
-fn substitute_inner(
-    expr: &Expr,
-    env: &HashMap<String, Expr>,
-    resolving: &mut HashSet<String>,
-) -> Option<Expr> {
+/// Identity of an `Expr` NODE, for memo keys.
+///
+/// `Expr` is `{ sort, value: Arc<ExprValue> }` and `Clone` clones the `Arc`, so
+/// two occurrences of the same subterm share one `ExprValue` allocation and
+/// therefore one address. Structural `Hash`/`Eq` on `Expr` would walk the whole
+/// subtree — the very cost the memo exists to avoid — so the key is the
+/// allocation address. Every memo that uses this key MUST also store a clone of
+/// the keyed `Expr`, so the allocation cannot be freed and its address reused by
+/// a later node while the entry is live.
+fn node_key(expr: &Expr) -> usize {
+    std::ptr::from_ref(expr.value()) as usize
+}
+
+/// Substitution state for one top-level [`substitute`] call.
+///
+/// `env` is fixed for the whole call, so `substitute_inner` is a pure function of
+/// its input node — EXCEPT when the occurs-check in the `Var` arm fires, which is
+/// the one place the answer depends on `resolving`. `cycle_hits` counts those
+/// firings so a node whose subtree triggered one is left UNCACHED; everything
+/// else is context-free and safe to reuse.
+struct SubstState<'a> {
+    env: &'a HashMap<String, Expr>,
+    resolving: HashSet<String>,
+    /// `node_key(input) -> (input clone, result)`. The input clone pins the
+    /// allocation the key names; see [`node_key`].
+    memo: HashMap<usize, (Expr, Expr)>,
+    cycle_hits: usize,
+}
+
+fn substitute(expr: &Expr, env: &HashMap<String, Expr>) -> Option<Expr> {
+    let mut state =
+        SubstState { env, resolving: HashSet::new(), memo: HashMap::new(), cycle_hits: 0 };
+    substitute_inner(expr, &mut state)
+}
+
+/// Substitute `env` into `expr` to a fixpoint, memoized on node identity.
+///
+/// Without the memo this is exponential in the length of a definition chain: a
+/// rule body `x1 = f(x0,x0); x2 = f(x1,x1); ...` makes each level re-expand its
+/// operand once per occurrence, so substituting `xk` costs 2^k node visits even
+/// though the result is a DAG with k distinct nodes. That is what turned four
+/// half-second harnesses into 80-95 s compiler hangs. Since `env` is fixed for
+/// the call and shared subterms share one `Arc<ExprValue>`, caching by node
+/// identity collapses it to one visit per distinct node.
+fn substitute_inner(expr: &Expr, state: &mut SubstState<'_>) -> Option<Expr> {
     let _depth_guard = StraightlineDepthGuard::enter()?;
-    match expr.value() {
+    let key = node_key(expr);
+    if let Some((_, cached)) = state.memo.get(&key) {
+        return Some(cached.clone());
+    }
+    let cycles_before = state.cycle_hits;
+    let result = match expr.value() {
         ExprValue::Var { name } => {
-            let Some(replacement) = env.get(name) else {
+            let Some(replacement) = state.env.get(name).cloned() else {
                 return Some(expr.clone());
             };
-            if !resolving.insert(name.clone()) {
+            if !state.resolving.insert(name.clone()) {
+                // Occurs-check hit: this answer is a function of `resolving`, not
+                // of the node alone, so it must not be cached.
+                state.cycle_hits += 1;
                 return Some(expr.clone());
             }
-            let resolved = substitute_inner(replacement, env, resolving);
-            resolving.remove(name);
+            let resolved = substitute_inner(&replacement, state);
+            state.resolving.remove(name);
             let resolved = resolved?;
             if resolved.sort() != expr.sort() {
                 tracing::debug!(
@@ -650,23 +996,109 @@ fn substitute_inner(
                 );
                 return None;
             }
-            Some(resolved)
+            resolved
         }
         _ => {
             let mut children = Vec::new();
             for child in expr.children() {
-                children.push(substitute_inner(&child, env, resolving)?);
+                children.push(substitute_inner(child, state)?);
             }
-            Some(rebuild_with_children(expr, children))
+            rebuild_with_children(expr, children)
         }
+    };
+    if state.cycle_hits == cycles_before && state.memo.len() < MAX_MEMO_ENTRIES {
+        state.memo.insert(key, (expr.clone(), result.clone()));
     }
+    Some(result)
 }
 
 fn simplify(expr: &Expr) -> Option<Expr> {
     simplify_with_facts(expr, &PathFacts::default())
 }
 
+thread_local! {
+    /// Stack of simplification memos, one per distinct `PathFacts` in flight.
+    ///
+    /// Each frame is `(facts identity, node_key -> (input clone, result))`.
+    static SIMPLIFY_MEMO: std::cell::RefCell<Vec<(usize, HashMap<usize, (Expr, Expr)>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII memo frame for one `PathFacts`.
+///
+/// `simplify_with_facts` is a pure function of `(expr, facts)`: the whole walk
+/// threads ONE `&PathFacts` down unchanged — no arm refines it — so within a
+/// top-level call the answer depends on the node alone. Memoizing that is what
+/// keeps the post-substitution term walkable: `substitute` returns a DAG (shared
+/// `Arc` subterms), and an unmemoized walk re-expands it into the tree it stands
+/// for, reintroducing exactly the blowup memoized substitution just removed.
+///
+/// A frame is pushed only when the incoming `facts` is a DIFFERENT object from
+/// the innermost one; a nested call under the same `facts` reuses the frame and
+/// its cache. Identity is safe to compare by address here because the enclosing
+/// frame's `PathFacts` is borrowed for the whole nested call, so a distinct live
+/// `PathFacts` cannot share its address.
+struct SimplifyMemoScope {
+    pushed: bool,
+}
+
+impl SimplifyMemoScope {
+    fn enter(facts: &PathFacts) -> Self {
+        let id = std::ptr::from_ref(facts) as usize;
+        let pushed = SIMPLIFY_MEMO.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.last().is_some_and(|(top, _)| *top == id) {
+                return false;
+            }
+            stack.push((id, HashMap::new()));
+            true
+        });
+        Self { pushed }
+    }
+}
+
+impl Drop for SimplifyMemoScope {
+    fn drop(&mut self) {
+        if self.pushed {
+            SIMPLIFY_MEMO.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+fn simplify_memo_get(expr: &Expr) -> Option<Expr> {
+    let key = node_key(expr);
+    SIMPLIFY_MEMO.with(|stack| {
+        stack.borrow().last().and_then(|(_, memo)| memo.get(&key).map(|(_, out)| out.clone()))
+    })
+}
+
+fn simplify_memo_put(expr: &Expr, result: &Expr) {
+    let key = node_key(expr);
+    SIMPLIFY_MEMO.with(|stack| {
+        if let Some((_, memo)) = stack.borrow_mut().last_mut()
+            && memo.len() < MAX_MEMO_ENTRIES
+        {
+            memo.insert(key, (expr.clone(), result.clone()));
+        }
+    });
+}
+
 fn simplify_with_facts(expr: &Expr, facts: &PathFacts) -> Option<Expr> {
+    let _scope = SimplifyMemoScope::enter(facts);
+    if let Some(cached) = simplify_memo_get(expr) {
+        return Some(cached);
+    }
+    // A `None` is a RESOURCE bail (depth / node budget), not a property of the
+    // node, so it is never cached — caching it would make an unrelated later
+    // walk inherit an exhausted budget's verdict.
+    let result = simplify_with_facts_uncached(expr, facts)?;
+    simplify_memo_put(expr, &result);
+    Some(result)
+}
+
+fn simplify_with_facts_uncached(expr: &Expr, facts: &PathFacts) -> Option<Expr> {
     let _depth_guard = StraightlineDepthGuard::enter()?;
     match expr.value() {
         ExprValue::Not(inner) => {
@@ -792,18 +1224,38 @@ fn simplify_bv_expr(expr: &Expr, facts: &PathFacts) -> Option<Expr> {
 
 fn simplify_bv_cmp_expr(expr: &Expr, facts: &PathFacts) -> Option<Expr> {
     match expr.value() {
-        ExprValue::BvUGe(lhs, rhs) => {
-            simplify_bv_cmp(lhs, rhs, facts, |l, r| l >= r, |l, r| l.try_bvuge(r).ok())
-        }
-        ExprValue::BvUGt(lhs, rhs) => {
-            simplify_bv_cmp(lhs, rhs, facts, |l, r| l > r, |l, r| l.try_bvugt(r).ok())
-        }
-        ExprValue::BvULe(lhs, rhs) => {
-            simplify_bv_cmp(lhs, rhs, facts, |l, r| l <= r, |l, r| l.try_bvule(r).ok())
-        }
-        ExprValue::BvULt(lhs, rhs) => {
-            simplify_bv_cmp(lhs, rhs, facts, |l, r| l < r, |l, r| l.try_bvult(r).ok())
-        }
+        ExprValue::BvUGe(lhs, rhs) => simplify_bv_cmp(
+            lhs,
+            rhs,
+            facts,
+            UnsignedCmp::Ge,
+            |l, r| l >= r,
+            |l, r| l.try_bvuge(r).ok(),
+        ),
+        ExprValue::BvUGt(lhs, rhs) => simplify_bv_cmp(
+            lhs,
+            rhs,
+            facts,
+            UnsignedCmp::Gt,
+            |l, r| l > r,
+            |l, r| l.try_bvugt(r).ok(),
+        ),
+        ExprValue::BvULe(lhs, rhs) => simplify_bv_cmp(
+            lhs,
+            rhs,
+            facts,
+            UnsignedCmp::Le,
+            |l, r| l <= r,
+            |l, r| l.try_bvule(r).ok(),
+        ),
+        ExprValue::BvULt(lhs, rhs) => simplify_bv_cmp(
+            lhs,
+            rhs,
+            facts,
+            UnsignedCmp::Lt,
+            |l, r| l < r,
+            |l, r| l.try_bvult(r).ok(),
+        ),
         ExprValue::BvSGe(lhs, rhs) => {
             simplify_bv_signed_cmp(lhs, rhs, facts, |ord| ord >= 0, |l, r| l.try_bvsge(r).ok())
         }
@@ -1095,6 +1547,204 @@ fn unsigned_bound_proves_mul_no_overflow(
     unsigned_mul_fits_width(max_value, constant, width)
 }
 
+/// Which unsigned comparison a [`simplify_bv_cmp`] call is folding, so the
+/// recorded [`PathFacts::unsigned_upper_bounds`] can decide it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsignedCmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl UnsignedCmp {
+    /// The relation that holds when this one is negated (`!(a < b)` is `a >= b`).
+    fn negated(self) -> Self {
+        match self {
+            UnsignedCmp::Lt => UnsignedCmp::Ge,
+            UnsignedCmp::Le => UnsignedCmp::Gt,
+            UnsignedCmp::Gt => UnsignedCmp::Le,
+            UnsignedCmp::Ge => UnsignedCmp::Lt,
+        }
+    }
+
+    /// The same relation with its operands exchanged (`c < e` <-> `e > c`), so
+    /// the bound lookup only ever has to handle `expr CMP const`.
+    fn swapped(self) -> Self {
+        match self {
+            UnsignedCmp::Lt => UnsignedCmp::Gt,
+            UnsignedCmp::Le => UnsignedCmp::Ge,
+            UnsignedCmp::Gt => UnsignedCmp::Lt,
+            UnsignedCmp::Ge => UnsignedCmp::Le,
+        }
+    }
+}
+
+/// Read `expr <u bound` (EXCLUSIVE) out of an unsigned comparison against a
+/// constant, honouring `negated`.
+///
+/// [`record_unsigned_upper_bound`] only ever learned from the single shape
+/// `BvULt(expr, const)`, so `assume(x <= 9)`, `assume(!(x >= 10))` and
+/// `assume(10 > x)` — the same fact, written the three other ways the encoder
+/// emits — taught the prover nothing. Every arm below is a rewriting of one
+/// comparison into that canonical form, so nothing is assumed that the
+/// constraint does not already state. Shapes an upper bound cannot express
+/// (`expr >u const`, a bound at the width maximum, a non-constant operand)
+/// return `None` and are dropped exactly as before.
+fn unsigned_upper_bound_from_cmp(expr: &Expr, negated: bool) -> Option<(Expr, u128, u32)> {
+    let (lhs, rhs, kind) = match expr.value() {
+        ExprValue::BvULt(lhs, rhs) => (lhs, rhs, UnsignedCmp::Lt),
+        ExprValue::BvULe(lhs, rhs) => (lhs, rhs, UnsignedCmp::Le),
+        ExprValue::BvUGt(lhs, rhs) => (lhs, rhs, UnsignedCmp::Gt),
+        ExprValue::BvUGe(lhs, rhs) => (lhs, rhs, UnsignedCmp::Ge),
+        _ => return None,
+    };
+    if lhs.sort() != rhs.sort() || !lhs.sort().is_bitvec() {
+        return None;
+    }
+    let width = lhs.sort().bitvec_sort()?.width;
+    let kind = if negated { kind.negated() } else { kind };
+    let (bounded, constant, kind) = match (bv_const_u128(lhs), bv_const_u128(rhs)) {
+        (None, Some((constant, _))) => (lhs, constant, kind),
+        (Some((constant, _)), None) => (rhs, constant, kind.swapped()),
+        // Both constant: the comparison already folded. Neither: no bound.
+        _ => return None,
+    };
+    let bound = match kind {
+        UnsignedCmp::Lt => constant,
+        // `expr <=u constant` is `expr <u constant + 1`; at the width maximum
+        // that is the vacuous bound, which carries no information.
+        UnsignedCmp::Le => {
+            if constant >= bv_mask(width) {
+                return None;
+            }
+            constant.checked_add(1)?
+        }
+        // A lower bound; `PathFacts` has nowhere to put it.
+        UnsignedCmp::Gt | UnsignedCmp::Ge => return None,
+    };
+    Some((bounded.clone(), bound, width))
+}
+
+/// Read an INCLUSIVE unsigned lower bound (`expr >=u bound`) out of a
+/// comparison against a constant — the `Gt`/`Ge` half that
+/// [`unsigned_upper_bound_from_cmp`] drops because an upper bound cannot
+/// express it.
+fn unsigned_lower_bound_from_cmp(expr: &Expr, negated: bool) -> Option<(Expr, u128, u32)> {
+    let (lhs, rhs, kind) = match expr.value() {
+        ExprValue::BvULt(lhs, rhs) => (lhs, rhs, UnsignedCmp::Lt),
+        ExprValue::BvULe(lhs, rhs) => (lhs, rhs, UnsignedCmp::Le),
+        ExprValue::BvUGt(lhs, rhs) => (lhs, rhs, UnsignedCmp::Gt),
+        ExprValue::BvUGe(lhs, rhs) => (lhs, rhs, UnsignedCmp::Ge),
+        _ => return None,
+    };
+    if lhs.sort() != rhs.sort() || !lhs.sort().is_bitvec() {
+        return None;
+    }
+    let width = lhs.sort().bitvec_sort()?.width;
+    let kind = if negated { kind.negated() } else { kind };
+    let (bounded, constant, kind) = match (bv_const_u128(lhs), bv_const_u128(rhs)) {
+        (None, Some((constant, _))) => (lhs, constant, kind),
+        (Some((constant, _)), None) => (rhs, constant, kind.swapped()),
+        _ => return None,
+    };
+    let bound = match kind {
+        // `expr >u constant` is `expr >=u constant + 1`. At the width maximum
+        // there is no such value, which the caller turns into Infeasible.
+        UnsignedCmp::Gt => constant.checked_add(1)?,
+        UnsignedCmp::Ge => constant,
+        // An upper bound; `unsigned_upper_bound_from_cmp` owns those.
+        UnsignedCmp::Lt | UnsignedCmp::Le => return None,
+    };
+    Some((bounded.clone(), bound, width))
+}
+
+/// Record a lower bound read out of `expr`, reporting `Infeasible` when it
+/// cannot be satisfied (a bound past the width maximum) or when it contradicts
+/// an upper bound already on this path.
+fn record_unsigned_lower_bound_from_cmp(
+    expr: &Expr,
+    negated: bool,
+    facts: &mut PathFacts,
+) -> Option<ConstraintStatus> {
+    let (bounded, bound, width) = unsigned_lower_bound_from_cmp(expr, negated)?;
+    if bound > bv_mask(width) {
+        return Some(ConstraintStatus::Infeasible);
+    }
+    facts.add_unsigned_lower_bound(bounded, bound, width);
+    if facts.bounds_contradict() {
+        return Some(ConstraintStatus::Infeasible);
+    }
+    Some(ConstraintStatus::Feasible)
+}
+
+/// Record an upper bound read out of `expr` (see
+/// [`unsigned_upper_bound_from_cmp`]), reporting `Infeasible` for the
+/// unsatisfiable `expr <u 0`.
+fn record_unsigned_upper_bound_from_cmp(
+    expr: &Expr,
+    negated: bool,
+    facts: &mut PathFacts,
+) -> Option<ConstraintStatus> {
+    let (bounded, bound, width) = unsigned_upper_bound_from_cmp(expr, negated)?;
+    if bound == 0 {
+        return Some(ConstraintStatus::Infeasible);
+    }
+    facts.add_unsigned_upper_bound(bounded, bound, width);
+    if facts.bounds_contradict() {
+        return Some(ConstraintStatus::Infeasible);
+    }
+    Some(ConstraintStatus::Feasible)
+}
+
+/// Decide an unsigned comparison against a constant from a recorded upper bound.
+///
+/// [`PathFacts::unsigned_upper_bounds`] holds `expr <u bound` (EXCLUSIVE), taken
+/// from a body constraint — typically the `kani::assume(x < N)` that guards the
+/// assertion the error edge negates. Until now that fact was consumed by exactly
+/// one rule ([`unsigned_bound_proves_mul_no_overflow`]), so the straight-line
+/// prover recorded `x <u 10` and then still could not fold `x <u 20`: the error
+/// guard `!(x <u 20)` stayed residual and the whole proof bailed on a "reachable"
+/// edge that the recorded fact already refutes.
+///
+/// Sound: `bound` is implied by a constraint on THIS path, so `expr <= bound - 1`
+/// holds wherever the rule fires, and every arm below is a consequence of that
+/// single inequality. Only the direction the bound can justify is decided — an
+/// upper bound can prove `expr <u c` TRUE and `expr >=u c` FALSE, and never the
+/// converse (that needs a lower bound), so an undecided comparison is returned
+/// as `None` and rebuilt residual exactly as before.
+fn unsigned_bound_decides_cmp(
+    lhs: &Expr,
+    rhs: &Expr,
+    kind: UnsignedCmp,
+    facts: &PathFacts,
+) -> Option<bool> {
+    let width = lhs.sort().bitvec_sort()?.width;
+    // Orient to `expr CMP constant`; a constant on the left flips the relation.
+    let (expr, constant, kind) = match (bv_const_u128(lhs), bv_const_u128(rhs)) {
+        (None, Some((constant, _))) => (lhs, constant, kind),
+        (Some((constant, _)), None) => (rhs, constant, kind.swapped()),
+        // Both constant: already folded by the caller. Neither: no bound to use.
+        _ => return None,
+    };
+    let (bound, bound_width) = facts.unsigned_upper_bound(expr)?;
+    if bound_width != width {
+        return None;
+    }
+    // `bound == 0` is pruned as Infeasible when recorded; guard anyway.
+    let max = bound.checked_sub(1)?;
+    match kind {
+        // expr <= max < constant  =>  expr <u constant.
+        UnsignedCmp::Lt => (max < constant).then_some(true),
+        // expr <= max <= constant =>  expr <=u constant.
+        UnsignedCmp::Le => (max <= constant).then_some(true),
+        // expr <= max <= constant =>  NOT (expr >u constant).
+        UnsignedCmp::Gt => (max <= constant).then_some(false),
+        // expr <= max < constant  =>  NOT (expr >=u constant).
+        UnsignedCmp::Ge => (max < constant).then_some(false),
+    }
+}
+
 fn unsigned_mul_fits_width(lhs: u128, rhs: u128, width: u32) -> bool {
     let max_value = bv_mask(width);
     lhs.checked_mul(rhs).is_some_and(|product| product <= max_value)
@@ -1218,6 +1868,7 @@ fn simplify_bv_cmp(
     lhs: &Expr,
     rhs: &Expr,
     facts: &PathFacts,
+    kind: UnsignedCmp,
     op: impl FnOnce(u128, u128) -> bool,
     rebuild: impl FnOnce(Expr, Expr) -> Option<Expr>,
 ) -> Option<Expr> {
@@ -1233,6 +1884,9 @@ fn simplify_bv_cmp(
             return None;
         }
         return Some(Expr::bool_const(op(lhs_value, rhs_value)));
+    }
+    if let Some(decided) = unsigned_bound_decides_cmp(&lhs, &rhs, kind, facts) {
+        return Some(Expr::bool_const(decided));
     }
     rebuild(lhs, rhs)
 }
@@ -1317,6 +1971,45 @@ mod tests {
         apply_constraint(constraint, env, &mut PathFacts::default())
     }
 
+    /// A definition chain whose every level names its predecessor TWICE.
+    ///
+    /// Unmemoized, `substitute` re-expands each level once per occurrence, so
+    /// this costs 2^depth node visits — the shape that turned four half-second
+    /// harnesses into 80-95 s compiler hangs. At depth 40 the unmemoized walker
+    /// would need ~10^12 visits; the memoized one needs ~40, so this test simply
+    /// completing is the regression check. (`MAX_STRAIGHTLINE_NODE_VISITS` would
+    /// otherwise bail at 4e6, which the assertion on the RESULT would catch.)
+    #[test]
+    fn substitute_is_memoized_across_shared_subterms() {
+        let sort = Sort::bitvec(64);
+        let mut env: HashMap<String, Expr> = HashMap::new();
+        env.insert("v0".to_string(), Expr::bitvec_const(1u64, 64));
+        for level in 1..=40u32 {
+            let prev = Expr::var(format!("v{}", level - 1), sort.clone());
+            // Both operands are clones of ONE Expr, so they share an Arc — the
+            // sharing the memo keys on.
+            let doubled = prev.clone().bvadd(prev);
+            env.insert(format!("v{level}"), doubled);
+        }
+        let top = Expr::var("v40", sort);
+        let substituted = substitute(&top, &env).expect("well-sorted substitution");
+        // 1 doubled 40 times = 2^40.
+        assert_eq!(simplify(&substituted), Some(Expr::bitvec_const(1u64 << 40, 64)));
+    }
+
+    /// The occurs-check answer depends on the resolving set, so a node whose
+    /// subtree hit it must NOT be cached and reused where no cycle is in flight.
+    #[test]
+    fn substitute_leaves_self_referential_bindings_intact() {
+        let sort = Sort::bitvec(64);
+        let x = Expr::var("x", sort.clone());
+        let mut env: HashMap<String, Expr> = HashMap::new();
+        // x = x + 1: substituting x must terminate, leaving the inner x alone.
+        env.insert("x".to_string(), x.clone().bvadd(Expr::bitvec_const(1u64, 64)));
+        let out = substitute(&x, &env).expect("cycle-broken substitution");
+        assert_eq!(out, x.bvadd(Expr::bitvec_const(1u64, 64)));
+    }
+
     #[test]
     fn substitute_follows_transitive_equalities() {
         let sort = Sort::bitvec(64);
@@ -1336,6 +2029,195 @@ mod tests {
 
         let substituted = substitute(&x, &env).expect("well-sorted substitution");
         assert_eq!(simplify(&substituted), Some(one));
+    }
+
+    /// `initial_env` produces `x -> x` for a pass-through relation column. That
+    /// binding is a tautology, so a body constraint `x = 1` must REFINE it, not
+    /// be reported as a conflict that bails the whole proof.
+    #[test]
+    fn identity_self_binding_is_refined_not_a_conflict() {
+        let sort = Sort::bitvec(32);
+        let x = Expr::var("x", sort.clone());
+        let one = Expr::bitvec_const(1u64, 32);
+        let mut env = HashMap::new();
+        env.insert("x".to_string(), x.clone());
+
+        assert_eq!(
+            apply_constraint_without_facts(&x.clone().eq(one.clone()), &mut env),
+            ConstraintStatus::Feasible
+        );
+        let substituted = substitute(&x, &env).expect("well-sorted substitution");
+        assert_eq!(simplify(&substituted), Some(one));
+    }
+
+    /// Refining a tautological binding must NOT swallow a real contradiction:
+    /// once `x` is pinned to 1, a second constraint `x = 2` still folds to
+    /// `false` and prunes the path.
+    #[test]
+    fn identity_self_binding_conflicting_values_stay_infeasible() {
+        let sort = Sort::bitvec(32);
+        let x = Expr::var("x", sort.clone());
+        let mut env = HashMap::new();
+        env.insert("x".to_string(), x.clone());
+
+        assert_eq!(
+            apply_constraint_without_facts(&x.clone().eq(Expr::bitvec_const(1u64, 32)), &mut env),
+            ConstraintStatus::Feasible
+        );
+        assert_eq!(
+            apply_constraint_without_facts(&x.eq(Expr::bitvec_const(2u64, 32)), &mut env),
+            ConstraintStatus::Infeasible
+        );
+    }
+
+    /// End-to-end: a straight-line VC whose only obstacle was the tautological
+    /// `x -> x` binding on a pass-through column now discharges.
+    #[test]
+    fn identity_self_binding_admits_straightline_proof() {
+        let sort = Sort::bitvec(32);
+        let x = Expr::var("x", sort.clone());
+        let mut vc = ChcVc::new();
+        vc.add_relation(RelationDecl::new("bb0", vec![sort.clone()]));
+        vc.add_relation(RelationDecl::new("bb1", vec![sort.clone()]));
+        vc.add_relation(RelationDecl::nullary("error"));
+        // bb0(x) :- .            -- frame [Var x]; env for the next rule is x -> x
+        vc.add_rule(Rule::new(
+            RuleBody::new(None, Vec::new()),
+            RelationApp::new("bb0", vec![x.clone()]),
+        ));
+        // bb1(x) :- bb0(x), x = 1.
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb0", vec![x.clone()])),
+                vec![x.clone().eq(Expr::bitvec_const(1u64, 32))],
+            ),
+            RelationApp::new("bb1", vec![x.clone()]),
+        ));
+        // error :- bb1(x), x = 2.   -- refuted only if x was pinned to 1
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb1", vec![x.clone()])),
+                vec![x.eq(Expr::bitvec_const(2u64, 32))],
+            ),
+            RelationApp::new("error", Vec::new()),
+        ));
+
+        assert!(prove_straightline_safety(&vc));
+    }
+
+    /// `assume(x < 10)` records `x <u 10`; the error guard `!(x < 20)` must then
+    /// fold to `false` instead of staying residual.
+    #[test]
+    fn recorded_unsigned_bound_folds_a_weaker_comparison() {
+        let sort = Sort::bitvec(32);
+        let x = Expr::var("x", sort);
+        let mut env = HashMap::new();
+        let mut facts = PathFacts::default();
+
+        assert_eq!(
+            apply_constraint(&x.clone().bvult(Expr::bitvec_const(10u64, 32)), &mut env, &mut facts),
+            ConstraintStatus::Feasible
+        );
+        let guard = x.clone().bvult(Expr::bitvec_const(20u64, 32)).not();
+        assert_eq!(simplify_with_facts(&guard, &facts), Some(Expr::bool_const(false)));
+        // The same bound decides the other three unsigned relations it implies.
+        assert_eq!(
+            simplify_with_facts(&x.clone().bvule(Expr::bitvec_const(9u64, 32)), &facts),
+            Some(Expr::bool_const(true))
+        );
+        assert_eq!(
+            simplify_with_facts(&x.clone().bvuge(Expr::bitvec_const(10u64, 32)), &facts),
+            Some(Expr::bool_const(false))
+        );
+        assert_eq!(
+            simplify_with_facts(&Expr::bitvec_const(10u64, 32).bvugt(x), &facts),
+            Some(Expr::bool_const(true))
+        );
+    }
+
+    /// An UPPER bound may never decide a comparison that needs a LOWER bound:
+    /// `x <u 10` says nothing about `x >u 3`, which must stay residual.
+    #[test]
+    fn recorded_unsigned_bound_does_not_decide_the_other_direction() {
+        let sort = Sort::bitvec(32);
+        let x = Expr::var("x", sort);
+        let mut env = HashMap::new();
+        let mut facts = PathFacts::default();
+
+        assert_eq!(
+            apply_constraint(&x.clone().bvult(Expr::bitvec_const(10u64, 32)), &mut env, &mut facts),
+            ConstraintStatus::Feasible
+        );
+        let residual = simplify_with_facts(&x.clone().bvugt(Expr::bitvec_const(3u64, 32)), &facts)
+            .expect("residual comparison");
+        assert!(!matches!(residual.value(), ExprValue::BoolConst(_)));
+        // A bound that does NOT cover the constant is equally undecided.
+        let residual = simplify_with_facts(&x.bvult(Expr::bitvec_const(5u64, 32)), &facts)
+            .expect("residual comparison");
+        assert!(!matches!(residual.value(), ExprValue::BoolConst(_)));
+    }
+
+    /// The three other spellings of `x <u 10` must record the same bound.
+    #[test]
+    fn unsigned_bound_is_read_from_every_comparison_spelling() {
+        let sort = Sort::bitvec(32);
+        let x = Expr::var("x", sort);
+        let ten = Expr::bitvec_const(10u64, 32);
+        let nine = Expr::bitvec_const(9u64, 32);
+        for constraint in [
+            x.clone().bvule(nine),              // x <= 9
+            ten.clone().bvugt(x.clone()),       // 10 > x
+            x.clone().bvuge(ten.clone()).not(), // !(x >= 10)
+        ] {
+            let mut env = HashMap::new();
+            let mut facts = PathFacts::default();
+            assert_eq!(
+                apply_constraint(&constraint, &mut env, &mut facts),
+                ConstraintStatus::Feasible
+            );
+            assert_eq!(facts.unsigned_upper_bound(&x), Some((10, 32)));
+        }
+        // `x <u 0` is unsatisfiable however it is spelled.
+        let mut env = HashMap::new();
+        let mut facts = PathFacts::default();
+        assert_eq!(
+            apply_constraint(&Expr::bitvec_const(0u64, 32).bvugt(x.clone()), &mut env, &mut facts),
+            ConstraintStatus::Infeasible
+        );
+    }
+
+    /// End-to-end: `assume(x < 10); assert!(x < 20)` is now discharged
+    /// syntactically instead of bailing on a "reachable" error edge.
+    #[test]
+    fn assume_bound_discharges_weaker_assertion() {
+        let sort = Sort::bitvec(32);
+        let x = Expr::var("x", sort.clone());
+        let mut vc = ChcVc::new();
+        vc.add_relation(RelationDecl::new("bb0", vec![sort.clone()]));
+        vc.add_relation(RelationDecl::new("bb1", vec![sort.clone()]));
+        vc.add_relation(RelationDecl::nullary("error"));
+        vc.add_rule(Rule::new(
+            RuleBody::new(None, Vec::new()),
+            RelationApp::new("bb0", vec![x.clone()]),
+        ));
+        // bb1(x) :- bb0(x), x <u 10.
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb0", vec![x.clone()])),
+                vec![x.clone().bvult(Expr::bitvec_const(10u64, 32))],
+            ),
+            RelationApp::new("bb1", vec![x.clone()]),
+        ));
+        // error :- bb1(x), !(x <u 20).
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb1", vec![x.clone()])),
+                vec![x.bvult(Expr::bitvec_const(20u64, 32)).not()],
+            ),
+            RelationApp::new("error", Vec::new()),
+        ));
+
+        assert!(prove_straightline_safety(&vc));
     }
 
     #[test]
@@ -1504,6 +2386,39 @@ mod tests {
         ));
 
         assert!(prove_straightline_safety(&vc));
+    }
+
+    #[test]
+    #[test]
+    fn a_lower_bound_contradicts_only_at_or_above_the_exclusive_upper() {
+        // Off-by-one here is a FALSE PROOF, not a missed one: an unsound
+        // contradiction prunes a path that can really run, `error` goes
+        // underivable, and the harness reports proved. Upper bounds are
+        // EXCLUSIVE (`x <u U`), lower bounds INCLUSIVE (`x >=u L`), so the pair
+        // is unsatisfiable exactly when L >= U.
+        let x = Expr::var("x", ay_bindings::Sort::bitvec(8));
+        let facts_for = |lower: u128, upper: u128| {
+            let mut f = PathFacts::default();
+            f.add_unsigned_lower_bound(x.clone(), lower, 8);
+            f.add_unsigned_upper_bound(x.clone(), upper, 8);
+            f
+        };
+        // x >= 4 and x < 5 -> x == 4. Satisfiable; pruning it would be unsound.
+        assert!(!facts_for(4, 5).bounds_contradict());
+        // x >= 5 and x < 5 -> empty.
+        assert!(facts_for(5, 5).bounds_contradict());
+        // The live case: assume(x > 10); assume(x < 5).
+        assert!(facts_for(11, 5).bounds_contradict());
+        // A bound on a DIFFERENT expression must not cross-contaminate.
+        let mut mixed = PathFacts::default();
+        mixed.add_unsigned_lower_bound(x.clone(), 11, 8);
+        mixed.add_unsigned_upper_bound(Expr::var("y", ay_bindings::Sort::bitvec(8)), 5, 8);
+        assert!(!mixed.bounds_contradict());
+        // ...nor may a bound of a different WIDTH on the same name.
+        let mut widths = PathFacts::default();
+        widths.add_unsigned_lower_bound(x.clone(), 11, 8);
+        widths.add_unsigned_upper_bound(x.clone(), 5, 32);
+        assert!(!widths.bounds_contradict());
     }
 
     #[test]

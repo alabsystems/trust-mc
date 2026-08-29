@@ -328,10 +328,77 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         // Single-pointer predicates: can_dereference, can_write, can_read_unaligned, is_inbounds
+        //
+        // A pointer whose pointee is a DEAD local is the case the heap query
+        // below cannot see: `obj_valid` is written only by heap_alloc, so a
+        // stack pointee has no entry and the predicate silently evaluated over
+        // unallocated memory — `can_dereference(new_dead_ptr())` proved
+        // SUCCESSFUL, a false proof. Kani fails these harnesses with its own
+        // unsupported check rather than answering, and so do we, reusing the
+        // same evidence the deref path's dead_object check reads
+        // (ref_pointees -> resolve_ref_chain_target -> dead_locals). Same
+        // path-condition gate too: dead_locals is accumulated globally, and in
+        // bb0 StorageDead of reference temporaries would false-positive.
+        // ZST pointees are exempt: `can_dereference` on a zero-sized type is
+        // TRUE by Kani's (and Rust's) semantics even for a dangling pointer —
+        // a ZST access reads nothing. thin_ptr_validity::check_invalid_zst
+        // pins exactly this: a DEAD pointer cast to *const [char; 0] must
+        // still verify.
+        let pointee_is_zst = args
+            .first()
+            .and_then(|a| a.ty(self.body.locals()).ok())
+            .and_then(|ty| match ty.kind() {
+                rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::RawPtr(pointee, _))
+                | rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, pointee, _)) => {
+                    crate::kani_middle::abi::LayoutOf::new(pointee).size_of()
+                }
+                _ => None,
+            })
+            == Some(0);
+        if let (false, Some(Operand::Copy(place) | Operand::Move(place))) =
+            (pointee_is_zst, args.first())
+        {
+            let ptr_base = self.ssa_base_name(place);
+            if let Some(pointee_base) = self.ref_pointees.get(ptr_base.as_str()).cloned() {
+                let target_local_idx =
+                    Self::resolve_ref_chain_target(&self.ref_pointees, &pointee_base);
+                // No path-condition gate here, unlike the deref path's
+                // dead_object check: an explicit predicate call in a
+                // straight-line harness has pc=None, and requiring one made
+                // this detection unreachable everywhere. The ref-temporary
+                // hazard that gate guards against is answered by the resolve
+                // chain ending at the UNDERLYING local, which stays live in
+                // every valid harness — the valid_access controls in the same
+                // corpus files pin exactly that.
+                if self.dead_locals.contains(&target_local_idx) {
+                    self.record_violation_guarded_with_message(
+                        Expr::bool_const(true),
+                        "mem_predicate_unallocated",
+                        Some(
+                            "Kani does not support reasoning about pointer to unallocated memory"
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+        }
         let result = match args.first().and_then(|a| self.codegen_operand(a)) {
             Some(ptr_expr) => {
                 let ptr = self.coerce_to_ptr_width(ptr_expr);
-                self.ctx.heap_is_allocated(ptr, None)
+                // NULL is never allocated. `heap_is_allocated` alone cannot
+                // say so — obj_valid[object(0)] is just another array cell the
+                // solver may set true — and `!is_inbounds(null())` was
+                // unprovable because of it.
+                let nonnull = ptr.clone().eq(Expr::bitvec_const(0u128, POINTER_WIDTH)).not();
+                if pointee_is_zst {
+                    // A ZST access reads nothing: non-null is the ONLY
+                    // requirement, and a dangling `NonNull::<ZST>::dangling()`
+                    // is dereferenceable by Kani's semantics. Asking the heap
+                    // model left exactly that case undecided.
+                    nonnull
+                } else {
+                    nonnull.and(self.ctx.heap_is_allocated(ptr, None))
+                }
             }
             None => {
                 debug!("kani_mem predicate: ptr translation failed, falling back to true");

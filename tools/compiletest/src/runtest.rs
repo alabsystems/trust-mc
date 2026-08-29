@@ -627,7 +627,21 @@ impl TestCx<'_> {
     /// lines.
     fn verify_output(&self, proc_res: &ProcRes, expected_path: &Path) {
         // Include the output from stderr here for cases where there are exceptions
-        let expected = fs::read_to_string(expected_path).unwrap();
+        // A missing/unreadable `expected` file is a test-authoring error; report
+        // it as a normal test failure naming the path instead of unwrapping the
+        // io::Error, which used to panic the test thread with an opaque
+        // `Os { code: 2, kind: NotFound }` (seen on intrinsics/simd-bitmask,
+        // which shipped without its `expected` file).
+        let expected = match fs::read_to_string(expected_path) {
+            Ok(expected) => expected,
+            Err(err) => self.fatal_proc_rec(
+                &format!(
+                    "test failed: cannot read expected-output file `{}`: {err}",
+                    expected_path.display()
+                ),
+                proc_res,
+            ),
+        };
         let output = proc_res.stdout.to_string() + &proc_res.stderr;
         let diff = TestCx::contains_lines(
             &output.split('\n').collect::<Vec<_>>(),

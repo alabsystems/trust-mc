@@ -101,11 +101,11 @@ Default limits (adjust in docker-compose.yaml):
 }
 ```
 
-Optional `run_context` captures machine and environment details for comparing results across hardware or execution environments. (Source: Andrew Yates, Benchmark Run Context Metadata, designs/2026-01-29-benchmark-run-context-metadata.md:10-49)
+Optional `run_context` captures machine and environment details for comparing results across hardware or execution environments.
 
-Recommended fields include `machine_id`, `cpu_model`, `cpu_arch`, `os`, `os_version`, `container_image`, and `tool_version`. (Source: Andrew Yates, Benchmark Run Context Metadata, designs/2026-01-29-benchmark-run-context-metadata.md:35-50)
+Recommended fields include `machine_id`, `cpu_model`, `cpu_arch`, `os`, `os_version`, `container_image`, and `tool_version`.
 
-Populate `run_context` by extending your runner or `run_eval.sh`, and keep it optional so existing consumers can ignore it. (Source: Andrew Yates, Benchmark Run Context Metadata, designs/2026-01-29-benchmark-run-context-metadata.md:52-59)
+Populate `run_context` by extending your runner or `run_eval.sh`, and keep it optional so existing consumers can ignore it.
 
 ### Artifact Freshness Invariant (Opt-In)
 

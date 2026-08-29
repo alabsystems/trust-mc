@@ -23,6 +23,7 @@ pub struct Roll {
     pub exceeds_oracle: u64,
     pub unknown: u64,
     pub error: u64,
+    pub vacuous: u64,
     pub crash: u64,
     pub build_unavailable: u64,
     /// Quarantined corpus sources (explicit evidence-quoted manifest,
@@ -47,6 +48,7 @@ impl Roll {
             Classification::ExceedsOracle => self.exceeds_oracle += 1,
             Classification::Unknown => self.unknown += 1,
             Classification::Error => self.error += 1,
+            Classification::Vacuous => self.vacuous += 1,
             Classification::Crash => self.crash += 1,
             Classification::BuildUnavailable => self.build_unavailable += 1,
             Classification::CorpusInvalid => self.corpus_invalid += 1,
@@ -64,6 +66,7 @@ impl Roll {
         self.exceeds_oracle += o.exceeds_oracle;
         self.unknown += o.unknown;
         self.error += o.error;
+        self.vacuous += o.vacuous;
         self.crash += o.crash;
         self.build_unavailable += o.build_unavailable;
         self.corpus_invalid += o.corpus_invalid;
@@ -312,9 +315,9 @@ pub fn format_text(s: &Summary, p: &Provenance) -> String {
         ));
     }
     o.push_str(&format!(
-        "  missed-bugs={} exceeds-oracle={} false-pos={} enc-gap={} unsupported={} unsound-pass={} unknown={} error={} crash={} build-unavail={} corpus-invalid={} timeout={} skipped={}\n",
+        "  missed-bugs={} exceeds-oracle={} false-pos={} enc-gap={} unsupported={} unsound-pass={} unknown={} vacuous={} error={} crash={} build-unavail={} corpus-invalid={} timeout={} skipped={}\n",
         s.full.missed_bug, s.full.exceeds_oracle, s.full.false_positive, s.full.encoding_gap,
-        s.full.unsupported, s.full.unsound_pass, s.full.unknown, s.full.error, s.full.crash,
+        s.full.unsupported, s.full.unsound_pass, s.full.unknown, s.full.vacuous, s.full.error, s.full.crash,
         s.full.build_unavailable, s.full.corpus_invalid, s.full.timeout, s.full.skipped
     ));
     if !s.rekey.is_empty() {
@@ -453,6 +456,11 @@ mod tests {
             observed: Some(Verdict::Success),
             classification: Some(Classification::Parity),
             sound_fallback: 0,
+            ctrex_categories_raw: Vec::new(),
+            translation_drops: Vec::new(),
+            no_harnesses: false,
+            vacuous: false,
+            aggregate_gap_reasons: Vec::new(),
             effective_success: false,
             proof_marker: true,
             native_proof_accepted: false,
@@ -526,6 +534,66 @@ mod tests {
     /// ledger key, and in both report formats. 1 parity + 1 corpus_invalid =
     /// 100% of a denominator of 1, never 50% of 2 — and the exclusion is
     /// printed, not silent.
+    /// Every classification a row can carry must survive the per-suite ->
+    /// full rollup.
+    ///
+    /// `Roll::merge` sums each counter by hand, so a variant added to
+    /// `Classification` and to `Roll::add` but NOT to `merge` reports the right
+    /// per-suite count and a silent ZERO in the headline. That is exactly how
+    /// `vacuous` first shipped: 11 rows classified correctly, `vacuous=0`
+    /// printed. Comparing `total` against the sum of the parts catches the
+    /// next one without needing to remember to update this test.
+    #[test]
+    fn merge_sums_every_class_counter() {
+        const ALL: &[Classification] = &[
+            Classification::Parity,
+            Classification::UnsoundPass,
+            Classification::FalsePositive,
+            Classification::Unsupported,
+            Classification::EncodingGap,
+            Classification::MissedBug,
+            Classification::ExceedsOracle,
+            Classification::Unknown,
+            Classification::Error,
+            Classification::Vacuous,
+            Classification::Crash,
+            Classification::BuildUnavailable,
+            Classification::CorpusInvalid,
+            Classification::Timeout,
+            Classification::Skipped,
+        ];
+        let mut a = Roll::default();
+        let mut b = Roll::default();
+        for c in ALL {
+            a.add(*c);
+            b.add(*c);
+        }
+        a.merge(&b);
+
+        let summed = a.parity
+            + a.unsound_pass
+            + a.false_positive
+            + a.unsupported
+            + a.encoding_gap
+            + a.missed_bug
+            + a.exceeds_oracle
+            + a.unknown
+            + a.error
+            + a.vacuous
+            + a.crash
+            + a.build_unavailable
+            + a.corpus_invalid
+            + a.timeout
+            + a.skipped;
+        assert_eq!(
+            summed, a.total,
+            "a Classification variant is missing from Roll::merge — it will \
+             report zero in the rollup while per-suite counts look correct"
+        );
+        assert_eq!(a.total, 2 * ALL.len() as u64);
+        assert_eq!(a.vacuous, 2, "vacuous specifically must survive merge");
+    }
+
     #[test]
     fn corpus_invalid_is_visible_but_out_of_denominator() {
         let s = summarize(&[result(None), result_with(Classification::CorpusInvalid)]);

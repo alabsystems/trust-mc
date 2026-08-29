@@ -83,6 +83,36 @@ use rustc_public::ty::{
 use rustc_span::Symbol;
 use std::collections::{BTreeSet, HashMap};
 
+/// Message stem of the BASE-case obligation, and the marker that carries the
+/// loop's index to the driver.
+///
+/// The obligation is registered through `hook_safety_check`, so its only
+/// channel to the report is this message: the label is `kani_assert` for every
+/// safety check, which is why the driver has to recognise loop-contract
+/// obligations by TEXT (`ay_parse::vc_artifact::LOOP_CONTRACT_OBLIGATION_PREFIXES`,
+/// which pins these same stems — keep the two in step).
+///
+/// The trailing `(loop N)` is the loop's index within its function, counted in
+/// source order over the loops this pass instruments. The driver strips it and
+/// renders `Check invariant before entry for loop <fn>.<N>` (CBMC/Kani's own
+/// wording), splicing the function name from the check's source location so the
+/// name in the description can never disagree with the check-id prefix.
+///
+/// LIMIT, deliberately not papered over: N counts CONTRACTED loops, while CBMC
+/// numbers every loop in the function. A function that mixes an uncontracted
+/// loop before a contracted one would therefore disagree with CBMC's id. No
+/// corpus shape has that mix today, and inventing a number we cannot derive
+/// would be worse than a documented divergence.
+pub(crate) const LOOP_INVARIANT_BASE_MSG: &str =
+    "loop invariant base case: invariant must hold on loop entry";
+
+/// Message stem of the INDUCTIVE-STEP obligation. See `LOOP_INVARIANT_BASE_MSG`.
+pub(crate) const LOOP_INVARIANT_STEP_MSG: &str =
+    "loop invariant inductive step: invariant must be re-established by the loop body";
+
+/// Opening of the loop-index suffix appended to both messages above.
+pub(crate) const LOOP_ID_MARKER: &str = "(loop ";
+
 /// `_transformed` code for the BASE breadcrumb at the rewritten loop head
 /// (FC-29's loop-assigns fallback recovers the loop region from the 2/1 pair).
 const TRANSFORMED_BASE: u128 = 2;
@@ -133,7 +163,7 @@ struct LoopRulePlan {
     assume_instance: Instance,
     /// Decreases interplay: re-snapshot `old = src` after the havoc so the
     /// ranking check compares within the symbolic iteration.
-    resnapshot: Option<(usize, usize)>,
+    resnapshot: Option<Vec<(usize, usize)>>,
 }
 
 impl LoopContractPass {
@@ -149,15 +179,26 @@ impl LoopContractPass {
             tracing::warn!("loop-contract proof rule disabled by TRUST_MC_NO_LOOP_RULE");
             return;
         }
-        // #47 scope gate 1: contract-instrumented bodies keep the legacy
-        // encoding verbatim. Function-contract expansion interleaves its own
-        // closures/havoc with the loop; the combined rule obligations regress
-        // tests the legacy path proves (function_with_loop_no_assertion,
-        // contract_proof_function_with_loop — both parity pre-rule).
-        if self.enclosing_has_contract {
-            tracing::debug!("loop-contract rule: skipped (contract-instrumented body)");
-            return;
-        }
+        // #47 scope gate 1 REMOVED (measured, 2026-08-28). It skipped every
+        // contract-instrumented body because "the combined rule obligations
+        // regress tests the legacy path proves (function_with_loop_no_assertion,
+        // contract_proof_function_with_loop — both parity pre-rule)". Both
+        // named tests were re-measured on the legacy path at this commit and
+        // BOTH already FAIL there: function_with_loop_no_assertion reports
+        // `contract_proof.unwind.1 "unwinding assertion loop 0": FAILURE`
+        // (the uninstrumented loop simply unrolls past the bound) and
+        // contract_proof_function_with_loop reports no loop obligation at all.
+        // The gate is therefore protecting failures, not parity.
+        //
+        // What still protects the combination is the PLAN, which is
+        // independent of this gate and unchanged: `scan_havoc_set` fails
+        // closed on every contract artifact it cannot account for — a
+        // kani-internal call that is not frame-pure, a `&mut`/raw-pointer
+        // call argument whose provenance it cannot resolve, a shared-reference
+        // argument carrying writable indirection (which is what a contract
+        // closure capturing `&mut` state looks like), a store to a local
+        // without a havocable type. Any of those leaves the loop on the
+        // legacy encoding exactly as this gate did.
         // #47 scope gate 2: an explicit `kani_loop_modifies` assigns clause
         // defines its own frame; the legacy FC-29 loop-modifies machinery
         // proves those tests today (loop_assigns_for_{ref,ptr,fat_ptr} are
@@ -170,7 +211,7 @@ impl LoopContractPass {
             tracing::debug!("loop-contract rule: skipped (explicit loop assigns clause)");
             return;
         }
-        let Some(check_type) = self.safety_check_type.clone() else {
+        let Some(check_type) = self.safety_check_no_assume_type.clone() else {
             // No harness in this unit: nothing is verified, keep MIR untouched.
             return;
         };
@@ -198,7 +239,7 @@ impl LoopContractPass {
         // func_call's `j = sum_pair(..)`) keep the full rule.
         let skip_inner = self.nested_dependent_inner_skips(tcx, body, &loops);
 
-        for (head_bb, latch_hint) in loops {
+        for (loop_idx, (head_bb, latch_hint)) in loops.into_iter().enumerate() {
             if skip_inner.contains(&head_bb) {
                 tracing::debug!(
                     head_bb,
@@ -242,7 +283,7 @@ impl LoopContractPass {
                         havoc = ?plan.havoc.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
                         "loop-contract rule: instrumenting base/step/post"
                     );
-                    Self::apply_loop_rule(body, &plan, &check_type);
+                    Self::apply_loop_rule(body, &plan, &check_type, loop_idx);
                 }
                 Err(reason) => {
                     // Unsupported shape: keep the LEGACY encoding verbatim
@@ -523,7 +564,7 @@ impl LoopContractPass {
         // ── Decreases interplay: re-snapshot after the havoc ────────────────
         // `instrument_loop_decreases` only fires on single-loop bodies, so the
         // snapshot (if any) belongs to this loop exactly when single_loop.
-        let resnapshot = if single_loop { self.decreases_snapshot } else { None };
+        let resnapshot = if single_loop { self.decreases_snapshot.clone() } else { None };
 
         // Sink-target selection (task #70; see the `sink_target` field doc).
         let return_reachable = return_reachable_blocks(body);
@@ -688,7 +729,7 @@ impl LoopContractPass {
                     }
                     add_store(destination.local, &mut havoc)?;
 
-                    let Some(RigidTy::FnDef(fn_def, _)) =
+                    let Some(RigidTy::FnDef(fn_def, call_genargs)) =
                         func.ty(body.locals()).ok().and_then(|t| t.kind().rigid().cloned())
                     else {
                         return Err("indirect call inside contracted loop");
@@ -702,6 +743,23 @@ impl LoopContractPass {
                             continue;
                         }
                         return Err("kani-internal call with side effects inside contracted loop");
+                    }
+                    // The loop-contract for-loop rewrite replaces the user's
+                    // `IntoIterator` with this repo's own `KaniIter` adapters
+                    // and steps them through a SHARED `&self` inside the loop
+                    // region. Those arguments are rejected by the generic rule
+                    // below because every adapter holds a `*const T`, and
+                    // `no_writable_indirection` rejects a raw pointer whatever
+                    // its mutability (a `*const` can be cast to `*mut`). That
+                    // is the right default for a type whose code we have not
+                    // read; it is wrong for these, whose bodies are in
+                    // `library/kani_core/src/iter.rs`.
+                    //
+                    // The exemption is POSITIVE and per-(method, adapter) —
+                    // see `readonly_kani_iter_shim` for why the trait as a
+                    // whole is NOT read-only.
+                    if readonly_kani_iter_shim(&fn_def.name(), &call_genargs) {
+                        continue;
                     }
 
                     for arg in args {
@@ -727,6 +785,16 @@ impl LoopContractPass {
                             TyKind::RigidTy(RigidTy::Ref(_, pointee, Mutability::Not))
                             | TyKind::RigidTy(RigidTy::RawPtr(pointee, Mutability::Not)) => {
                                 if !no_writable_indirection(pointee, 8) {
+                                    // Name the callee and the pointee: this
+                                    // is the gate the for-loop family trips,
+                                    // and the reason string alone does not
+                                    // say WHICH call blocked the loop.
+                                    tracing::debug!(
+                                        callee = ?fn_def.name(),
+                                        pointee = ?pointee,
+                                        "loop-contract rule: shared-pointer call argument blocked \
+                                         the havoc scan"
+                                    );
                                     return Err(
                                         "shared-pointer call argument with interior mutability or writable indirection",
                                     );
@@ -781,7 +849,12 @@ impl LoopContractPass {
     /// guard-7 "undeclared-mid" trap), silently erasing the obligation.
     /// Check conditions in branch blocks are same-block constants (the user
     /// `assert!` pattern), so reachability of the branch IS the property.
-    fn apply_loop_rule(body: &mut MutableBody, plan: &LoopRulePlan, check_type: &CheckType) {
+    fn apply_loop_rule(
+        body: &mut MutableBody,
+        plan: &LoopRulePlan,
+        check_type: &CheckType,
+        loop_idx: usize,
+    ) {
         let span = body.blocks()[plan.anchor_bb].terminator.span;
         let (CheckType::SafetyCheck(check_instance)
         | CheckType::SafetyCheckNoAssume(check_instance)
@@ -800,10 +873,26 @@ impl LoopContractPass {
             Operand::Copy(Place::from(body.new_local(instance.ty(), span, Mutability::Not)))
         };
 
-        // A `safety_check(false, msg)` block: reachable => property FAILS, and
-        // the check's assume-half kills the continuation (assert+assume false).
-        let make_fail_block = |body: &mut MutableBody, msg: &str, target: usize| {
-            let ff = body.new_local(Ty::bool_ty(), span, Mutability::Mut);
+        // An OBLIGATION block: `safety_check_no_assume(_v, msg)` where `_v`
+        // holds the freshly-evaluated invariant.
+        //
+        // The condition is the invariant VALUE, not a constant `false` inside
+        // a `¬inv`-guarded branch. That is the whole point: with the constant
+        // form the obligation's own path condition IS `¬inv`, so the driver's
+        // reachability classification demotes a DISCHARGED obligation to
+        // UNREACHABLE — indistinguishable from a loop sitting in dead code.
+        // Both printed UNREACHABLE before this change (controls `ctrl_true`
+        // vs `ctrl_dead_loop`, which were byte-identical). Asserting `_v` at
+        // the reachable loop head instead gives the three outcomes distinct
+        // reports, and matches Kani/CBMC, which asserts the invariant itself:
+        // provable => SUCCESS, refutable => FAILURE, loop head dead =>
+        // UNREACHABLE.
+        //
+        // The check is assert-ONLY. Its `false` continuation is cut by the
+        // switch that still follows it (base) or by the sink it targets
+        // (step), so the assume half would only restate an edge the CFG
+        // already removes.
+        let make_check_block = |body: &mut MutableBody, msg: &str, target: usize| {
             let func = fn_op(body, check_instance);
             let msg_op = Operand::Constant(ConstOperand {
                 span,
@@ -812,14 +901,11 @@ impl LoopContractPass {
             });
             let dest = Place::from(body.new_local(unit_ty, span, Mutability::Mut));
             body.push_block(BasicBlock {
-                statements: vec![Statement {
-                    kind: StatementKind::Assign(Place::from(ff), Rvalue::Use(bool_op(false))),
-                    span,
-                }],
+                statements: vec![],
                 terminator: Terminator {
                     kind: TerminatorKind::Call {
                         func,
-                        args: vec![Operand::Move(Place::from(ff)), msg_op],
+                        args: vec![Operand::Copy(plan.reg_dest.clone()), msg_op],
                         destination: dest,
                         target: Some(target),
                         unwind: UnwindAction::Terminate,
@@ -848,19 +934,6 @@ impl LoopContractPass {
             })
         };
 
-        // ── BASE: reg(closure, 2) → switch(_v): false ⇒ FAIL, true ⇒ havoc ──
-        let base_fail_bb = make_fail_block(
-            body,
-            "loop invariant base case: invariant must hold on loop entry",
-            sink_bb,
-        );
-        // ── STEP: latch reg(closure, 1) → switch(_v): false ⇒ FAIL, true ⇒ cut
-        let step_fail_bb = make_fail_block(
-            body,
-            "loop invariant inductive step: invariant must be re-established by the loop body",
-            sink_bb,
-        );
-
         let bool_switch = |discr: Place, false_bb: usize, true_bb: usize| Terminator {
             kind: TerminatorKind::SwitchInt {
                 discr: Operand::Copy(discr),
@@ -877,7 +950,11 @@ impl LoopContractPass {
         }];
         // Decreases interplay: the ranking snapshot must be taken on the
         // havocked (symbolic-iteration) state, not the concrete entry state.
-        if let Some((old_local, measure_src)) = plan.resnapshot {
+        // Refresh EVERY measure component after the havoc. A compound measure
+        // (`hi - lo`) records one pair per component; the latch recomputes the
+        // difference from these, so missing one would leave `old` free and the
+        // ranking obligation would refute on a terminating loop.
+        for &(old_local, measure_src) in plan.resnapshot.iter().flatten() {
             tail_stmts.push(Statement {
                 kind: StatementKind::Assign(
                     Place::from(old_local),
@@ -953,22 +1030,34 @@ impl LoopContractPass {
         }
         let havoc_head_bb = next;
 
-        // base-switch: false (¬inv on entry) ⇒ base FAIL; true ⇒ havoc chain.
+        // ── BASE: assert(inv) on the ENTRY state, then the ORIGINAL switch:
+        // false ⇒ sink (the ¬inv continuation is cut structurally, exactly as
+        // before this obligation moved into the check condition), true ⇒ the
+        // havoc chain. Keeping the switch is what lets the check be
+        // assert-ONLY: the assume half would duplicate an edge the CFG
+        // already removes, and it measurably costs (see
+        // `safety_check_no_assume_type`).
         let base_sw_bb = body.push_block(BasicBlock {
             statements: vec![],
-            terminator: bool_switch(plan.reg_dest.clone(), base_fail_bb, havoc_head_bb),
+            terminator: bool_switch(plan.reg_dest.clone(), sink_bb, havoc_head_bb),
         });
+        let base_check_bb = make_check_block(
+            body,
+            &format!("{LOOP_INVARIANT_BASE_MSG} {LOOP_ID_MARKER}{loop_idx})"),
+            base_sw_bb,
+        );
         // Evaluate the invariant on the entry state.
-        let base_eval_bb = make_eval_block(body, base_sw_bb);
+        let base_eval_bb = make_eval_block(body, base_check_bb);
 
-        // step-switch: false (¬inv after one iteration) ⇒ step FAIL; true ⇒
-        // sink (the CUT: the back edge is gone, the system is acyclic).
-        let step_sw_bb = body.push_block(BasicBlock {
-            statements: vec![],
-            terminator: bool_switch(plan.reg_dest.clone(), step_fail_bb, sink_bb),
-        });
+        // ── STEP: assert(inv) after the one symbolic body iteration, then the
+        // CUT (sink; the back edge is gone, the system is acyclic). ──────────
+        let step_check_bb = make_check_block(
+            body,
+            &format!("{LOOP_INVARIANT_STEP_MSG} {LOOP_ID_MARKER}{loop_idx})"),
+            sink_bb,
+        );
         // Evaluate the invariant after the one symbolic body iteration.
-        let step_eval_bb = make_eval_block(body, step_sw_bb);
+        let step_eval_bb = make_eval_block(body, step_check_bb);
 
         // ── Rewire: entry edge -> breadcrumb+eval; latch register -> step ───
         // The register calls are kept as BREADCRUMBS only (their body is
@@ -1622,6 +1711,88 @@ fn no_writable_indirection(ty: Ty, fuel: usize) -> bool {
         },
         _ => false,
     }
+}
+
+/// A call to one of the loop-contract library's `KaniIter` adapters that
+/// provably only READS through its `&self` argument, so it cannot widen the
+/// loop's frame beyond its (already havocked) destination.
+///
+/// This is deliberately NOT "the `KaniIter` trait is pure". `KaniMapIter`
+/// breaks that: its `nth`/`first` do
+///
+/// ```text
+/// let map_ptr = &self.map as *const F as *mut F;
+/// unsafe { (*map_ptr)(item) }
+/// ```
+///
+/// — they call an `FnMut` through a `*const -> *mut` cast on a shared `&self`,
+/// so stepping a mapped iterator can mutate the closure's captured state.
+/// The exemption is therefore split:
+///
+/// * `assumption` / `len` — read-only for EVERY adapter in the library. Each
+///   impl either returns a field or recurses into the inner adapter's
+///   `assumption`/`len`; none touches a mapped closure. Self is unrestricted.
+/// * `nth` / `first` — read-only only for the adapters listed below, and only
+///   when every adapter they are built from is also on the list.
+///
+/// Everything else — `KaniMapIter`, a user impl of the public `KaniIter`
+/// trait, an adapter added later — is not matched, and the loop keeps the
+/// legacy encoding exactly as before. Adding an adapter to the list without
+/// reading its body would be an unsoundness: an unhavocked loop-modified
+/// location makes the invariant obligations prove too much.
+fn readonly_kani_iter_shim(callee: &str, genargs: &GenericArgs) -> bool {
+    let Some(method) = callee.strip_prefix("kani::KaniIter::") else {
+        return false;
+    };
+    match method {
+        "assumption" | "len" => true,
+        "nth" | "first" => genargs
+            .0
+            .iter()
+            .filter_map(|a| match a {
+                GenericArgKind::Type(t) => Some(*t),
+                _ => None,
+            })
+            .all(|t| kani_iter_adapter_is_readonly(t, 8)),
+        _ => false,
+    }
+}
+
+/// Recursive membership test for `readonly_kani_iter_shim`'s `nth`/`first`
+/// arm: an adapter whose element step only reads, built only from such
+/// adapters. Type arguments that are not adapters must themselves carry no
+/// writable indirection (the element type).
+fn kani_iter_adapter_is_readonly(ty: Ty, fuel: usize) -> bool {
+    if fuel == 0 {
+        return false;
+    }
+    let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else {
+        return no_writable_indirection(ty, fuel - 1);
+    };
+    let name = def.name();
+    let admitted = matches!(
+        name.as_str(),
+        "kani::KaniPtrIter"
+            | "kani::KaniRefIter"
+            | "kani::KaniStepBy"
+            | "kani::KaniChainIter"
+            | "kani::KaniZipIter"
+            | "kani::KaniEnumerateIter"
+            | "kani::KaniTakeIter"
+            | "kani::KaniRevIter"
+            | "core::ops::Range"
+            | "std::ops::Range"
+    );
+    if !admitted {
+        // Not an adapter we have read: fall back to the generic rule, which
+        // accepts a plain element type and rejects anything with writable
+        // indirection (including `kani::KaniMapIter`).
+        return no_writable_indirection(ty, fuel - 1);
+    }
+    args.0.iter().all(|a| match a {
+        GenericArgKind::Type(t) => kani_iter_adapter_is_readonly(*t, fuel - 1),
+        _ => true,
+    })
 }
 
 /// Kani-internal fn markers whose calls only write their destination — safe

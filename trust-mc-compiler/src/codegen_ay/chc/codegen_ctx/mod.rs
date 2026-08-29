@@ -26,11 +26,11 @@ pub(in crate::codegen_ay::chc) use globals::{
     CHC_DEBUG_FLAG, PENDING_FRESH_VAR_DECLS, UNDEF_COUNTER, chc_debug_enabled, chc_fresh_name,
     declare_pending_var, push_pending_datatype_sort, record_aggregate_encoding_gap_for_fn,
     record_aggregate_gap_reason_for_fn, record_drop_fallback_reason_for_fn,
-    record_fp_bitvector_encoding_for_fn, record_inferable_summary_name_for_fn,
-    record_kani_mem_overapprox_for_fn, record_offset_provenance_unresolved_for_fn,
-    record_ptr_metadata_unconstrained_for_fn, record_signedness_fallback_for_fn,
-    record_sound_havoc_drop_for_fn, record_static_init_incomplete_for_fn,
-    record_store_dropped_for_fn, record_stub_approximation_for_fn, record_translation_drop_for_fn,
+    record_fp_bitvector_encoding_for_fn, record_kani_mem_overapprox_for_fn,
+    record_offset_provenance_unresolved_for_fn, record_ptr_metadata_unconstrained_for_fn,
+    record_signedness_fallback_for_fn, record_sound_havoc_drop_for_fn,
+    record_static_init_incomplete_for_fn, record_store_dropped_for_fn,
+    record_stub_approximation_for_fn, record_translation_drop_for_fn,
     record_translation_drop_site_reason_for_fn, record_type_sort_fallback,
     record_type_sort_fallback_for_fn, record_unhandled_call_for_fn, set_chc_fallback_count_for_fn,
 };
@@ -152,6 +152,26 @@ pub(in crate::codegen_ay::chc) fn fallback_soundness(reason: &str) -> FallbackSo
         // invalidated at dispatch. ∀-sound; blessing keeps parity untouched
         // with attribution visible.
         | "vec_clone_dest_unconstrained"
+        // Task #78 (walker nested-call fallback, terminator_exec.rs): a call
+        // the walker could not inline (no stdlib MIR, unhandled stub) writes a
+        // FRESH `__nested_call_overapprox` `declare-var` to the destination.
+        // A declare-var is universally quantified over its rule, so the rule
+        // must hold for EVERY value the var can take — a superset of what the
+        // real callee could return. That is monotone: it can only add
+        // behaviours, never remove one, so no proof this admits is a false
+        // proof. (The two narrowing shapes that ride the same path — a valid
+        // heap backing for provably-allocating collection constructors, and
+        // alignment/non-null invariants on a pointer destination — are
+        // pre-existing audited decisions gated on their own predicates, not
+        // part of this blessing.)
+        //
+        // Blessed rather than fail-closed because the alternative demotes every
+        // CHC harness that touches an un-inlinable stdlib call — nearly all of
+        // them — turning clean proofs into Unknown to fix a COUNTEREXAMPLE
+        // labelling bug. The SoundHavoc lane is precisely the right one: it is
+        // excluded from the proof qualifier (proofs stay clean) while still
+        // tagging a dependent counterexample OverApproximation.
+        | "nested_call_overapprox"
         // P4-4 audit (emit_math_axiom_goto_extra): PURE math intrinsic
         // (sin/cos/sqrt/exp/powf even-power) — the destination is the call's
         // only effect; it reaches the head as fresh havoc constrained only by
@@ -160,7 +180,58 @@ pub(in crate::codegen_ay::chc) fn fallback_soundness(reason: &str) -> FallbackSo
         // side effect exists to be identity-retained, so the fallback is a
         // strict over-approximation. ∀-sound. Duals: dual_p4_float_nan.rs
         // (sine value not pinned; powf lower bound refutable) stay FAILED.
-        | "math_axiom_range_overapprox" => FallbackSoundness::SoundHavoc,
+        //
+        // #4270 / TL18 UPDATE: the destination is now bound to a select over
+        // the frozen `call_uf_tbl` (call_uf_table.rs) instead of a bare fresh
+        // variable. This does NOT weaken the audit. The table is never
+        // constrained anywhere, so for a FIXED key the ∀-quantified table
+        // still ranges over every value of the sort — the destination remains
+        // universally quantified and no behaviour is removed. What the select
+        // adds is CONGRUENCE: two sites with the same intrinsic and the same
+        // argument value now get the same result, which is what the real
+        // function does (`sin(x) == sin(x)` was previously unprovable because
+        // the two sites drew independent havocs). Arguments that differ stay
+        // independent — `sin(x) == sin(y)` is still refutable.
+        // Bounded-inline SwitchInt branch fallback (switchint.rs
+        // `switchint_branch_fallback`): the branch result is a FRESH,
+        // universally-quantified variable of the callee's return sort — a
+        // certified fresh havoc, not a dropped constraint on an existing var.
+        // This site previously recorded NOTHING at all, so blessing it here is
+        // a strict INCREASE in accounting: proof behaviour is unchanged (which
+        // is what SoundHavoc buys) while every counterexample that reads the
+        // freed value is now demoted by `classify_ctrex`, and one that is
+        // provably independent of it is re-certified Genuine by
+        // `recertify_overapprox_ctrex`. RECEIPT: kani/Intrinsics/Count/ctlz.rs
+        // and cttz.rs — the reference loop outruns the replay budget, the
+        // residual becomes this variable, and the assertion over it was
+        // reported as a genuine failed assertion.
+        | "switchint_branch_overapprox"
+        | "math_axiom_range_overapprox"
+        // #4270 / TL18 audit (see call_uf_table.rs for the full written gate):
+        // an ESTABLISHED-pure scalar callee summarised by the frozen congruent
+        // table. `established_pure_scalar_callee` reads the callee's MIR body
+        // (not its signature shape) and admits it only when the body has no
+        // Deref, no reference/raw-pointer constant, no pointer-creating rvalue,
+        // no memory intrinsic, no panicking terminator (no `Assert`, so an
+        // overflow check is never swallowed) and no nested call outside the
+        // same gate or the total/pure bit intrinsics. Such a callee's ONLY
+        // observable effect is its return value, which reaches the head as
+        // `select` over a table that is never constrained anywhere -- the real
+        // function is one interpretation of it, so the term is universally
+        // quantified exactly like a fresh havoc, only congruent. No memory
+        // side effect exists to be identity-retained. ∀-sound; a callee that
+        // can panic, read a static or take a pointer FAILS the gate and keeps
+        // the fail-closed `call_dispatch_fallback_prebuilt` havoc.
+        => FallbackSoundness::SoundHavoc,
+        // NOT blessed: "call_uf_congruent_summary". The UF-summary lane replaces
+        // an unconditional fail-closed `return None` in `fallback_dispatch.rs`,
+        // so blessing it would let a `Success` stand UN-DEMOTED. Its author
+        // could not construct a harness where the lane both fires and the solver
+        // decides, i.e. it was argued from code review, never observed. A/B on
+        // the kani suite with it blessed vs fail-closed is BYTE-IDENTICAL
+        // (parity 472, fp 9, missed_bug 0) — it buys nothing measurable, so it
+        // is pure risk surface against a fail-closed net. Bless it only with a
+        // harness that demonstrates the lane firing AND the verdict changing.
         // Everything else — including all SUSPECT/UNSOUND reasons (flatten
         // self-loops, drop_fallback, kani_write_any_slim_target_unresolved,
         // call_dispatch_fallback, float_*_fallback, offset_pointee_size_unknown,
@@ -238,6 +309,7 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) int_lift: bool,
     /// Narrow each block relation's frame to backward-live columns (`ChcConfig`).
     pub(in crate::codegen_ay::chc) frame_narrowing: bool,
+    pub(in crate::codegen_ay::chc) frame_narrowing_flattened: bool,
 
     /// Basic block indices identified as loop headers (back-edge targets).
     /// Populated during fragment analysis or block relation declaration.
@@ -398,6 +470,19 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// recovery (#3641).
     pub(in crate::codegen_ay::chc) known_layout_sizes: HashMap<usize, (u64, u64)>,
 
+    /// Per-local single-writer MIR summary used by the address-provenance walk
+    /// (`mir_provable_referent_local`). Built once per body: the walk is asked
+    /// the same question at many statements, and rescanning every block per hop
+    /// made it quadratic in body size.
+    pub(in crate::codegen_ay::chc) provenance_defs:
+        std::cell::OnceCell<Vec<Option<crate::codegen_ay::chc::stmt::ProvDef>>>,
+
+    /// Memo for `mir_provable_referent_local`, keyed by `(local, depth)`.
+    /// Two of the walk's hops recurse, so without it a single query re-walks
+    /// the same locals exponentially (a contract harness spent ~25s there).
+    pub(in crate::codegen_ay::chc) provenance_walk_memo:
+        std::cell::RefCell<HashMap<(usize, usize), Option<usize>>>,
+
     /// Known allocation IDs: maps local_idx → heap alloc obj_id (Part of #3273).
     /// Populated by `codegen_call_alloc` when `translate_rust_alloc` returns a
     /// concrete obj_id. Used by `translate_rust_realloc` to resolve symbolic
@@ -444,6 +529,14 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// summaries (Part of #3395). Multiple calls to the same function reuse
     /// the existing uninterpreted function declaration if sorts match.
     pub(in crate::codegen_ay::chc) declared_inferable_fns: HashMap<String, (Vec<Sort>, Sort)>,
+
+    /// Per-VC callee tags for the frozen congruent call-summary table
+    /// (`call_uf_table.rs`): mangled callee name -> tag occupying the fixed
+    /// high 32 bits of the table key. Sequential and monomorphisation-unique,
+    /// so two distinct callees can never select the same table entry (a
+    /// collision would ASSERT an equality that need not hold). `BTreeMap` for
+    /// deterministic tag assignment across runs.
+    pub(in crate::codegen_ay::chc) call_uf_tags: std::collections::BTreeMap<String, u32>,
 
     /// Locals known to hold a power of 2: maps local_idx → exponent Expr.
     /// Populated by `codegen_pow` when base == 2 (result = `2^exp`).
@@ -665,6 +758,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let step_mode = cfg.step_mode;
         let int_lift = cfg.int_lift;
         let frame_narrowing = cfg.frame_narrowing;
+        let frame_narrowing_flattened = cfg.frame_narrowing && cfg.frame_narrowing_flattened;
         let wide_mem = cfg.wide_mem;
         let extra_pointer_checks = cfg.extra_pointer_checks;
         let prove_safety_only = cfg.prove_safety_only;
@@ -753,12 +847,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             state_var_mgr: StateVarManager::with_capacity(num_locals, num_blocks),
             flatten: FlattenState::new(),
             stub_registry: StubRegistry::new(),
+            provenance_defs: std::cell::OnceCell::new(),
+            provenance_walk_memo: std::cell::RefCell::new(HashMap::new()),
             ref_resolution: RefResolution::new(),
             encode: EncodeState::with_capacity(num_locals),
             track_level,
             step_mode,
             int_lift,
             frame_narrowing,
+            frame_narrowing_flattened,
             loop_headers: HashSet::new(),
             int_lifted_vars: HashMap::new(),
             fragment_analysis: None,
@@ -788,6 +885,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             known_stack_addr_exprs: HashMap::new(),
             known_pointer_to_alloc: HashMap::new(),
             declared_inferable_fns: HashMap::new(),
+            call_uf_tags: std::collections::BTreeMap::new(),
             known_pow2_locals: HashMap::new(),
             current_encode_bb: 0,
             modifies_frames: Vec::new(),
@@ -839,6 +937,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// in the per-function aggregate gap reasons map for diagnostic triage.
     pub(in crate::codegen_ay::chc) fn record_aggregate_gap(&self, reason: &str) {
         self.diagnostics.aggregate_encoding_gap.inc();
+        record_aggregate_gap_reason_for_fn(&self.fn_name, reason);
+    }
+
+    /// Record a diagnostic reason for this function WITHOUT touching any
+    /// counter.
+    ///
+    /// [`Self::record_aggregate_gap`] also `inc()`s `aggregate_encoding_gap`,
+    /// which feeds CTREX classification — so it cannot be used purely to label
+    /// something. This can: it only adds a string to the per-function reason
+    /// map, so it is measurement with no behavioural reach.
+    ///
+    /// Exists because the walker's nested-call over-approximation knows the
+    /// callee it gave up on and recorded only that it happened. That cluster is
+    /// the largest non-parity population in the corpus (62 rows on 2026-08-23,
+    /// 42 of them spurious counterexamples built on an invented return value),
+    /// and without the callee it cannot be triaged.
+    pub(in crate::codegen_ay::chc) fn note_gap_reason(&self, reason: &str) {
         record_aggregate_gap_reason_for_fn(&self.fn_name, reason);
     }
 
@@ -992,6 +1107,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.state_var_mgr.state_vars.len()
         );
         self.encode.modified_state_indices.insert(idx);
+    }
+
+    /// The state slot of the `static` a `--c-lib` translation unit names by
+    /// LINKER SYMBOL.
+    ///
+    /// C reaches an exported object by symbol, not by Rust path, so the C
+    /// front-end's `S` has to resolve through the symbol table the foreign
+    /// static declaration registers — never by matching the Rust name, which
+    /// `#[link_name]` is free to differ from.
+    pub(in crate::codegen_ay::chc) fn foreign_static_slot(&self, symbol: &str) -> Option<usize> {
+        self.ref_resolution.c_symbol_static_state_idx.get(symbol).copied()
+    }
+
+    /// The expression denoting a state slot's CURRENT value: its output
+    /// variable once something in this block has written it, its input
+    /// variable otherwise.
+    pub(in crate::codegen_ay::chc) fn state_slot_expr(&self, slot: usize) -> Option<Expr> {
+        if self.encode.modified_state_indices.contains(&slot) {
+            let (name, sort) = self.state_var_mgr.output_state_vars.get(slot)?;
+            return Some(Expr::var(&**name, sort.clone()));
+        }
+        let (name, sort) = self.state_var_mgr.state_vars.get(slot)?;
+        Some(Expr::var(&**name, sort.clone()))
     }
 
     /// Find the state_var index for a given variable name.

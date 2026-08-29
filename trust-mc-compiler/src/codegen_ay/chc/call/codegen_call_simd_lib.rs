@@ -208,6 +208,26 @@ fn dispatch_as_array_ref(
         ctx.ref_resolution.const_ref_values.insert(dest_local, arr_expr);
     }
 
+    // `as_array(&self) -> &[T; N]` returns a reference to `self` ITSELF: a
+    // repr(simd) newtype and its inner array are co-located, so the returned
+    // reference carries the same address as the one that came in. Binding it
+    // is a fact about the callee, not a relaxation of any check.
+    //
+    // Without this, `dest_local` stays a free BV64 and every obligation on the
+    // returned pointer is unconstrained — the solver is free to pick an offset
+    // near 2^32 and the `offset + N >= offset` overflow guard fires, reporting
+    // a spurious memory-safety violation on a load that is manifestly in
+    // bounds. Registering the ref_target above is not enough: the deref
+    // rewrite it feeds is (correctly) declined when the cast retypes the place
+    // from `V` to `[T; N]`, leaving the Mem lane to read through these bits.
+    if let Some(self_addr) = ctx.translate_operand_with_modified(&dcx.args[0], dcx.modified_locals)
+        && self_addr.sort().is_bitvec()
+    {
+        debug!(bb = dcx.bb_idx, dest_local, ref_local, "simd as_array: bound dest to self address");
+        emit_simd_dest_constraint(ctx, dcx, target, dest_local, self_addr);
+        return true;
+    }
+
     let out = ctx.build_output_args(dcx.modified_locals, &[]);
     ctx.emit_goto_rule(dcx.from_app, target, &out, dcx.stmt_constraints);
     true

@@ -22,6 +22,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
+TRUST_MC_CARGO="$("${ROOT_DIR}/scripts/resolve-trust-tool.sh" cargo)"
 
 # Soundness regression files — must match tests/ay/soundness_ledger.toml.
 # The ledger test enforces this list matches the ledger exactly.
@@ -43,7 +44,15 @@ ERRORS=()
 echo "[soundness-gate] Root: ${ROOT_DIR}"
 echo "[soundness-gate] Files: ${#SOUNDNESS_FILES[@]}"
 AY_SOLVER="${AY_SOLVER:-auto}"
-AY_TEST_TIMEOUT="${AY_TEST_TIMEOUT:-60}"
+# 300, not 60: the per-harness budget must clear the slowest LEDGERED solve on
+# the slowest host, or the watchdog kills the verifier before ANY verdict and
+# this gate reports the kill as VACUOUS. Measured 2026-08-19 on the GB10
+# (Grace, debug driver): offset_symbolic_count_byte_wrap_fail.rs completes in
+# 120.7s with its expected genuine-CTREX verdict; at 60s it died verdict-less
+# right at the boundary. 300s gives the same ~2.5x headroom the measured
+# trust-vc BV cap uses. A genuinely hung solve still fails the gate — the
+# verdict is required, not just an exit.
+AY_TEST_TIMEOUT="${AY_TEST_TIMEOUT:-300}"
 export AY_SOLVER AY_TEST_TIMEOUT
 
 echo "[soundness-gate] AY_SOLVER=${AY_SOLVER}"
@@ -72,7 +81,7 @@ echo ""
 # files live in tests/ay/, so each run is `ay-compiletest.sh <suite=ay>` with a
 # --filter on the file name (ay-compiletest.sh takes a SUITE dir, not a file).
 echo "[soundness-gate] building trust-mc (cargo build-dev) ..."
-cargo build-dev
+"${TRUST_MC_CARGO}" build-dev
 
 for file in "${SOUNDNESS_FILES[@]}"; do
     if [[ ! -f "${file}" ]]; then

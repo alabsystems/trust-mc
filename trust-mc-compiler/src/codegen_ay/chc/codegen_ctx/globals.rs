@@ -247,6 +247,16 @@ pub(in crate::codegen_ay) fn get_chc_fallback_count_for_fn(fn_name: &str) -> usi
     GLOBAL_COUNTERS.get_chc_fallback_count_for_fn(fn_name)
 }
 
+/// Record that `fn_name`'s straight-line discharge proved its checks
+/// UNREACHABLE rather than SAFE — a vacuous proof (CHC lane V4).
+pub(in crate::codegen_ay) fn record_vacuous_checks_for_fn(fn_name: &str) {
+    GLOBAL_COUNTERS.record_vacuous_checks_for_fn(fn_name);
+}
+
+pub(in crate::codegen_ay) fn get_vacuous_checks_for_fn(fn_name: &str) -> bool {
+    GLOBAL_COUNTERS.get_vacuous_checks_for_fn(fn_name)
+}
+
 pub(in crate::codegen_ay) fn take_chc_fallback_counts() -> BTreeMap<String, usize> {
     GLOBAL_COUNTERS.take_chc_fallback_counts()
 }
@@ -522,4 +532,16 @@ pub(in crate::codegen_ay) fn take_inferable_summary_names_by_fn()
 /// Record a per-site aggregate gap reason for a specific function.
 pub(in crate::codegen_ay::chc) fn record_aggregate_gap_reason_for_fn(fn_name: &str, reason: &str) {
     GLOBAL_COUNTERS.record_aggregate_gap_reason_for_fn(fn_name, reason);
+}
+
+/// Drain the per-function aggregate gap REASONS.
+///
+/// These carry the callee for the nested-call lane
+/// (`inline_nested_call_fallback_symbolic@<callee_path>`), so they name WHICH
+/// call was over-approximated rather than merely how many were. Nothing outside
+/// unit tests drained them before, which left the largest non-parity cluster in
+/// the corpus reportable but not actionable.
+pub(in crate::codegen_ay) fn take_aggregate_gap_reasons_by_fn()
+-> BTreeMap<String, BTreeMap<String, usize>> {
+    GLOBAL_COUNTERS.take_aggregate_gap_reasons_by_fn()
 }

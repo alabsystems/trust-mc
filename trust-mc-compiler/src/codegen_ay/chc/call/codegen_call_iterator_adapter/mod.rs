@@ -26,6 +26,7 @@ mod collect_data;
 mod concrete_eval;
 mod constructor;
 mod epilogue;
+mod fold_precise;
 mod helpers;
 mod next;
 mod range;
@@ -156,8 +157,14 @@ impl<'tcx, 'body> CallIteratorAdapter for ChcCtx<'tcx, 'body> {
                 extra_constraints.extend(range_extra);
             }
             StubKind::IterFold | StubKind::IterSum => {
-                let (res, flat) =
-                    self.codegen_reduce_arm(stub, args, modified_locals, dest_local, dest_vec_idx);
+                let (res, flat) = self.codegen_reduce_arm(
+                    stub,
+                    args,
+                    modified_locals,
+                    dest_local,
+                    dest_vec_idx,
+                    &mut extra_constraints,
+                );
                 result_expr = res;
                 flattened_result_fields = flat;
             }

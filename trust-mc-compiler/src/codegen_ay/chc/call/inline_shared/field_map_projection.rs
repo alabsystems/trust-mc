@@ -237,7 +237,11 @@ pub(in crate::codegen_ay::chc) fn resolve_projected_place(
                 if !current.sort().is_array() {
                     return None;
                 }
-                let actual_offset = constant_index_offset(*offset, *min_length, *from_end);
+                // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                let Some(actual_offset) = constant_index_offset(*offset, *min_length, *from_end)
+                else {
+                    return None;
+                };
                 current = current.select(Expr::bitvec_const(actual_offset as u128, POINTER_WIDTH));
                 current_ty = ctx.resolve_body_ty(ctx.get_array_element_ty(current_ty)?);
                 current = ctx.try_unflatten_bv_to_datatype(current, current_ty);

@@ -1,4 +1,4 @@
 Status: SUCCESS\
-Description: "scalar property holds; the String drop must not demote"
+Description: ""scalar property holds; the String drop must not demote""
 
 VERIFICATION:- SUCCESSFUL

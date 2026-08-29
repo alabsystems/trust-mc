@@ -12,7 +12,7 @@ use rustc_public::mir::{BasicBlockIdx, Operand, Place};
 use tracing::{debug, warn};
 
 use super::{IntoOption, SimdLayout};
-use crate::codegen_ay::statement::StatementCodegen;
+use crate::codegen_ay::statement::{Allocation, ConstantKind, StatementCodegen, TyConstKind};
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     // -------------------------------------------------------------------------
@@ -55,14 +55,85 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Get the indices (third argument is a SIMD vector of u32 indices)
         let indices_ty = args[2].ty(self.body.locals()).into_option()?;
         let indices_layout = self.simd_layout(indices_ty)?;
-        let indices_expr = self.codegen_operand(&args[2])?;
-        let indices = self.simd_extract_elements(&indices_expr, &indices_layout)?;
 
-        // Build result by selecting elements according to indices
-        // For verification, we build ITE chains for all index values
-        // This handles both constant and symbolic indices correctly
-        let result_elements: Vec<Expr> =
-            indices.iter().map(|idx| self.build_indexed_select(&combined, idx)).collect();
+        // Kani checks every shuffle index against the combined input length
+        // and fails with "index out of bounds: the length is less than or
+        // equal to the given index". Without this obligation an
+        // out-of-bounds index emitted no verification condition at all
+        // (corpus: tests/expected/intrinsics/simd-shuffle-indexes-out
+        // reported VACUOUS no-checks), and `build_indexed_select` silently
+        // clamped the lane to element 0.
+        //
+        // The index vector is a required-const operand, so read its lanes
+        // CONCRETELY whenever the constant allocation is available: the
+        // symbolic encoding of a constant vector is a select over a
+        // const-array store chain, which ay reports `unknown (incomplete)`
+        // on — that shape turned this whole harness UNDECIDED. The symbolic
+        // path below is kept as the fallback for anything the reader
+        // declines.
+        let oob_msg = "index out of bounds: the length is less than or equal to the given index";
+        let result_elements: Vec<Expr> = match self
+            .simd_const_index_lanes(&args[2], &indices_layout)
+        {
+            Some(lanes) => lanes
+                .iter()
+                .map(|&lane| {
+                    let in_bounds = (lane as usize) < combined.len();
+                    self.record_violation_guarded_with_message(
+                        Expr::bool_const(!in_bounds),
+                        "simd_shuffle_index_check",
+                        Some(oob_msg.to_string()),
+                    );
+                    if in_bounds {
+                        combined[lane as usize].clone()
+                    } else {
+                        // Assert-then-assume: past a constantly-failed index
+                        // check the path is dead, and the lane value is a
+                        // fresh unconstrained var the solver never evaluates
+                        // an OOB select for (the div/rem poison pattern in
+                        // ops.rs). Sound both ways: the var is only visible
+                        // past a check that already failed the harness.
+                        let constraint = match &self.current_path_condition {
+                            None => Expr::bool_const(false),
+                            Some(pc) => pc.clone().implies(Expr::bool_const(false)),
+                        };
+                        self.ctx.add_ordered_assumption(constraint);
+                        let name = self.ctx.fresh_name("simd_shuffle_poison");
+                        self.ctx.declare_var(&name, combined[0].sort().clone())
+                    }
+                })
+                .collect(),
+            None => {
+                let indices_expr = self.codegen_operand(&args[2])?;
+                let indices = self.simd_extract_elements(&indices_expr, &indices_layout)?;
+                indices
+                    .iter()
+                    .map(|idx| {
+                        if let Some(idx_width) = idx.sort().bitvec_width() {
+                            let len_const =
+                                Expr::bitvec_const(combined.len() as u128, idx_width);
+                            let in_bounds = idx.clone().bvult(len_const);
+                            self.record_violation_guarded_with_message(
+                                in_bounds.clone().not(),
+                                "simd_shuffle_index_check",
+                                Some(oob_msg.to_string()),
+                            );
+                            // Assert-then-assume (ordered): code after a
+                            // failed index check is path-constrained, and
+                            // the assume cannot mask the check.
+                            let constraint = match &self.current_path_condition {
+                                None => in_bounds,
+                                Some(pc) => pc.clone().implies(in_bounds),
+                            };
+                            self.ctx.add_ordered_assumption(constraint);
+                        }
+                        // Build result by selecting elements according to
+                        // indices: ITE chains handle symbolic index values.
+                        self.build_indexed_select(&combined, idx)
+                    })
+                    .collect()
+            }
+        };
 
         // Construct result - use destination type's layout
         let dest_ty = destination.ty(self.body.locals()).into_option()?;
@@ -73,6 +144,50 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.bind_ssa_result(destination, result_expr);
 
         target
+    }
+
+    /// Read the lanes of a constant SIMD index vector (e.g. `simd_shuffle`'s
+    /// third argument, which rustc requires to be a const item) directly
+    /// from its MIR allocation bytes, little-endian.
+    ///
+    /// Returns None — caller falls back to the symbolic encoding — when the
+    /// operand is not a materialized constant allocation, the layout has no
+    /// bitvec element width, any byte is uninitialized, or the allocation is
+    /// shorter than `lanes * elem_bytes`.
+    fn simd_const_index_lanes(
+        &self,
+        operand: &Operand,
+        layout: &SimdLayout,
+    ) -> Option<Vec<u128>> {
+        let Operand::Constant(const_op) = operand else {
+            return None;
+        };
+        let alloc: &Allocation = match const_op.const_.kind() {
+            ConstantKind::Allocated(alloc) => alloc,
+            ConstantKind::Ty(ty_const) => match ty_const.kind() {
+                TyConstKind::Value(_, alloc) => alloc,
+                _ => return None, // external enum: TyConstKind
+            },
+            _ => return None, // external enum: ConstantKind
+        };
+        let elem_bits = layout.elem_width()?;
+        let elem_bytes = (elem_bits as usize).div_ceil(8);
+        let lanes = layout.lane_count();
+        if elem_bytes == 0 || elem_bytes > 16 || alloc.bytes.len() < lanes.checked_mul(elem_bytes)?
+        {
+            return None;
+        }
+        let mut vals = Vec::with_capacity(lanes);
+        for i in 0..lanes {
+            let start = i * elem_bytes;
+            let mut v = 0u128;
+            for (b, byte) in alloc.bytes.get(start..start + elem_bytes)?.iter().enumerate() {
+                let byte = (*byte)?; // uninit byte: decline, use symbolic path
+                v |= (byte as u128) << (b * 8);
+            }
+            vals.push(v);
+        }
+        Some(vals)
     }
 
     /// Build an ITE chain for symbolic index selection.
@@ -128,7 +243,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Check: index < lanes (out-of-bounds check)
         // UB if index >= lanes, so violation condition is index >= lanes
         let in_bounds = index_expr.clone().bvult(lanes_const);
-        self.record_violation_guarded(in_bounds.not(), label);
+        // Name the intrinsic in the description: the corpus expected files
+        // (simd-extract/insert-out-of-bounds) match on "simd_extract" /
+        // "simd_insert", and the label-derived default text dropped it.
+        self.record_violation_guarded_with_message(
+            in_bounds.not(),
+            label,
+            Some(format!("SIMD index out of bounds: {label}")),
+        );
     }
 
     // -------------------------------------------------------------------------

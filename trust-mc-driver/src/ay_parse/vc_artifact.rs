@@ -96,6 +96,184 @@ pub(crate) fn load_approximation_evidence(path: &Path) -> Option<ApproximationEv
 /// relation (`error_p{id}`). Empty if the artifact is missing, unreadable, or
 /// carries no such properties (e.g. a BMC-mode artifact). The returned order
 /// matches the artifact order, which is the deterministic MIR emission order.
+/// Whether this harness's artifact is readable AND registers NO obligations.
+///
+/// [`load_chc_property_table`] returns an empty vector for four different
+/// situations — missing file, unreadable file, unparseable file, and a harness
+/// that genuinely emitted no checks — and only the last one means "there was
+/// nothing to verify". The CHC success path fabricates a synthetic `Success`
+/// property whenever the table is empty, which makes the V4b no-checks gate
+/// (`harness_runner`) unable to fire: a harness that compiled to zero
+/// obligations reported `VERIFICATION:- SUCCESSFUL` under `--ay-chc` while BMC
+/// correctly reported `INCONCLUSIVE (no checks)`.
+///
+/// Deliberately narrow: anything other than "parsed cleanly, zero properties"
+/// answers `false` and leaves the existing behaviour alone, so a missing or
+/// relocated artifact cannot turn a whole run inconclusive.
+pub(crate) fn artifact_registers_no_obligations(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let Ok(artifact): Result<VcArtifact, _> = serde_json::from_reader(BufReader::new(file)) else {
+        return false;
+    };
+    artifact.properties.is_empty()
+}
+
+/// The message prefixes the loop-contract instrumentation stamps on its
+/// obligations. These are the ONLY reliable marker at the artifact level:
+/// the obligations are registered through `hook_safety_check`, so their
+/// `kind` is `assertion`/`memory_safety` — indistinguishable from a user
+/// assertion — and their `smt_var` is an `ay_violation_*` name, so
+/// `load_chc_property_table` (which keeps only `error_p*`) filters every one
+/// of them out. Matching the text is what c63470f59 made possible.
+pub(crate) const LOOP_CONTRACT_OBLIGATION_PREFIXES: [&str; 3] = [
+    "loop invariant base case:",
+    "loop invariant inductive step:",
+    "loop decreases clause:",
+];
+
+/// The Kani/CBMC-identical description text the RENDERED report carries for the
+/// two invariant obligations, and the check classes they are listed under.
+///
+/// Mirrors `trust-mc-compiler`'s
+/// `kani_middle::transform::loop_contracts::rule::{LOOP_INVARIANT_BASE_MSG,
+/// LOOP_INVARIANT_STEP_MSG, LOOP_ID_MARKER}` — the compiler stamps the internal
+/// stem plus a `(loop N)` suffix onto the artifact, and
+/// `violation::apply_loop_contract_naming` rewrites it into these forms for
+/// display. Two different consumers therefore need two different markers:
+/// `LOOP_CONTRACT_OBLIGATION_PREFIXES` reads the ARTIFACT (still the internal
+/// stem), while the two-lane vacuity guard reads a lane's rendered STDOUT and
+/// must look for the texts below.
+pub(crate) const LOOP_INVARIANT_BASE_CLASS: &str = "loop_invariant_base";
+
+/// Check class of the inductive-step obligation. See `LOOP_INVARIANT_BASE_CLASS`.
+pub(crate) const LOOP_INVARIANT_STEP_CLASS: &str = "loop_invariant_step";
+
+/// Rendered description of the base-case obligation, up to the loop id
+/// (`<fn>.<N>`, appended by `apply_loop_contract_naming`).
+pub(crate) const LOOP_INVARIANT_BASE_REPORT_TEXT: &str = "Check invariant before entry for loop ";
+
+/// Rendered description of the inductive-step obligation, up to the loop id.
+pub(crate) const LOOP_INVARIANT_STEP_REPORT_TEXT: &str = "Check invariant after step for loop ";
+
+/// The same three obligations as `LOOP_CONTRACT_OBLIGATION_PREFIXES`, but as
+/// they appear in the RENDERED report: `[canonical, also-accepted]`.
+///
+/// Both spellings are listed because the rename is a display step, and a
+/// report is only guaranteed to carry the canonical form on paths that ran it.
+/// The guard that uses this is a VACUITY check ("did this lane actually contain
+/// the obligation?"), so accepting the instrumentation's internal stem as well
+/// can only prevent a false "missing" — the stem cannot appear unless the
+/// obligation is genuinely there. The decreases obligation is never renamed, so
+/// both of its entries are the same stem.
+pub(crate) const LOOP_CONTRACT_REPORT_MARKERS: [[&str; 2]; 3] = [
+    [LOOP_INVARIANT_BASE_REPORT_TEXT, "loop invariant base case:"],
+    [LOOP_INVARIANT_STEP_REPORT_TEXT, "loop invariant inductive step:"],
+    ["loop decreases clause:", "loop decreases clause:"],
+];
+
+/// Does this harness carry loop-contract obligations?
+///
+/// Deliberately reads the RAW artifact rather than `load_chc_property_table`:
+/// see the note on the prefixes above. Answers `false` for a missing or
+/// unparseable artifact, so a relocated file can only mean "do not retry" —
+/// never a changed verdict.
+///
+/// `kani_metadata`'s `has_loop_contracts` is NOT usable here: it is hardwired
+/// `false` (trust-mc-compiler/src/kani_middle/metadata.rs:52,177).
+pub(crate) fn artifact_has_loop_contract_obligations(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let Ok(artifact): Result<VcArtifact, _> = serde_json::from_reader(BufReader::new(file))
+    else {
+        return false;
+    };
+    artifact.properties.iter().any(is_loop_contract_property)
+}
+
+/// A property belongs to the loop contract if EITHER its kind says so, OR its
+/// message carries one of the instrumentation's prefixes.
+///
+/// Both channels are needed, and which one fires depends on the configuration:
+/// * With `--ay-chc` on a harness whose measure is unsupported, the run
+///   short-circuits on the fail-closed decreases stub and the artifact holds
+///   exactly ONE property — `PropertyKind::LoopDecreases`, message "loop
+///   `decreases` ranking not proven". No prefix matches it.
+/// * In bmc mode the obligations arrive through `hook_safety_check`, so their
+///   kind is `assertion` and only the MESSAGE identifies them.
+/// Matching one channel only makes the detector a silent no-op on exactly the
+/// rows that need it — measured both ways.
+fn is_loop_contract_property(p: &trust_mc_core::artifact::PropertyMetadata) -> bool {
+    if matches!(
+        p.kind,
+        trust_mc_core::violation::PropertyKind::LoopInvariant
+            | trust_mc_core::violation::PropertyKind::LoopDecreases
+    ) {
+        return true;
+    }
+    p.message.as_deref().is_some_and(|m| {
+        LOOP_CONTRACT_OBLIGATION_PREFIXES.iter().any(|pre| m.starts_with(pre))
+    })
+}
+
+/// The loop-contract obligation messages present in an artifact, deduplicated
+/// by prefix. The two-lane merge uses this to require that the obligations were
+/// actually PRESENT in the obligations lane — "no failing checks" alone would
+/// let a lane whose obligations were dropped pass vacuously.
+/// Did the compiler certify that this harness's body has NO obligation site?
+///
+/// Positive evidence for the vacuity decision: an encoded body with no `Call`
+/// and no `Assert` terminator cannot have HAD an obligation to drop, so zero
+/// checks is the `fn check() {}` shape Kani reports as a clean `0 of 0 failed`.
+/// Anything that can panic — including `Option::unwrap`, which stays a `Call`
+/// because the inliner preserves the boundary — is never certified.
+///
+/// Fail-closed: a missing, unreadable, or unmarked artifact answers `false`.
+pub(crate) fn artifact_body_is_obligation_free(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let Ok(artifact): Result<VcArtifact, _> = serde_json::from_reader(BufReader::new(file))
+    else {
+        return false;
+    };
+    artifact.metadata.as_ref().and_then(|m| m.obligation_free_body).unwrap_or(false)
+}
+
+pub(crate) fn artifact_loop_obligation_kinds(path: &Path) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    if !path.exists() {
+        return found;
+    }
+    let Ok(file) = File::open(path) else {
+        return found;
+    };
+    let Ok(artifact): Result<VcArtifact, _> = serde_json::from_reader(BufReader::new(file))
+    else {
+        return found;
+    };
+    for p in &artifact.properties {
+        let Some(msg) = p.message.as_deref() else { continue };
+        for pre in LOOP_CONTRACT_OBLIGATION_PREFIXES {
+            if msg.starts_with(pre) && !found.contains(&pre) {
+                found.push(pre);
+            }
+        }
+    }
+    found
+}
+
 pub(crate) fn load_chc_property_table(path: &Path) -> Vec<ChcArtifactProperty> {
     if !path.exists() {
         return Vec::new();

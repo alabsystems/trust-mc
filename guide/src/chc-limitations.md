@@ -11,7 +11,7 @@ trust-mc's CHC (Constrained Horn Clauses) backend uses the ay-chc portfolio solv
 |---------|--------|-------|
 | Loops with constant bounds | Fully supported | Fast verification |
 | Simple loops with weak assertions | Usually works | Depends on invariant complexity |
-| Loops with symbolic bounds (counting/accumulation) | Working | 7/7 PROOF in checked-in 2026-03-20 tier2 reports |
+| Loops with symbolic bounds (counting/accumulation) | Unmeasured on the current pin | Last recorded 7/7 PROOF at AY@a70a12da (2026-03-20) |
 | Loops with complex nonlinear invariants | Limited | May timeout depending on invariant complexity |
 | Nested loops with parametric bounds | Limited | Likely timeout |
 
@@ -66,9 +66,9 @@ while i < n {  // Symbolic bound — now PROOF
 assert!(i == n);
 ```
 
-**Result**: PROOF in the checked-in tier2 reports (AY@a70a12da, 2026-03-20)
+**Result**: PROOF in the last recorded tier2 run (AY@a70a12da, 2026-03-20)
 
-The checked-in 2026-03-20 tier2 reports record 7/7 symbolic-bound harnesses as
+That run recorded 7/7 symbolic-bound harnesses as
 PROOF (`tier2_unbounded` 5/5, `tier2_loop_for` 2/2). This covers counting
 loops, accumulation, conditional accumulation, and for-range iteration with
 symbolic bounds. Re-run the tier2 canaries after AY bumps before treating this
@@ -110,12 +110,12 @@ while i < n {
 }
 ```
 
-### Use BMC Mode for Bounded Verification
+### Use the Bounded (BMC) Lane
 
-For time-bounded verification, use BMC (Bounded Model Checking) mode instead of CHC:
+BMC is the default lane, so for time-bounded verification simply omit `--ay-chc`:
 
 ```bash
-trust-mc --ay-emit-bmc --unwind 100 your_file.rs
+trust-mc --unwind 100 your_file.rs
 ```
 
 ### Split Into Multiple Proofs
@@ -176,8 +176,9 @@ This explicit failure is a soundness safeguard. When the iterator's sort doesn't
 
 ## Current Status
 
-**The latest checked-in tier2 symbolic-bound reports are green** (`7/7 PROOF`
-at `AY@a70a12da` on 2026-03-20). Remaining enhancements tracked for complex
+**The last recorded tier2 symbolic-bound run was green** (`7/7 PROOF` at
+`AY@a70a12da`, 2026-03-20). That predates the AY pin now in `Cargo.toml`, so
+it is not the current pin's status. Remaining enhancements tracked for complex
 invariant patterns:
 
 - **Abstract interpretation (CRAB)**: Generate candidate invariants via abstract domains (for NLA loops)

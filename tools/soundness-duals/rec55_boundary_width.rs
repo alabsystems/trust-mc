@@ -1,3 +1,7 @@
+// Oracle (per harness):
+//   check_boundary_pass -> VERIFICATION:- SUCCESSFUL
+//   check_boundary_fail -> VERIFICATION:- FAILED
+//
 // Boundary-width discriminant duals: i8 match arms cross the sign boundary —
 // SwitchTargets stores raw-bits u128 (-1i8 => 255), so a fold with wrong
 // width-masking or sign handling picks the wrong arm.

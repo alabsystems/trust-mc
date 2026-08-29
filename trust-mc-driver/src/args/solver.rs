@@ -271,4 +271,17 @@ pub(crate) struct CheckArgs {
     /// Turn off default unwinding checks
     #[arg(long)]
     pub no_unwinding_checks: bool,
+
+    /// Check that floating-point operations do not GENERATE NaN (Kani's
+    /// `--nan-check`). Opt-in, matching Kani: NaN generation is legal Rust, so
+    /// it is only a defect when the program intends otherwise.
+    ///
+    /// The compiler has always had this flag (`nan_checks`), but nothing
+    /// forwarded it, so it was unreachable from the driver — which silently
+    /// made `tools/soundness-duals/fastmath_dual_nan.rs` and
+    /// `fastmath_dual_mul_div.rs` VACUOUS: they verified because the NaN
+    /// obligation was never emitted at all (`grep -i nan` over their check
+    /// lists returns nothing), not because the program was proven safe.
+    #[arg(long)]
+    pub nan_check: bool,
 }

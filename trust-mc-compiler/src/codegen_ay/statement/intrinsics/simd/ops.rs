@@ -138,8 +138,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let value_elements = self.simd_extract_elements(&value_expr, &layout)?;
         let shift_elements = self.simd_extract_elements(&shift_expr, &layout)?;
 
+        let op_name = if is_left { "simd_shl" } else { "simd_shr" };
         for (value, distance) in value_elements.iter().zip(shift_elements.iter()) {
-            self.emit_shift_distance_check(value, distance, Some(is_signed));
+            self.emit_shift_distance_check_named(value, distance, Some(is_signed), Some(op_name));
         }
 
         // Apply shift element-wise
@@ -253,6 +254,94 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let a_elements = self.simd_extract_elements(&a_expr, &layout)?;
         let b_elements = self.simd_extract_elements(&b_expr, &layout)?;
 
+        // Integer simd_div / simd_rem are UB on a zero divisor and (signed)
+        // on INT_MIN / -1 overflow. Kani checks each lane with
+        // assert-assume semantics ("division by zero" / "attempt to compute
+        // simd_div which would overflow"); a missing check here proved
+        // `simd_div(i32::MIN, -1)` SAFE (a false proof — this corpus test:
+        // tests/expected/intrinsics/simd-div-rem-overflow).
+        let int_div_rem = !is_float && matches!(op, SimdArithOp::Div | SimdArithOp::Rem);
+        if int_div_rem {
+            let op_name = match op {
+                SimdArithOp::Div => "simd_div",
+                SimdArithOp::Rem => "simd_rem",
+                _ => unreachable!("int_div_rem implies Div | Rem"),
+            };
+            for (x, y) in a_elements.iter().zip(b_elements.iter()) {
+                let Some(width) = y.sort().bitvec_width() else {
+                    continue;
+                };
+                let zero = Expr::bitvec_const(0u128, width);
+                let div_zero = y.clone().eq(zero);
+                // Kani's SIMD lane check text is "division by zero" (the
+                // corpus expected files demand it); the bare label default
+                // renders the SCALAR text "attempt to divide by zero", so
+                // carry the message explicitly.
+                self.record_violation_guarded_with_message(
+                    div_zero.clone(),
+                    "div_by_zero_check",
+                    Some("division by zero".to_string()),
+                );
+                let mut no_ub = div_zero.not();
+                if is_signed {
+                    let int_min = Expr::bitvec_const(1u128 << (width - 1), width);
+                    let neg_one = Expr::bitvec_const(!0u128, width);
+                    let overflow = x.clone().eq(int_min).and(y.clone().eq(neg_one));
+                    self.record_violation_guarded_with_message(
+                        overflow.clone(),
+                        "overflow_check_simd_div_rem",
+                        Some(format!("attempt to compute {op_name} which would overflow")),
+                    );
+                    no_ub = no_ub.and(overflow.not());
+                }
+                // Kani lowers these checks assert-then-assume: code after a
+                // failed lane check is path-constrained (UNREACHABLE, not
+                // SUCCESS). Ordered so it cannot mask the checks above.
+                let constraint = match &self.current_path_condition {
+                    None => no_ub,
+                    Some(pc) => pc.clone().implies(no_ub),
+                };
+                self.ctx.add_ordered_assumption(constraint);
+            }
+        }
+
+        // Integer simd_add / simd_sub / simd_mul are UB on lane overflow.
+        // Kani checks each lane with assert-assume semantics ("attempt to
+        // compute simd_add which would overflow"); a missing check here
+        // emitted NO obligation at all, so a harness whose whole point is
+        // that overflow reported VACUOUS no-checks (corpus:
+        // tests/expected/intrinsics/simd-arith-overflows). The lane
+        // predicates are the same house `overflow_check` the scalar
+        // Add/Sub/Mul path uses.
+        let int_arith = !is_float && matches!(op, SimdArithOp::Add | SimdArithOp::Sub | SimdArithOp::Mul);
+        if int_arith {
+            use rustc_public::mir::BinOp;
+            let (mir_op, op_name) = match op {
+                SimdArithOp::Add => (BinOp::Add, "simd_add"),
+                SimdArithOp::Sub => (BinOp::Sub, "simd_sub"),
+                SimdArithOp::Mul => (BinOp::Mul, "simd_mul"),
+                _ => unreachable!("int_arith implies Add | Sub | Mul"),
+            };
+            for (x, y) in a_elements.iter().zip(b_elements.iter()) {
+                let Some((no_overflow, _)) = self.overflow_check(mir_op, x, y, is_signed) else {
+                    continue;
+                };
+                self.record_violation_guarded_with_message(
+                    no_overflow.clone().not(),
+                    "overflow_check_simd_arith",
+                    Some(format!("attempt to compute {op_name} which would overflow")),
+                );
+                // Kani lowers these checks assert-then-assume: code after a
+                // failed lane check is path-constrained (UNREACHABLE, not
+                // SUCCESS). Ordered so it cannot mask the checks above.
+                let constraint = match &self.current_path_condition {
+                    None => no_overflow,
+                    Some(pc) => pc.clone().implies(no_overflow),
+                };
+                self.ctx.add_ordered_assumption(constraint);
+            }
+        }
+
         // Apply operation element-wise.
         // Part of #3857: float SIMD lanes use FP theory operations via bv_float_binop
         // instead of BV integer ops, matching the scalar float arithmetic path.
@@ -281,19 +370,29 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     SimdArithOp::Add => x.bvadd(y),
                     SimdArithOp::Sub => x.bvsub(y),
                     SimdArithOp::Mul => x.bvmul(y),
-                    SimdArithOp::Div => {
-                        if is_signed {
-                            x.bvsdiv(y)
-                        } else {
-                            x.bvudiv(y)
-                        }
-                    }
-                    SimdArithOp::Rem => {
-                        if is_signed {
-                            x.bvsrem(y)
-                        } else {
-                            x.bvurem(y)
-                        }
+                    // Division and remainder keep the RAW op out of the
+                    // zero-divisor path. The UB obligation above already fires
+                    // there, and the ordered assumption makes everything after
+                    // it unreachable — but the solver still MODEL-CHECKS the
+                    // term, and ay's validator rejects a model containing
+                    // `bvsdiv x 0`, degrading the whole harness to
+                    // UndecidedModel. An `ite` on the divisor leaves the
+                    // poisoned case a fresh unconstrained value the validator
+                    // never has to evaluate a division for. Sound both ways:
+                    // that value is only reachable past a check that has
+                    // already failed the harness.
+                    SimdArithOp::Div | SimdArithOp::Rem => {
+                        let width = y.sort().bitvec_width().unwrap_or(32);
+                        let zero = Expr::bitvec_const(0u128, width);
+                        let raw = match (op, is_signed) {
+                            (SimdArithOp::Div, true) => x.clone().bvsdiv(y.clone()),
+                            (SimdArithOp::Div, false) => x.clone().bvudiv(y.clone()),
+                            (_, true) => x.clone().bvsrem(y.clone()),
+                            (_, false) => x.clone().bvurem(y.clone()),
+                        };
+                        let poisoned_name = self.ctx.fresh_name("simd_divrem_poison");
+                        let poisoned = self.ctx.declare_var(&poisoned_name, raw.sort().clone());
+                        Expr::ite(y.eq(zero), poisoned, raw)
                     }
                 }
             })

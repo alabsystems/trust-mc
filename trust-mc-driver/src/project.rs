@@ -264,7 +264,7 @@ impl<'a> StandaloneProjectBuilder<'a> {
 
         // Note that the order of arguments is important. Kani specific flags should precede
         // rustc ones.
-        let mut cmd = Command::new(&self.session.kani_compiler);
+        let mut cmd = Command::new(self.session.kani_compiler()?);
 
         cmd.pass_rustc_arg(encode_as_rustc_arg(&kani_args), PassTo::OnlyLocalCrate)
             .pass_rustc_args(&rustc_args, PassTo::OnlyLocalCrate);

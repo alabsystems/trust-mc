@@ -707,6 +707,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             return Some(Referent::Value(Val::of_value(pointee_expr)));
         }
+        // Tier 4.9: references INTO a collection element.
+        //
+        // `&v[i]` and `&((*index_result).field)` have no ref_target — the
+        // `Index::index` destination is a CALL destination, invisible to the
+        // decl-time ref-target pass — so every tier above declines and Tier 5
+        // hands back the operand's own pointer. That pointer is a MINTED
+        // symbolic address (`ref_address.rs`), and reading through it selects
+        // from a type-indexed memory array the collection was never stored
+        // into: `Vec::push` writes the Vec datatype's `fld_data`, not
+        // `_main_mem_u64`. The compared value was therefore a free variable,
+        // and `regions[0].guest_base == GuestAddress(0)` was "refuted" on a
+        // one-element Vec.
+        //
+        // Resolve it in the collection's VALUE lane instead — the same lane the
+        // direct read `v[0].base.0` already goes through. On failure the
+        // resolver records a fail-closing fallback and this declines, so the
+        // verdict degrades to UNDETERMINED rather than to a fabricated Genuine
+        // counterexample.
+        if let Operand::Copy(place) | Operand::Move(place) = arg
+            && place.projection.is_empty()
+            && let Some(expr) =
+                self.resolve_collection_elem_field_ref_value(place.local, &[], modified_locals)
+        {
+            return Some(Referent::Value(Val::of_value(expr)));
+        }
+
         // Tiers 5 and 6 hand back the operand's OWN term — for a reference
         // operand that is the pointer, not the referent — and report nothing
         // about it: `Referent::Unreported`.

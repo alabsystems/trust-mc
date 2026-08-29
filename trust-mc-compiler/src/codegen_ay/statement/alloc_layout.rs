@@ -257,7 +257,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let elem_align_expr = Expr::bitvec_const(elem_align as u128, POINTER_WIDTH);
         let layout = self.create_layout_struct(array_size, elem_align_expr);
         let layout = if let Some(guard) = no_overflow {
-            let fresh = Expr::var(self.ctx.fresh_name("layout_overflow"), layout.sort().clone());
+            // DECLARE it. `Expr::var` only mints a NAME — an undeclared constant
+            // makes ay discard the whole `(check-sat)` as a problem-contributing
+            // command and answer `unknown`, so the harness reported an empty
+            // check table and INCONCLUSIVE (#layout-overflow-undeclared).
+            let name = self.ctx.fresh_name("layout_overflow");
+            let fresh = self.ctx.declare_var(&name, layout.sort().clone());
             Expr::ite(guard, layout, fresh)
         } else {
             layout
@@ -326,7 +331,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let align_coerced = self.coerce_to_ptr_width(align);
         let layout = self.create_layout_struct(array_size, align_coerced);
-        let fresh = Expr::var(self.ctx.fresh_name("layout_overflow"), layout.sort().clone());
+        // DECLARE it — see the note at the sibling site above.
+        let name = self.ctx.fresh_name("layout_overflow");
+        let fresh = self.ctx.declare_var(&name, layout.sort().clone());
         let layout = Expr::ite(no_overflow, layout, fresh);
         self.assign_value_to_place(destination, layout);
         debug!("codegen_layout_array_inner: computed layout from runtime args");

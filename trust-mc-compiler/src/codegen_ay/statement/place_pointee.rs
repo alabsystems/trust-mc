@@ -442,11 +442,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     );
                     return None;
                 }
-                let result_len = to.saturating_sub(from);
+                let Some(result_len) = to.checked_sub(from) else {
+                    debug!(
+                        "ensure_derived_pointee_in_env: subslice end {} precedes start {}",
+                        to, from
+                    );
+                    return None;
+                };
                 if result_len == 0 {
-                    // Empty subslice or identity: pass through.
-                    remaining = rest;
-                    continue;
+                    // `from_end=false` means `[from..to]`, so a zero-length
+                    // range is EMPTY. This array-only fallback has no separate
+                    // length carrier with which to represent that value safely.
+                    return None;
                 }
                 if let Some(arr_sort) = expr.sort().array_sort() {
                     let elem_sort = arr_sort.element_sort.clone();

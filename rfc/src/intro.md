@@ -1,8 +1,8 @@
 # Introduction
 
-Kani is an open-source verification tool that uses automated reasoning to analyze Rust programs. In order to
-integrate feedback from developers and users on future changes to Kani, we decided to follow a light-weight
-"RFC" (request for comments) process.
+trust-mc is a software model checker for Rust, derived from Kani. In order to
+integrate feedback from developers and users on future changes to trust-mc, we follow a light-weight
+"RFC" (request for comments) process. RFCs 0001-0013 are inherited verbatim from upstream Kani and are kept as historical records.
 
 ## When to create an RFC
 
@@ -12,7 +12,7 @@ You should create an RFC in one of two cases:
 2. The change you are making has a significant design component, and would benefit from a design review.
 
 Bugs and improvements to existing features do not require an RFC.
-If you are in doubt, feel free to create  a [feature request](https://github.com/model-checking/kani/issues/new?assignees=&labels=&template=feature_request.md) and discuss the next steps in the new issue.
+If you are in doubt, feel free to create a [feature request](https://github.com/alabsystems/trust-mc/issues/new) and discuss the next steps in the new issue.
 Your PR reviewer may also request an RFC if your change appears to fall into category 1 or 2.
 
 You do not necessarily need to create an RFC immediately. It is our experience that it is often best to write some "proof of concept" code to test out possible ideas before writing the formal RFC.
@@ -32,17 +32,17 @@ This is the overall workflow for the RFC process:
 ```
 
 1. Create an RFC
-   1. Create a tracking issue for your RFC (e.g.: [Issue-1588](https://github.com/model-checking/kani/issues/1588)).
-   2. Start from a fork of the Kani repository.
+   1. Create a tracking issue for your RFC in [this repository's issue tracker](https://github.com/alabsystems/trust-mc/issues).
+   2. Start from a fork of the trust-mc repository.
    3. Copy the template file ([`rfc/src/template.md`](./template.md)) to `rfc/src/rfcs/<ID_NUMBER><my-feature>.md`.
    4. Fill in the details according to the template instructions.
      - For the first RFC version, we recommend that you leave the "Software Design" section empty.
      - Focus on the user impact and user experience.
        Include a few usage examples if possible.
-   5. Add a link to the new RFC inside [`rfc/src/SUMMARY.md`](https://github.com/model-checking/kani/blob/main/rfc/src/SUMMARY.md)
+   5. Add a link to the new RFC inside [`rfc/src/SUMMARY.md`](./SUMMARY.md)
    6. Submit a pull request.
 2. Build consensus and integrate feedback.
-   1. RFCs should get approved by at least 2 Kani developers.
+   1. RFCs should get approved by at least 2 trust-mc maintainers.
    2. Once the RFC has been approved, update the RFC status and merge the PR.
    3. If the RFC is not approved, close the PR without merging.
 3. Feature implementation.

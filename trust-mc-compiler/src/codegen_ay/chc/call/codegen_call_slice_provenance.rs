@@ -36,10 +36,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             _ => return None,
         };
 
+        // This shortcut returns literal `true`, so every identity input must
+        // be unambiguous.  Even though statement propagation normally clears
+        // side metadata at multi-producer joins, defend this authority boundary
+        // directly: a stale entry on either joined local must never turn one
+        // predecessor's backing into whole-program equality.
+        if self.local_has_multiple_whole_definitions(lhs_local)
+            || self.local_has_multiple_whole_definitions(rhs_local)
+        {
+            return None;
+        }
+
         // Resolve each operand to a local with const_ref_values metadata,
         // following ref_targets chains (up to 5 hops to avoid cycles).
         let lhs_resolved = self.resolve_provenance_local(lhs_local);
         let rhs_resolved = self.resolve_provenance_local(rhs_local);
+        if self.local_has_multiple_whole_definitions(lhs_resolved)
+            || self.local_has_multiple_whole_definitions(rhs_resolved)
+        {
+            return None;
+        }
 
         let lhs_val = self.ref_resolution.const_ref_values.get(&lhs_resolved)?;
         let rhs_val = self.ref_resolution.const_ref_values.get(&rhs_resolved)?;
@@ -87,7 +103,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// created for call arguments. The actual provenance metadata lives on
     /// the original local from which the reference was taken.
     pub(in crate::codegen_ay::chc) fn resolve_provenance_local(&self, mut local: usize) -> usize {
+        let origin = local;
         for _ in 0..8 {
+            // This resolver is deliberately path-insensitive. Once any local
+            // in the chain has multiple whole-local producers, choosing the
+            // first MIR assignment would turn one predecessor into proof
+            // authority for the join. Staying at the origin makes every
+            // metadata lookup fail closed unless the origin independently has
+            // valid authority.
+            if self.local_has_multiple_whole_definitions(local) {
+                return origin;
+            }
             if self.ref_resolution.const_ref_values.contains_key(&local) {
                 return local;
             }
@@ -200,7 +226,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// happens to have slice data. Two `&(*_box)` temps both trace to the
     /// same Box local, producing identical cache keys.
     pub(in crate::codegen_ay::chc) fn resolve_provenance_root(&self, mut local: usize) -> usize {
+        let origin = local;
         for _iter in 0..8 {
+            if self.local_has_multiple_whole_definitions(local) {
+                return origin;
+            }
             // Try ref_targets: _arg = &_source
             if let Some(rt) = self.ref_resolution.ref_targets.get(&local) {
                 if rt.projections.is_empty() {

@@ -358,6 +358,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) {
         let modified_locals = cx.modified_locals;
         debug!(fn_name = %self.fn_name, "CHC slice index: RangeFull identity propagation");
+
+        // RangeFull preserves the source length, but may not create authority
+        // from a path-insensitive backing-table entry.  Derive the length from
+        // the conflict-sticky MIR provenance walk before resolving backing
+        // storage: that walk retains unanimous joins (4 vs 4) and rejects
+        // conflicting joins (4 vs 8).  Clear any stale destination metadata
+        // first so a failed derivation cannot inherit a fact from another CFG
+        // producer visited earlier.
+        self.clear_path_insensitive_ref_metadata(dest_local);
+        let exact_source_len = Self::operand_local(slice_arg)
+            .and_then(|local| self.try_resolve_slice_len_for_local(local))
+            .map(|len| Expr::bitvec_const(len as u128, POINTER_WIDTH));
         let slice_backing = self.resolve_slice_backing(slice_arg, modified_locals);
         let slice_value = self.resolve_ref_or_const_referent(slice_arg, modified_locals);
         if let Some(backing) = slice_backing.as_ref() {
@@ -370,6 +382,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 self.ref_resolution.subslice_offset.remove(&dest_local);
             }
             self.ref_resolution.subslice_len.insert(dest_local, backing.len.as_expr().clone());
+        } else if let Some(len) = exact_source_len {
+            self.ref_resolution.subslice_len.insert(dest_local, len);
         }
         // Compute pointer-level value BEFORE the Mem-level bridge so it can be
         // stored into typed memory (which expects BV64 pointer sort, not Array sort).

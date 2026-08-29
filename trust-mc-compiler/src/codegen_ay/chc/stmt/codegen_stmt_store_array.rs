@@ -129,7 +129,19 @@ impl<'tcx, 'body> StmtStoreArray for ChcCtx<'tcx, 'body> {
                 coerce_bitvec_width_safe(raw, POINTER_WIDTH, SignExtension::ZeroExtend)
             }
             ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                let actual_index = constant_index_offset(*offset, *min_length, *from_end);
+                // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                let Some(actual_index) = constant_index_offset(*offset, *min_length, *from_end)
+                else {
+                    warn!(
+                        ?local_idx,
+                        "CHC: dropped array store - from_end ConstantIndex needs the slice's \
+                         runtime length, which min_length does not provide"
+                    );
+                    self.diagnostics.store_dropped_transition.inc();
+                    // Part of #3138: mark array modified-unconstrained (universally quantified)
+                    acc.modified.insert(local_idx);
+                    return true;
+                };
                 Expr::bitvec_const(actual_index as u128, POINTER_WIDTH)
             }
             _ => unreachable!("guard above ensures Index or ConstantIndex"),

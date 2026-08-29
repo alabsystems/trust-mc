@@ -111,6 +111,21 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             artifact.add_property(coverage);
         }
 
+        // Positive evidence for the driver's vacuity decision: no obligation
+        // SITE is reachable from this harness, so zero checks cannot be a
+        // dropped obligation — it is the `fn check() {}` shape Kani reports as
+        // a clean `0 of 0 failed`. See `obligation_free_walk`.
+        //
+        // Keyed by HARNESS. It was one shared flag, which made it meaningless
+        // in a multi-harness file: codegen runs per function, artifacts are per
+        // harness, so whichever function ran LAST answered for all of them.
+        {
+            if self.obligation_free_body_by_fn.get(harness_name).copied().unwrap_or(false) {
+                let metadata = artifact.metadata.get_or_insert_with(ArtifactMetadata::default);
+                metadata.obligation_free_body = Some(true);
+            }
+        }
+
         // Part of #972: Add loop invariant hints if CHC mode is enabled
         if self.config.use_chc {
             let loop_hints = self.build_loop_hints(harness_name);

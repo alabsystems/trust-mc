@@ -255,7 +255,12 @@ fn solve_with_guard(
     timeout: Duration,
     guard_slack: Duration,
 ) -> Result<VerifiedChcResult, String> {
+    // Held across the move so the guard-timeout arm can cancel the solve
+    // instead of orphaning a thread that keeps burning cores after we have
+    // stopped waiting for its answer. Cancellation only ever degrades a verdict
+    // to Unknown, and this arm discards the verdict anyway.
     let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = solver.cancellation_handle();
     let solver_thread = std::thread::spawn(move || {
         let result = solver.try_solve();
         let _ = tx.send(result);
@@ -273,7 +278,11 @@ fn solve_with_guard(
             let _ = solver_thread.join();
             result.map_err(|reason| format!("ay-chc panic during adaptive solve: {reason}"))
         }
-        Err(_) => Err(format!("ay-chc portfolio exceeded guard timeout ({guard_timeout:?})")),
+        Err(_) => {
+            cancel.cancel();
+            let _ = rx.recv_timeout(Duration::from_secs(3));
+            Err(format!("ay-chc portfolio exceeded guard timeout ({guard_timeout:?})"))
+        }
     }
 }
 

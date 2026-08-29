@@ -8,7 +8,7 @@ In this section, we're going to expand on these additional checks, to give you a
 ## Bounds checking and pointers
 
 Rust is safe by default, and so includes dynamic (run-time) bounds checking where needed.
-Consider this Rust code (available [here](https://github.com/model-checking/kani/blob/main/docs/src/tutorial/kinds-of-failure/src/bounds_check.rs)):
+Consider this Rust code (available [here](https://github.com/alabsystems/trust-mc/blob/main/guide/src/tutorial/kinds-of-failure/src/bounds_check.rs)):
 
 ```rust
 {{#include tutorial/kinds-of-failure/src/bounds_check.rs:code}}
@@ -137,7 +137,7 @@ trust-mc will spot this not as a bound error, but as a mathematical error: on an
 
 Rust can also perform runtime safety checks for integer overflows, much like it does for bounds checks.
 ([Though Rust disables this by default in `--release` mode, it can be re-enabled.](https://doc.rust-lang.org/reference/expressions/operator-expr.html#overflow))
-Consider this code (available [here](https://github.com/model-checking/kani/blob/main/docs/src/tutorial/kinds-of-failure/src/overflow.rs)):
+Consider this code (available [here](https://github.com/alabsystems/trust-mc/blob/main/guide/src/tutorial/kinds-of-failure/src/overflow.rs)):
 
 ```rust
 {{#include tutorial/kinds-of-failure/src/overflow.rs:code}}
@@ -165,7 +165,7 @@ trust-mc will then report no issues.
 ### Exercise: Classic overflow failure
 
 A classic example of a subtle bug that persisted in many implementations for a very long time is "finding the midpoint" in quick sort.
-This often naively looks like this (code available [here](https://github.com/model-checking/kani/blob/main/docs/src/tutorial/kinds-of-failure/src/overflow_quicksort.rs)):
+This often naively looks like this (code available [here](https://github.com/alabsystems/trust-mc/blob/main/guide/src/tutorial/kinds-of-failure/src/overflow_quicksort.rs)):
 
 ```rust
 {{#include tutorial/kinds-of-failure/src/overflow_quicksort.rs:code}}

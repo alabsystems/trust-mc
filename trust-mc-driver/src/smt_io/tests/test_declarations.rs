@@ -7,8 +7,9 @@
 use super::super::classifier::smt_file_uses_horn_logic;
 use super::super::datatypes;
 use super::super::declarations::{
-    build_cover_sat_query, extract_cover_declarations, extract_coverage_declarations_from_content,
-    extract_violation_declarations, strip_cover_assertions_for_chc_solver,
+    build_cover_sat_query, build_cover_sat_query_for_chc, extract_cover_declarations,
+    extract_coverage_declarations_from_content, extract_violation_declarations,
+    strip_cover_assertions_for_chc_solver,
 };
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -293,4 +294,145 @@ fn test_strip_cover_assertions_for_chc_solver_keeps_query_and_rules() {
     assert!(stripped.contains("(query error)"));
     assert!(stripped.contains("(rule (=> true P))"));
     assert!(!stripped.contains("ay_cover_0"));
+}
+
+// ---------------------------------------------------------------------------
+// build_cover_sat_query_for_chc — the CHC cover query must PARSE
+// ---------------------------------------------------------------------------
+
+/// The shape trust-mc emits for `let x: u8 = kani::any(); assume(x < 10);
+/// cover!(x > 5);` — cover assertions land AFTER `(query error)` and are
+/// written over the Horn program's `(declare-var ...)` symbols.
+const CHC_WITH_COVER: &str = "\
+(set-logic HORN)
+(declare-var x (_ BitVec 8))
+(declare-var x_o (_ BitVec 8))
+(declare-rel bb0 ((_ BitVec 8)))
+(declare-rel error ())
+(rule (=> true
+          (bb0 x)))
+(rule (=> (and (bb0 x)
+               (bvult x #x0a))
+          error))
+(query error)
+(declare-const ay_cover_0 Bool)
+(assert (= ay_cover_0 (bvugt x #x05)))
+";
+
+#[test]
+fn chc_cover_query_declares_the_vars_its_own_assertion_references() {
+    // The defect: every `(declare-var ...)` was stripped while the cover
+    // assertion that references those symbols was kept, so ay answered
+    // `(error "unknown constant x")`, nothing parsed as sat/unsat, and EVERY
+    // cover landed UNDETERMINED — which is what made --strict-vacuity unable
+    // to fire and --conformance-harness unable to pass.
+    let query = build_cover_sat_query_for_chc(CHC_WITH_COVER, &["ay_cover_0".to_string()]);
+
+    assert!(query.contains("(declare-const x (_ BitVec 8))"), "{query}");
+    assert!(query.contains("(declare-const x_o (_ BitVec 8))"), "{query}");
+    assert!(query.contains("(assert (= ay_cover_0 (bvugt x #x05)))"), "{query}");
+    assert!(query.contains("(assert ay_cover_0)"), "{query}");
+    // Nothing may still say `declare-var`: that is not a plain-SMT command.
+    assert!(!query.contains("declare-var"), "{query}");
+    assert!(query.contains("(set-logic ALL)"), "{query}");
+    assert!(!query.contains("HORN"), "{query}");
+}
+
+#[test]
+fn chc_cover_query_strips_a_rule_that_spans_several_lines() {
+    // The line-based filter dropped only the line starting `(rule `, leaving
+    // the continuation lines of a wrapped rule behind as free-floating
+    // garbage — a second way the query failed to parse.
+    let query = build_cover_sat_query_for_chc(CHC_WITH_COVER, &["ay_cover_0".to_string()]);
+
+    assert!(!query.contains("rule"), "{query}");
+    assert!(!query.contains("bb0"), "{query}");
+    assert!(!query.contains("declare-rel"), "{query}");
+    assert!(!query.contains("(query error)"), "{query}");
+    assert_eq!(query.matches("(check-sat)").count(), 1, "{query}");
+}
+
+#[test]
+fn chc_cover_query_never_declares_a_symbol_twice() {
+    // A duplicate declaration is a hard solver error, which would put the
+    // whole query back where it started (no parseable answer at all).
+    let content = "\
+(set-logic HORN)
+(declare-const shared (_ BitVec 8))
+(declare-var shared (_ BitVec 8))
+(declare-rel error ())
+(query error)
+(declare-const ay_cover_0 Bool)
+(assert (= ay_cover_0 (bvugt shared #x05)))
+";
+    let query = build_cover_sat_query_for_chc(content, &["ay_cover_0".to_string()]);
+    assert_eq!(query.matches("(declare-const shared").count(), 1, "{query}");
+}
+
+#[test]
+fn chc_cover_query_asks_one_check_sat_per_cover() {
+    let content = "\
+(set-logic HORN)
+(declare-var x (_ BitVec 8))
+(declare-rel error ())
+(query error)
+(declare-const ay_cover_0 Bool)
+(assert (= ay_cover_0 (bvugt x #x05)))
+(declare-const ay_cover_1 Bool)
+(assert (= ay_cover_1 (bvult x #x05)))
+";
+    let query =
+        build_cover_sat_query_for_chc(content, &["ay_cover_0".to_string(), "ay_cover_1".to_string()]);
+    assert_eq!(query.matches("(check-sat)").count(), 2, "{query}");
+    assert_eq!(query.matches("(push 1)").count(), 2, "{query}");
+    assert_eq!(query.matches("(pop 1)").count(), 2, "{query}");
+    assert!(query.contains("(assert ay_cover_0)"), "{query}");
+    assert!(query.contains("(assert ay_cover_1)"), "{query}");
+}
+
+#[test]
+fn chc_cover_query_keeps_datatype_and_define_fun_forms_a_cover_may_use() {
+    let content = "\
+(set-logic HORN)
+(declare-datatypes ((Pair 0)) (((mk (fst (_ BitVec 8)) (snd (_ BitVec 8))))))
+(define-fun is_hi ((p Pair)) Bool (bvugt (fst p) #x05))
+(declare-var p Pair)
+(declare-rel error ())
+(query error)
+(declare-const ay_cover_0 Bool)
+(assert (= ay_cover_0 (is_hi p)))
+";
+    let query = build_cover_sat_query_for_chc(content, &["ay_cover_0".to_string()]);
+    assert!(query.contains("declare-datatypes"), "{query}");
+    assert!(query.contains("define-fun is_hi"), "{query}");
+    assert!(query.contains("(declare-const p Pair)"), "{query}");
+}
+
+#[test]
+fn strip_cover_assertions_drops_a_cover_assert_that_wrapped_across_lines() {
+    // The printer wraps a long cover condition. Dropping only the line that
+    // starts `(assert (= ay_cover_` left its tail behind, and the leftover
+    // `#x05)))` is a parse error for the HORN solver — i.e. a cover would
+    // break the whole harness, not just its own verdict.
+    let smt_content = "\
+(set-logic HORN)
+(declare-rel error ())
+(rule (=> false error))
+(query error)
+(declare-const ay_cover_0 Bool)
+(assert (= ay_cover_0 (and (bvugt x
+                                  #x05)
+                           (bvult x
+                                  #x0a))))
+(declare-const keep_me Bool)
+";
+    let stripped = strip_cover_assertions_for_chc_solver(smt_content);
+
+    assert!(!stripped.contains("ay_cover_0"), "{stripped}");
+    assert!(!stripped.contains("bvugt"), "{stripped}");
+    assert!(!stripped.contains("#x0a"), "{stripped}");
+    // Everything after the wrapped assertion must survive untouched.
+    assert!(stripped.contains("(declare-const keep_me Bool)"), "{stripped}");
+    assert!(stripped.contains("(query error)"), "{stripped}");
+    assert!(stripped.contains("(rule (=> false error))"), "{stripped}");
 }

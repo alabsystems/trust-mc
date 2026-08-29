@@ -1,7 +1,7 @@
 # Getting started
 
 trust-mc is a verification tool that uses [model checking](./tool-comparison.md) to analyze Rust programs.
-trust-mc is derived from [Kani](https://github.com/model-checking/kani) and keeps the `kani::` proof API, while using the [AY backend](https://github.com/alabsystems/ay) exclusively for verification. AY is trust-mc's sole solver, powering CHC unbounded verification and the Phase 5 (beyond-CBMC) workstream.
+trust-mc is derived from [Kani](https://github.com/model-checking/kani) and keeps the `kani::` proof API, so existing Kani harnesses compile unchanged. Its only solver is [AY](https://github.com/alabsystems/ay), which discharges both bounded (BMC) obligations and unbounded ones via Constrained Horn Clauses. There is no CBMC.
 
 trust-mc is useful for checking both safety and correctness of Rust code.
 - *Safety*: trust-mc automatically checks for many kinds of [undefined behavior](./undefined-behaviour.md).
@@ -17,9 +17,11 @@ Proof harnesses are similar to test harnesses, especially property-based test ha
 
 trust-mc is currently under active development.
 The AY backend targets code that CBMC cannot handle, including:
-- Arbitrary-precision integers (BigInt) - Phase 5 capability under active validation
-- HashMap-heavy data structures - Phase 5 capability with stale historical evidence; replacement-quality evidence still requires the authority tuple and gates in the replacement proof standard
-- Complex theory solver code - active CHC workstream
+- Arbitrary-precision integers (BigInt), modelled as mathematical integers rather than unrolled bitvectors
+- HashMap-heavy code, via a symbolic map model with symbolic keys
+- Loops whose trip count is symbolic, proved by induction with `--ay-chc` instead of unrolled to a bound
+
+Each of these is under active development; see [Limitations](./limitations.md) for what is and is not supported today.
 
 Note: trust-mc currently uses `kani::` macros (e.g., `#[kani::proof]`). These will be renamed to `trust-mc::` in a future release.
 

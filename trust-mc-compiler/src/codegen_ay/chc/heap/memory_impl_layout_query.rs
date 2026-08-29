@@ -209,6 +209,35 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// Gets the inner `[T; N]` field type of a repr-SIMD newtype wrapper.
+    ///
+    /// A `#[repr(simd)] struct V([T; N])` is layout-compatible with `[T; N]`,
+    /// so the idiomatic way to read one is a pointer cast to the inner array
+    /// (field projection into a SIMD type is banned by MCP#838). That cast
+    /// loads from the `[T; N]` type-indexed memory array, which is a DIFFERENT
+    /// partition from both `mem_<T>` and `mem_<V>`. Callers that mirror SIMD
+    /// elements need this type to also populate the punned view.
+    ///
+    /// Returns `None` for non-SIMD types and for SIMD wrappers whose single
+    /// field is not a fixed-size array.
+    pub(in crate::codegen_ay::chc) fn simd_inner_array_ty(
+        &self,
+        ty: rustc_public::ty::Ty,
+    ) -> Option<rustc_public::ty::Ty> {
+        let TyKind::RigidTy(RigidTy::Adt(adt_def, args)) = ty.kind() else {
+            return None;
+        };
+        if !rustc_internal::internal(self.tcx, ty).is_simd() {
+            return None;
+        }
+        let variants = adt_def.variants();
+        if variants.len() != 1 || variants[0].fields().len() != 1 {
+            return None;
+        }
+        let field_ty = variants[0].fields()[0].ty_with_args(&args);
+        matches!(field_ty.kind(), TyKind::RigidTy(RigidTy::Array(..))).then_some(field_ty)
+    }
+
     /// Gets the element type of an array, slice, or repr-SIMD wrapper type.
     /// Part of #4086: handles `[T; N]`, `[T]`, and `Simd<T, N>` (wraps `[T; N]`).
     pub(in crate::codegen_ay::chc) fn get_array_element_ty(

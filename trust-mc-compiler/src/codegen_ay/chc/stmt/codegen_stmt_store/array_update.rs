@@ -33,8 +33,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         ref_target: &RefTarget,
         rhs_expr: &Expr,
         ref_local: usize,
+        bb_idx: usize,
+        acc: &mut StmtAccumulator<'_>,
+    ) {
+        self.emit_ref_target_array_update_indexed(
+            ref_target, rhs_expr, ref_local, bb_idx, acc, None,
+        )
+    }
+
+    /// As [`Self::emit_ref_target_array_update`], but with the element index
+    /// supplied directly rather than read off an `Index` projection.
+    ///
+    /// A pointer produced by `as_mut_ptr().add(n)` carries its element index in
+    /// `ref_resolution.subslice_offset`, NOT as a projection on the ref target
+    /// (whose target is the whole array). Without this entry point such a store
+    /// had nowhere to land in the scalarized value lanes.
+    pub(in crate::codegen_ay::chc) fn emit_ref_target_array_update_indexed(
+        &self,
+        ref_target: &RefTarget,
+        rhs_expr: &Expr,
+        ref_local: usize,
         _bb_idx: usize,
         acc: &mut StmtAccumulator<'_>,
+        explicit_index: Option<Expr>,
     ) {
         // Check if ref_target has an Index projection (points to array element)
         let index_proj = ref_target
@@ -58,11 +79,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             })
             .collect();
 
-        let Some(index_proj) = index_proj else {
+        if index_proj.is_none() && explicit_index.is_none() {
             // No Index/ConstantIndex projection — ref doesn't point to array element.
             // This is not a dropped store; the caller already handled memory via build_memory_store.
             return;
-        };
+        }
 
         let target_local = ref_target.local;
         let Some(target_vec_idx) = self.try_state_idx_for_local(target_local) else {
@@ -77,19 +98,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         };
 
-        // Get index expression
-        let index_expr = match index_proj {
-            ProjectionElem::Index(index_local) => {
-                // Fix #2238: Use local_to_state_idx mapping for index local
-                self.try_resolve_local_expr(*index_local, acc.modified)
-            }
-            ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                let actual_index = constant_index_offset(*offset, *min_length, *from_end);
-                Some(Expr::bitvec_const(actual_index as u128, POINTER_WIDTH))
-            }
-            other => {
-                trace!(?other, "CHC: non-index projection in array store path");
-                None
+        // Get index expression — an explicitly supplied one wins, since it
+        // comes from the pointer's own offset rather than from the target's
+        // shape.
+        let index_expr = if let Some(idx) = explicit_index {
+            Some(idx)
+        } else {
+            match index_proj.expect("index_proj or explicit_index is Some") {
+                ProjectionElem::Index(index_local) => {
+                    // Fix #2238: Use local_to_state_idx mapping for index local
+                    self.try_resolve_local_expr(*index_local, acc.modified)
+                }
+                ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
+                    // #from_end: needs the slice's runtime length -> fail closed (projection_path.rs)
+                    constant_index_offset(*offset, *min_length, *from_end)
+                        .map(|i| Expr::bitvec_const(i as u128, POINTER_WIDTH))
+                }
+                other => {
+                    trace!(?other, "CHC: non-index projection in array store path");
+                    None
+                }
             }
         };
 

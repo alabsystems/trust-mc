@@ -77,8 +77,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         target_alloc: &rustc_public::ty::Allocation,
         inner_ty: rustc_public::ty::Ty,
         variants: &[rustc_public::ty::VariantDef],
-        _memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        _promoted_obj_id: u32,
+        memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
+        promoted_obj_id: u32,
     ) -> Option<Expr> {
         // Skip Option-like and Result-like 2-variant enums for specialized handlers.
         let skip_for_specialized = variants.len() == 2 && {
@@ -98,22 +98,40 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if variant_idx >= dt.constructors.len() {
             return None;
         }
-        let field_exprs: Vec<Expr> = dt.constructors[variant_idx]
-            .fields
-            .iter()
-            .map(|field| {
-                if field.sort.is_bool() {
-                    Expr::bool_const(false)
-                } else if let Some(width) = field.sort.bitvec_width() {
-                    Expr::bitvec_const(0u128, width)
-                } else {
-                    Expr::bool_const(false)
-                }
-            })
-            .collect();
+        // READ the active variant's payload from the allocation. Zero-filling
+        // the fields (the previous behavior) fabricated a value: `E::D(true)`
+        // came back as `E::D(false)`, so `x == E::D(true)` was refutable — and
+        // the reverse mistake would have PROVED a false equality. A field the
+        // reader cannot decode aborts the whole extraction (fail-closed: the
+        // caller then leaves the promoted object unconstrained).
+        let mir_fields = variants.get(variant_idx)?.fields();
+        let mut field_exprs: Vec<Expr> =
+            Vec::with_capacity(dt.constructors[variant_idx].fields.len());
+        for (field_idx, dt_field) in dt.constructors[variant_idx].fields.iter().enumerate() {
+            let field_ty = mir_fields.get(field_idx)?.ty();
+            field_exprs.push(read_variant_field_const(
+                target_alloc,
+                inner_ty,
+                variant_idx,
+                field_idx,
+                field_ty,
+                &dt_field.sort,
+            )?);
+        }
         let ctor_name = dt.constructors[variant_idx].name.clone();
         let dt_name = dt.name.clone();
-        Some(Expr::datatype_constructor(dt_name, ctor_name, field_exprs, sort))
+        let expr = Expr::datatype_constructor(dt_name, ctor_name, field_exprs, sort);
+        // Seed the promoted object's byte image so a reference to this constant
+        // dereferences to the constant, not to an unconstrained memory cell.
+        Self::seed_flattened_memory_init(
+            target_alloc.bytes.len(),
+            &expr,
+            inner_ty,
+            memory_inits,
+            promoted_obj_id,
+            0u64,
+        );
+        Some(expr)
     }
 
     /// Dispatch between Option-like and Result-like 2-variant enums.
@@ -188,7 +206,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         promoted_obj_id: u32,
     ) -> Option<Expr> {
         let sort = Self::translate_ty(inner_ty)?;
-        let expr = Self::read_composite_from_allocation(target_alloc, 0, &sort)?;
+        // Layout-aware: rustc reorders `repr(Rust)` fields, so the constant's
+        // bytes must be read at `field_offset(i)` and not at a running
+        // declaration-order cursor. `RangeInclusive<u8>` is laid out
+        // `start@0, exhausted@1, end@2`, and the sequential reader decoded
+        // `&(0..=1)` as `start=0, end=0, exhausted=true`.
+        let expr = Self::read_adt_composite_from_allocation(target_alloc, 0, inner_ty, &sort)?;
         debug!(?inner_ty, "const ref: multi-field struct extracted (#3470)");
 
         let adt_byte_width = target_alloc.bytes.len();
@@ -664,4 +687,44 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         Some(payload_exprs)
     }
+}
+
+/// Read ONE field of an enum variant out of a constant allocation.
+///
+/// ZST fields carry no bytes: the CHC model represents them with the canonical
+/// `true` Bool sentinel (matching `extract_payload_from_alloc`), so reading
+/// bytes for them would materialize a spurious `false`. Every other field is
+/// read little-endian at the field's own layout offset within the variant.
+/// Sorts the reader does not decode (datatypes, arrays) return `None` so the
+/// caller drops the whole constant rather than inventing a value.
+fn read_variant_field_const(
+    alloc: &rustc_public::ty::Allocation,
+    inner_ty: rustc_public::ty::Ty,
+    variant_idx: usize,
+    field_idx: usize,
+    field_ty: rustc_public::ty::Ty,
+    sort: &Sort,
+) -> Option<Expr> {
+    if LayoutOf::new(field_ty).size_of() == Some(0) {
+        return if sort.is_bool() {
+            Some(Expr::bool_const(true))
+        } else {
+            sort.bitvec_width().map(|w| Expr::bitvec_const(0u128, w))
+        };
+    }
+    let offset = LayoutOf::new(inner_ty).variant_field_offset(variant_idx, field_idx)?;
+    let byte_size = if sort.is_bool() { 1usize } else { (sort.bitvec_width()? / 8) as usize };
+    if byte_size == 0 || offset + byte_size > alloc.bytes.len() {
+        return None;
+    }
+    let mut value: u128 = 0;
+    for (i, byte) in alloc.bytes.get(offset..offset + byte_size)?.iter().enumerate() {
+        value |= ((*byte)? as u128) << (i * 8);
+    }
+    if sort.is_bool() {
+        return Some(Expr::bool_const(value != 0));
+    }
+    let width = sort.bitvec_width()?;
+    let masked = if width >= 128 { value } else { value & ((1u128 << width) - 1) };
+    Some(Expr::bitvec_const(masked, width))
 }

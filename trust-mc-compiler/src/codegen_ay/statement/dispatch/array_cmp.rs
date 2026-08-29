@@ -21,7 +21,6 @@ use crate::codegen_ay::statement::StatementCodegen;
 use crate::rustc_public::CrateDef;
 
 use self::range_contains::is_range_contains_call;
-use self::range_full::is_range_full_index_call;
 use super::super::IntoOption;
 
 /// Maximum lanes for unrolled lexicographic comparison in BMC path.
@@ -47,8 +46,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return Some(bb);
         }
 
-        if is_range_full_index_call(&callee_path, args, self.body.locals()) {
-            if let Some(bb) = self.try_codegen_range_full_index(args, destination, target) {
+        if let Some((source, index)) = self.authenticated_core_index_args(func, args)
+            && self.is_exact_core_range_full_operand(index)
+        {
+            if let Some(bb) = self.try_codegen_range_full_index(source, destination, target) {
                 return Some(bb);
             }
         }

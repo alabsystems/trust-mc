@@ -197,6 +197,14 @@ pub fn trust_mc_chc_pdr_obligations_from_native_bundle(
                     // verdict at Unknown, never to mint authority.
                     .with_fail_closed_lowering_site_count(
                         u32::try_from(output.diagnostics.len()).unwrap_or(u32::MAX),
+                    )
+                    // …and the DISTINCT typed reasons behind that count, so the
+                    // demotion message can name the blocking constructs instead
+                    // of only counting them. Diagnostic only — the builder
+                    // sorts + dedups, and nothing but the message formatter
+                    // reads the result.
+                    .with_fail_closed_lowering_reasons(
+                        output.diagnostics.iter().map(|d| d.reason.label()),
                     ),
                 );
                 obligation.validate().map_err(|source| {

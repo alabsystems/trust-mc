@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "report_status": "current",
+  "solver": "z4",
+  "tree_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "tree_state": "clean",
+  "replacement_evidence": true,
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "z4_pin": "90e42a0e32bcc178f4732a49679a92ba18a0fe65",
+  "solver_binary": {
+    "name": "z4",
+    "path": "/usr/local/bin/z4",
+    "version": "z4 0.0.0 build.commit=90e42a0",
+    "commit": "90e42a0"
+  },
+  "summary": {
+    "total": 1,
+    "pass": 1,
+    "proof": 1,
+    "known_fp": 0,
+    "trusted_proof": 1,
+    "ctrex": 0,
+    "fail": 1,
+    "unknown": 1,
+    "error": 1,
+    "bmc": 1,
+    "xfail": 0,
+    "skip": 1
+  },
+  "harnesses": [
+    {
+      "file": "zani/example.rs",
+      "harness": "proof_one",
+      "status": "PASS",
+      "expected": "PROOF",
+      "verdict": "PROOF",
+      "execution_state": "complete",
+      "execution_details": "final_marker=PROOF",
+      "proof_qualifiers": "clean",
+      "sound_fallback_count": 0,
+      "trusted_proof": true,
+      "translation_drop_reasons": {}
+    }
+  ]
+}

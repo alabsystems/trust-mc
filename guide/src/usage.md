@@ -66,9 +66,16 @@ Common to both `trust-mc` and `targo trust-mc` are many command-line flags:
 
  * `--version-authority`: Print one machine-readable evidence line containing
    the trust-mc version, trust-mc git SHA and dirty flag, AY package version,
-   declared AY pin, and linked AY build revision, then exit. The command fails
-   closed without printing an authority row when the AY inventory is malformed
-   or the linked build is dirty or does not exactly match the pin.
+   declared AY pin, linked AY build revision, and the `ay_authority` lane that
+   relation was established in, then exit. The lane is read out of `Cargo.lock`,
+   not asserted: `matched` when the lock resolves AY from the pinned git
+   revision, in which case the linked build must equal the pin exactly;
+   `contains-pin` when the root manifest `[patch]`es AY to a sibling checkout and
+   Cargo accepted that patch, in which case the linked build must contain the
+   declared pin. The command fails closed without printing an authority row when
+   the AY inventory is malformed, the linked build is dirty, the linked build
+   does not satisfy its lane's relation, or the manifest declares an AY `[patch]`
+   that Cargo silently declined.
 
  * `--default-unwind <n>`: Set a default global upper [loop unwinding](./tutorial-loop-unwinding.md) bound for proof harnesses.
    This can force termination when the solver tries to unwind loops indefinitely.
@@ -117,6 +124,26 @@ trust-mc filename.rs [OPTIONS]
 ```
 
 This will build `filename.rs` and run all proof harnesses found within.
+
+The `trust-mc` binary documents itself, and everything below works with nothing
+else installed:
+
+```
+trust-mc --help                 commands, verify options, exit codes
+trust-mc explain [TOPIC]        how it works: harness, bmc, chc, results,
+                                soundness, cargo, kani, flags, install, exit-codes
+trust-mc quickstart             a five-minute walkthrough
+trust-mc example [NAME] [PATH]  sample harnesses (--list shows them); each
+                                says what it proves or which bug it finds
+trust-mc doctor                 what verification needs and whether it is here
+trust-mc flags [--all]          the engine's complete flag reference
+trust-mc version -v             engine and solver provenance
+```
+
+Front-door flags `--harness`, `--unwind`, `--timeout`, `--list` and `--solver`
+are translated onto the engine's flags, and `--summary` is handled by the front
+door itself (the engine never sees it); every other flag is forwarded unchanged.
+See [Usage on a single file](./trust-mc-single-file.md) for a worked session.
 
 ## Configuration in `Cargo.toml`
 

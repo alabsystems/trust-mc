@@ -168,9 +168,13 @@ Rust has two different strategies when a panic occurs:
     each function it encounters.
  2. Abortion: Immediately ends the program without cleaning up.
 
-Currently, trust-mc does not support stack unwinding. This has some implications
-regarding memory safety since programs sometimes rely on the unwinding logic to
-ensure there is no resource leak or persistent data inconsistency. Check out
+By default trust-mc compiles with `-C panic=abort`, which eliminates every
+unwind cleanup path from MIR. That has implications for memory safety, since
+programs sometimes rely on the unwinding logic to ensure there is no resource
+leak or persistent data inconsistency. The experimental `--ay-panic-unwind`
+flag switches to `-C panic=unwind`, preserving cleanup blocks with
+Resume/Abort terminators so `Drop` impls executed during unwinding can be
+verified. Check out
 [#1547](https://github.com/alabsystems/trust-mc/issues/1547) for updates on
 stack unwinding support.
 

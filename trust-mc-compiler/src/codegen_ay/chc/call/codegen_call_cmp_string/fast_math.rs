@@ -79,14 +79,10 @@ pub(in crate::codegen_ay::chc) fn codegen_fast_math_intrinsic(
     let lhs_assumed_finite = has_dominating_finite_assume(ctx, dcx.bb_idx, &args[0]);
     let rhs_assumed_finite = has_dominating_finite_assume(ctx, dcx.bb_idx, &args[1]);
 
-    if let Some(ref expr) = lhs
-        && !lhs_assumed_finite
-    {
+    if let Some(ref expr) = lhs {
         emit_finite_check(ctx, expr, from_app, stmt_constraints, target);
     }
-    if let Some(ref expr) = rhs
-        && !rhs_assumed_finite
-    {
+    if let Some(ref expr) = rhs {
         emit_finite_check(ctx, expr, from_app, stmt_constraints, target);
     }
 

@@ -33,12 +33,11 @@ Inputs
       ``{harness, crate_name, status, effective_success, validation_status,
         proof_qualifiers[], property_counts{...}}`` entries.
 
-   b. The ``scripts/ay-compiletest.sh`` per-harness report: a list of records
-      (or ``{"harnesses": [...]}``) each carrying a ``harness`` name plus the
-      verifier markers it parsed from ``trust-mc`` stdout --
-      ``ctrex_category`` (from ``[AY:CTREX_CAT:...]``),
-      ``sound_fallback`` (from ``[AY:SOUND_FALLBACK:n]``) and
-      ``effective_success`` (from ``[AY:EFFECTIVE_SUCCESS:reason]``).
+   b. The schema-v2 ``scripts/ay-compiletest.sh`` per-harness report: a list
+      of records (or ``{"harnesses": [...]}``) carrying source identity,
+      ``status``, ``verdict``, execution state, proof qualifiers, and
+      ``sound_fallback_count``. Legacy marker-derived fields remain readable,
+      but cannot override explicit schema-v2 failure or inactive accounting.
 
 The two shapes are auto-detected.
 """
@@ -74,6 +73,7 @@ class Observed:
     """A single harness result distilled from a fresh report."""
 
     harness: str
+    file: str | None
     crate_name: str | None
     status: str  # SUCCESS | FAILURE | <missing>
     effective_success: bool
@@ -83,12 +83,26 @@ class Observed:
     undetermined: int
     unknown: int
     validation_status: str | None
+    verdict: str | None = None
+    execution_state: str | None = None
+    report_match: bool | None = None
+    proof_quality: bool | None = None
 
     def classify(self) -> str:
         """Map an observed harness result onto the inventory vocabulary.
 
         Returns one of EXPECTED_OUTCOMES so it can be compared row-for-row.
         """
+        if self.status == "INACTIVE" or self.verdict == "SKIP":
+            return "INACTIVE"
+        if self.execution_state is not None and self.execution_state != "complete":
+            return "ERROR"
+        if self.verdict is not None:
+            if self.verdict == "BMC":
+                return "BMC_SAFE"
+            if self.verdict in EXPECTED_OUTCOMES:
+                return self.verdict
+
         # A clean, fully-validated success with no soundness fallback proves a
         # PROOF row.
         if self.status == HARNESS_SUCCESS:
@@ -215,6 +229,7 @@ def _observed_from_proof_summary(entry: dict[str, Any]) -> Observed:
         status = status_raw.upper() or "<missing>"
     return Observed(
         harness=str(entry.get("harness", "")),
+        file=entry.get("file"),
         crate_name=entry.get("crate_name"),
         status=status,
         effective_success=bool(entry.get("effective_success", False)),
@@ -230,7 +245,18 @@ def _observed_from_proof_summary(entry: dict[str, Any]) -> Observed:
 def _observed_from_ay_compiletest(entry: dict[str, Any]) -> Observed:
     # scripts/ay-compiletest.sh marker-derived record.
     status_raw = str(entry.get("status", "")).strip().upper()
-    if status_raw not in (HARNESS_SUCCESS, HARNESS_FAILURE):
+    schema_v2 = "verdict" in entry or "execution_state" in entry
+    report_match: bool | None = None
+    if schema_v2 and status_raw == "PASS":
+        status_raw = HARNESS_SUCCESS
+        report_match = True
+    elif schema_v2 and status_raw == "FAIL":
+        status_raw = HARNESS_FAILURE
+        report_match = False
+    elif schema_v2 and status_raw == "SKIP":
+        status_raw = "INACTIVE"
+        report_match = False
+    elif status_raw not in (HARNESS_SUCCESS, HARNESS_FAILURE):
         # Fall back to effective_success / failed markers.
         if bool(entry.get("effective_success", False)):
             status_raw = HARNESS_SUCCESS
@@ -238,17 +264,48 @@ def _observed_from_ay_compiletest(entry: dict[str, Any]) -> Observed:
             status_raw = HARNESS_FAILURE
         else:
             status_raw = status_raw or "<missing>"
+    verdict = str(entry.get("verdict", "")).strip().upper() or None
+    execution_state = entry.get("execution_state")
+    proof_quality: bool | None = None
+    if schema_v2 and verdict == "PROOF":
+        proof_quality = (
+            status_raw == HARNESS_SUCCESS
+            and execution_state == "complete"
+            and entry.get("proof_qualifiers") == "clean"
+            and entry.get("trusted_proof") is True
+            and _as_int(entry.get("sound_fallback_count")) == 0
+            and not entry.get("demotion_reasons")
+            and not entry.get("translation_drop_reasons")
+            and not any(
+                field in entry
+                for field in (
+                    "retried",
+                    "retry_attempts",
+                    "retry_resolved_by",
+                    "retry_final",
+                    "retry_recursive",
+                    "retry_relation_count",
+                )
+            )
+        )
     return Observed(
         harness=str(entry.get("harness", "")),
+        file=entry.get("file"),
         crate_name=entry.get("crate_name") or entry.get("crate"),
         status=status_raw,
         effective_success=bool(entry.get("effective_success", False)),
-        sound_fallback=_as_int(entry.get("sound_fallback")),
+        sound_fallback=_as_int(
+            entry.get("sound_fallback_count", entry.get("sound_fallback"))
+        ),
         ctrex_category=(entry.get("ctrex_category") or None),
         failed=_as_int(entry.get("failed")),
         undetermined=_as_int(entry.get("undetermined")),
         unknown=_as_int(entry.get("unknown")),
         validation_status=entry.get("validation_status"),
+        verdict=verdict,
+        execution_state=(str(execution_state) if execution_state is not None else None),
+        report_match=report_match,
+        proof_quality=proof_quality,
     )
 
 
@@ -289,6 +346,9 @@ def _index_observed(observed: list[Observed]) -> dict[tuple[str, str], Observed]
     index: dict[tuple[str, str], Observed] = {}
     for obs in observed:
         full, tail = _harness_keys(obs.harness)
+        if obs.file:
+            normalized_file = str(obs.file).replace("\\", "/").removeprefix("./")
+            index.setdefault(("file", f"{normalized_file}\0{full}"), obs)
         # Full name wins; tail is a fallback key only registered if unambiguous.
         index.setdefault(("full", full), obs)
         index.setdefault(("crate", f"{obs.crate_name}::{full}"), obs)
@@ -308,8 +368,10 @@ def _lookup(
 ) -> Observed | None:
     harness = row.get("harness", "")
     full, tail = _harness_keys(harness)
-    file_stem = Path(str(row.get("file", ""))).stem
+    row_file = str(row.get("file", "")).replace("\\", "/").removeprefix("./")
+    file_stem = Path(row_file).stem
     for key in (
+        ("file", f"{row_file}\0{full}"),
         ("crate", f"{file_stem}::{full}"),
         ("full", full),
         ("tail", tail),
@@ -346,11 +408,17 @@ def compute_progress(inventory: dict[str, Any], observed: list[Observed]) -> Pro
             matched = actual == expected
             prog.rows_measured += 1
             if is_proof:
-                proven = actual == "PROOF" and obs.status == HARNESS_SUCCESS and fallback == 0
+                proven = (
+                    actual == "PROOF"
+                    and obs.status == HARNESS_SUCCESS
+                    and fallback == 0
+                    and obs.report_match is not False
+                    and obs.proof_quality is not False
+                )
                 closed = False
             else:
                 proven = False
-                closed = matched
+                closed = matched and obs.report_match is not False
 
         rr = RowResult(
             file=str(row.get("file", "")),

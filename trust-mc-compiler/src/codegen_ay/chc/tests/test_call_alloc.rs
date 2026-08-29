@@ -340,7 +340,7 @@ fn test_ptr_comparison_real_file_mem_level_after_inline_localizer() {
                  idx_ty={idx_ty:?}, slice_def={slice_def:?}, modified_locals={modified_locals:?}, \
                  backing_resolved={}, backing_sort={:?}",
                 slice_backing.is_some(),
-                slice_backing.as_ref().map(|backing| backing.data.sort()),
+                slice_backing.as_ref().map(|backing| backing.data.as_expr().sort()),
             );
         }
 
@@ -484,15 +484,15 @@ fn test_check_box_comparison_range_backing_recovers_without_ref_targets() {
                 .expect("range receiver should recover backing from &_raw_ptr deref");
 
             assert!(
-                backing.data.sort().is_array(),
+                backing.data.as_expr().sort().is_array(),
                 "range receiver backing should recover an Array-sort source, got {:?}",
-                backing.data.sort()
+                backing.data.as_expr().sort()
             );
             assert!(
-                ChcCtx::is_zero_pointer_width_bitvec(&backing.offset),
+                ChcCtx::is_zero_pointer_width_bitvec(backing.offset.as_expr()),
                 "box subslice receiver should start from zero offset before range rebasing"
             );
-            match backing.len.value() {
+            match backing.len.as_expr().value() {
                 ExprValue::BitVecConst { value, .. } => {
                     assert_eq!(
                         u64::try_from(value).ok(),

@@ -20,6 +20,7 @@ use tracing::debug;
 
 use super::ChcCtx;
 use super::RefTarget;
+use crate::codegen_ay::chc::stmt::codegen_stmt_slice_metadata::projected_subslice_len;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -108,6 +109,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             "Pass1.5",
         );
 
+        // Pass 2.5 runs HERE as well as after PostPass2 (below): Pass 1.5's
+        // `DerefProjectedCopy` records `dest = Copy((*src).f)` as the PLACE
+        // `src_target.f` — the "value-of" relation — while Pass 2 consumes
+        // `ref_targets` as the "points-at" relation. When `f` is itself
+        // reference-typed the two disagree, and Pass 2 composes further
+        // projections onto a base that means "the slot" instead of "what the
+        // slot points to". `resolve_adt_field_ref_targets` is exactly the
+        // repair for that shape, but running it only at the end left every
+        // target Pass 2 had already COMPOSED on the stale base uncorrected —
+        // a contract `ensures` reading `im.x` through a closure capture
+        // resolved to the closure environment's own storage instead of the
+        // captured referent, so the post-state read landed on a memory cell
+        // nothing ever writes (free BV -> refutable postcondition on a correct
+        // program). Correct the base BEFORE composing on top of it.
+        self.resolve_adt_field_ref_targets(&field_sources);
+
         // Part of #1712: Pass 2 - Resolve deref-through-ref patterns like _ref = &((*other_ref).field)
         for bb_data in &self.body.blocks {
             for stmt in &bb_data.statements {
@@ -120,7 +137,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
                     // Try ref_targets first; fall back to ref_arg_pointee_idx for
                     // &T/&mut T parameters (Part of #3348).
-                    let base_target = self.propagated_ref_target(base_local);
+                    //
+                    // Last resort: a pointer with no `_p = &_L` statement of its
+                    // own may still PROVABLY hold `&_L` — a contract closure's
+                    // `&result` arrives through the one-element capture tuple
+                    // that closure inlining builds, so Pass 1 never sees it.
+                    // `mir_provable_referent_local` is the same single-assignment
+                    // MIR walk the address-provenance guard already trusts.
+                    // Without this edge, `&((*result) as B).0` becomes a symbolic
+                    // address and the later load is a free variable, so an
+                    // `ensures(|r| matches!(*r, Foo::B(c) if …))` on a
+                    // BV-flattened multi-variant enum is refutable.
+                    let base_target = self.propagated_ref_target(base_local).or_else(|| {
+                        let referent = self.mir_provable_referent_local(base_local)?;
+                        let pointee_ty = Self::deref_pointee_ty(self.body.locals()[base_local].ty)?;
+                        (self.body.locals()[referent].ty == pointee_ty)
+                            .then(|| RefTarget::with_projections(referent, vec![]))
+                    });
 
                     if let Some(target) = base_target {
                         // Extract projections after the Deref and append to the existing target.
@@ -241,8 +274,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// to `&[T]`. Extract the static array length N and store in `subslice_len`.
     ///
     /// Pass 5b: Scan all blocks for `Ref(_s, [Deref, Subslice { from, to, .. }])`.
-    /// If `subslice_len[_s]` exists, compute `subslice_len[dest] = len - from - to`
-    /// and `subslice_offset[dest] = from`.
+    /// If `subslice_len[_s]` exists, compute the exact polarity-sensitive
+    /// `subslice_len[dest]` and `subslice_offset[dest] = from`.
     fn collect_subslice_metadata(&mut self) {
         // Order: 5a (Unsize) → 5c (RangeFull terminators) → 5b (Subslice projections)
         // → 5d (Use chains).
@@ -273,6 +306,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 else {
                     continue;
                 };
+                let source_local = match operand {
+                    Operand::Copy(source) | Operand::Move(source)
+                        if source.projection.is_empty() =>
+                    {
+                        Some(source.local)
+                    }
+                    _ => None,
+                };
+                if self.local_has_multiple_whole_definitions(place.local)
+                    || source_local
+                        .is_some_and(|source| self.local_has_multiple_whole_definitions(source))
+                {
+                    self.ref_resolution.clear_path_insensitive_ref_metadata(place.local);
+                    continue;
+                }
                 let Ok(src_ty) = operand.ty(self.body.locals()) else {
                     continue;
                 };
@@ -330,7 +378,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 if !ref_place.projection.iter().any(|p| matches!(p, ProjectionElem::Deref)) {
                     continue;
                 }
-                let Some((from, to, _)) = ref_place.projection.iter().rev().find_map(|p| {
+                let Some((from, to, from_end)) = ref_place.projection.iter().rev().find_map(|p| {
                     if let ProjectionElem::Subslice { from, to, from_end } = p {
                         Some((*from, *to, *from_end))
                     } else {
@@ -340,6 +388,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     continue;
                 };
                 let source_local = ref_place.local;
+                if !self.path_insensitive_metadata_copy_is_unique(source_local, dest_local) {
+                    self.ref_resolution.clear_path_insensitive_ref_metadata(dest_local);
+                    continue;
+                }
 
                 if let Some(val) = self.ref_resolution.const_ref_values.get(&source_local).cloned()
                 {
@@ -361,17 +413,33 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 if let Some(src_len) = self.ref_resolution.subslice_len.get(&source_local).cloned()
                 {
-                    let adj = from + to;
-                    let new_len = if adj > 0 {
-                        src_len.bvsub(Expr::bitvec_const(adj as i128, POINTER_WIDTH))
-                    } else {
-                        src_len
-                    };
-                    self.ref_resolution.subslice_len.insert(dest_local, new_len);
-                    debug!(
-                        source_local,
-                        dest_local, from, to, "collect_subslice_metadata: Subslice propagation"
-                    );
+                    match projected_subslice_len(src_len, from, to, from_end) {
+                        Some(new_len) => {
+                            self.ref_resolution.subslice_len.insert(dest_local, new_len);
+                            debug!(
+                                source_local,
+                                dest_local,
+                                from,
+                                to,
+                                from_end,
+                                "collect_subslice_metadata: Subslice propagation"
+                            );
+                        }
+                        None => {
+                            self.ref_resolution.const_ref_values.remove(&dest_local);
+                            self.ref_resolution.const_ref_slice_views.remove(&dest_local);
+                            self.ref_resolution.subslice_offset.remove(&dest_local);
+                            self.ref_resolution.subslice_len.remove(&dest_local);
+                            debug!(
+                                source_local,
+                                dest_local,
+                                from,
+                                to,
+                                from_end,
+                                "collect_subslice_metadata: invalid Subslice bounds; dropping length authority"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -392,32 +460,30 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let TerminatorKind::Call { func, args, destination, .. } = &bb.terminator.kind else {
                 continue;
             };
-            // Detect Index::index with RangeFull index type.
-            let Operand::Constant(func_const) = func else { continue };
-            let func_ty = func_const.const_.ty();
-            let TyKind::RigidTy(RigidTy::FnDef(_, ref generics)) = func_ty.kind() else {
+            // The suffix-compatible stub registry and generic debug names are
+            // not semantic authority. Only the exact core Index/SliceIndex
+            // method over the exact core RangeFull type may propagate identity
+            // metadata in this path-insensitive prepass.
+            let Some(source) = self.authenticated_core_range_full_source(func, args) else {
                 continue;
             };
-            // Check if the second generic arg is RangeFull.
-            let is_range_full = generics.0.iter().any(|g| {
-                if let rustc_public::ty::GenericArgKind::Type(ty) = g {
-                    if let TyKind::RigidTy(RigidTy::Adt(adt_def, _)) = ty.kind() {
-                        let name = format!("{:?}", adt_def.0);
-                        return name.contains("RangeFull");
-                    }
-                }
-                false
-            });
-            if !is_range_full || args.len() < 2 {
+            if !destination.projection.is_empty() {
                 continue;
             }
             let dest_local: usize = destination.local;
-            let Some(src_local) = (match &args[0] {
+            let Some(src_local) = (match source {
                 Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => Some(p.local),
                 _ => None,
             }) else {
                 continue;
             };
+            // All three maps are path-insensitive semantic metadata. If either
+            // endpoint has several whole-local producers, whichever producer
+            // this scan visits last is not authority for the joined value.
+            if !self.path_insensitive_metadata_copy_is_unique(src_local, dest_local) {
+                self.ref_resolution.clear_path_insensitive_ref_metadata(dest_local);
+                continue;
+            }
             // Propagate subslice_len from source to destination (identity).
             if let Some(len) = self.ref_resolution.subslice_len.get(&src_local).cloned() {
                 self.ref_resolution.subslice_len.insert(dest_local, len);
@@ -467,6 +533,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         _ => continue,
                     };
                     let dest_local = place.local;
+                    if !self.path_insensitive_metadata_copy_is_unique(src_local, dest_local) {
+                        self.ref_resolution.clear_path_insensitive_ref_metadata(dest_local);
+                        continue;
+                    }
                     let crv = self.ref_resolution.const_ref_values.get(&src_local).cloned();
                     let sl = self.ref_resolution.subslice_len.get(&src_local).cloned();
                     let so = self.ref_resolution.subslice_offset.get(&src_local).cloned();

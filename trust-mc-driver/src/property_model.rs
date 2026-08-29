@@ -218,10 +218,17 @@ fn filepath(file: &str) -> String {
         return file.to_owned();
     };
 
-    match diff_paths(file_path, cur_dir) {
-        Some(diff_path) => {
-            diff_path.into_os_string().into_string().unwrap_or_else(|_| file.to_owned())
-        }
+    match diff_paths(&file_path, cur_dir) {
+        Some(diff_path) => match diff_path.into_os_string().into_string() {
+            // A relative path is only friendlier when it is actually shorter.
+            // For a file outside the working directory — the Rust toolchain
+            // sources, or trust-mc's own library — `diff_paths` produces a
+            // chain like `../../../../../../../home/dir/...`, which is longer
+            // than the absolute path, harder to read and impossible to paste
+            // into an editor. Prefer whichever is shorter.
+            Ok(relative) if relative.len() < file.len() => relative,
+            _ => file.to_owned(),
+        },
         None => file.to_owned(),
     }
 }
