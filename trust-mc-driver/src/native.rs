@@ -2071,6 +2071,15 @@ fn disabled_native_bundle_safety_checks(
         // rule. It can therefore only drop a rule irrelevant to the obligation
         // being asked about — never mask a violation, never mint a proof.
         narrow_to_target_block: _,
+        // AUDITED, deliberately NOT reported as a disabled check.
+        //
+        // The call-summary census is purely observational: it appends one row
+        // per `Inst::Call` site to `ChcTranslationOutput::call_summary_census`
+        // saying whether the modular summary succeeded and, when it did not,
+        // which labelled exit declined. It emits no rule, suppresses no rule,
+        // and is read by no verdict, gate or acceptance check. Turning it on
+        // cannot weaken a proof; turning it off cannot strengthen one.
+        collect_call_summary_census: _,
     } = options;
     let mut disabled = Vec::new();
     if !*check_signed_overflow {

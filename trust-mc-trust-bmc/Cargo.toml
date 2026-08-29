@@ -14,16 +14,29 @@ description = "trust_ir Module consumption for trust-mc BMC verification"
 trust-mc-core = { path = "../trust-mc-core" }
 ay_bindings.workspace = true
 thiserror.workspace = true
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea" }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979" }
+serde_json = { workspace = true, optional = true }
+
+[features]
+# The direct-call-summary census CLI (`call-summary-census`). Opt-in so the
+# default dependency graph of this crate gains NOTHING: serde/serde_json enter
+# only when the measurement binary is asked for. Build it with
+#   cargo build -p trust-mc-trust-bmc --features census-cli --bin call-summary-census
+census-cli = ["dep:serde_json", "trust_ir/serde"]
+
+[[bin]]
+name = "call-summary-census"
+path = "src/bin/call_summary_census.rs"
+required-features = ["census-cli"]
 
 [dev-dependencies]
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea" }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979" }
 # In-process AY solving for guarded-path CFG encoding tests (SAT/UNSAT checks).
 ay_bindings = { workspace = true, features = ["direct"] }
 # Load a REAL `-Ztrust-dump=native-bundle` module (produced by trustc from Rust
 # source through the trust-ir-bridge) so the interior-pointer store tests run on
 # the production lowering path, not only on hand-built IR.
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea", features = ["serde", "binary"] }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979", features = ["serde", "binary"] }
 serde_json.workspace = true
 
 [lints]

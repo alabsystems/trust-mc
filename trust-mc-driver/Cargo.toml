@@ -5,7 +5,7 @@
 
 [package]
 name = "trust-mc-driver"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Build a project with trust-mc and run all proof harnesses"
 license = "MIT OR Apache-2.0"
@@ -69,8 +69,8 @@ ay-sys = { workspace = true, optional = true }
 # Required for source location mapping from .vc.json sidecar files
 trust-mc-core = { path = "../trust-mc-core" }
 # Optional native trust_ir bundle embedding path for compiler integrations.
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea", optional = true }
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea", optional = true }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979", optional = true }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979", optional = true }
 trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", optional = true }
 
 # Unix SIGPIPE handling (#663)
@@ -81,8 +81,8 @@ trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea", features = ["serde"] }
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea" }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979", features = ["serde"] }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979" }
 ay_bindings = { workspace = true }
 trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc" }
 

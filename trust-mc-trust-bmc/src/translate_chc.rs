@@ -9,6 +9,7 @@
 //! SMT-LIB strings. Unsupported trust_ir semantics are represented as reachable
 //! error rules so the CHC/PDR path fails closed.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use ay_bindings::Expr;
@@ -52,6 +53,12 @@ pub struct ChcTranslationOutput {
     pub vc: ChcVc,
     /// Fail-closed diagnostics emitted while lowering unsupported trust_ir semantics.
     pub diagnostics: Vec<TrustIrChcDiagnostic>,
+    /// One row per direct-call site, recording whether the modular call summary
+    /// succeeded and -- when it did not -- the exact labelled exit it declined at.
+    ///
+    /// EMPTY unless `TranslateOptions::collect_call_summary_census` is set.
+    /// Diagnostic only: nothing in the verdict path reads it.
+    pub call_summary_census: Vec<CallSummaryAttempt>,
 }
 
 /// Structured diagnostic for trust_ir constructs that were represented by a
@@ -145,6 +152,221 @@ impl TrustIrChcUnsupportedReason {
     #[must_use]
     pub fn label(self) -> String {
         format!("{self:?}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct-call-summary census
+//
+// `try_direct_call_summary` is the modular mechanism: it interprets a callee's
+// body into the caller's CHC encoding so the caller can be proved panic-free
+// THROUGH the call. It declines through ~80 separate exits, and until this
+// census existed there was NO counter of SUCCESSFUL summaries anywhere in
+// tree and no way to learn WHICH exit a decline took -- the only downstream
+// signal was one undifferentiated `UnsupportedDirectCallSummary` diagnostic.
+//
+// Attribution is reported BY THIS CODE, not reconstructed by an external
+// probe replicating the ladder: every exit carries a hand-written tag, and
+// `tests/call_summary_census_labels_every_exit.rs` fails when a new unlabelled
+// `return None` or `?` appears in the instrumented region. A probe that
+// mirrors the ladder drifts silently; a label cannot.
+//
+// The census is OFF by default (`TranslateOptions::collect_call_summary_census`)
+// and is diagnostic only: it observes, never decides. No verdict, gate or
+// acceptance check reads it.
+// ---------------------------------------------------------------------------
+
+/// The exact `try_direct_call_summary` exit a decline took.
+///
+/// `tag` is hand-written and unique across the interpreter; `line` is `line!()`
+/// at that exit, so a tag stays locatable after the file moves around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CallSummaryDeclineSite {
+    /// Unique short name of the exit.
+    pub tag: &'static str,
+    /// Source line of the exit in `translate_chc.rs`.
+    pub line: u32,
+}
+
+/// What the translator did with one direct-call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CallSummaryOutcome {
+    /// A summary was produced and its return arity matched: the callee's body
+    /// is now interpreted into the caller's encoding. This is the SUCCESS count.
+    Summarized,
+    /// A summary was produced but its return arity disagreed with the callee
+    /// signature, so the site still failed closed (`MalformedControlFlow`).
+    SummarizedArityMismatch,
+    /// The interpreter declined at exactly this exit.
+    Declined {
+        /// The labelled exit.
+        site: CallSummaryDeclineSite,
+        /// Discriminator for a catch-all exit -- the trust_ir opcode that hit
+        /// it. `None` for every exit that already names one construct.
+        ///
+        /// Without this the `_ => return None` arm is an anonymous catch-all
+        /// that would hide the whole wave behind it.
+        detail: Option<String>,
+    },
+    /// The interpreter was never reached: an earlier arm of `translate_call`
+    /// took the site first.
+    NotAttempted {
+        /// Which earlier arm.
+        reason: &'static str,
+    },
+}
+
+/// One direct-call site (`Inst::Call`) and what the translator did with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CallSummaryAttempt {
+    /// Function being translated.
+    pub caller: String,
+    /// Callee name, or `#<id>` when the module has no such function.
+    pub callee: String,
+    /// Block holding the call.
+    pub block: BlockId,
+    /// Zero-based instruction index within `block`.
+    pub instruction_index: usize,
+    /// Outcome for this site.
+    pub outcome: CallSummaryOutcome,
+}
+
+/// Where the in-flight `try_direct_call_summary` records its decline.
+///
+/// A plain LOCAL passed by reference, deliberately not a translator field: the
+/// exits sit inside expressions that already borrow `self` mutably, and a field
+/// would make every label a borrow-checker negotiation. First writer wins, so
+/// the innermost exit (e.g. inside `call_summary_successor_state`) is the one
+/// reported -- never the outer `?` that merely propagated it.
+#[derive(Debug, Default)]
+struct DeclineSlot {
+    site: Cell<Option<CallSummaryDeclineSite>>,
+    detail: RefCell<Option<String>>,
+}
+
+impl DeclineSlot {
+    fn note(&self, tag: &'static str, line: u32) {
+        if self.site.get().is_none() {
+            self.site.set(Some(CallSummaryDeclineSite { tag, line }));
+        }
+    }
+
+    fn note_with_detail(&self, tag: &'static str, line: u32, detail: String) {
+        if self.site.get().is_none() {
+            self.site.set(Some(CallSummaryDeclineSite { tag, line }));
+            *self.detail.borrow_mut() = Some(detail);
+        }
+    }
+
+    fn into_outcome(self) -> CallSummaryOutcome {
+        match self.site.get() {
+            Some(site) => CallSummaryOutcome::Declined { site, detail: self.detail.into_inner() },
+            // Unreachable while every exit is labelled; REPORTED rather than
+            // hidden, so the census can never silently attribute a decline to
+            // nothing. The label test is what keeps this at zero.
+            None => CallSummaryOutcome::Declined {
+                site: CallSummaryDeclineSite { tag: "__unlabelled__", line: 0 },
+                detail: None,
+            },
+        }
+    }
+}
+
+/// Record a decline at this exit and return `None`.
+macro_rules! decline {
+    ($slot:expr, $tag:literal) => {{
+        $slot.note($tag, line!());
+        return None;
+    }};
+}
+
+/// `Option` extension that labels the exit a `?` is about to take.
+///
+/// Written as a SUFFIX combinator on purpose: it leaves the `?` in place, so
+/// adding a label provably cannot change control flow.
+trait OrDecline<T> {
+    fn or_decline(self, slot: &DeclineSlot, tag: &'static str, line: u32) -> Option<T>;
+}
+
+impl<T> OrDecline<T> for Option<T> {
+    #[inline]
+    fn or_decline(self, slot: &DeclineSlot, tag: &'static str, line: u32) -> Option<T> {
+        if self.is_none() {
+            slot.note(tag, line);
+        }
+        self
+    }
+}
+
+/// The leading identifier of `value`'s `Debug` rendering, or `"?"` if it has
+/// none.
+///
+/// Census labels are derived from `Debug` deliberately, exactly like
+/// `TrustIrChcUnsupportedReason::label`: a hand-written match would silently
+/// return a stale name for a variant added later. The sink stops at the first
+/// non-alphanumeric byte, so this never formats a whole `Ty` or `Inst` tree —
+/// the write is abandoned by returning `Err`, which `write!` propagates.
+fn debug_head(value: &dyn std::fmt::Debug) -> String {
+    use std::fmt::Write as _;
+
+    #[derive(Default)]
+    struct Head(String);
+    impl std::fmt::Write for Head {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            for ch in s.chars() {
+                if !ch.is_alphanumeric() || self.0.len() >= 40 {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push(ch);
+            }
+            Ok(())
+        }
+    }
+
+    let mut head = Head::default();
+    let _ = write!(head, "{value:?}");
+    if head.0.is_empty() { "?".to_owned() } else { head.0 }
+}
+
+/// The trust_ir opcode name of `inst`, bounded to its leading identifier.
+fn inst_opcode(inst: &Inst) -> String {
+    debug_head(inst)
+}
+
+/// The CARRIER CLASS of `ty` — the census discriminator for a signature exit.
+///
+/// Derived from `Debug`'s leading identifier exactly like [`inst_opcode`], so a
+/// `Ty` variant added later cannot be silently misreported by a stale hand-
+/// written match. Two refinements, because the head alone would merge causes
+/// that want different work:
+///
+/// * `FatPtr` keeps its kind (`FatPtr_Str`, `FatPtr_Slice`, `FatPtr_TraitObject`,
+///   `FatPtr_ContainerLen`). `&str`, `&[T]` and `&dyn Trait` are three separate
+///   carrier decisions and reporting them as one number would repeat the
+///   `signature_not_summary_value` mistake at the next level down. The match is
+///   EXHAUSTIVE on purpose — a `_` arm would fold a kind added later into an
+///   anonymous `Other` bucket, which is the attribution failure this census
+///   exists to remove, so a new kind must be a compile error and not a silent
+///   merge. (`ContainerLen` was reported as `FatPtr_Other` until this was made
+///   exhaustive, contradicting the list above; it is a measured zero in the
+///   corpus swept so far, so no published split changes.)
+/// * A named aggregate is NOT keyed by its id — `Struct(StructId(7))` would make
+///   every struct in the corpus its own cause. The head `Struct`/`Array`/`Tuple`
+///   is the actionable class.
+fn ty_carrier(ty: &Ty) -> String {
+    match ty {
+        Ty::FatPtr(kind) => {
+            let head = match kind {
+                FatPtrKind::Slice(_) => "Slice",
+                FatPtrKind::Str => "Str",
+                FatPtrKind::TraitObject { .. } => "TraitObject",
+                FatPtrKind::ContainerLen => "ContainerLen",
+            };
+            format!("FatPtr_{head}")
+        }
+        other => debug_head(other),
     }
 }
 
@@ -309,6 +531,9 @@ struct ChcFuncTranslator<'a> {
     block_live_cells: BTreeMap<BlockId, std::collections::BTreeSet<u32>>,
     block_cell_bindings: BTreeMap<BlockId, Vec<ValueBinding>>,
     diagnostics: Vec<TrustIrChcDiagnostic>,
+    // One row per `Inst::Call` site when the census is enabled; see
+    // `ChcTranslationOutput::call_summary_census`.
+    call_summary_census: Vec<CallSummaryAttempt>,
     next_sym_id: u32,
 }
 
@@ -469,8 +694,31 @@ impl<'a> ChcFuncTranslator<'a> {
             block_live_cells: BTreeMap::new(),
             block_cell_bindings: BTreeMap::new(),
             diagnostics: Vec::new(),
+            call_summary_census: Vec::new(),
             next_sym_id: 0,
         }
+    }
+
+    /// Record one direct-call site's fate. No-op unless the census is enabled.
+    fn record_call_summary_attempt(
+        &mut self,
+        callee: FuncId,
+        callee_name: Option<&str>,
+        block: BlockId,
+        instruction_index: usize,
+        outcome: CallSummaryOutcome,
+    ) {
+        if !self.options.collect_call_summary_census {
+            return;
+        }
+        self.call_summary_census.push(CallSummaryAttempt {
+            caller: self.func.name.clone(),
+            callee: callee_name
+                .map_or_else(|| format!("#{}", callee.as_usize()), std::borrow::ToOwned::to_owned),
+            block,
+            instruction_index,
+            outcome,
+        });
     }
 
     fn translate(mut self) -> ChcTranslationOutput {
@@ -496,7 +744,11 @@ impl<'a> ChcFuncTranslator<'a> {
             self.translate_block(block);
         }
 
-        ChcTranslationOutput { vc: self.vc, diagnostics: self.diagnostics }
+        ChcTranslationOutput {
+            vc: self.vc,
+            diagnostics: self.diagnostics,
+            call_summary_census: self.call_summary_census,
+        }
     }
 
     fn declare_block_relations(&mut self) {
@@ -3083,6 +3335,13 @@ impl<'a> ChcFuncTranslator<'a> {
         let Some(callee_func) = self.module.function_by_id(callee).cloned() else {
             let result = self.fresh_symbolic("unknown_call_result", &Ty::I64);
             self.bind_first_result(node, result);
+            self.record_call_summary_attempt(
+                callee,
+                None,
+                block,
+                instruction_index,
+                CallSummaryOutcome::NotAttempted { reason: "callee_not_in_module" },
+            );
             self.add_unsupported_error(
                 block,
                 instruction_index,
@@ -3106,6 +3365,13 @@ impl<'a> ChcFuncTranslator<'a> {
                     .unwrap_or(&Ty::I64);
                 let _ = self.resolve(*arg, arg_ty);
             }
+            self.record_call_summary_attempt(
+                callee,
+                Some(&callee_func.name),
+                block,
+                instruction_index,
+                CallSummaryOutcome::NotAttempted { reason: "recursive_direct_call" },
+            );
             self.add_unsupported_error(
                 block,
                 instruction_index,
@@ -3152,11 +3418,19 @@ impl<'a> ChcFuncTranslator<'a> {
                 let rhs = self.resolve(args[1], &rhs_ty);
                 let result = self.eval_binop(op, &ret_ty, &lhs, &rhs);
                 self.bind_first_result(node, result);
+                self.record_call_summary_attempt(
+                    callee,
+                    Some(&callee_func.name),
+                    block,
+                    instruction_index,
+                    CallSummaryOutcome::NotAttempted { reason: "wrapping_arith_intrinsic" },
+                );
                 return;
             }
         }
 
-        if let Some(summary) = self.try_direct_call_summary(&callee_func, args) {
+        let decline = DeclineSlot::default();
+        if let Some(summary) = self.try_direct_call_summary(&callee_func, args, &decline) {
             for condition in summary.error_conditions {
                 self.add_error_rule(from, path_constraints, condition);
             }
@@ -3164,6 +3438,13 @@ impl<'a> ChcFuncTranslator<'a> {
                 && summary.returns.len() == node.results.len()
                 && summary.returns.len() == callee_func_ty.returns.len()
             {
+                self.record_call_summary_attempt(
+                    callee,
+                    Some(&callee_func.name),
+                    block,
+                    instruction_index,
+                    CallSummaryOutcome::Summarized,
+                );
                 for ((result, ty), binding) in
                     node.results.iter().zip(callee_func_ty.returns.iter()).zip(summary.returns)
                 {
@@ -3171,6 +3452,13 @@ impl<'a> ChcFuncTranslator<'a> {
                 }
                 return;
             }
+            self.record_call_summary_attempt(
+                callee,
+                Some(&callee_func.name),
+                block,
+                instruction_index,
+                CallSummaryOutcome::SummarizedArityMismatch,
+            );
             self.add_unsupported_error(
                 block,
                 instruction_index,
@@ -3181,6 +3469,13 @@ impl<'a> ChcFuncTranslator<'a> {
             );
             return;
         }
+        self.record_call_summary_attempt(
+            callee,
+            Some(&callee_func.name),
+            block,
+            instruction_index,
+            decline.into_outcome(),
+        );
 
         let ret_ty = self
             .module
@@ -3216,30 +3511,63 @@ impl<'a> ChcFuncTranslator<'a> {
             )
     }
 
+    /// Bounded symbolic interpretation of `callee_func`, folded into the
+    /// caller's encoding, or `None` when any construct is not modeled.
+    ///
+    /// EVERY exit -- each `return None` and each `?` -- records a unique
+    /// labelled site into `decline` before returning, so the census can
+    /// attribute a decline to the exact line that took it. First writer wins,
+    /// so an exit inside `call_summary_successor_state` outranks the `?` that
+    /// propagated it. `tests/call_summary_census_labels_every_exit.rs` fails
+    /// when a new unlabelled exit appears here.
     fn try_direct_call_summary(
         &mut self,
         callee_func: &Function,
         args: &[ValueId],
+        decline: &DeclineSlot,
     ) -> Option<DirectCallSummary> {
-        let callee_func_ty = self.module.func_types.get(callee_func.ty.as_usize())?.clone();
-        if callee_func_ty.params.len() != args.len()
-            || !callee_func_ty.params.iter().all(|ty| self.is_call_summary_value_ty(ty))
-            || !callee_func_ty.returns.iter().all(|ty| self.is_call_summary_value_ty(ty))
+        let callee_func_ty = self.module.func_types.get(callee_func.ty.as_usize())
+            .or_decline(decline, "callee_func_ty_missing", line!())?.clone();
+        // Split three ways deliberately. As ONE condition this was the census's
+        // second-largest cause and it was a SUM: "the signature is not summary-
+        // shaped" cannot tell an argument-count disagreement from a parameter
+        // type the interpreter has no carrier for from a RETURN type it has no
+        // carrier for, and those want different work.
+        if callee_func_ty.params.len() != args.len() {
+            decline!(decline, "signature_param_count_mismatch");
+        }
+        if let Some(ty) =
+            callee_func_ty.params.iter().find(|ty| !self.is_call_summary_value_ty(ty))
         {
+            // Carry the REJECTED CARRIER as a detail, on the same reasoning as the
+            // `unmodeled_instruction` catch-all: "the interpreter has no carrier for
+            // some parameter" reported as one number is a SUM over `&str`, `&[T]`,
+            // `&dyn Trait`, `f64` and an over-budget aggregate, and those want
+            // different work. First offending parameter wins, matching the
+            // first-writer-wins discipline of `DeclineSlot`.
+            decline.note_with_detail("signature_param_ty_unsupported", line!(), ty_carrier(ty));
+            return None;
+        }
+        if let Some(ty) =
+            callee_func_ty.returns.iter().find(|ty| !self.is_call_summary_value_ty(ty))
+        {
+            decline.note_with_detail("signature_return_ty_unsupported", line!(), ty_carrier(ty));
             return None;
         }
 
-        let entry_block = callee_func.block(callee_func.entry)?;
+        let entry_block = callee_func.block(callee_func.entry)
+            .or_decline(decline, "entry_block_missing", line!())?;
         if entry_block.params.len() != args.len() {
-            return None;
+            decline!(decline, "entry_block_param_arity");
         }
 
         let mut locals = BTreeMap::new();
         for ((param, param_ty), arg) in entry_block.params.iter().zip(args.iter()) {
             if !self.is_call_summary_value_ty(param_ty) {
-                return None;
+                decline!(decline, "entry_param_ty_unsupported");
             }
-            locals.insert(*param, self.resolve_call_summary_argument(*arg, param_ty)?);
+            locals.insert(*param, self.resolve_call_summary_argument(*arg, param_ty)
+                .or_decline(decline, "argument_not_resolvable", line!())?);
         }
 
         let mut pending = vec![CallSummaryState {
@@ -3261,11 +3589,12 @@ impl<'a> ChcFuncTranslator<'a> {
             if processed_states > DIRECT_CALL_SUMMARY_MAX_STATES
                 || state.visited_blocks.contains(&state.block)
             {
-                return None;
+                decline!(decline, "state_budget_or_block_revisit");
             }
             state.visited_blocks.push(state.block);
 
-            let block = callee_func.block(state.block)?;
+            let block = callee_func.block(state.block)
+                .or_decline(decline, "state_block_missing", line!())?;
             let mut terminated = false;
             for node in &block.body {
                 match &node.inst {
@@ -3276,16 +3605,21 @@ impl<'a> ChcFuncTranslator<'a> {
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Scalar(const_to_expr(ty, value)?),
-                        )?;
+                            ValueBinding::Scalar(const_to_expr(ty, value)
+                                .or_decline(decline, "const_no_exact_encoding", line!())?),
+                        ).or_decline(decline, "const_bind_conflict", line!())?;
                     }
                     Inst::Copy { ty, operand } if self.is_call_summary_value_ty(ty) => {
-                        let binding = call_summary_value(&state.locals, *operand, ty)?;
-                        bind_call_summary_result(&mut state.locals, node, binding)?;
+                        let binding = call_summary_value(&state.locals, *operand, ty)
+                            .or_decline(decline, "copy_operand_unbound", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, binding)
+                            .or_decline(decline, "copy_bind_conflict", line!())?;
                     }
                     Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
-                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)?;
-                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)?;
+                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)
+                            .or_decline(decline, "int_binop_lhs_unbound", line!())?;
+                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)
+                            .or_decline(decline, "int_binop_rhs_unbound", line!())?;
                         // Trust Gap 3: `Wrapping`-tagged ops carry no overflow obligation.
                         if !node.proofs.contains(&ProofAnnotation::Wrapping) {
                             if let Some(no_overflow) = integer_binop_no_overflow_condition(
@@ -3314,7 +3648,7 @@ impl<'a> ChcFuncTranslator<'a> {
                             &mut state.locals,
                             node,
                             ValueBinding::Scalar(result),
-                        )?;
+                        ).or_decline(decline, "int_binop_bind_conflict", line!())?;
                     }
                     Inst::BinOp { op, ty, lhs, rhs } if matches!(ty, Ty::Bool) => {
                         // Logical And/Or/Xor on `Bool` carry no overflow/div-by-zero
@@ -3323,74 +3657,89 @@ impl<'a> ChcFuncTranslator<'a> {
                         // `x == i32::MIN && y == -1` (the signed-division overflow guard)
                         // threads through the summary instead of falling past the
                         // integer-only arm above to `_ => return None`.
-                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)?;
-                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)?;
+                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)
+                            .or_decline(decline, "bool_binop_lhs_unbound", line!())?;
+                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)
+                            .or_decline(decline, "bool_binop_rhs_unbound", line!())?;
                         let result = self.eval_binop(*op, ty, &lhs_expr, &rhs_expr);
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
                             ValueBinding::Scalar(result),
-                        )?;
+                        ).or_decline(decline, "bool_binop_bind_conflict", line!())?;
                     }
                     Inst::ICmp { op, ty, lhs, rhs } => {
-                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)?;
-                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)?;
-                        let result = self.eval_icmp(*op, ty, &lhs_expr, &rhs_expr)?;
+                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)
+                            .or_decline(decline, "icmp_lhs_unbound", line!())?;
+                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)
+                            .or_decline(decline, "icmp_rhs_unbound", line!())?;
+                        let result = self.eval_icmp(*op, ty, &lhs_expr, &rhs_expr)
+                            .or_decline(decline, "icmp_unsupported_comparison", line!())?;
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
                             ValueBinding::Scalar(result),
-                        )?;
+                        ).or_decline(decline, "icmp_bind_conflict", line!())?;
                     }
                     Inst::Cast { op, src_ty, dst_ty, operand }
                         if is_call_summary_scalar_ty(src_ty)
                             && is_call_summary_scalar_ty(dst_ty) =>
                     {
-                        let operand = call_summary_scalar(&state.locals, *operand)?;
-                        let result = eval_cast_expr(*op, src_ty, dst_ty, operand)?;
+                        let operand = call_summary_scalar(&state.locals, *operand)
+                            .or_decline(decline, "cast_operand_unbound", line!())?;
+                        let result = eval_cast_expr(*op, src_ty, dst_ty, operand)
+                            .or_decline(decline, "cast_unsupported", line!())?;
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
                             ValueBinding::Scalar(result),
-                        )?;
+                        ).or_decline(decline, "cast_bind_conflict", line!())?;
                     }
                     Inst::Select { ty, cond, then_val, else_val }
                         if is_call_summary_scalar_ty(ty) =>
                     {
-                        let cond_expr = call_summary_bool(&state.locals, *cond)?;
+                        let cond_expr = call_summary_bool(&state.locals, *cond)
+                            .or_decline(decline, "select_cond_not_bool", line!())?;
                         // Decline the summary when malformed TrustIR gives either arm
                         // an incompatible carrier. The caller then takes the existing
                         // fail-closed UnsupportedDirectCallSummary path.
                         let then_expr = normalize_expr_to_exact_ty(
-                            &call_summary_scalar(&state.locals, *then_val)?,
+                            &call_summary_scalar(&state.locals, *then_val)
+                                .or_decline(decline, "select_then_unbound", line!())?,
                             ty,
-                        )?;
+                        ).or_decline(decline, "select_then_carrier_mismatch", line!())?;
                         let else_expr = normalize_expr_to_exact_ty(
-                            &call_summary_scalar(&state.locals, *else_val)?,
+                            &call_summary_scalar(&state.locals, *else_val)
+                                .or_decline(decline, "select_else_unbound", line!())?,
                             ty,
-                        )?;
-                        let selected = Expr::try_ite(cond_expr, then_expr, else_expr).ok()?;
+                        ).or_decline(decline, "select_else_carrier_mismatch", line!())?;
+                        let selected = Expr::try_ite(cond_expr, then_expr, else_expr).ok()
+                            .or_decline(decline, "select_ite_ill_sorted", line!())?;
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
                             ValueBinding::Scalar(selected),
-                        )?;
+                        ).or_decline(decline, "select_bind_conflict", line!())?;
                     }
                     Inst::NullPtr => {
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
                             ValueBinding::Scalar(Expr::bitvec_const(0u64, 64)),
-                        )?;
+                        ).or_decline(decline, "nullptr_bind_conflict", line!())?;
                     }
                     Inst::Undef { ty } if self.is_call_summary_value_ty(ty) => {
-                        let result = self.fresh_call_summary_value("call_undef", ty)?;
-                        bind_call_summary_result(&mut state.locals, node, result)?;
+                        let result = self.fresh_call_summary_value("call_undef", ty)
+                            .or_decline(decline, "undef_fresh_value_failed", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, result)
+                            .or_decline(decline, "undef_bind_conflict", line!())?;
                     }
                     Inst::DialectOp(op) if node.results.len() == 1 && is_thread_local_addr(op) => {
                         let result =
-                            self.fresh_call_summary_value("call_thread_local_addr", &Ty::Ptr)?;
-                        bind_call_summary_result(&mut state.locals, node, result)?;
+                            self.fresh_call_summary_value("call_thread_local_addr", &Ty::Ptr)
+                                .or_decline(decline, "thread_local_addr_fresh_failed", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, result)
+                            .or_decline(decline, "thread_local_addr_bind_conflict", line!())?;
                     }
                     Inst::ExtractField { ty, aggregate, field }
                         if self.is_call_summary_value_ty(ty) =>
@@ -3402,16 +3751,19 @@ impl<'a> ChcFuncTranslator<'a> {
                         // `call_summary_value` applies on the `Inst::Copy` arm. A mismatch
                         // declines the whole summary (fail closed) rather than admitting a
                         // wrongly-sorted term into the callee model.
-                        let result = call_summary_aggregate(&state.locals, *aggregate)?
+                        let result = call_summary_aggregate(&state.locals, *aggregate)
+                            .or_decline(decline, "extract_field_aggregate_unbound", line!())?
                             .fields
-                            .get(*field as usize)?
+                            .get(*field as usize)
+                                .or_decline(decline, "extract_field_index_out_of_range", line!())?
                             .clone();
                         if is_call_summary_scalar_ty(ty)
                             != matches!(&result, ValueBinding::Scalar(_))
                         {
-                            return None;
+                            decline!(decline, "extract_field_binding_variant_mismatch");
                         }
-                        bind_call_summary_result(&mut state.locals, node, result)?;
+                        bind_call_summary_result(&mut state.locals, node, result)
+                            .or_decline(decline, "extract_field_bind_conflict", line!())?;
                     }
                     Inst::ExtractElement { ty, .. } if is_call_summary_scalar_ty(ty) => {
                         // Array/vector element read: model the element as a fresh
@@ -3420,18 +3772,23 @@ impl<'a> ChcFuncTranslator<'a> {
                         // carried by the separately-emitted Assert), mirroring
                         // translate_block's ExtractElement arm. Scalar element results
                         // only; an aggregate-element read falls through to fail closed.
-                        let result = self.fresh_call_summary_value("call_element_read", ty)?;
-                        bind_call_summary_result(&mut state.locals, node, result)?;
+                        let result = self.fresh_call_summary_value("call_element_read", ty)
+                            .or_decline(decline, "extract_element_fresh_failed", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, result)
+                            .or_decline(decline, "extract_element_bind_conflict", line!())?;
                     }
                     Inst::InsertField { ty, aggregate, field, value }
                         if self.aggregate_field_tys(ty).is_some() =>
                     {
-                        let field_tys = self.aggregate_field_tys(ty)?;
+                        let field_tys = self.aggregate_field_tys(ty)
+                            .or_decline(decline, "insert_field_field_tys_missing", line!())?;
                         let field_index = *field as usize;
-                        let value_ty = field_tys.get(field_index)?;
-                        let mut result = call_summary_aggregate(&state.locals, *aggregate)?;
+                        let value_ty = field_tys.get(field_index)
+                            .or_decline(decline, "insert_field_index_out_of_range", line!())?;
+                        let mut result = call_summary_aggregate(&state.locals, *aggregate)
+                            .or_decline(decline, "insert_field_aggregate_unbound", line!())?;
                         if result.fields.len() != field_tys.len() {
-                            return None;
+                            decline!(decline, "insert_field_aggregate_arity_mismatch");
                         }
                         // Trust (#46): a nested-aggregate field VALUE is spliced as its own
                         // nested binding, so an ordinary wrapper/newtype constructor no
@@ -3441,52 +3798,70 @@ impl<'a> ChcFuncTranslator<'a> {
                         // still declines the summary (fail closed) — this widens what is
                         // ATTEMPTED, never what is trusted.
                         result.fields[field_index] =
-                            call_summary_value(&state.locals, *value, value_ty)?;
+                            call_summary_value(&state.locals, *value, value_ty).or_decline(
+                                decline,
+                                "insert_field_value_variant_mismatch",
+                                line!(),
+                            )?;
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
                             ValueBinding::Aggregate(result),
-                        )?;
+                        ).or_decline(decline, "insert_field_bind_conflict", line!())?;
                     }
                     Inst::Assert { cond } => {
                         error_conditions.push(call_summary_guarded_condition(
                             &state.path_conditions,
-                            call_summary_bool(&state.locals, *cond)?.not(),
+                            call_summary_bool(&state.locals, *cond)
+                                .or_decline(decline, "assert_cond_not_bool", line!())?.not(),
                         ));
                     }
                     Inst::Br { target, args } => {
-                        pending.push(self.call_summary_successor_state(
-                            callee_func,
-                            &state,
-                            *target,
-                            args,
-                            None,
-                        )?);
+                        pending.push(
+                            self.call_summary_successor_state(
+                                callee_func,
+                                &state,
+                                *target,
+                                args,
+                                None,
+                                decline,
+                            )
+                            .or_decline(decline, "br_successor_state", line!())?,
+                        );
                         terminated = true;
                         break;
                     }
                     Inst::CondBr { cond, then_target, then_args, else_target, else_args } => {
-                        let cond_expr = call_summary_bool(&state.locals, *cond)?;
-                        pending.push(self.call_summary_successor_state(
-                            callee_func,
-                            &state,
-                            *else_target,
-                            else_args,
-                            Some(cond_expr.clone().not()),
-                        )?);
-                        pending.push(self.call_summary_successor_state(
-                            callee_func,
-                            &state,
-                            *then_target,
-                            then_args,
-                            Some(cond_expr),
-                        )?);
+                        let cond_expr = call_summary_bool(&state.locals, *cond)
+                            .or_decline(decline, "condbr_cond_not_bool", line!())?;
+                        pending.push(
+                            self.call_summary_successor_state(
+                                callee_func,
+                                &state,
+                                *else_target,
+                                else_args,
+                                Some(cond_expr.clone().not()),
+                                decline,
+                            )
+                            .or_decline(decline, "condbr_else_successor_state", line!())?,
+                        );
+                        pending.push(
+                            self.call_summary_successor_state(
+                                callee_func,
+                                &state,
+                                *then_target,
+                                then_args,
+                                Some(cond_expr),
+                                decline,
+                            )
+                            .or_decline(decline, "condbr_then_successor_state", line!())?,
+                        );
                         terminated = true;
                         break;
                     }
                     Inst::Return { values } => {
                         if values.len() != callee_func_ty.returns.len() {
-                            return None;
+                            decline!(decline, "return_arity_mismatch");
                         }
                         // Resolve each returned value; if one is NOT in scope on this path
                         // (the trust-ir lowering can leave a shared return block referencing
@@ -3501,7 +3876,8 @@ impl<'a> ChcFuncTranslator<'a> {
                         for (value, ty) in values.iter().zip(callee_func_ty.returns.iter()) {
                             let binding = match call_summary_value(&state.locals, *value, ty) {
                                 Some(binding) => binding,
-                                None => self.fresh_call_summary_value("call_ret_havoc", ty)?,
+                                None => self.fresh_call_summary_value("call_ret_havoc", ty)
+                                    .or_decline(decline, "return_havoc_unsupported_ty", line!())?,
                             };
                             resolved.push(binding);
                         }
@@ -3525,7 +3901,8 @@ impl<'a> ChcFuncTranslator<'a> {
                     // A `Wrapping` negation carries no obligation (matches the `BinOp` arm).
                     Inst::UnOp { op: UnOp::Neg, ty, operand } if ty.is_integer() => {
                         let operand_expr = normalize_expr_to_ty(
-                            &call_summary_scalar(&state.locals, *operand)?,
+                            &call_summary_scalar(&state.locals, *operand)
+                                .or_decline(decline, "neg_operand_unbound", line!())?,
                             ty,
                         );
                         if !node.proofs.contains(&ProofAnnotation::Wrapping) {
@@ -3551,7 +3928,7 @@ impl<'a> ChcFuncTranslator<'a> {
                             &mut state.locals,
                             node,
                             ValueBinding::Scalar(operand_expr.bvneg()),
-                        )?;
+                        ).or_decline(decline, "neg_bind_conflict", line!())?;
                     }
                     // Bitwise / logical NOT (`!x`) is TOTAL and modeled PRECISELY — a
                     // Bool operand negates (`not`), a BitVec operand bit-complements
@@ -3565,19 +3942,20 @@ impl<'a> ChcFuncTranslator<'a> {
                     // panic, so NO error condition is pushed. A non-scalar operand (never
                     // produced under the `is_call_summary_scalar_ty` guard) fails closed.
                     Inst::UnOp { op: UnOp::Not, ty, operand } if is_call_summary_scalar_ty(ty) => {
-                        let operand_expr = call_summary_scalar(&state.locals, *operand)?;
+                        let operand_expr = call_summary_scalar(&state.locals, *operand)
+                            .or_decline(decline, "not_operand_unbound", line!())?;
                         let result = if operand_expr.sort().is_bool() {
                             operand_expr.not()
                         } else if operand_expr.sort().is_bitvec() {
                             operand_expr.bvnot()
                         } else {
-                            return None;
+                            decline!(decline, "not_operand_ill_sorted");
                         };
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
                             ValueBinding::Scalar(result),
-                        )?;
+                        ).or_decline(decline, "not_bind_conflict", line!())?;
                     }
                     // The remaining UNARY ops are TOTAL — population count `CtPop` and the
                     // IEEE float unary ops (`FNeg`/`FAbs`/`FSqrt`/`FFloor`/`FCeil`/`FTrunc`)
@@ -3606,9 +3984,12 @@ impl<'a> ChcFuncTranslator<'a> {
                         // Resolve the operand to confirm it is in scope on this path (a missing
                         // operand means a malformed CFG — decline, like the arms above). The
                         // resolved value is unused: the result is havoc, never panics.
-                        let _ = call_summary_scalar(&state.locals, *operand)?;
-                        let result = self.fresh_call_summary_value("call_unop_total", ty)?;
-                        bind_call_summary_result(&mut state.locals, node, result)?;
+                        let _ = call_summary_scalar(&state.locals, *operand)
+                            .or_decline(decline, "total_unop_operand_unbound", line!())?;
+                        let result = self.fresh_call_summary_value("call_unop_total", ty)
+                            .or_decline(decline, "total_unop_fresh_failed", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, result)
+                            .or_decline(decline, "total_unop_bind_conflict", line!())?;
                     }
                     // A checked-arithmetic intrinsic (`a.overflowing_sub(b)` etc. — the
                     // lowering of a Rust `CheckedBinaryOp`, INCLUDING i128 negation as
@@ -3624,15 +4005,17 @@ impl<'a> ChcFuncTranslator<'a> {
                     // the main translate's `OverflowIntrinsic` unsupported path.
                     Inst::Overflow { op, ty, lhs, rhs } if ty.is_integer() => {
                         let binop = overflow_op_to_binop(*op);
-                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)?;
-                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)?;
+                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)
+                            .or_decline(decline, "overflow_lhs_unbound", line!())?;
+                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)
+                            .or_decline(decline, "overflow_rhs_unbound", line!())?;
                         let no_overflow = integer_binop_no_overflow_condition(
                             binop,
                             ty,
                             &lhs_expr,
                             &rhs_expr,
                             self.options,
-                        )?;
+                        ).or_decline(decline, "overflow_no_semantics", line!())?;
                         let value = self.eval_binop(binop, ty, &lhs_expr, &rhs_expr);
                         let flag = no_overflow.not();
                         let mut results = node.results.iter();
@@ -3683,13 +4066,14 @@ impl<'a> ChcFuncTranslator<'a> {
                     Inst::Call { callee, .. } if *callee == callee_func.id => {
                         self_recursion_seen = true;
                         if node.results.len() != callee_func_ty.returns.len() {
-                            return None;
+                            decline!(decline, "self_recursive_result_arity");
                         }
                         for (result, ty) in node.results.iter().zip(callee_func_ty.returns.iter()) {
                             if !self.is_call_summary_value_ty(ty) {
-                                return None;
+                                decline!(decline, "self_recursive_result_ty_unsupported");
                             }
-                            let havoc = self.fresh_call_summary_value("call_self_rec", ty)?;
+                            let havoc = self.fresh_call_summary_value("call_self_rec", ty)
+                                .or_decline(decline, "self_recursive_havoc_failed", line!())?;
                             state.locals.insert(*result, havoc);
                         }
                     }
@@ -3704,12 +4088,23 @@ impl<'a> ChcFuncTranslator<'a> {
                         // load). The access's bounds safety is carried by the
                         // separately-emitted bounds Assert. A raw-pointer load (no
                         // `ValidBorrow`) or a volatile load falls through to fail closed.
-                        let result = self.fresh_call_summary_value("call_load", ty)?;
-                        bind_call_summary_result(&mut state.locals, node, result)?;
+                        let result = self.fresh_call_summary_value("call_load", ty)
+                            .or_decline(decline, "valid_borrow_load_fresh_failed", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, result)
+                            .or_decline(decline, "valid_borrow_load_bind_conflict", line!())?;
                     }
                     // Any other instruction in the callee body is not modeled by the
                     // bounded summary interpreter — decline (fail closed / conservative).
-                    _ => return None,
+                    _ => {
+                        // ANONYMOUS CATCH-ALL: carry the opcode as a detail so this
+                        // exit reports a SPLIT, not one undifferentiated wave.
+                        decline.note_with_detail(
+                            "unmodeled_instruction",
+                            line!(),
+                            inst_opcode(&node.inst),
+                        );
+                        return None;
+                    }
                 }
             }
 
@@ -3741,7 +4136,7 @@ impl<'a> ChcFuncTranslator<'a> {
                 // Recovering precision for the `?` shape is the bridge's job (emit a
                 // well-formed terminated CFG that models Try::branch), not this interpreter's
                 // — it must never paper over a malformed lowering.
-                return None;
+                decline!(decline, "block_without_terminator");
             }
         }
 
@@ -3753,12 +4148,15 @@ impl<'a> ChcFuncTranslator<'a> {
         // all recursion depths from this single invocation (it would have to be checked at every
         // reachable argument, not just the call site's), so we fail closed — sound, conservative.
         if self_recursion_seen && !error_conditions.is_empty() {
-            return None;
+            decline!(decline, "self_recursion_with_obligations");
         }
-        let returns = combine_call_summary_returns(&returns, callee_func_ty.returns.len())?;
+        let returns = combine_call_summary_returns(&returns, callee_func_ty.returns.len())
+            .or_decline(decline, "returns_not_combinable", line!())?;
         Some(DirectCallSummary { returns, error_conditions })
     }
 
+    /// Successor state for one summary CFG edge. Labels its own exits, so an
+    /// edge-side decline is attributed here rather than to the `?` upstream.
     fn call_summary_successor_state(
         &self,
         callee_func: &Function,
@@ -3766,22 +4164,25 @@ impl<'a> ChcFuncTranslator<'a> {
         target: BlockId,
         args: &[ValueId],
         guard: Option<Expr>,
+        decline: &DeclineSlot,
     ) -> Option<CallSummaryState> {
         if state.visited_blocks.contains(&target) {
-            return None;
+            decline!(decline, "successor_block_revisit");
         }
 
-        let target_block = callee_func.block(target)?;
+        let target_block = callee_func.block(target)
+            .or_decline(decline, "successor_block_missing", line!())?;
         if target_block.params.len() != args.len() {
-            return None;
+            decline!(decline, "successor_param_arity_mismatch");
         }
 
         let mut locals = state.locals.clone();
         for (arg, (param, ty)) in args.iter().zip(target_block.params.iter()) {
             if !self.is_call_summary_value_ty(ty) {
-                return None;
+                decline!(decline, "successor_param_ty_unsupported");
             }
-            locals.insert(*param, call_summary_value(&state.locals, *arg, ty)?);
+            locals.insert(*param, call_summary_value(&state.locals, *arg, ty)
+                .or_decline(decline, "successor_arg_unbound", line!())?);
         }
 
         let mut path_conditions = state.path_conditions.clone();

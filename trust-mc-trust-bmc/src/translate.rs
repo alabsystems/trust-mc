@@ -59,6 +59,15 @@ pub struct TranslateOptions {
     /// the CFG successors; ANY uncertainty (unknown terminator, missing block)
     /// includes the rule — over-approximate, never under.
     pub narrow_to_target_block: Option<trust_ir::BlockId>,
+    /// Collect the direct-call-summary census into
+    /// `ChcTranslationOutput::call_summary_census` (default: false).
+    ///
+    /// PURELY OBSERVATIONAL. It switches no check off, emits no rule,
+    /// suppresses no rule and changes no verdict -- it records, per
+    /// `Inst::Call` site, whether the modular call summary succeeded and which
+    /// labelled exit a decline took. Off by default so production translation
+    /// allocates nothing for it.
+    pub collect_call_summary_census: bool,
 }
 
 impl Default for TranslateOptions {
@@ -71,6 +80,7 @@ impl Default for TranslateOptions {
             logic: Some("QF_BV".to_owned()),
             timeout_ms: None,
             narrow_to_target_block: None,
+            collect_call_summary_census: false,
         }
     }
 }

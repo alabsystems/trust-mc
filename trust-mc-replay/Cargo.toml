@@ -24,7 +24,7 @@ trust-mc-core = { path = "../trust-mc-core" }
 # us deserialize the bundle JSON dumped by `TRUST_DUMP_NATIVE_BUNDLE`. Feature
 # unification means trust_ir is built once (serde enabled) and shared with the
 # driver, so `solve_*` accept the deserialized `NativeVerificationBundle`.
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea", features = ["serde"] }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979", features = ["serde"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 

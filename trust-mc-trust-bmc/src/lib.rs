@@ -71,7 +71,8 @@ pub use native_bundle::{
 };
 pub use translate::{TranslateOptions, trust_ir_function_to_bmc_vc, trust_ir_to_bmc_vc};
 pub use translate_chc::{
-    BlockLocalAllocaReject, ChcTranslationOutput, PromotedAllocaReject, PromotionBlocker,
+    BlockLocalAllocaReject, CallSummaryAttempt, CallSummaryDeclineSite, CallSummaryOutcome,
+    ChcTranslationOutput, PromotedAllocaReject, PromotionBlocker,
     SingleCellAllocaRejection, StackCellAdmission, TrustIrChcDiagnostic,
     TrustIrChcUnsupportedReason, classify_aggregate_stack_cell, proof_grade_cast_is_admissible,
     single_cell_alloca_is_admissible, single_cell_alloca_rejection,
