@@ -5,7 +5,7 @@
 
 [package]
 name = "trust-mc-driver"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Build a project with trust-mc and run all proof harnesses"
 license = "MIT OR Apache-2.0"
