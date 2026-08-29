@@ -70,6 +70,44 @@ pub(crate) fn build_success_properties(
     violation_names: &[String],
     location_map: Option<&VcLocationMap>,
 ) -> Vec<Property> {
+    build_declared_properties(violation_names, location_map, CheckStatus::Success)
+}
+
+/// Build a property list from violation declarations with every check
+/// UNDETERMINED — the undecided-solver counterpart of
+/// [`build_success_properties`].
+///
+/// When the solver answers `unknown` (or returns a model that names no
+/// violation), there is no per-check verdict to read out of the solver, so the
+/// model-derived list is empty and the report used to print an EMPTY check
+/// table under a "0 of 0 failed" summary — indistinguishable from a harness
+/// that genuinely emitted no obligations. Kani prints every check it emitted
+/// with `Status: UNDETERMINED` and the real description; this rebuilds that
+/// list from the SMT declarations.
+///
+/// SOUNDNESS: `Undetermined` is the fail-closed status. It claims nothing —
+/// not proved, not violated — so no obligation is dropped and no undecided
+/// check is upgraded. The only thing that changes is that the obligations the
+/// harness actually emitted become VISIBLE instead of silently absent.
+///
+/// REQUIRES: violation_names in the same format `build_success_properties` takes
+/// ENSURES: result.len() == violation_names.len()
+/// ENSURES: all returned properties have status == CheckStatus::Undetermined
+pub(crate) fn build_undetermined_properties(
+    violation_names: &[String],
+    location_map: Option<&VcLocationMap>,
+) -> Vec<Property> {
+    build_declared_properties(violation_names, location_map, CheckStatus::Undetermined)
+}
+
+/// Shared body of [`build_success_properties`] and
+/// [`build_undetermined_properties`]: identical name parsing, location lookup
+/// and description recovery, differing only in the status stamped on each check.
+fn build_declared_properties(
+    violation_names: &[String],
+    location_map: Option<&VcLocationMap>,
+    status: CheckStatus,
+) -> Vec<Property> {
     violation_names
         .iter()
         .map(|name| {
@@ -97,7 +135,7 @@ pub(crate) fn build_success_properties(
                 description,
                 property_id: PropertyId { fn_name: None, class: Cow::Borrowed(class), id },
                 source_location,
-                status: CheckStatus::Success,
+                status,
 
                 trace: None,
             }
@@ -1072,6 +1110,33 @@ mod tests {
         assert_eq!(props.len(), 2);
         assert_eq!(props[0].status, CheckStatus::Success);
         assert_eq!(props[1].status, CheckStatus::Success);
+    }
+
+    /// The undecided-path builder must produce the SAME table the UNSAT path
+    /// produces — same checks, same classes, same descriptions — differing only
+    /// in the status. That is the whole point: an undecided run was hiding the
+    /// obligations it had, and a table that disagreed with the UNSAT one about
+    /// what those obligations ARE would just be a second wrong answer.
+    #[test]
+    fn undetermined_properties_mirror_the_success_table_except_for_status() {
+        let names = vec![
+            "ay_violation_kani_assert_0".to_string(),
+            "ay_violation_overflow_check_add_1".to_string(),
+        ];
+        let success = build_success_properties(&names, None);
+        let undetermined = build_undetermined_properties(&names, None);
+
+        assert_eq!(undetermined.len(), success.len());
+        for (u, s) in undetermined.iter().zip(success.iter()) {
+            assert_eq!(u.status, CheckStatus::Undetermined, "the fail-closed status");
+            assert_eq!(s.status, CheckStatus::Success);
+            assert_eq!(u.description, s.description);
+            assert_eq!(u.property_id.class, s.property_id.class);
+            assert_eq!(u.property_id.id, s.property_id.id);
+        }
+        // An empty declaration list stays empty: a harness with no obligation
+        // must NOT grow a phantom UNDETERMINED check.
+        assert!(build_undetermined_properties(&[], None).is_empty());
     }
 
     #[test]

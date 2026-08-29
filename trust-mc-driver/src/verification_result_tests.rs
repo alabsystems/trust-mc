@@ -407,6 +407,126 @@ fn only_undecidable_reasons_change_the_no_checks_verdict() {
     assert!(output.contains("INCONCLUSIVE (no checks)"), "{output}");
 }
 
+/// THE TRAP this change was deferred on, pinned in both directions.
+///
+/// The "solver undecided" arm used to key on `number_properties == 0`, which
+/// only ever coincided with "nothing was decided" because an undecided run
+/// printed an EMPTY table. Now that those runs print their real obligations as
+/// UNDETERMINED, an `== 0` key would stop firing and the harness would fall
+/// through to `FAILED` — asserting a refutation about a harness the solver never
+/// decided. The verdict must be identical either way.
+#[test]
+fn a_populated_undetermined_table_still_reports_the_solver_undecided() {
+    let empty_table = format_result(
+        &[],
+        VerificationStatus::Failure,
+        false,
+        FailedProperties::Other,
+        true,
+        ValidationStatus::Validated,
+        Some(SolverUnknownReason::UndecidedModel),
+        HarnessFeasibility::Undetermined,
+    );
+    let populated = [
+        make_property(CheckStatus::Undetermined),
+        make_property(CheckStatus::Undetermined),
+        make_property(CheckStatus::Undetermined),
+    ];
+    let populated_table = format_result(
+        &populated,
+        VerificationStatus::Failure,
+        false,
+        FailedProperties::Other,
+        true,
+        ValidationStatus::Validated,
+        Some(SolverUnknownReason::UndecidedModel),
+        HarnessFeasibility::Undetermined,
+    );
+
+    assert!(empty_table.contains("solver undecided"), "{empty_table}");
+    assert!(
+        populated_table.contains("solver undecided"),
+        "populating the table must not change the verdict, got: {populated_table}"
+    );
+    assert!(
+        !populated_table.contains("VERIFICATION:- FAILED"),
+        "an undecided harness must never be reported FAILED: {populated_table}"
+    );
+    // Kani prints the count of checks it could not settle on the summary line.
+    assert!(
+        populated_table.contains("** 0 of 3 failed (3 undetermined)"),
+        "the summary must carry the undetermined count: {populated_table}"
+    );
+    assert!(
+        populated_table.contains("Status: UNDETERMINED"),
+        "each check must render its own UNDETERMINED status: {populated_table}"
+    );
+}
+
+/// The other direction: ONE decided check is enough to disqualify the arm.
+///
+/// A harness where the solver settled something is not a harness the solver
+/// could not decide, whichever way that one check came out — and masking a
+/// DECIDED `Failure` behind an INCONCLUSIVE verdict would be the unsound
+/// direction of this same edit.
+#[test]
+fn one_decided_check_takes_the_harness_out_of_the_undecided_arm() {
+    for decided in [CheckStatus::Failure, CheckStatus::Success, CheckStatus::Unreachable] {
+        assert!(
+            has_decided_check(&[make_property(CheckStatus::Undetermined), make_property(decided)]),
+            "{decided:?} is a decided answer"
+        );
+    }
+    for undecided in [CheckStatus::Undetermined, CheckStatus::Unknown] {
+        assert!(
+            !has_decided_check(&[make_property(undecided)]),
+            "{undecided:?} is the absence of an answer"
+        );
+    }
+    assert!(!has_decided_check(&[]), "no checks ⇒ nothing decided");
+
+    let with_failure =
+        [make_property(CheckStatus::Undetermined), make_property(CheckStatus::Failure)];
+    let output = format_result(
+        &with_failure,
+        VerificationStatus::Failure,
+        false,
+        FailedProperties::Other,
+        true,
+        ValidationStatus::Validated,
+        Some(SolverUnknownReason::UndecidedModel),
+        HarnessFeasibility::Undetermined,
+    );
+    assert!(
+        output.contains("VERIFICATION:- FAILED"),
+        "a DECIDED failure must still be reported as one: {output}"
+    );
+    assert!(
+        !output.contains("solver undecided"),
+        "a decided failure is not an undecided harness: {output}"
+    );
+}
+
+/// `tests/expected/slice_c_str` control, re-pinned against the new key: a
+/// `SolverError` that fell over BEFORE any check existed keeps `(no checks)`.
+/// The re-keyed arm above must not swallow it — `has_decided_check` is false for
+/// an empty table too, so only the reason set keeps the two apart.
+#[test]
+fn a_solver_error_with_no_checks_keeps_the_no_checks_verdict() {
+    let output = format_result(
+        &[],
+        VerificationStatus::Failure,
+        false,
+        FailedProperties::Other,
+        true,
+        ValidationStatus::Validated,
+        Some(SolverUnknownReason::SolverError),
+        HarnessFeasibility::Undetermined,
+    );
+    assert!(output.contains("INCONCLUSIVE (no checks)"), "{output}");
+    assert!(!output.contains("solver undecided"), "{output}");
+}
+
 // --- V4 cause split: unsat assumption vs dead check ---------------------------
 
 /// The two situations that produce the SAME all-UNREACHABLE table, told apart

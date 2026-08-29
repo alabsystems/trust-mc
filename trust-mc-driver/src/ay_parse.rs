@@ -27,7 +27,7 @@ pub(crate) use vc_artifact::{
 pub(crate) use violation::{
     apply_kani_property_naming, apply_loop_contract_naming, build_cover_properties_from_sat_checks,
     build_coverage_results_from_sat_checks, build_success_properties,
-    determine_failed_from_properties, parse_cover_properties, parse_cover_sat_check_output,
-    parse_coverage_results, parse_solver_output, parse_violation_entry_names,
-    parse_violation_properties,
+    build_undetermined_properties, determine_failed_from_properties, parse_cover_properties,
+    parse_cover_sat_check_output, parse_coverage_results, parse_solver_output,
+    parse_violation_entry_names, parse_violation_properties,
 };

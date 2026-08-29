@@ -10,8 +10,6 @@ Use the pinned solver environment for measurements:
 
 ```bash
 export PATH=/path/to/ay/target/release:$PATH
-export AY_NO_PULL=1
-export AY_SELF_CONTAINED=1
 export AY_SOLVER=ay
 ay --version
 ```

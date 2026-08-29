@@ -128,41 +128,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         if let Some(pointee_base) = pointee_base_opt {
             debug!("codegen_place Deref: ref_base={}, pointee_base={}", ref_base, pointee_base);
-            // Interior-mutability soundness (Cell/UnsafeCell false-PROOF fix — READ side).
-            // `Cell::set` lowers to a raw-pointer store into the global memory array,
-            // but `Cell::get()` = `*self.value.get()` resolves HERE via ref_pointees ->
-            // env_lookup(pointee_base), returning the transparent CONSTRUCTION scalar and
-            // short-circuiting the raw-ptr memory load. Store target (memory) and load
-            // source (env scalar) are different theories, so the store is invisible and
-            // get() returns the stale construction value -> a FALSE PROOF (e.g.
-            // `Cell::new(0); c.set(10); assert(c.get()==0)` verified SUCCESSFUL). Fail-
-            // closed: if the pointee is provably interior-mutable, return a FRESH
-            // unconstrained value PER READ (ctx.fresh_name, NOT env_update'd, so two
-            // get() reads are independent SMT vars — else `assert(x==y)` re-false-proves)
-            // and demote via the canonical fallback pair so the harness goes
-            // INCONCLUSIVE/FAILED, never SUCCESSFUL. Havoc is a sound over-approximation:
-            // a shared `&Cell` may be mutated between any two reads, so forgetting the
-            // contents on each read is always valid. The POSITIVE `contains UnsafeCell`
-            // predicate leaves ordinary `&T`/`&mut T` and Freeze wrappers
-            // (MaybeUninit/ManuallyDrop) untouched.
-            if self.base_name_is_interior_mutable(pointee_base.as_ref()) {
-                if let Some(sort) = self
+            // INTERIOR-MUTABILITY FAIL-CLOSE, part 1 of 2: MULTI-payload wrappers.
+            //
+            // The unified naming that lets the fail-close stand down further below
+            // holds only when the payload is a SINGLE-payload chain
+            // (`unsafe_cell_is_single_payload`) — `Cell`/`UnsafeCell`, and a struct
+            // wrapping exactly one of them. `RefCell` is `{ borrow, value }`, two
+            // non-ZST fields, so the erased-wrapper identity refuses it, its payload
+            // keeps a separate name, and its write escapes into a synthetic
+            // `arg_pointee` slot. MEASURED: `RefCell::new(7);
+            // c.replace_with(|&mut old| old + 2); assert!(*c.as_ptr() == 7)` is
+            // UNFALSIFIABLE without this guard. So those keep the blanket havoc they
+            // have always had, at the position they have always had it.
+            if self.base_name_is_interior_mutable(pointee_base.as_ref())
+                && !self.base_name_unsafe_cell_is_single_payload(pointee_base.as_ref())
+                && let Some(sort) = self
                     .infer_sort_from_place(place)
                     .or_else(|| self.env_lookup(pointee_base.as_ref()).map(|e| e.sort().clone()))
-                {
-                    let fresh = self.ctx.fresh_name("cell_read_havoc");
-                    let havoc = self.ctx.declare_var(&fresh, sort);
-                    self.ctx.unsupported_with_fallback(
-                        "Interior-mutable (Cell/UnsafeCell) read through shared reference",
-                        format!("Cell::get of {pointee_base}"),
-                    );
-                    self.record_violation_guarded(
-                        Expr::bool_const(true),
-                        "unsound_interior_mutable_read",
-                    );
-                    debug!("codegen_place Deref: interior-mutable read -> havoc (fail-closed)");
-                    return DerefFirstResult::Resolved(havoc);
-                }
+            {
+                let fresh = self.ctx.fresh_name("cell_read_havoc");
+                let havoc = self.ctx.declare_var(&fresh, sort);
+                self.ctx.unsupported_with_fallback(
+                    "Interior-mutable (Cell/UnsafeCell) read through shared reference",
+                    format!("multi-payload interior-mutable read of {pointee_base}"),
+                );
+                self.record_violation_guarded(
+                    Expr::bool_const(true),
+                    "unsound_interior_mutable_read",
+                );
+                debug!("codegen_place Deref: multi-payload interior-mutable read -> havoc");
+                return DerefFirstResult::Resolved(havoc);
             }
             // Get the pointee's value from the environment
             if let Some(pointee_expr) = self.env_lookup(pointee_base.as_ref()) {
@@ -235,6 +230,53 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         DerefFirstResult::Unsupported
                     }
                 };
+            }
+
+            // INTERIOR-MUTABILITY FAIL-CLOSE, part 2 of 2: single-payload wrappers
+            // whose value NOTHING above could resolve.
+            //
+            // This guard used to sit BEFORE the `env_lookup` above and override a
+            // value the model already held. That was the right call while the
+            // payload had two names: `Cell::set`'s `ptr::write` landed in the env
+            // slot `<base>_field_0` while `Cell::get` read `<base>`, so the store
+            // was invisible and `get()` returned the CONSTRUCTION value — a false
+            // PROOF the blanket havoc converted into a sound FAILED/INCONCLUSIVE.
+            //
+            // That split is gone: `erased_wrapper_field_sort` now names the
+            // `Cell`/`UnsafeCell` payload after the wrapper on BOTH sides, and the
+            // BMC mini-inliner carries SSA versions in and publishes a callee's
+            // writes to caller storage back out (`inline_body`). Construction,
+            // `Cell::get`, `Cell::set`/`replace`, the `UnsafeCell::get` raw-pointer
+            // store and `as_ptr` now all name ONE slot, so a resolved value here is
+            // the value the program last WROTE, not a stale snapshot. Overriding it
+            // would only discard a correct answer. MEASURED in both directions:
+            // `c.set(9); assert!(c.get() == 7)` FAILS and `assert!(c.get() == 9)`
+            // SUCCEEDS; with the guard in its old position the first was
+            // INCONCLUSIVE (an UNSAT VC — a PROOF of the false claim, kept off the
+            // console only by AY's strict proof self-check) and the second FAILED.
+            //
+            // What remains is the case the havoc is actually FOR: nothing resolved,
+            // so the next step is `synthesize_pointee_expr`, an unconstrained value
+            // minted with no record that the interior-mutable contents were never
+            // tracked. Keep the fresh-per-read havoc AND the canonical fallback pair
+            // here so that read is demoted rather than silently trusted. Fresh per
+            // read (never `env_update`d) is deliberate: two `get()`s of an untracked
+            // `&Cell` must be independent, or `assert(x == y)` re-proves itself.
+            if self.base_name_is_interior_mutable(pointee_base.as_ref())
+                && let Some(sort) = self.infer_sort_from_place(place)
+            {
+                let fresh = self.ctx.fresh_name("cell_read_havoc");
+                let havoc = self.ctx.declare_var(&fresh, sort);
+                self.ctx.unsupported_with_fallback(
+                    "Interior-mutable (Cell/UnsafeCell) read through shared reference",
+                    format!("untracked Cell::get of {pointee_base}"),
+                );
+                self.record_violation_guarded(
+                    Expr::bool_const(true),
+                    "unsound_interior_mutable_read",
+                );
+                debug!("codegen_place Deref: untracked interior-mutable read -> havoc");
+                return DerefFirstResult::Resolved(havoc);
             }
 
             // Last resort: synthesize a fresh symbolic pointee value.

@@ -3393,24 +3393,25 @@ impl<'a> ChcFuncTranslator<'a> {
                         bind_call_summary_result(&mut state.locals, node, result)?;
                     }
                     Inst::ExtractField { ty, aggregate, field }
-                        if is_call_summary_scalar_ty(ty) =>
+                        if self.is_call_summary_value_ty(ty) =>
                     {
-                        // Trust (#46): this arm is guarded scalar-result; the call-
-                        // summary path stays scalar-only, so a nested-aggregate field
-                        // here bails (fail closed).
-                        let ValueBinding::Scalar(result) =
-                            call_summary_aggregate(&state.locals, *aggregate)?
-                                .fields
-                                .get(*field as usize)?
-                                .clone()
-                        else {
+                        // Trust (#46): a nested-aggregate field is read as its OWN nested
+                        // binding. `ValueBinding` already carries aggregates, so the field
+                        // is taken whatever its shape; what must still hold is that the
+                        // binding VARIANT matches the declared result type — the same bar
+                        // `call_summary_value` applies on the `Inst::Copy` arm. A mismatch
+                        // declines the whole summary (fail closed) rather than admitting a
+                        // wrongly-sorted term into the callee model.
+                        let result = call_summary_aggregate(&state.locals, *aggregate)?
+                            .fields
+                            .get(*field as usize)?
+                            .clone();
+                        if is_call_summary_scalar_ty(ty)
+                            != matches!(&result, ValueBinding::Scalar(_))
+                        {
                             return None;
-                        };
-                        bind_call_summary_result(
-                            &mut state.locals,
-                            node,
-                            ValueBinding::Scalar(result),
-                        )?;
+                        }
+                        bind_call_summary_result(&mut state.locals, node, result)?;
                     }
                     Inst::ExtractElement { ty, .. } if is_call_summary_scalar_ty(ty) => {
                         // Array/vector element read: model the element as a fresh
@@ -3428,16 +3429,19 @@ impl<'a> ChcFuncTranslator<'a> {
                         let field_tys = self.aggregate_field_tys(ty)?;
                         let field_index = *field as usize;
                         let value_ty = field_tys.get(field_index)?;
-                        if !is_call_summary_scalar_ty(value_ty) {
-                            return None;
-                        }
                         let mut result = call_summary_aggregate(&state.locals, *aggregate)?;
                         if result.fields.len() != field_tys.len() {
                             return None;
                         }
-                        // Trust (#46): guarded scalar value_ty (above) — wrap as Scalar.
+                        // Trust (#46): a nested-aggregate field VALUE is spliced as its own
+                        // nested binding, so an ordinary wrapper/newtype constructor no
+                        // longer bails on its first non-scalar field. `call_summary_value`
+                        // matches the binding variant to the declared field type and
+                        // returns `None` otherwise, so every shape it cannot represent
+                        // still declines the summary (fail closed) — this widens what is
+                        // ATTEMPTED, never what is trusted.
                         result.fields[field_index] =
-                            ValueBinding::Scalar(call_summary_scalar(&state.locals, *value)?);
+                            call_summary_value(&state.locals, *value, value_ty)?;
                         bind_call_summary_result(
                             &mut state.locals,
                             node,

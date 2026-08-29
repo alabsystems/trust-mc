@@ -25,11 +25,19 @@
 //! A concrete forward simulation of the body's control flow from `bb0`, with an
 //! abstract store that holds only values it can compute exactly (`Val`) and `⊤`
 //! for everything else. A branch on `⊤` stops the simulation. For every natural
-//! loop header the simulation records the longest run of back-edges taken in a
-//! single entry of that loop; that run length is exactly the `unwind_depth` the
-//! unroller needs (see `remap_target`: at `iter == unwind_depth` only *in-loop*
-//! targets from the header divert to the fail block, so a loop with `n` body
-//! executions needs `unwind_depth == n`).
+//! loop header the simulation records the smallest `unwind_depth` at which no
+//! header visit is truncated (see `remap_target`: at `iter == unwind_depth`
+//! *every* in-loop target of the header diverts to the fail block).
+//!
+//! * A header that branches itself (`while c { .. }`) leaves the loop from the
+//!   header on its final visit, and that edge is out-of-loop, so `n` body
+//!   executions need `unwind_depth == n`.
+//! * A header that only computes the condition and `goto`s the block that
+//!   branches — how an indexed `for` loop lowers — has an IN-loop successor on
+//!   every visit, its last one included, so it needs `n + 1`. Once the final
+//!   header copy is not truncated, the out-of-loop exit edge can sit any number
+//!   of blocks further down the loop body: `remap_target` only truncates edges
+//!   whose source is the header.
 //!
 //! # Why a wrong answer is safe
 //!
@@ -48,10 +56,10 @@ use super::cfg::Cfg;
 use super::dominators::find_loop_headers;
 use super::unroll::natural_loop;
 use rustc_public::mir::{
-    BinOp, Body, CastKind, ConstOperand, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
-    StatementKind, TerminatorKind, UnOp,
+    AggregateKind, BinOp, Body, CastKind, ConstOperand, Local, Operand, Place, ProjectionElem,
+    Rvalue, Statement, StatementKind, TerminatorKind, UnOp,
 };
-use rustc_public::ty::{ConstantKind, RigidTy, Ty, TyConstKind, TyKind};
+use rustc_public::ty::{AdtKind, ConstantKind, RigidTy, Ty, TyConstKind, TyKind};
 use std::collections::HashMap;
 use trust_mc_codegen_shared::IntoOption;
 use trust_mc_codegen_types::types::{int_ty_to_bitvec_width, uint_ty_to_bitvec_width};
@@ -212,6 +220,27 @@ impl Store {
             // whole base local. (Its pointee, if it is a local, is poisoned.)
             None => self.kill_local(place.local),
         }
+    }
+}
+
+/// Whether an aggregate's operands land in the same field slots a later read
+/// addresses them by.
+///
+/// Structs and tuples qualify: operand `i` is `FieldIdx` `i`, and MIR reads the
+/// value back with the bare `Field(i)` projection that `place_slot` models.
+/// Enums do not — the read goes through a `Downcast` that `place_slot` refuses,
+/// so recording the fields could only ever be read back under the WRONG variant.
+/// Unions do not — `Field` there reinterprets the same bytes. Arrays, closures,
+/// coroutines and raw pointers are not one-level-field-addressable at all.
+fn aggregate_is_field_addressable(kind: &AggregateKind) -> bool {
+    match kind {
+        AggregateKind::Tuple => true,
+        // A struct has exactly one variant, so the variant index is necessarily
+        // zero; `active_field` is `Some` only for a union initialiser.
+        AggregateKind::Adt(def, _, _, _, active_field) => {
+            def.kind() == AdtKind::Struct && active_field.is_none()
+        }
+        _ => false,
     }
 }
 
@@ -421,6 +450,24 @@ impl Simulator {
             }
             return;
         }
+        // `_2 = Range::<i32> { start: 1, end: 4 }` is an `Aggregate`, and every
+        // `a..b` loop bound is built exactly that way. Without this the whole
+        // local goes to TOP, the later `(_2.0: i32)` read is unknown, and the
+        // loop condition is undecidable — so the header switch bails and the
+        // trip count is never derived. A struct/tuple aggregate is precisely a
+        // field-wise write, so recording it is exact, not an approximation.
+        if let Rvalue::Aggregate(kind, ops) = rvalue
+            && let Some((local, None)) = place_slot(place)
+            && aggregate_is_field_addressable(kind)
+        {
+            self.store.kill_local(local);
+            for (idx, op) in ops.iter().enumerate() {
+                if let Some(v) = self.operand(op) {
+                    self.store.vals.insert((local, Some(idx as u32)), v);
+                }
+            }
+            return;
+        }
         let val = self.rvalue(rvalue);
         self.store.write(place, val);
     }
@@ -482,6 +529,7 @@ fn simulate(body: &Body, loops: &HashMap<usize, Vec<bool>>) -> TripCounts {
 
     loop {
         if steps >= MAX_SIM_STEPS {
+            tracing::debug!(bb, steps, "const-trip: bail — step cap reached");
             return TripCounts {
                 max_run,
                 outcome: SimOutcome::Bailed { inside: inside_now(bb, loops) },
@@ -508,6 +556,11 @@ fn simulate(body: &Body, loops: &HashMap<usize, Vec<bool>>) -> TripCounts {
             TerminatorKind::Goto { target } => *target,
             TerminatorKind::SwitchInt { discr, targets } => {
                 let Some(val) = sim.operand(discr) else {
+                    tracing::debug!(
+                        bb,
+                        ?discr,
+                        "const-trip: bail — SwitchInt discriminant is not modelled"
+                    );
                     return TripCounts {
                         max_run,
                         outcome: SimOutcome::Bailed { inside: inside_now(bb, loops) },
@@ -544,6 +597,7 @@ fn simulate(body: &Body, loops: &HashMap<usize, Vec<bool>>) -> TripCounts {
             }
             // Inline asm can mutate anything the simulator models.
             TerminatorKind::InlineAsm { .. } => {
+                tracing::debug!(bb, "const-trip: bail — inline asm");
                 return TripCounts {
                     max_run,
                     outcome: SimOutcome::Bailed { inside: inside_now(bb, loops) },
@@ -552,11 +606,30 @@ fn simulate(body: &Body, loops: &HashMap<usize, Vec<bool>>) -> TripCounts {
         };
 
         if next >= body.blocks.len() {
+            tracing::debug!(bb, next, "const-trip: bail — successor out of range");
             return TripCounts {
                 max_run,
                 outcome: SimOutcome::Bailed { inside: inside_now(bb, loops) },
             };
         }
+        // The LAST visit to a header has to be able to leave the loop through the
+        // header's OWN terminator: `remap_target` sends every in-loop target of
+        // the header to the unwinding-assertion failure once `iter == depth`.
+        // A header that branches itself (`while c { .. }`) therefore needs
+        // exactly its back-edge count — its final visit takes the out-of-loop
+        // edge. A header that only computes the condition and `goto`s the block
+        // that branches — exactly how an indexed `for` loop lowers — reaches an
+        // in-loop successor on EVERY visit, its final one included, and so needs
+        // one copy more. Recording `run + 1` for an in-loop successor covers
+        // both without ever lowering the bound below the back-edge count.
+        if let Some(in_loop) = loops.get(&bb)
+            && in_loop[next]
+        {
+            let need = cur_run.get(&bb).copied().unwrap_or(0) + 1;
+            let entry = max_run.entry(bb).or_insert(0);
+            *entry = (*entry).max(need);
+        }
+
         prev = Some(bb);
         bb = next;
     }

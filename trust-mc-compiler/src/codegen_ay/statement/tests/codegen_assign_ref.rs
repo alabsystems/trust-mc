@@ -485,3 +485,83 @@ fn test_track_ref_pointees_keeps_syntactic_name_without_resolution() {
         assert!(found, "borrow_first MIR should contain `&mut (*_1).0`");
     });
 }
+
+// ---------------------------------------------------------------------------
+// unsafe_cell_is_single_payload — the gate deciding whether the
+// interior-mutability read fail-close in `place_deref_first` may stand down.
+// ---------------------------------------------------------------------------
+
+const SINGLE_PAYLOAD_SOURCE: &str = r#"
+use std::cell::{Cell, RefCell, UnsafeCell};
+
+pub struct OneCell {
+    pub x: Cell<u32>,
+}
+
+pub struct OneUnsafeCell {
+    pub x: UnsafeCell<u32>,
+}
+
+pub struct TwoCells {
+    pub a: Cell<u32>,
+    pub b: Cell<u32>,
+}
+
+#[inline(never)]
+pub fn single_payload_probe(
+    one: &OneCell,
+    one_unsafe: &OneUnsafeCell,
+    two: &TwoCells,
+    plain: &u32,
+    refcell: &RefCell<u32>,
+) -> u32 {
+    let _ = one_unsafe;
+    one.x.get() + two.a.get() + *plain + *refcell.borrow()
+}
+"#;
+
+/// The predicate must answer YES for a chain of single-payload wrappers down to
+/// `UnsafeCell` and NO for a multi-field interior-mutable wrapper.
+///
+/// Both directions are load-bearing. YES is what lets `place_deref_first` trust
+/// a resolved `Cell`/`UnsafeCell` value instead of havocking it, which is what
+/// makes `c.set(9); assert!(c.get() == 9)` provable. NO is what keeps `RefCell`
+/// failing closed: its payload write escapes into a synthetic `arg_pointee`
+/// slot, so a trusted read there would return the pre-write value and
+/// `assert!(*c.as_ptr() == 7)` after a `replace_with` would be unfalsifiable.
+#[test]
+fn test_unsafe_cell_is_single_payload_both_directions() {
+    with_test_ay_ctx_for_source(SINGLE_PAYLOAD_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(&ctx, "single_payload_probe");
+        let body = instance.body().expect("body");
+        let locals = body.locals();
+
+        // Argument locals are 1..=5 in declaration order; each is `&T`, so read
+        // through the reference to reach the referent type.
+        let referent = |idx: usize| match locals[idx].ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, ty, _)) => ty,
+            other => panic!("arg {idx} is not a reference: {other:?}"),
+        };
+
+        assert!(
+            StatementCodegen::unsafe_cell_is_single_payload(referent(1), 0),
+            "a struct wrapping exactly one Cell<u32> is a single-payload chain"
+        );
+        assert!(
+            StatementCodegen::unsafe_cell_is_single_payload(referent(2), 0),
+            "a struct wrapping exactly one UnsafeCell<u32> is a single-payload chain"
+        );
+        assert!(
+            !StatementCodegen::unsafe_cell_is_single_payload(referent(3), 0),
+            "two non-ZST interior-mutable fields is NOT a single-payload chain"
+        );
+        assert!(
+            !StatementCodegen::unsafe_cell_is_single_payload(referent(4), 0),
+            "a plain u32 holds no UnsafeCell at all"
+        );
+        assert!(
+            !StatementCodegen::unsafe_cell_is_single_payload(referent(5), 0),
+            "RefCell is two non-ZST fields, so it must keep failing closed"
+        );
+    });
+}

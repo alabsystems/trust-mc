@@ -22,7 +22,7 @@ use crate::session::KaniSession;
 use crate::verification_provenance::SolverUnknownReason;
 use crate::verification_result::{
     CtrexCategory, FailedProperties, VacuityShape, ValidationStatus, VerificationResult,
-    VerificationStatus, classify_vacuity,
+    VerificationStatus, classify_vacuity, has_decided_check,
 };
 
 /// What actually happened to a harness, at the granularity the CONSOLE channel
@@ -204,19 +204,29 @@ pub(crate) fn classify_harness_verdict(
             VacuityShape::None => {}
         }
     }
-    if console_check_count(&result.results) == 0 {
-        // Only the reasons that actually mean "we had something and could not
-        // settle it". `SolverError` / `ChcParseError` / `PreSolveDeadline` fell
-        // over BEFORE there was anything to decide, and "no checks" is then the
-        // honest description — the same split `format_result` documents.
-        return if matches!(
+    // Mirrors `format_result`'s two INCONCLUSIVE arms, key for key.
+    //
+    // The undecided arm keys on "no check is DECIDED", not on an empty table:
+    // an undecided run now PRINTS its checks as UNDETERMINED (see
+    // `call_ay::try_ay_solver`), so a `console_check_count == 0` test would stop
+    // firing here and this channel would file the harness as `Failed` while the
+    // console said INCONCLUSIVE — the two channels disagreeing about the same
+    // run. Only the reasons that actually mean "we had something and could not
+    // settle it": `SolverError` / `ChcParseError` / `PreSolveDeadline` fell over
+    // BEFORE there was anything to decide.
+    if !has_decided_check(&result.results)
+        && matches!(
             result.solver_unknown_reason,
             Some(SolverUnknownReason::UndecidedModel | SolverUnknownReason::Timeout)
-        ) {
-            HarnessVerdict::InconclusiveUndecided
-        } else {
-            HarnessVerdict::InconclusiveNoChecks
-        };
+        )
+    {
+        return HarnessVerdict::InconclusiveUndecided;
+    }
+    // "No checks" keeps the literal empty-table key, as it does in the console:
+    // it is the honest description only when there was genuinely nothing to
+    // decide (corpus: `tests/expected/slice_c_str`).
+    if console_check_count(&result.results) == 0 {
+        return HarnessVerdict::InconclusiveNoChecks;
     }
     // Exactly the two categories that make the driver print
     // `[AY:CTREX_NOT_CERTIFIED]`. `Genuine` is a real bug and `Unknown` carries
@@ -640,6 +650,38 @@ mod tests {
         let mut ok_unvalidated = test_result(VerificationStatus::Success, FailedProperties::None);
         ok_unvalidated.validation_status = ValidationStatus::Unvalidated;
         assert_eq!(verdict_of(&ok_unvalidated), "successful_unvalidated");
+    }
+
+    /// The JSON channel must not disagree with the console about the same run.
+    ///
+    /// An undecided harness now PRINTS its obligations as UNDETERMINED; keying
+    /// this classifier on an empty table would file it as `failed` while the
+    /// console said `INCONCLUSIVE (solver undecided …)`. Both shapes — the empty
+    /// table and the populated undetermined one — must land on the same verdict.
+    #[test]
+    fn a_populated_undetermined_table_is_still_inconclusive_undecided() {
+        let mut empty = test_result(VerificationStatus::Failure, FailedProperties::Other);
+        empty.solver_unknown_reason = Some(SolverUnknownReason::UndecidedModel);
+        assert_eq!(verdict_of(&empty), "inconclusive_undecided");
+
+        let mut populated = test_result(VerificationStatus::Failure, FailedProperties::Other);
+        populated.solver_unknown_reason = Some(SolverUnknownReason::UndecidedModel);
+        populated.results =
+            vec![check(CheckStatus::Undetermined), check(CheckStatus::Undetermined)];
+        assert_eq!(verdict_of(&populated), "inconclusive_undecided");
+
+        // And one DECIDED check takes it back out of the arm, exactly as in the
+        // console: the solver settled something, so this is not "undecided".
+        let mut decided = test_result(VerificationStatus::Failure, FailedProperties::Other);
+        decided.solver_unknown_reason = Some(SolverUnknownReason::UndecidedModel);
+        decided.results = vec![check(CheckStatus::Undetermined), check(CheckStatus::Failure)];
+        assert_eq!(verdict_of(&decided), "failed");
+
+        // The `slice_c_str` control: no checks at all plus a reason that means
+        // "fell over before there was anything to decide".
+        let mut solver_error = test_result(VerificationStatus::Failure, FailedProperties::Other);
+        solver_error.solver_unknown_reason = Some(SolverUnknownReason::SolverError);
+        assert_eq!(verdict_of(&solver_error), "inconclusive_no_checks");
     }
 
     /// A `should_panic` pass is a pass, and its panic-shaped verdict must not

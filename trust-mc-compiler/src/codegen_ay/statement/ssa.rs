@@ -137,6 +137,28 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         Self::ty_contains_unsafe_cell(local.ty, 0)
     }
 
+    /// Whether the interior-mutable payload named by `base_name` lives in ONE
+    /// storage slot in this model — see
+    /// [`StatementCodegen::unsafe_cell_is_single_payload`]. Same local-index
+    /// parse as `base_name_is_interior_mutable`, and the two are used together:
+    /// the read fail-close in `place_deref_first` stands down only when the
+    /// pointee is interior-mutable AND single-payload.
+    pub(super) fn base_name_unsafe_cell_is_single_payload(&self, base_name: &str) -> bool {
+        let local_prefix = "::local_";
+        let Some(local_start) = base_name.find(local_prefix).map(|p| p + local_prefix.len()) else {
+            return false;
+        };
+        let rest = &base_name[local_start..];
+        let digit_end = rest.bytes().position(|b| !b.is_ascii_digit()).unwrap_or(rest.len());
+        let Ok(local_idx) = rest[..digit_end].parse::<usize>() else {
+            return false;
+        };
+        let Some(local) = self.body.locals().get(local_idx) else {
+            return false;
+        };
+        Self::unsafe_cell_is_single_payload(local.ty, 0)
+    }
+
     /// Determine signedness from a base name by extracting the local index and looking up its type.
     ///
     /// Base names follow the pattern `{fn_name}::local_{N}` or `{fn_name}::local_{N}_field_{M}`.

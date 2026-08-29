@@ -38,7 +38,7 @@ rm -r build/x86_64-apple-darwin/tests/
 ```bash
 # Test suite run (we can only run one at a time)
 # cargo run -p compiletest -- --suite ${suite} --mode ${mode}
-cargo run -p compiletest -- --suite kani --mode kani
+cargo run -p compiletest -- --suite expected --mode expected
 ```
 
 ```bash

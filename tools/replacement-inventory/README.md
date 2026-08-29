@@ -77,7 +77,6 @@ The checked source-bound plan is the only supported route for running the
 historical denominator:
 
 ```bash
-AY_SELF_CONTAINED=1 \
 AY_SOLVER=ay \
 AY_EXPECTED_HARNESSES=818 \
 ./scripts/ay-compiletest.sh --replacement-public

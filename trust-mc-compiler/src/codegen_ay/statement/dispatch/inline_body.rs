@@ -79,6 +79,20 @@ struct InlineParentState {
     entry_keys: std::collections::HashMap<std::sync::Arc<str>, Expr>,
     ssa_concrete_values: std::collections::HashMap<String, Expr>,
     stub_indexed_refs: std::collections::HashMap<std::sync::Arc<str>, (std::sync::Arc<str>, Expr)>,
+    /// The caller's SSA version counters, carried INTO the callee frame.
+    ///
+    /// Each inline frame builds a fresh `StatementCodegen`, so without this the
+    /// callee's counters restart at 0 for EVERY base name — including the
+    /// caller's. A callee that stores through a pointer into caller storage
+    /// (`ptr::write(dest, v)` inside `mem::replace`, reached from `Cell::set`)
+    /// then re-defines `<caller>::local_N_0`, a name the caller already
+    /// equality-defined, and the two definitions contradict: the harness goes
+    /// infeasible and every check passes VACUOUSLY. The per-call-site frame salt
+    /// above fixes only the callee's OWN `<callee>::local_N` names; a caller base
+    /// reached through `ref_pointees` carries no salt. Versions are monotone, so
+    /// carrying them in can only ever hand out a HIGHER version — it removes a
+    /// collision and can never create one.
+    ssa_version: std::collections::HashMap<std::sync::Arc<str>, u32>,
     /// Pre-resolved fn_ptr callees from the caller's body scan.
     /// Enables nested fn_ptr resolution when the fn_ptr is received as a parameter.
     parent_fn_ptr_callees: Vec<(Instance, bool)>,
@@ -124,6 +138,10 @@ struct InlineExecutionResult {
     /// safe to merge into the parent's cache (same keyspace, callee-frame
     /// names are unique per `set_current_fn`).
     ssa_concrete_values: std::collections::HashMap<String, Expr>,
+    /// SSA version counters as the callee left them, merged back into the caller
+    /// so a later caller-side write to a base the CALLEE re-defined allocates a
+    /// version above the callee's, not a duplicate of it.
+    ssa_version: std::collections::HashMap<Arc<str>, u32>,
 }
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
@@ -194,6 +212,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         let inherited_state = self.capture_inline_parent_state();
+        // Snapshot of the caller's storage BEFORE the callee runs, so
+        // `merge_inline_writes_to_caller_storage` can tell a real write apart
+        // from an unchanged inherited entry.
+        let pre_call_env = inherited_state.env.clone();
         let parent_fn = self.ctx.current_fn().cloned();
         // Per-call-site SSA namespace (see `next_inline_frame_salt`). Two call
         // sites of the SAME instance in one harness would otherwise share the
@@ -220,6 +242,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.ctx.restore_current_fn(parent_fn);
 
         let result = result?;
+        self.merge_inline_ssa_versions(&result.ssa_version);
+        self.merge_inline_writes_to_caller_storage(
+            &pre_call_env,
+            &result.env,
+            &result.ref_pointees,
+        );
         self.propagate_inline_return_ref_pointees(
             destination,
             &result.return_base,
@@ -289,6 +317,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         let inherited_state = self.capture_inline_parent_state();
+        let pre_call_env = inherited_state.env.clone();
         let parent_fn = self.ctx.current_fn().cloned();
         // Per-call-site SSA namespace — same reason as in
         // `try_inline_small_instance_call` above.
@@ -309,7 +338,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // pop returns to a caller frame that must keep its own (un-salted, or
         // differently-salted) namespace.
         self.ctx.restore_current_fn(parent_fn);
-        Some(result?.result)
+        let result = result?;
+        self.merge_inline_ssa_versions(&result.ssa_version);
+        self.merge_inline_writes_to_caller_storage(
+            &pre_call_env,
+            &result.env,
+            &result.ref_pointees,
+        );
+        Some(result.result)
     }
 
     fn execute_dag_inline_body(
@@ -380,6 +416,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             entry_keys: self.entry_keys.clone(),
             ssa_concrete_values: self.ssa_concrete_values.clone(),
             stub_indexed_refs: self.stub_indexed_refs.clone(),
+            ssa_version: self.ssa_version.clone(),
             parent_fn_ptr_callees,
             parent_foreign_fn_ptrs,
         }
@@ -399,6 +436,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.entry_keys.extend(state.entry_keys);
         self.ssa_concrete_values.extend(state.ssa_concrete_values);
         self.stub_indexed_refs.extend(state.stub_indexed_refs);
+        // Take the MAX per base: the fresh frame's map is empty, so this is the
+        // caller's counter, and a later merge can only raise it.
+        for (base, version) in state.ssa_version {
+            let slot = self.ssa_version.entry(base).or_insert(0);
+            *slot = (*slot).max(version);
+        }
         self.parent_fn_ptr_callees = state.parent_fn_ptr_callees;
         self.parent_foreign_fn_ptrs = state.parent_foreign_fn_ptrs;
     }
@@ -574,6 +617,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 env: self.current_env.clone(),
                 ref_pointees: self.ref_pointees.clone(),
                 ssa_concrete_values: self.ssa_concrete_values.clone(),
+                ssa_version: self.ssa_version.clone(),
             });
         }
 
@@ -585,9 +629,72 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 env: self.current_env.clone(),
                 ref_pointees: self.ref_pointees.clone(),
                 ssa_concrete_values: self.ssa_concrete_values.clone(),
+                ssa_version: self.ssa_version.clone(),
             });
         }
         None
+    }
+
+    /// Merge the callee frame's SSA version counters back into the caller.
+    ///
+    /// Versions are monotone per base name, so taking the MAX is the only sound
+    /// merge: after the callee re-defined `<caller>::local_N` at version V, a
+    /// later caller-side write must allocate above V, never re-use it.
+    fn merge_inline_ssa_versions(&mut self, callee: &std::collections::HashMap<Arc<str>, u32>) {
+        for (base, version) in callee {
+            let slot = self.ssa_version.entry(Arc::clone(base)).or_insert(0);
+            *slot = (*slot).max(*version);
+        }
+    }
+
+    /// Publish writes the inlined callee made to CALLER-VISIBLE storage.
+    ///
+    /// The callee frame inherits the caller's env, mutates it, and is then
+    /// discarded: only the return value and some `ref_pointees` links were
+    /// carried back, and `propagate_inline_return_ref_pointees` deliberately
+    /// skips any base the caller ALREADY holds. So a store the callee made
+    /// through a pointer into caller storage was DROPPED, and the caller kept
+    /// reading its pre-call value — a lost write, which is the stale-read shape
+    /// that fabricates proofs. `Cell::set` is exactly this: the `ptr::write`
+    /// lives three inline frames down (`set` -> `replace` -> `mem::replace`) and
+    /// never reached the harness, so `c.set(9); c.get()` returned the
+    /// CONSTRUCTION value and `assert!(c.get() == 7)` was UNSAT-to-falsify.
+    ///
+    /// Restricted, deliberately, to bases that are POINTEE targets — a value
+    /// something actually points at, in either frame's `ref_pointees`. That is
+    /// the only channel through which a callee can legitimately reach caller
+    /// storage; it keeps ordinary callee-local churn and phi rebuilds of
+    /// unrelated caller locals out of the caller's env.
+    ///
+    /// SOUNDNESS: every published expression is a definition the callee already
+    /// asserted in the SAME shared solver context (`self.ctx`), so this adds no
+    /// term and weakens no constraint — it makes the caller READ the value the
+    /// program wrote instead of one it had overwritten. Entries the callee left
+    /// untouched are skipped, so an unchanged inherited value is never churned.
+    fn merge_inline_writes_to_caller_storage(
+        &mut self,
+        pre_call_env: &std::collections::BTreeMap<Arc<str>, Expr>,
+        inline_env: &std::collections::BTreeMap<Arc<str>, Expr>,
+        inline_ref_pointees: &std::collections::BTreeMap<Arc<str>, Arc<str>>,
+    ) {
+        for (base, pre_value) in pre_call_env {
+            let Some(post_value) = inline_env.get(base) else {
+                continue;
+            };
+            if post_value == pre_value {
+                continue;
+            }
+            let is_pointee_target = inline_ref_pointees.values().any(|t| t == base)
+                || self.ref_pointees.values().any(|t| t == base);
+            if !is_pointee_target {
+                continue;
+            }
+            debug!(
+                base = base.as_ref(),
+                "mini-inline: publishing callee write to caller storage"
+            );
+            self.current_env.insert(Arc::clone(base), post_value.clone());
+        }
     }
 
     fn propagate_inline_return_ref_pointees(

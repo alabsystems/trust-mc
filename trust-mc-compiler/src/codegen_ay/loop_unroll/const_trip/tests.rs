@@ -310,6 +310,78 @@ fn writing_through_a_deref_poisons_the_pointer_local() {
 }
 
 // ---------------------------------------------------------------------------
+// Aggregates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tuple_aggregate_is_recorded_field_wise() {
+    // `_1 = (_2, _3)` — the store must be able to answer `(_1.0)` and `(_1.1)`
+    // afterwards, or a loop bound built out of a struct literal (every `a..b`
+    // range is one) goes unknown and the header switch is undecidable.
+    let clean = vec![false; 8];
+    let mut sim = Simulator { poisoned: clean.clone(), store: Store::default() };
+    sim.store.write(&local_place(2), Some(i32_val(1)));
+    sim.store.write(&local_place(3), Some(i32_val(4)));
+
+    sim.assign(
+        &local_place(1),
+        &Rvalue::Aggregate(
+            AggregateKind::Tuple,
+            vec![Operand::Copy(local_place(2)), Operand::Copy(local_place(3))],
+        ),
+    );
+
+    assert_eq!(sim.store.get(&field_place(1, 0), &clean), Some(i32_val(1)));
+    assert_eq!(sim.store.get(&field_place(1, 1), &clean), Some(i32_val(4)));
+}
+
+#[test]
+fn tuple_aggregate_with_an_unknown_operand_leaves_that_field_unknown() {
+    let clean = vec![false; 8];
+    let mut sim = Simulator { poisoned: clean.clone(), store: Store::default() };
+    sim.store.write(&local_place(2), Some(i32_val(1)));
+    // _3 is never written: TOP.
+    sim.assign(
+        &local_place(1),
+        &Rvalue::Aggregate(
+            AggregateKind::Tuple,
+            vec![Operand::Copy(local_place(2)), Operand::Copy(local_place(3))],
+        ),
+    );
+    assert_eq!(sim.store.get(&field_place(1, 0), &clean), Some(i32_val(1)));
+    assert_eq!(sim.store.get(&field_place(1, 1), &clean), None);
+}
+
+#[test]
+fn aggregate_kinds_that_are_not_one_level_field_addressable_are_rejected() {
+    // The store addresses a local plus ONE field, and only a struct/tuple reads
+    // back through a bare `Field(i)`. Everything else must fall through to the
+    // whole-local TOP write.
+    assert!(aggregate_is_field_addressable(&AggregateKind::Tuple));
+    assert!(!aggregate_is_field_addressable(&AggregateKind::Array(dummy_ty())));
+    assert!(!aggregate_is_field_addressable(&AggregateKind::RawPtr(dummy_ty(), Mutability::Not)));
+}
+
+#[test]
+fn a_rejected_aggregate_erases_the_destination() {
+    // Negative control for the field-wise path: an array aggregate must leave
+    // NOTHING readable behind, neither the whole local nor a field view.
+    let clean = vec![false; 8];
+    let mut sim = Simulator { poisoned: clean.clone(), store: Store::default() };
+    sim.store.write(&local_place(1), Some(i32_val(9)));
+    sim.store.write(&field_place(1, 0), Some(i32_val(9)));
+    sim.store.write(&local_place(2), Some(i32_val(1)));
+
+    sim.assign(
+        &local_place(1),
+        &Rvalue::Aggregate(AggregateKind::Array(dummy_ty()), vec![Operand::Copy(local_place(2))]),
+    );
+
+    assert_eq!(sim.store.get(&local_place(1), &clean), None);
+    assert_eq!(sim.store.get(&field_place(1, 0), &clean), None);
+}
+
+// ---------------------------------------------------------------------------
 // Fail-open control flow
 // ---------------------------------------------------------------------------
 

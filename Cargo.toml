@@ -388,22 +388,22 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # 40-character ay revision for reproducible measurements; a floating
 # `branch = "main"` does not satisfy it. Cargo.lock intentionally records the
 # path-patched packages; this manifest rev records the exact upstream commit.
-ay-dpll = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
-ay-core = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
-ay-frontend = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
-ay-chc = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
-ay_bindings = { version = "0.19.0", package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
+ay-dpll = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
+ay-core = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
+ay-frontend = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
+ay-chc = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
+ay_bindings = { version = "0.22.0", package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
 # Trust: default-features = false drops ay's GMP-backed LRA path (`rug` +
 # `gmp-mpfr-sys`). trust-mc-driver links ay in-process; the pure-Rust
 # num_rational fallback is functionally identical and adds no native `-lgmp`
 # link, so the Trust rustc_driver link has no undefined `___gmpq_*` symbols.
-ay = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32", default-features = false }
-ay-sys = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
+ay = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3", default-features = false }
+ay-sys = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
 # Shared AY encoding/invocation surface — consumed from its canonical home in
 # the ay repo (NOT vendored). Because all ay-family deps above use the same
 # pinned rev, ay-encode's own ay-chc/ay-bindings/ay-core resolve to the same
 # rev — one shared copy of ChcProblem/VerifiedChcResult/etc.
-ay-encode = { version = "0.19.0", git = "https://github.com/alabsystems/ay.git", rev = "419bc211ca4b95c04e0c63896389a2d1ad54dc32" }
+ay-encode = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
 num-bigint = "0.4"
 
 # Common dependencies centralized for version consistency across workspace members.
@@ -431,33 +431,6 @@ thiserror = "2"
 # Ignored inside the trust superproject (a workspace member's [patch] is not
 # honored — trust's root [patch] governs there), so the reproducible trustc build
 # is unaffected.
-[patch."https://github.com/alabsystems/trust-ir.git"]
-trust-ir = { path = "../trust-ir/crates/trust-ir" }
-trust-ir-build = { path = "../trust-ir/crates/trust-ir-build" }
-
-# Trust(local-co-dev / obligation-replay): redirect the pinned ay.git rev to the
-# in-tree `first-party/ay` checkout — the SAME source the stage-2 build resolves
-# via the main workspace's [patch]. Without this, standalone `cargo build` in
-# this inner workspace would resolve a separate Git copy instead of the exact
-# sibling checkout audited by `scripts/check-ay-pin.sh`. Patching the entry
-# crates is sufficient: the sibling AY workspace resolves their transitive deps
-# (ay-core, ay-theories/*, ...) by path. This is local-build-only and does NOT
-# affect the x.py stage-2 build, which uses the trust superproject's main
-# workspace manifest.
-[patch."https://github.com/alabsystems/ay.git"]
-ay = { path = "../ay/crates/ay" }
-ay-core = { path = "../ay/crates/ay-core" }
-ay-dpll = { path = "../ay/crates/ay-dpll" }
-ay-frontend = { path = "../ay/crates/ay-frontend" }
-ay-proof = { path = "../ay/crates/ay-proof" }
-ay-translate = { path = "../ay/crates/ay-translate" }
-ay-chc = { path = "../ay/crates/ay-chc" }
-ay-allsat = { path = "../ay/crates/ay-allsat" }
-ay-sat = { path = "../ay/crates/ay-sat" }
-ay-bindings = { path = "../ay/crates/ay-bindings" }
-ay-sys = { path = "../ay/crates/ay-sys" }
-ay-encode = { path = "../ay/crates/ay-encode" }
-
 [workspace.metadata.atpkg]
 # READ THIS BEFORE ADDING A COMMAND HERE.
 #

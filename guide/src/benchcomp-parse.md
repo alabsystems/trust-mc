@@ -1,7 +1,11 @@
 # Custom parsers
 
+> **NOTE**: `benchcomp` is not checked into this repository — there is no
+> `tools/benchcomp` directory. This page describes the tool as inherited from
+> upstream Kani (see [Performance comparisons](./performance-comparisons.md)).
+
 Benchcomp ships with built-in *parsers* that retrieve the results of a benchmark suite after the run has completed.
-You can also create your own parser, either to run locally or to check into the trust-mc codebase.
+You can also create your own parser to run locally.
 
 ## Built-in parsers
 
@@ -30,7 +34,7 @@ suites:
         command: ./my-cool-parser.sh
 ```
 
-The `kani_perf` parser mentioned above, in `tools/benchcomp/benchcomp/parsers/kani_perf.py`, is a good starting point for writing a custom parser, as it also works as a standalone executable.
+The `kani_perf` parser mentioned above lives in upstream Kani's `tools/benchcomp/benchcomp/parsers/kani_perf.py`, and is a good starting point for writing a custom parser, as it also works as a standalone executable.
 Here is an example output from an executable parser:
 
 ```yaml

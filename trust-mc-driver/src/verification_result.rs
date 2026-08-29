@@ -397,6 +397,29 @@ pub(crate) fn is_unsat_assumption_vacuous(properties: &[Property]) -> bool {
     checks > 0 && unreachable == checks
 }
 
+/// `true` iff at least one non-cover check carries a DECIDED status.
+///
+/// `Success`, `Failure` and `Unreachable` are answers the solver settled;
+/// `Undetermined` and `Unknown` are the absence of an answer. Cover properties
+/// are adjudicated on their own line and `Covered`/`Uncovered` are coverage
+/// rows, not verification checks — both are excluded, matching
+/// [`is_unsat_assumption_vacuous`].
+///
+/// This is the predicate the "the solver never decided this harness" verdict
+/// must key on. Keying it on `number_properties == 0` instead — as it did while
+/// an undecided run printed an EMPTY table — conflates "no answer for N checks"
+/// with "no checks", and silently turns into a WRONG `FAILED` verdict the
+/// moment those N undecided checks become visible.
+pub(crate) fn has_decided_check(properties: &[Property]) -> bool {
+    properties.iter().any(|p| {
+        !p.is_cover_property()
+            && matches!(
+                p.status,
+                CheckStatus::Success | CheckStatus::Failure | CheckStatus::Unreachable
+            )
+    })
+}
+
 /// V5 detection (pure): `true` iff the harness declares a `cover(...)` the solver
 /// PROVED `Unsatisfiable` or `Unreachable` — a definitive negative (NOT an
 /// `Undetermined` timeout). Such a cover is a vacuous witness: the harness claims to
@@ -584,7 +607,7 @@ pub(crate) fn format_result(
         // discharged over an empty set of runs, so nothing about the program
         // was exercised. INCONCLUSIVE says that without inventing a cause.
         style("INCONCLUSIVE (every check is unreachable — dead code, nothing exercised)").yellow()
-    } else if number_properties == 0
+    } else if !has_decided_check(properties)
         && matches!(
             solver_unknown_reason,
             Some(SolverUnknownReason::UndecidedModel | SolverUnknownReason::Timeout)
@@ -603,6 +626,13 @@ pub(crate) fn format_result(
         // The marker line already carried the truth; the verdict now agrees
         // with it, and names the flag that decides this shape.
         //
+        // The key is "no check is DECIDED", NOT "there are no checks". Those
+        // coincided only while an undecided run printed an empty table; now that
+        // the checks are populated as UNDETERMINED (see `call_ay::try_ay_solver`),
+        // an `== 0` test would stop firing and the harness would fall through to
+        // `FAILED` — a WRONG verdict on a harness nothing was decided about.
+        // `has_decided_check` is false for both shapes, so both still land here.
+        //
         // Only for the reasons that actually mean "we had something and could
         // not settle it". A solver reason and an empty property list are NOT
         // mutually exclusive, which I got wrong first time round and the corpus
@@ -615,6 +645,11 @@ pub(crate) fn format_result(
     } else if number_properties == 0 {
         // #4216: A proof with 0 checks (no assertions to verify) is inconclusive,
         // not failed — there is nothing to disprove.
+        //
+        // This one KEEPS the `== 0` key on purpose: it is the literal "there was
+        // nothing here" description, and it must stay reachable for the shape
+        // `tests/expected/slice_c_str` pins — a `SolverError` that fell over
+        // before any check existed, which the arm above deliberately excludes.
         style("INCONCLUSIVE (no checks)").yellow()
     } else if validation_status == ValidationStatus::Unvalidated {
         style("UNVALIDATED (DT+BV)").yellow()

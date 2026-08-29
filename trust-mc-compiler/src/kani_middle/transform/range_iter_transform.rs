@@ -10,6 +10,7 @@
 
 use super::body::MutableBody;
 use super::range_iter::{ElemIntType, RangeForLoop};
+use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::{
     BinOp, ConstOperand, Local, Mutability, Operand, Place, ProjectionElem, Rvalue, Statement,
     StatementKind, SwitchTargets, Terminator, TerminatorKind,
@@ -19,7 +20,11 @@ use rustc_public::ty::{MirConst, Ty};
 /// Transform a detected range for-loop into an explicit indexed loop.
 ///
 /// Returns `true` if the transformation succeeded.
-pub(super) fn transform_range_loop(body: &mut MutableBody, loop_info: &RangeForLoop) -> bool {
+pub(super) fn transform_range_loop(
+    tcx: TyCtxt<'_>,
+    body: &mut MutableBody,
+    loop_info: &RangeForLoop,
+) -> bool {
     let idx_local = body.new_local(loop_info.elem_ty, loop_info.span, Mutability::Mut);
     let end_local = body.new_local(loop_info.elem_ty, loop_info.span, Mutability::Not);
     let cond_local = body.new_local(Ty::bool_ty(), loop_info.span, Mutability::Not);
@@ -32,7 +37,7 @@ pub(super) fn transform_range_loop(body: &mut MutableBody, loop_info: &RangeForL
     }
     replace_next_call(body, loop_info, idx_local, end_local, cond_local);
     replace_option_switch(body, loop_info, cond_local);
-    replace_unwrap_and_add_increment(body, loop_info, idx_local);
+    replace_unwrap_and_add_increment(tcx, body, loop_info, idx_local);
     true
 }
 
@@ -120,6 +125,7 @@ fn replace_option_switch(body: &mut MutableBody, loop_info: &RangeForLoop, cond_
 
 /// Step 4: Replace Option unwrap reads with idx reads and add `_idx += 1`.
 fn replace_unwrap_and_add_increment(
+    tcx: TyCtxt<'_>,
     body: &mut MutableBody,
     loop_info: &RangeForLoop,
     idx_local: Local,
@@ -134,7 +140,7 @@ fn replace_unwrap_and_add_increment(
                 const_: one_const,
             })
         }
-        ElemIntType::Signed(int_ty) => body.new_int_operand(1i128, int_ty, loop_info.span),
+        ElemIntType::Signed(int_ty) => body.new_int_operand(tcx, 1i128, int_ty, loop_info.span),
     };
 
     let body_block = body.block_mut(loop_info.body_bb);

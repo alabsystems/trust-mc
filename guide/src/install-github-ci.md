@@ -1,7 +1,9 @@
 # GitHub CI
 
 trust-mc can be run in GitHub CI using a workflow.
-As of now, only `x86_64-unknown-linux-gnu` (Ubuntu 22.04) is supported for trust-mc in CI.
+The workflow below is written for the `ubuntu-22.04` runner; because it builds
+trust-mc from source, the same steps work on any platform the tool supports (see
+[Installation](./install-guide.md)).
 
 ## Using trust-mc in your GitHub workflow
 

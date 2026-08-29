@@ -17,7 +17,7 @@ verification engine
   using: /work/trust-mc/target/trust-mc/bin/trust-mc-driver (local build)
   [x] trust-mc-compiler beside it
   [x] engine reports: trust-mc 0.3.0
-  [x] linked AY 0.13.0 @ 5bd746693491 (the pinned commit)
+  [x] linked AY <version> @ <sha> (the pinned commit)
 
 library sysroot  /work/trust-mc/target/trust-mc
   [x] lib           verification (std + kani crate compiled for proofs)
@@ -29,7 +29,7 @@ rust toolchain (the compiler is a rustc driver)
 
 SMT solver (bounded runs shell out to it; CHC solves in-process)
   [x] ay  /work/ay/target/release/ay
-      ay 0.13.0+build.8212.5bd74669349190eae57027c91c0430b4980046ac@...
+      ay <version>+build.<n>.<sha>@...
   [x] the binary is the same AY commit the engine links
 
 ready. Try:

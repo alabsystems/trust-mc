@@ -497,6 +497,62 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
+    /// Whether every `UnsafeCell` inside `ty` is reached through a chain of
+    /// SINGLE-PAYLOAD ADTs — i.e. the interior-mutable payload has exactly ONE
+    /// storage slot in this model, named after the outermost wrapper by
+    /// `erased_wrapper_field_sort` on both the read and the write side.
+    ///
+    /// This is the precondition under which the interior-mutability read
+    /// fail-close in `place_deref_first` may stand down. `Cell<T>` and
+    /// `UnsafeCell<T>` qualify — and so does a user struct that wraps exactly one
+    /// of them, which is the `InteriorMutability { x: Cell<u32> }` shape the
+    /// contract corpus uses.
+    ///
+    /// `RefCell<T>` deliberately does NOT: it is `{ borrow: Cell<isize>, value:
+    /// UnsafeCell<T> }`, two non-ZST fields, so the erased-wrapper identity
+    /// refuses it and its payload keeps a separate `_field_1` name. MEASURED on
+    /// `RefCell::new(7); c.replace_with(|&mut old| old + 2)`: the write escapes
+    /// into `mem::replace::arg_pointee_1`, a SYNTHETIC slot minted by
+    /// `init_reference_arguments` because the `&mut` reaches `mem::replace`
+    /// through `RefMut`'s struct field and loses its `ref_pointees` link, while
+    /// `as_ptr()` still reads `local_1_field_1`. `*c.as_ptr() == 7` is then
+    /// unfalsifiable — the very stale read the havoc exists to stop. So
+    /// multi-field interior-mutable wrappers keep failing closed, exactly as
+    /// before, until that reference identity is repaired.
+    ///
+    /// FAIL-CLOSED: anything not positively recognised answers `false`, which only
+    /// ever KEEPS the havoc.
+    pub(super) fn unsafe_cell_is_single_payload(ty: Ty, depth: u32) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else {
+            return false;
+        };
+        if def.trimmed_name() == "UnsafeCell" {
+            return true;
+        }
+        if def.kind() != AdtKind::Struct {
+            return false;
+        }
+        let variants = def.variants();
+        let Some(variant) = variants.first() else {
+            return false;
+        };
+        let mut payload = None;
+        for f in variant.fields() {
+            let field_ty = f.ty_with_args(&args);
+            if Self::layout_is_zst(field_ty) {
+                continue;
+            }
+            if payload.is_some() {
+                return false; // more than one non-ZST field: not single-payload
+            }
+            payload = Some(field_ty);
+        }
+        payload.is_some_and(|t| Self::unsafe_cell_is_single_payload(t, depth + 1))
+    }
+
     /// Track Copy/Move of references and wrapper values that carry reference fields.
     ///
     /// Direct ref copies (`_new = move _old_ref`) propagate the pointee mapping.

@@ -13,8 +13,12 @@
 
 use crate::kani_middle::kani_functions::KaniHook;
 use crate::kani_queries::QueryDb;
+use rustc_middle::mir::Const as InternalMirConst;
+use rustc_middle::mir::interpret::Scalar;
+use rustc_middle::ty::{ScalarInt, TyCtxt, TypingEnv};
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::*;
+use rustc_public::rustc_internal;
 use rustc_public::ty::{GenericArgs, IntTy, MirConst, Span, Ty, UintTy};
 use std::fmt::Debug;
 use std::mem;
@@ -190,42 +194,44 @@ impl MutableBody {
         self.new_const_operand(literal, span)
     }
 
-    /// Create an operand for a signed integer constant.
+    /// Create an operand for a signed integer constant of type `int_ty`.
     ///
-    /// Uses two's complement encoding: the signed value is encoded as its
-    /// unsigned bit pattern and stored via `MirConst::try_from_uint`. This
-    /// workaround is needed because rustc's stable_mir lacks `try_from_int`.
+    /// The constant's MIR type is the SIGNED type, not the same-width unsigned
+    /// one. That distinction is load-bearing: `Rvalue::ty` for an arithmetic
+    /// `BinaryOp` asserts `lhs_ty == rhs_ty` (rustc_middle `BinOp::ty`), so a
+    /// `u32` literal used as the right operand of an `i32` add is ill-typed MIR
+    /// and ICEs the moment anything asks the rvalue for its type.
     ///
-    /// The resulting constant has the corresponding unsigned type internally
-    /// but represents the same bit pattern as the signed value.
-    pub(crate) fn new_int_operand(&mut self, val: i128, int_ty: IntTy, span: Span) -> Operand {
-        // Map signed type to unsigned type and bit width
-        let (uint_ty, width) = match int_ty {
-            IntTy::I8 => (UintTy::U8, 8u32),
-            IntTy::I16 => (UintTy::U16, 16),
-            IntTy::I32 => (UintTy::U32, 32),
-            IntTy::I64 => (UintTy::U64, 64),
-            IntTy::I128 => (UintTy::U128, 128),
-            // For isize, use target pointer width to preserve the right bit pattern
-            // across 32/64-bit targets.
-            IntTy::Isize => (UintTy::Usize, usize::BITS),
+    /// `rustc_public::ty::MirConst` only exposes `try_from_uint`, so the signed
+    /// constant is built on the internal side (`ScalarInt::try_from_int`, which
+    /// does the two's-complement truncation against the TARGET-computed layout
+    /// size — correct for `isize` on a 32-bit target too) and converted back
+    /// with `rustc_internal::stable`, which interns it so that a later
+    /// `internal()` round-trip yields the same constant.
+    pub(crate) fn new_int_operand(
+        &mut self,
+        tcx: TyCtxt<'_>,
+        val: i128,
+        int_ty: IntTy,
+        span: Span,
+    ) -> Operand {
+        let ty = match int_ty {
+            IntTy::I8 => tcx.types.i8,
+            IntTy::I16 => tcx.types.i16,
+            IntTy::I32 => tcx.types.i32,
+            IntTy::I64 => tcx.types.i64,
+            IntTy::I128 => tcx.types.i128,
+            IntTy::Isize => tcx.types.isize,
         };
-
-        // Two's complement encoding: negative values wrap around
-        let bits = if val >= 0 {
-            val as u128
-        } else if width == 128 {
-            // Special case: 1u128 << 128 overflows, but Rust's cast
-            // already does two's complement conversion for i128 -> u128
-            val as u128
-        } else {
-            // For negative values: -1 becomes 0xFF..FF for the given width
-            // Formula: 2^width + val (where val is negative)
-            (1u128 << width).wrapping_add(val as u128)
-        };
-
-        let literal = MirConst::try_from_uint(bits, uint_ty)
-            .expect("two's complement bit pattern should fit in uint type");
+        let typing_env = TypingEnv::fully_monomorphized();
+        let size = tcx
+            .layout_of(typing_env.as_query_input(ty))
+            .unwrap_or_else(|e| panic!("no layout for signed integer type {ty:?}: {e:?}"))
+            .size;
+        let scalar = ScalarInt::try_from_int(val, size)
+            .unwrap_or_else(|| panic!("{val} is not representable in {ty:?}"));
+        let literal =
+            rustc_internal::stable(InternalMirConst::from_scalar(tcx, Scalar::Int(scalar), ty));
         self.new_const_operand(literal, span)
     }
 

@@ -24,10 +24,10 @@ use crate::args::AYSolver;
 use crate::ay_parse::{
     apply_kani_property_naming, build_cover_properties_from_sat_checks,
     build_coverage_results_from_sat_checks, build_success_properties,
-    determine_failed_from_properties, load_vc_artifact, parse_cover_properties,
-    parse_cover_sat_check_output, parse_coverage_results, parse_kani_any_trace,
-    parse_solver_output, parse_violation_entry_names, parse_violation_properties,
-    vc_artifact_path_for_smt,
+    build_undetermined_properties, determine_failed_from_properties, load_vc_artifact,
+    parse_cover_properties, parse_cover_sat_check_output, parse_coverage_results,
+    parse_kani_any_trace, parse_solver_output, parse_violation_entry_names,
+    parse_violation_properties, vc_artifact_path_for_smt,
 };
 use crate::coverage::cov_results::CoverageResults;
 use crate::deadline::Deadline;
@@ -402,10 +402,23 @@ impl KaniSession {
                             );
                             let runtime = start.elapsed();
                             let validation_status = logic_tier.validation_status();
+                            // Same Kani-parity population as the undecided arm
+                            // in `try_ay_solver`: a timeout is the other way to
+                            // have obligations and settle none of them, and the
+                            // verdict chain already treats the two identically
+                            // (`SolverUnknownReason::Timeout` sits beside
+                            // `UndecidedModel` in the "solver undecided" arm).
+                            // Printing an empty table for one and a full
+                            // UNDETERMINED table for the other would be the same
+                            // news told two ways.
+                            let results = build_undetermined_properties(
+                                &extract_violation_declarations_from_content(&smt_content),
+                                load_vc_artifact(&vc_artifact_path_for_smt(smt_file)).as_ref(),
+                            );
                             return Ok(VerificationResult {
                                 status: VerificationStatus::Failure,
                                 failed_properties: FailedProperties::Other,
-                                results: Vec::new(),
+                                results,
                                 runtime,
                                 generated_concrete_test: false,
                                 coverage_results: None,
@@ -781,6 +794,43 @@ impl KaniSession {
         let mut properties =
             parse_violation_properties(&stdout, true, Some(&any_trace), location_map.as_ref());
 
+        // Kani-parity per-check UNDETERMINED population.
+        //
+        // The list above is derived from the solver's MODEL. On the undecided
+        // arm of this path — `unknown` (solver incompleteness, an unwind bound
+        // that truncated the search), or a `sat` whose model names no violation
+        // — there is no model to read, so the list came back EMPTY and the
+        // report printed an empty check table under `** 0 of 0 failed`. That is
+        // indistinguishable from a harness that emitted no obligation at all,
+        // which is the opposite diagnosis. Kani prints every check it emitted
+        // with `Status: UNDETERMINED` and the real description.
+        //
+        // Rebuild the list from the SMT declarations, which are the obligations
+        // the compiler actually emitted, exactly as the UNSAT arm above does via
+        // `build_success_properties` — same names, same locations, same
+        // descriptions, only the status differs.
+        //
+        // SOUNDNESS: `Undetermined` asserts nothing. No obligation is deleted
+        // (this only ADDS the ones that were being hidden), nothing undecided is
+        // promoted to SUCCESS, and no failure is masked — the branch is entered
+        // only when the model-derived list is empty, so there is no decided
+        // verdict to overwrite. The verdict arm in `verification_result` keys on
+        // "no check is DECIDED", not on an empty list, so the harness still
+        // reports INCONCLUSIVE rather than falling through to FAILED.
+        //
+        // `no_model_verdict` is the trigger, and it is deliberately the EMPTY
+        // model-derived list rather than a re-read of the solver's answer word:
+        // it is exactly the condition under which there is nothing to overwrite.
+        let no_model_verdict = properties.is_empty();
+        let mut synthesized_from_declarations = false;
+        if no_model_verdict {
+            let violation_names = extract_violation_declarations_from_content(smt_content);
+            if !violation_names.is_empty() {
+                properties = build_undetermined_properties(&violation_names, location_map.as_ref());
+                synthesized_from_declarations = true;
+            }
+        }
+
         // Kani-parity all-properties classification: the single SAT model only
         // surfaces one (or a subset) of the failing checks. Re-query each
         // undecided violation flag individually (sat → FAILURE, unsat →
@@ -824,8 +874,26 @@ impl KaniSession {
         );
 
         // Part of #922: Also parse cover properties
-        let cover_properties =
+        let mut cover_properties =
             parse_cover_properties(&stdout, true, Some(&any_trace), location_map.as_ref());
+        // Same undecided arm as the violation population above: with no model
+        // there is no per-cover verdict either, so the covers this harness
+        // declared were vanishing from the report entirely. Kani prints them
+        // UNDETERMINED (corpus: `tests/expected/cover/cover-undetermined`).
+        // Guarded on the PARSED list being empty as well, so a cover-only
+        // harness whose model DID name its covers is never listed twice.
+        if no_model_verdict && cover_properties.is_empty() {
+            let cover_names = extract_cover_declarations_from_content(smt_content);
+            if !cover_names.is_empty() {
+                let undecided = vec![None; cover_names.len()];
+                cover_properties = build_cover_properties_from_sat_checks(
+                    &cover_names,
+                    &undecided,
+                    location_map.as_ref(),
+                );
+                synthesized_from_declarations = true;
+            }
+        }
         properties.extend(cover_properties);
         // Kani-parity display names, as on the UNSAT path above.
         apply_kani_property_naming(&mut properties);
@@ -859,7 +927,14 @@ impl KaniSession {
         // Detect contradictory result: solver returned SAT but no violation predicate
         // is true in the model. This indicates solver incompleteness (e.g., ALL logic
         // with datatypes + bitvectors) or a codegen constraint issue.
+        // `!synthesized_from_declarations`: the warning is about a MODEL that
+        // named no violation. Rows built from the SMT declarations came from no
+        // model at all, so firing on them would report a contradiction that did
+        // not happen — on EVERY undecided run. The flag is exactly "this list
+        // contains rows the model did not produce", which is why it is set by
+        // both synthesis branches and not by either one alone.
         if base_status == VerificationStatus::Failure
+            && !synthesized_from_declarations
             && !properties.is_empty()
             && properties.iter().all(|p| p.status != CheckStatus::Failure)
         {

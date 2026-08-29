@@ -91,9 +91,9 @@ Two Kani features were carried over rather than reimplemented from scratch. Both
 
 Functional and genuinely wired to AY counterexample models, not stubbed. Flow:
 
-1. `call_ay.rs:481` parses AY's `get-value` output on a `Failure` verdict via `ay_parse::trace::parse_kani_any_trace()`, which extracts `(ay_any_N <value>)` pairs from the SMT model and converts them to `TraceItem` assignments.
-2. `parse_violation_properties` / `parse_cover_properties` attach that trace to each satisfied `Property` (`violation.rs:305,546`).
-3. `harness_runner.rs:562` calls `gen_and_add_concrete_playback()` after every harness.
+1. `call_ay.rs:595` parses AY's `get-value` output on a `Failure` verdict via `ay_parse::trace::parse_kani_any_trace()`, which extracts `(ay_any_N <value>)` pairs from the SMT model and converts them to `TraceItem` assignments.
+2. `parse_violation_properties` / `parse_cover_properties` attach that trace to each satisfied `Property` (`violation.rs:296,559`).
+3. `harness_runner.rs:1287` calls `gen_and_add_concrete_playback()` after every harness.
 4. `concrete_playback/test_generator.rs:39` runs `extract_harness_values()` over `verification_result.results` (the `Property` traces) via the `concrete_vals_extractor` crate, then formats and either prints (`Print`) or injects in-place (`InPlace`) a Rust unit test.
 5. The `playback` subcommand (`concrete_playback/playback.rs`) compiles and runs the generated tests with the trust-mc compiler.
 
@@ -101,12 +101,12 @@ Gating, conflicts (`--quiet`+print, `--output-format=old`, multi-thread `--jobs`
 
 ### Coverage — **working**
 
-Works under AY, not dead or stubbed. The `--coverage` flag is gated by `-Z source-coverage` (`validation.rs:269`), identical to Kani. Coverage is implemented over AY rather than CBMC's coverage instrumentation:
+Works under AY, not dead or stubbed. The `--coverage` flag is gated by `-Z source-coverage` (`validation.rs:270`), identical to Kani. Coverage is implemented over AY rather than CBMC's coverage instrumentation:
 
 - The compiler emits `ay_coverage_*` boolean predicates per code region.
-- `call_ay.rs:543/625` builds `CoverageResults` either from per-region AY SAT reachability checks (`build_coverage_results_from_sat_checks`, querying `check_cover_satisfiability`) on the UNSAT/success path, or by parsing `ay_coverage_*` booleans from `get-value` output (`parse_coverage_results`) on the SAT path.
+- `call_ay.rs:743/833` builds `CoverageResults` either from per-region AY SAT reachability checks (`build_coverage_results_from_sat_checks`, querying `check_cover_satisfiability`) on the UNSAT/success path, or by parsing `ay_coverage_*` booleans from `get-value` output (`parse_coverage_results`) on the SAT path.
 - Source locations come from the VC artifact location map (#1164).
-- `main.rs:700-716` then writes `kanicov_<stamp>` metadata (`kanimap` source list) and per-harness `_kaniraw.json` results via `coverage/cov_session.rs`, mirroring Kani's `kanicov` layout for the downstream report tool.
+- `main.rs:769` then writes `kanicov_<date>` metadata (`kanimap` source list) and per-harness `_kaniraw.json` results via `coverage/cov_session.rs`, mirroring Kani's `kanicov` layout for the downstream report tool.
 - `cov_results.rs` models `CoverageRegion`/`CoverageCheck`/`CheckStatus` and a `Display` impl.
 
 **Caveat:** `cov_session.rs` notes coverage **mappings** are not yet persisted in metadata (a TODO carried from Kani), and granularity depends on the compiler emitting `ay_coverage_*` predicates — but the end-to-end path (encode → AY-decide → serialize → save) is live.

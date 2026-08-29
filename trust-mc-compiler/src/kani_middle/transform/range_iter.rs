@@ -56,7 +56,7 @@ impl TransformPass for RangeIterUnrollPass {
         query_db.args().unstable_features.iter().any(|f| f == "range-iter-unroll")
     }
 
-    fn transform(&mut self, _tcx: TyCtxt, body: Body, instance: Instance) -> (bool, Body) {
+    fn transform(&mut self, tcx: TyCtxt, body: Body, instance: Instance) -> (bool, Body) {
         debug!("RangeIterUnrollPass::transform for {:?}", instance.name());
 
         let range_loops = find_range_for_loops(&body);
@@ -68,7 +68,7 @@ impl TransformPass for RangeIterUnrollPass {
         let mut transformed = false;
 
         for loop_info in range_loops {
-            if transform_range_loop(&mut mutable_body, &loop_info) {
+            if transform_range_loop(tcx, &mut mutable_body, &loop_info) {
                 transformed = true;
                 debug!(
                     "Transformed range loop: range={:?}, into_iter_bb={}",

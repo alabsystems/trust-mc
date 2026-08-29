@@ -3829,6 +3829,116 @@ fn typed_chc_translation_summarizes_direct_call_with_checked_overflow() {
 }
 
 #[test]
+fn typed_chc_translation_summarizes_direct_call_constructing_nested_wrapper() {
+    // The operative `proc_macro2::Literal { inner: imp::Literal, _marker }` shape: a
+    // callee that CONSTRUCTS a wrapper whose field is itself an aggregate, then reads
+    // that field back out. BEFORE nested-aggregate field support in the call-summary
+    // interpreter, `Inst::InsertField` bailed on the first non-scalar `value_ty` and
+    // `Inst::ExtractField` bailed on a non-scalar result ty, so EVERY ordinary
+    // newtype/wrapper constructor declined (UnsupportedDirectCallSummary) and its
+    // caller was conservatively modeled as an unconditional may-panic. Both arms now
+    // splice the nested `ValueBinding::Aggregate` that `resolve_field_binding` /
+    // `fresh_call_summary_value` already build, so the callee summarizes and its
+    // underflow obligation propagates as a GUARDED caller error rule — a real
+    // underflow still refutes (no false PROVE), and the obligation is not deleted.
+    let mut mb = ModuleBuilder::new("test_direct_call_nested_wrapper_chc");
+
+    let inner_id = StructId::new(0);
+    let inner_ty = Ty::Struct(inner_id);
+    mb.add_struct(StructDef {
+        repr: Default::default(),
+        id: inner_id,
+        name: "Inner".to_owned(),
+        fields: vec![FieldDef { name: "v".to_owned(), ty: Ty::U32, offset: None }],
+        size: None,
+        align: None,
+    });
+
+    let outer_id = StructId::new(1);
+    let outer_ty = Ty::Struct(outer_id);
+    mb.add_struct(StructDef {
+        repr: Default::default(),
+        id: outer_id,
+        name: "Outer".to_owned(),
+        fields: vec![
+            FieldDef { name: "inner".to_owned(), ty: inner_ty.clone(), offset: None },
+            FieldDef { name: "tag".to_owned(), ty: Ty::U32, offset: None },
+        ],
+        size: None,
+        align: None,
+    });
+
+    let callee_ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U32]);
+    let caller_ft = mb.add_func_type(vec![Ty::U32], vec![]);
+
+    // callee wrap_dec(n): `Outer { inner: Inner { v: n }, tag: 0 }.inner.v - 1`, with
+    // the underflow branching to an `Unreachable` panic block.
+    let mut fb = mb.function("wrap_dec_chc", callee_ft);
+    let entry = fb.create_block();
+    let ok = fb.create_block();
+    let panic = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let n = fb.add_block_param(entry, Ty::U32);
+
+    let inner_undef = fb.undef(inner_ty.clone());
+    let inner = fb.insert_field(inner_ty.clone(), inner_undef, 0, n);
+    let outer_undef = fb.undef(outer_ty.clone());
+    // The nested-aggregate VALUE insert — the arm that used to bail.
+    let outer_with_inner = fb.insert_field(outer_ty.clone(), outer_undef, 0, inner);
+    let zero = fb.iconst(Ty::U32, 0);
+    let outer = fb.insert_field(outer_ty.clone(), outer_with_inner, 1, zero);
+    // The nested-aggregate RESULT extract — the mirror arm that used to bail.
+    let read_inner = fb.extract_field(inner_ty.clone(), outer, 0);
+    let v = fb.extract_field(Ty::U32, read_inner, 0);
+
+    let one = fb.iconst(Ty::U32, 1);
+    let (value, flag) = fb.overflow(OverflowOp::SubOverflow, Ty::U32, v, one);
+    fb.condbr(flag, panic, vec![], ok, vec![]);
+    fb.switch_to_block(ok);
+    fb.ret(vec![value]);
+    fb.switch_to_block(panic);
+    fb.unreachable();
+    fb.build();
+
+    // caller(n): `wrap_dec(n); ret` — forwards an unconstrained n.
+    let mut fb = mb.function("caller_of_wrap_dec_chc", caller_ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let caller_n = fb.add_block_param(entry, Ty::U32);
+    let _ = fb.call(trust_ir::value::FuncId::new(0), vec![caller_n]);
+    fb.ret(vec![]);
+    fb.build();
+
+    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    assert_eq!(outputs.len(), 2);
+    let caller = &outputs[1];
+    assert!(
+        caller.diagnostics.is_empty(),
+        "a callee CONSTRUCTING and re-reading a nested wrapper aggregate must summarize \
+         cleanly (no UnsupportedDirectCallSummary), got {:?}",
+        caller.diagnostics
+    );
+    // The obligation must SURVIVE the widening: the callee's underflow still reaches
+    // the caller as an error rule. An obligation that DISAPPEARS is not one that
+    // proved, so this pins presence, and the guard pins that it is not vacuous.
+    let error_rule = caller
+        .vc
+        .rules
+        .iter()
+        .find(|rule| rule.head.name == "error")
+        .expect("the wrapped checked-sub underflow must propagate as a caller error rule");
+    assert!(
+        error_rule.body.relation.as_ref().is_some_and(|rel| rel.name == "bb0")
+            && format!("{:?}", error_rule.body.constraints).contains("bb0_v0"),
+        "the panic must be GUARDED by the forwarded argument (reachable iff it \
+         underflows), not unconditional; constraints: {:?}",
+        error_rule.body.constraints
+    );
+}
+
+#[test]
 fn typed_chc_translation_summarizes_direct_call_with_signed_negation() {
     // A callee performing a signed negation `-x` (`Inst::UnOp { Neg }` — the shape of
     // `signed_min`'s `-(1 << (width-1))`). The main translate leaves `Inst::UnOp`

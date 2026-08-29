@@ -156,7 +156,7 @@ have tests, run `cargo test --workspace --no-run` and check the compiled test
 binaries. Key packages with unit tests include:
  * `trust-mc-driver` - CLI and driver logic
  * `trust-mc-compiler` - Compiler and codegen
- * `ay_bindings` - AY solver bindings
+ * `trust-mc-trust-bmc` - trust_ir ingestion and native CHC/BMC translation
 
 ## Python unit tests
 

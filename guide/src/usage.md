@@ -9,7 +9,7 @@ If you plan to integrate trust-mc in your projects, the recommended approach is 
 This will handle dependencies automatically, and it can be configured (if needed) in `Cargo.toml`.
 But `trust-mc` is useful for small examples/tests.
 
-> **Back-compat:** `targo trust-mc` remains a working alias for `targo trust-mc`
+> **Back-compat:** `cargo trust-mc` remains a working alias for `targo trust-mc`
 > — the tool ships both a `targo-trust-mc` and a `cargo-trust-mc` proxy, so every
 > existing script and command line keeps working. New docs use the Trust-native
 > `targo trust-mc` spelling.

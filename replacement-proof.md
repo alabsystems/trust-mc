@@ -155,13 +155,12 @@ source scripts/ay_python.sh
 "$AY_PYTHON_BIN" scripts/replacement_harness_dispositions.py --check
 "$AY_PYTHON_BIN" -m unittest scripts/test_replacement_evidence_tools.py
 
-AY_SELF_CONTAINED=1 AY_SOLVER=ay ./scripts/ay-compiletest.sh --self-test
+AY_SOLVER=ay ./scripts/ay-compiletest.sh --self-test
 ```
 
 Run the complete source-bound public plan with:
 
 ```bash
-AY_SELF_CONTAINED=1 \
 AY_SOLVER=ay \
 AY_EXPECTED_HARNESSES=818 \
 ./scripts/ay-compiletest.sh --replacement-public

@@ -331,16 +331,32 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         {
             return None;
         }
-        // INTERIOR MUTABILITY IS EXCLUDED, and that is a soundness gate, not
-        // conservatism. `Cell<T>`/`UnsafeCell<T>` are erased wrappers too, but
-        // their payload is written through a RAW pointer minted by
-        // `UnsafeCell::get` — a path that never goes through the borrow whose name
-        // `track_ref_pointees` aligns. Make the read an identity there and
-        // `c.set(9); c.get()` reads the pre-`set` value, so `v == 7` PROVES.
-        // Measured, not assumed. These therefore keep failing closed, as before.
-        if Self::contains_unsafe_cell(base_ty, 0) {
-            return None;
-        }
+        // INTERIOR MUTABILITY IS INCLUDED — this is the ONE STORAGE THEORY for a
+        // `Cell`/`UnsafeCell` payload, and excluding it is what USED to fabricate
+        // proofs, not what prevented them.
+        //
+        // The exclusion was written on the belief that `UnsafeCell::get` mints its
+        // raw pointer on "a path that never goes through the borrow whose name
+        // `track_ref_pointees` aligns". Measured on `Cell::new(7); c.set(9)`, that
+        // is not what happens: `UnsafeCell::get` lowers to `&raw const (*self).0`,
+        // i.e. exactly the Ref/AddressOf rvalue `track_ref_pointees` names. With
+        // the exclusion in place the two sides of ONE location got two names —
+        //
+        //     write  `ptr::write(dest, 9)` -> env slot `<harness>::local_1_field_0`
+        //     read   `Cell::get`           -> env slot `<harness>::local_1`
+        //
+        // — so `set` was invisible and `get()` returned the CONSTRUCTION value. The
+        // exported VC for `c.set(9); assert!(c.get() == 7)` was UNSAT (i.e. would
+        // be reported SUCCESSFUL); only AY's strict proof self-check downgrading it
+        // to `unknown` kept that false PROOF off the console. Naming both sides
+        // after the wrapper is what closes it: `assert!(c.get() == 7)` now FAILS
+        // and `assert!(c.get() == 9)` SUCCEEDS.
+        //
+        // Two collaborators are REQUIRED for that to hold, both in `inline_body`:
+        // the callee frame must carry the caller's SSA versions (else the write
+        // re-defines `local_1_0` and the harness goes VACUOUS), and a write the
+        // callee makes to caller-visible storage must propagate back to the
+        // caller's env (else `Cell::get` still reads the pre-`set` value).
         if Self::infer_sort_from_ty(field_ty)? != base_sort {
             return None;
         }
@@ -352,61 +368,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// sees `PhantomData` and other all-ZST composites. A type whose layout
     /// cannot be computed answers `false`, which only ever makes the caller
     /// refuse.
-    fn layout_is_zst(ty: rustc_public::ty::Ty) -> bool {
+    pub(super) fn layout_is_zst(ty: rustc_public::ty::Ty) -> bool {
         ty.layout().ok().is_some_and(|l| l.shape().is_sized() && l.shape().size.bytes() == 0)
-    }
-
-    /// Whether `ty` may contain an `UnsafeCell` — the sole primitive of interior
-    /// mutability — anywhere in its own representation. FAIL-CLOSED: any type this
-    /// cannot fully inspect (generic param, alias, `dyn`, closure, foreign, or a
-    /// walk deeper than the bound) answers `true`.
-    ///
-    /// Deliberately distinct from `codegen_assign_ref`'s `definitely_freeze`, which
-    /// answers a stricter question for the durable-snapshot publish and refuses
-    /// EVERY union outright. Here a union is exactly what must be looked inside:
-    /// `MaybeUninit<T>` is a union with no interior mutability at all, and refusing
-    /// it would leave `assume_init` failing closed for no reason.
-    fn contains_unsafe_cell(ty: rustc_public::ty::Ty, depth: u32) -> bool {
-        use rustc_public::ty::{RigidTy, TyKind};
-        if depth > 16 {
-            return true;
-        }
-        let TyKind::RigidTy(rigid) = ty.kind() else {
-            return true; // generic param / alias / bound: not certain
-        };
-        match rigid {
-            RigidTy::Bool
-            | RigidTy::Char
-            | RigidTy::Int(_)
-            | RigidTy::Uint(_)
-            | RigidTy::Float(_)
-            | RigidTy::Str
-            | RigidTy::Never
-            | RigidTy::FnDef(..)
-            | RigidTy::FnPtr(_)
-            // Pointer-like: the pointer's own bytes carry no interior mutability;
-            // the pointee is a separate allocation, not part of this representation.
-            | RigidTy::RawPtr(..)
-            | RigidTy::Ref(..) => false,
-            RigidTy::Array(elem, _) | RigidTy::Slice(elem) | RigidTy::Pat(elem, _) => {
-                Self::contains_unsafe_cell(elem, depth + 1)
-            }
-            RigidTy::Tuple(tys) => {
-                tys.into_iter().any(|t| Self::contains_unsafe_cell(t, depth + 1))
-            }
-            RigidTy::Adt(def, args) => {
-                if def.trimmed_name() == "UnsafeCell" {
-                    return true;
-                }
-                def.variants().into_iter().any(|v| {
-                    v.fields()
-                        .into_iter()
-                        .any(|f| Self::contains_unsafe_cell(f.ty_with_args(&args), depth + 1))
-                })
-            }
-            // Foreign / Closure / Coroutine* / Dynamic / CoroutineWitness: opaque.
-            _ => true,
-        }
     }
 
     /// Infer AY sort for ADT (enum/struct) types.

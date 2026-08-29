@@ -40,6 +40,23 @@ No `v0.3.0` tag has been cut, so the entries below remain under
   must-summary, so `(hdr #x00 n)` claimed every state was proven reachable and
   PDR emitted a 1-step counterexample with no assignments on SAFE programs.
 
+- An undecided harness no longer prints an EMPTY check table. When the solver
+  answers `unknown` (or returns a model naming no violation) there is no
+  per-check verdict to read, so the report showed `RESULTS:` with nothing under
+  it and `** 0 of 0 failed` — the report of a harness that emitted no obligation
+  at all, which is the opposite diagnosis. The checks the compiler actually
+  emitted are now listed with `Status: UNDETERMINED` and their real
+  descriptions, rebuilt from the same SMT declarations the UNSAT path uses, and
+  the summary carries the count (`** 0 of 23 failed (23 undetermined)`), as Kani
+  does. 75 of the 462 `tests/expected` harnesses printed the empty table.
+  `Undetermined` claims nothing, so no obligation is dropped and nothing
+  undecided is promoted. The `INCONCLUSIVE (solver undecided …)` verdict — in
+  both the console and the `--proof-summary-json` / `--sarif` channel — now keys
+  on "no check is DECIDED" rather than "there are no checks", which those two
+  populated tables would otherwise have fallen through into a wrong `FAILED`
+  verdict. `INCONCLUSIVE (no checks)` keeps its literal empty-table key for the
+  case where the solver fell over before any check existed.
+
 ### Added (the standalone `trust-mc` binary)
 - `trust-mc` is now a self-describing front door. `explain [TOPIC]` describes
   how the tool works from inside the tool (pipeline, harnesses, bounded vs
