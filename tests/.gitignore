@@ -4,6 +4,7 @@
 !trust-mc/replacement-harness-inventory.proof.json
 !trust-mc/non-proof-closure.json
 !trust-mc/replacement-harness-dispositions.json
+!trust-mc/replacement-upstream-inactive.json
 kani_concrete_playback
 rmet*/
 target/

@@ -35,9 +35,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     // BigInt stub interception (Part of #734)
     // =========================================================================
 
-    /// Resolve a call operand to its canonical def path.
+    /// Resolve a call operand to its canonical def path, against the ctx body.
     pub(in crate::codegen_ay::chc) fn resolve_callee_path(&self, func: &Operand) -> Option<String> {
-        let func_ty = func.ty(self.body.locals()).ok()?;
+        self.resolve_callee_path_with_locals(func, self.body.locals())
+    }
+
+    /// Resolve a call operand against an EXPLICIT locals table.
+    ///
+    /// `Operand::ty` indexes `locals[local]`, so the table must be the one the
+    /// operand was drawn from. `ChcCtx.body` is a `&'body Body` bound to the
+    /// OUTER function and cannot be rebound while a callee is being inlined; the
+    /// virtual-dispatch walker therefore carries the inlined body's locals in
+    /// `InlineWalkCtx.locals` separately. Resolving an inlined operand against
+    /// `self.body` reads the wrong table and, once the callee has more locals
+    /// than the outer body, indexes past its end — an ICE
+    /// (#chc-inline-operand-locals: `index out of bounds: the len is 5 but the
+    /// index is 7`, reached through five nested `speculative_inline` frames on
+    /// `tokio_test::block_on::async_block`).
+    pub(in crate::codegen_ay::chc) fn resolve_callee_path_with_locals(
+        &self,
+        func: &Operand,
+        locals: &[rustc_public::mir::LocalDecl],
+    ) -> Option<String> {
+        let func_ty = func.ty(locals).ok()?;
         let (fn_def, fn_args) = match func_ty.kind() {
             TyKind::RigidTy(RigidTy::FnDef(def, args)) => (def, args),
             _ => return None, // external enum: TyKind
@@ -56,7 +76,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Used when `resolve_callee_path` returns `None` for const-generic unstable
     /// intrinsics where `Instance::resolve` may fail. Part of #3741.
     pub(in crate::codegen_ay::chc) fn resolve_fn_def_name(&self, func: &Operand) -> Option<String> {
-        let func_ty = func.ty(self.body.locals()).ok()?;
+        self.resolve_fn_def_name_with_locals(func, self.body.locals())
+    }
+
+    /// `resolve_fn_def_name` against an explicit locals table; see
+    /// `resolve_callee_path_with_locals` for why the table must be the operand's own.
+    pub(in crate::codegen_ay::chc) fn resolve_fn_def_name_with_locals(
+        &self,
+        func: &Operand,
+        locals: &[rustc_public::mir::LocalDecl],
+    ) -> Option<String> {
+        let func_ty = func.ty(locals).ok()?;
         let fn_def = match func_ty.kind() {
             TyKind::RigidTy(RigidTy::FnDef(def, _)) => def,
             _ => return None,
@@ -93,9 +123,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Dispatch modules should call this once, then route on the result.
     /// Part of #2408.
     pub(in crate::codegen_ay::chc) fn detect_stub(&self, func: &Operand) -> Option<StubKind> {
-        let callee_path =
-            self.resolve_callee_path(func).or_else(|| self.resolve_fn_def_name(func))?;
-        if let Some(stub) = self.detect_string_eq_shared_impl(func, &callee_path) {
+        self.detect_stub_with_locals(func, self.body.locals())
+    }
+
+    /// `detect_stub` for an operand drawn from a body OTHER than `self.body` —
+    /// the inlined callee inside the virtual-dispatch walker. Every locals read
+    /// on this path goes through the explicit table; see
+    /// `resolve_callee_path_with_locals`.
+    pub(in crate::codegen_ay::chc) fn detect_stub_with_locals(
+        &self,
+        func: &Operand,
+        locals: &[rustc_public::mir::LocalDecl],
+    ) -> Option<StubKind> {
+        let callee_path = self
+            .resolve_callee_path_with_locals(func, locals)
+            .or_else(|| self.resolve_fn_def_name_with_locals(func, locals))?;
+        if let Some(stub) = self.detect_string_eq_shared_impl_with_locals(func, &callee_path, locals)
+        {
             return Some(stub);
         }
         self.stub_registry.lookup(&callee_path)
@@ -243,11 +287,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     fn detect_string_eq_shared_impl(&self, func: &Operand, callee_path: &str) -> Option<StubKind> {
+        self.detect_string_eq_shared_impl_with_locals(func, callee_path, self.body.locals())
+    }
+
+    fn detect_string_eq_shared_impl_with_locals(
+        &self,
+        func: &Operand,
+        callee_path: &str,
+        locals: &[rustc_public::mir::LocalDecl],
+    ) -> Option<StubKind> {
         if !callee_path.ends_with("::eq") || !callee_path.contains("PartialEq") {
             return None;
         }
 
-        let func_ty = func.ty(self.body.locals()).ok()?;
+        let func_ty = func.ty(locals).ok()?;
         if !matches!(func_ty.kind(), TyKind::RigidTy(RigidTy::FnDef(_, _))) {
             return None;
         }

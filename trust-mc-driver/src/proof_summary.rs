@@ -214,10 +214,21 @@ pub(crate) fn classify_harness_verdict(
     // run. Only the reasons that actually mean "we had something and could not
     // settle it": `SolverError` / `ChcParseError` / `PreSolveDeadline` fell over
     // BEFORE there was anything to decide.
+    //
+    // `SmtParseError` and `Memout` land here too: both print their obligations
+    // UNDETERMINED (the console arms sit beside the undecided one), so the
+    // `console_check_count == 0` key below would not fire and this channel
+    // would file them as `Failed` — the two channels disagreeing again. The
+    // cause is carried by the reason label, not by a finer verdict.
     if !has_decided_check(&result.results)
         && matches!(
             result.solver_unknown_reason,
-            Some(SolverUnknownReason::UndecidedModel | SolverUnknownReason::Timeout)
+            Some(
+                SolverUnknownReason::UndecidedModel
+                    | SolverUnknownReason::Timeout
+                    | SolverUnknownReason::SmtParseError
+                    | SolverUnknownReason::Memout
+            )
         )
     {
         return HarnessVerdict::InconclusiveUndecided;
@@ -676,6 +687,20 @@ mod tests {
         decided.solver_unknown_reason = Some(SolverUnknownReason::UndecidedModel);
         decided.results = vec![check(CheckStatus::Undetermined), check(CheckStatus::Failure)];
         assert_eq!(verdict_of(&decided), "failed");
+
+        // A query the solver REJECTED (our encoder defect) and one it ran out
+        // of memory on both list their obligations UNDETERMINED and print an
+        // INCONCLUSIVE console verdict; the JSON channel must agree, and must
+        // not read the populated table as `failed`.
+        for reason in [SolverUnknownReason::SmtParseError, SolverUnknownReason::Memout] {
+            let mut rejected = test_result(VerificationStatus::Failure, FailedProperties::Other);
+            rejected.solver_unknown_reason = Some(reason);
+            rejected.results = vec![check(CheckStatus::Undetermined)];
+            assert_eq!(verdict_of(&rejected), "inconclusive_undecided", "{reason:?}");
+            let mut bare = test_result(VerificationStatus::Failure, FailedProperties::Other);
+            bare.solver_unknown_reason = Some(reason);
+            assert_eq!(verdict_of(&bare), "inconclusive_undecided", "{reason:?}");
+        }
 
         // The `slice_c_str` control: no checks at all plus a reason that means
         // "fell over before there was anything to decide".

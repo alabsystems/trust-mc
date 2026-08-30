@@ -1,0 +1,167 @@
+{
+  "description": "PROOF rows upstream Kani disabled because CBMC could not run them. Outside the replacement BAR, inside the historical DENOMINATOR, tracked as supersession candidates.",
+  "fork_commit": "c4d858036",
+  "row_sha256": "7e2eef01baaa59e5f4ee92daa7f025e3dc841071ae784dd68247dc0f464c9fe5",
+  "rows": [
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_copy.rs",
+      "harness": "copy",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_copy.rs",
+      "harness": "proxy",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_lines.rs",
+      "harness": "lines_inherent",
+      "reason": "requires memchr"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "across_tasks",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "disconnect",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "disconnect_reader",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "duplex_is_cooperative",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "max_write_size",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
+      "harness": "ping_pong",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line_fail",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line_fail_and_utf8_fail",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line_invalid_utf8",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
+      "harness": "read_line_not_all_ready",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
+      "harness": "read_to_string",
+      "reason": "CBMC takes more than 15 minutes"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
+      "harness": "to_string_appends",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
+      "harness": "to_string_does_not_truncate_on_io_error",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
+      "harness": "to_string_does_not_truncate_on_utf8_error",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_until.rs",
+      "harness": "read_until",
+      "reason": "requires memchr"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_until.rs",
+      "harness": "read_until_fail",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_read_until.rs",
+      "harness": "read_until_not_all_ready",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_util_empty.rs",
+      "harness": "empty_buf_reads_are_cooperative",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_util_empty.rs",
+      "harness": "empty_read_is_cooperative",
+      "reason": "requires pthread_key_create"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio/io_write_all_buf.rs",
+      "harness": "write_all_buf",
+      "reason": "requires write"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_stream_map.rs",
+      "harness": "empty",
+      "reason": "requires syscall"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio_test/block_on.rs",
+      "harness": "async_block",
+      "reason": "CBMC takes more than 15 minutes"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio_test/block_on.rs",
+      "harness": "async_fn",
+      "reason": "CBMC takes more than 15 minutes"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
+      "harness": "read1",
+      "reason": "CBMC takes more than 15 minutes"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
+      "harness": "read_error",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
+      "harness": "write1",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
+      "harness": "write_error",
+      "reason": "CBMC consumes more than 10 GB"
+    },
+    {
+      "file": "tests/slow/tokio-proofs/src/tokio_util/io_reader_stream.rs",
+      "harness": "correct_behavior_on_errors",
+      "reason": "CBMC takes more than 15 minutes"
+    }
+  ]
+}

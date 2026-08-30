@@ -299,6 +299,41 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 expr.field_select(&dt.name, &field.name, target_sort.clone())
             }
 
+            // Datatype(single NARROWER bitvec field) -> wider BitVec: select the
+            // field and ZERO-EXTEND it into the LOW bits.
+            //
+            // #unwrap-or-default-false-proof. The `#2295` arm above handles a
+            // single-field wrapper whose field sort EQUALS the target; this is
+            // the same shape when the field is narrower — `S { a: u8 }` meeting
+            // the bv64 `Some` payload of a flattened `Option<S>` at the phi that
+            // merges `<S as Default>::default()` with the `Some` arm. Falling
+            // through to `flatten_datatype_to_bitvec` was a FALSE PROOF:
+            // that packer is MSB-first with TRAILING zero padding (`#2915`,
+            // correct for the CHC memory-array consumers and their MSB-first
+            // `unflatten` inverse), so the u8 landed in bits 63..56, while the
+            // BMC erased-wrapper read of `.a` takes bits 7..0 — a default of 7
+            // PROVED to be 0, clean, no demotion. Measured: u64 (no padding)
+            // right, u32 and u8 both wrong, so the padded case is exactly the
+            // defect. A little-endian struct's first field IS the low bits, so
+            // zero-extension is the faithful layout and matches the read side.
+            // Multi-field padded shapes still take the arm below and its
+            // fail-closed fresh-var fallback; this arm claims only the single
+            // leaf it can prove the read side for.
+            (SortInner::Datatype(dt), _)
+                if dt.constructors.len() == 1
+                    && dt.constructors[0].fields.len() == 1
+                    && target_sort.is_bitvec()
+                    && dt.constructors[0].fields[0].sort.is_bitvec()
+                    && dt.constructors[0].fields[0].sort.bitvec_width()
+                        < target_sort.bitvec_width() =>
+            {
+                let field = &dt.constructors[0].fields[0];
+                let field_w = field.sort.bitvec_width().unwrap_or(0);
+                let target_w = target_sort.bitvec_width().unwrap_or(0);
+                expr.field_select(&dt.name, &field.name, field.sort.clone())
+                    .zero_extend(target_w - field_w)
+            }
+
             // Datatype -> BitVec: flatten via flatten_datatype_to_bitvec.
             // Handles Option<bool> where Datatype and BitVec(1) meet at phi nodes.
             // Part of #3260.

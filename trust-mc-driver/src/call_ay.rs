@@ -65,6 +65,52 @@ fn solver_error_is_timeout(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| cause.to_string().contains(" timed out after "))
 }
 
+/// ay's per-command rejections of the query the encoder emitted.
+///
+/// ay does not abort on a malformed command: it prints
+/// `(error "line L column C: <why>")` (or `(error "unknown constant <name>")`),
+/// discards that command, carries on, and then refuses to certify whatever it
+/// found — `(:reason-unknown "a problem-contributing command was discarded")`.
+/// The one benign shape is `(error "... model is not available")`, which answers
+/// a `(get-value ...)` after a decided `unsat` and says nothing about the
+/// query. Returns how many commands were rejected and the first rejection
+/// verbatim, so the report can name the defect instead of "solver undecided".
+pub(crate) fn smt_command_rejections(stdout: &str, stderr: &str) -> (usize, Option<String>) {
+    let mut count = 0usize;
+    let mut first = None;
+    for line in stdout.lines().chain(stderr.lines()) {
+        if line.contains("(error") && !line.contains("model is not available") {
+            count += 1;
+            if first.is_none() {
+                first = Some(line.trim().to_string());
+            }
+        }
+    }
+    (count, first)
+}
+
+/// The `(:reason-unknown "...")` line ay prints (on stderr, `--stats` or not)
+/// beside an `unknown` answer, with the quotes and parentheses stripped:
+/// `memout`, `timeout`, `incomplete`, `a problem-contributing command was
+/// discarded`, ...
+pub(crate) fn solver_reason_unknown(stdout: &str, stderr: &str) -> Option<String> {
+    stdout.lines().chain(stderr.lines()).find_map(|line| {
+        let rest = line.trim().strip_prefix("(:reason-unknown")?.trim();
+        let rest = rest.strip_suffix(')').unwrap_or(rest);
+        Some(rest.trim().trim_matches('"').to_string())
+    })
+}
+
+/// The budget-bound `unknown`s the solver names itself. Anything else keeps
+/// the caller's default (`UndecidedModel`).
+pub(crate) fn classify_reason_unknown(reason: &str) -> Option<SolverUnknownReason> {
+    match reason {
+        "memout" => Some(SolverUnknownReason::Memout),
+        "timeout" => Some(SolverUnknownReason::Timeout),
+        _ => None,
+    }
+}
+
 #[cfg(feature = "ay-chc-native")]
 fn native_chc_error_allows_external_proof_fallback(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
@@ -454,7 +500,14 @@ impl KaniSession {
             }
         };
 
-        let (status, failed_properties, properties, coverage_results, harness_feasibility) = solved;
+        let (
+            status,
+            failed_properties,
+            properties,
+            coverage_results,
+            harness_feasibility,
+            solver_named_reason,
+        ) = solved;
 
         let runtime = start.elapsed();
         let validation_status = logic_tier.validation_status();
@@ -466,14 +519,17 @@ impl KaniSession {
         // exactly that shape (a DECIDED failure has a failing property and
         // keeps reason=None). Attribution only; verdicts unchanged.
         //
-        // This is UndecidedModel, NOT SolverError: nothing errored, the model was
-        // simply not decided. Sharing one label with real ay-chc errors is what
-        // made the gate's largest bucket unactionable.
+        // The default is UndecidedModel, NOT SolverError: nothing errored, the
+        // model was simply not decided. Sharing one label with real ay-chc
+        // errors is what made the gate's largest bucket unactionable. But the
+        // `(error` path DID error — ay rejected commands of the query we wrote
+        // — and a `memout`/`timeout` is a budget, not a model; `try_ay_solver`
+        // names those shapes itself and they take precedence over the default.
         let solver_unknown_reason = if status == VerificationStatus::Failure
             && matches!(failed_properties, FailedProperties::Other)
             && matches!(determine_failed_from_properties(&properties), FailedProperties::None)
         {
-            Some(SolverUnknownReason::UndecidedModel)
+            solver_named_reason.or(Some(SolverUnknownReason::UndecidedModel))
         } else {
             None
         };
@@ -502,14 +558,21 @@ impl KaniSession {
 
     /// Try to run the native AY solver on an SMT-LIB2 file.
     ///
-    /// Returns (status, failed_properties, properties, coverage, harness feasibility)
-    /// on success, error if AY not available.
+    /// Returns (status, failed_properties, properties, coverage, harness
+    /// feasibility, solver-named unknown reason) on success, error if AY not
+    /// available.
     ///
-    /// The last element is the answer to "can this harness run at all", from the
-    /// vacuity probe below. It is `Undetermined` on every path that does not
-    /// reach the probe (any non-UNSAT verdict, an empty property list, an
-    /// undecided or failed probe), which is the fail-closed reading — see
+    /// The feasibility element is the answer to "can this harness run at all",
+    /// from the vacuity probe below. It is `Undetermined` on every path that
+    /// does not reach the probe (any non-UNSAT verdict, an empty property list,
+    /// an undecided or failed probe), which is the fail-closed reading — see
     /// `verification_result::classify_vacuity`.
+    ///
+    /// The last element is the solver's OWN account of an undecided answer,
+    /// when it gives one the caller should prefer to its `UndecidedModel`
+    /// default: `SmtParseError` when ay rejected commands of the emitted query,
+    /// `Memout`/`Timeout` from `(:reason-unknown ...)`. `None` otherwise —
+    /// always `None` on a decided answer. Attribution only; never a verdict.
     fn try_ay_solver(
         &self,
         smt_file: &Path,
@@ -522,6 +585,7 @@ impl KaniSession {
         Vec<Property>,
         Option<CoverageResults>,
         HarnessFeasibility,
+        Option<SolverUnknownReason>,
     )> {
         // Check if ay is available
         let ay_path = which::which("ay")
@@ -768,6 +832,7 @@ impl KaniSession {
                 properties,
                 coverage_results,
                 harness_feasibility,
+                None,
             ));
         }
 
@@ -777,15 +842,49 @@ impl KaniSession {
             && !stdout.contains("model is not available");
 
         if has_real_error {
+            // ay REJECTED part of the query the encoder emitted (an undeclared
+            // sort, two incompatible sorts equated, a constructor applied with
+            // the wrong arity, a constant whose own declaration was rejected),
+            // discarded those commands, carried on, and fail-closed on the
+            // result. Whatever it answered, the harness was NOT decided as
+            // emitted, and no budget changes that: with unlimited memory ay
+            // still refuses — `(:reason-unknown "a problem-contributing command
+            // was discarded")`. Count the rejections and name the first one.
+            // The generic "solver undecided — try --ay-chc" this arm used to
+            // fall into sent the tokio-proofs `tokio_test::block_on` rows off
+            // to hunt a solver incompleteness that did not exist (276 rejected
+            // commands in a 14 MB query, 2026-08-29): the opposite diagnosis.
+            let (rejected, first) = smt_command_rejections(&stdout, &stderr);
+            eprintln!(
+                "[AY:SMT_REJECTED:count={rejected}] ay rejected {rejected} command(s) of the \
+                 emitted query as ill-formed and discarded them — the harness was NOT \
+                 decided as emitted (encoder defect, not solver incompleteness). First: {}",
+                first.as_deref().unwrap_or("<not captured>")
+            );
+            if let Some(reason) = solver_reason_unknown(&stdout, &stderr) {
+                eprintln!(
+                    "[AY] solver answer after the rejections: (:reason-unknown \"{reason}\")"
+                );
+            }
             if self.args.common_args.verbose {
                 println!("[AY] ay reported error, treating as inconclusive");
             }
+            // Kani-parity, as on the undecided arm below: the obligations the
+            // compiler emitted are still this harness's checks. List them
+            // UNDETERMINED (asserts nothing) instead of printing an empty table
+            // that reads as "no checks" — the opposite of what happened.
+            let mut properties = build_undetermined_properties(
+                &extract_violation_declarations_from_content(smt_content),
+                location_map.as_ref(),
+            );
+            apply_kani_property_naming(&mut properties);
             return Ok((
                 VerificationStatus::Failure,
                 FailedProperties::Other,
-                vec![],
+                properties,
                 None,
                 HarnessFeasibility::Undetermined,
+                Some(SolverUnknownReason::SmtParseError),
             ));
         }
 
@@ -952,6 +1051,12 @@ impl KaniSession {
             }
         }
 
+        // The solver's own account of an `unknown`, when it is budget-bound
+        // (`memout`, `timeout`); anything else leaves the caller's
+        // `UndecidedModel` default in place. Attribution only.
+        let solver_reason = solver_reason_unknown(&stdout, &stderr)
+            .and_then(|reason| classify_reason_unknown(&reason));
+
         // The SAT path never probes: the main query already produced a model, so
         // there is nothing vacuous to adjudicate.
         Ok((
@@ -960,6 +1065,7 @@ impl KaniSession {
             properties,
             coverage_results,
             HarnessFeasibility::Undetermined,
+            solver_reason,
         ))
     }
 

@@ -1,7 +1,7 @@
 # trust-mc — a bit-precise software model checker for Rust
 
 **Author:** Andrew Yates <andrewyates.name@gmail.com>
-**Version:** 0.3.0
+**Version:** 0.5.0
 **License:** MIT OR Apache-2.0
 **Copyright:** 2026 Andrew Yates
 
@@ -68,7 +68,10 @@ stays Kani-compatible: `#[kani::proof]`, `kani::any()`, `kani::assume()`,
 
 ## Quick Start
 
-With nothing else installed, the binary explains itself and hands you a harness:
+One prerequisite: `rust-toolchain.toml` pins the `trust` toolchain, built from
+[trust](https://github.com/alabsystems/trust) (its INSTALL.md walks through the
+build) and linked into rustup as `trust`. With that linked and nothing else
+installed, the binary explains itself and hands you a harness:
 
 ```bash
 cargo install --path .            # trust-mc, cargo-trust-mc, targo-trust-mc
@@ -79,7 +82,12 @@ trust-mc example --list           # sample harnesses that prove or fail as label
 ```
 
 To verify, build the engine and its library sysroot once, and put the
-[AY](https://github.com/alabsystems/ay) solver binary on `PATH`:
+[AY](https://github.com/alabsystems/ay) solver binary on `PATH`. The engine
+step needs more than the linked toolchain: six crates (`build-trust-mc` itself
+among them) link `rustc_private` and take the stage2 `rustc-dev` rlibs of a
+self-hosted [trust](https://github.com/alabsystems/trust) build — its
+INSTALL.md's self-hosted lane. The other 15 workspace crates, front doors
+included, build without them.
 
 ```bash
 cargo run --release -p build-trust-mc -- build-dev --release

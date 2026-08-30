@@ -94,8 +94,13 @@ use std::{
 /// Note that [`spawn`] is not supported with this function. Use [`block_on_with_spawn`] if you need it.
 #[crate::unstable(feature = "async-lib", issue = 2559, reason = "experimental async support")]
 pub fn block_on<T>(mut fut: impl Future<Output = T>) -> T {
-    let waker = unsafe { Waker::from_raw(NOOP_RAW_WAKER) };
-    let cx = &mut Context::from_waker(&waker);
+    // `Waker::noop()` is a `&'static Waker`: there is no owned `Waker` local
+    // whose `Drop` calls `(vtable.drop)(data)` through a function pointer read
+    // out of a promoted `RawWakerVTable` constant. The BMC encoder cannot
+    // resolve that indirect call and used to record it as an unsupported
+    // `Call terminator` on EVERY async harness — a demotion for a no-op.
+    // `block_on_with_spawn` still builds its waker from `NOOP_RAW_WAKER`.
+    let cx = &mut Context::from_waker(Waker::noop());
     // SAFETY: we shadow the original binding, so it cannot be accessed again for the rest of the scope.
     // This is the same as what the pin_mut! macro in the futures crate does.
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };

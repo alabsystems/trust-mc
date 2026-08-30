@@ -72,6 +72,20 @@ def _read_object(path: Path) -> dict[str, Any]:
     return value
 
 
+UPSTREAM_INACTIVE_PATH = REPO_ROOT / "tests/trust-mc/replacement-upstream-inactive.json"
+
+# Reason text is part of the key on purpose. Editing a comment must not be able
+# to move a row out of the bar (#gate-upstream-reason-bound).
+def _load_upstream_inactive() -> dict[tuple[str, str], str]:
+    if not UPSTREAM_INACTIVE_PATH.exists():
+        return {}
+    data = json.loads(UPSTREAM_INACTIVE_PATH.read_text())
+    return {(r["file"], r["harness"]): r["reason"] for r in data.get("rows", [])}
+
+
+UPSTREAM_INACTIVE = _load_upstream_inactive()
+
+
 def _row_digest(rows: list[dict[str, Any]]) -> str:
     payload = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
@@ -234,10 +248,21 @@ def _source_candidates(path: Path, bare_harness: str) -> list[dict[str, Any]]:
                 "line": index + 1,
                 "attributes": attributes,
                 "cfg_disabled": CFG_DISABLED_RE.search(attributes) is not None,
+                "cfg_disabled_reason": _cfg_disabled_reason(attributes),
                 "cfg_features": sorted(set(CFG_FEATURE_RE.findall(attributes))),
             }
         )
     return candidates
+
+
+CFG_DISABLED_REASON_RE = re.compile(
+    r"#\[\s*cfg\s*\(\s*disabled\s*\)\s*\]\s*//\s*(.+?)\s*$", re.MULTILINE
+)
+
+
+def _cfg_disabled_reason(attributes: str) -> str:
+    hit = CFG_DISABLED_REASON_RE.search(attributes)
+    return hit.group(1) if hit else ""
 
 
 def _nearest_manifest(path: Path) -> Path | None:
@@ -473,12 +498,24 @@ def _plan_row(row: dict[str, str]) -> dict[str, Any]:
         )
     candidate = candidates[0]
     if candidate["cfg_disabled"]:
+        # UPSTREAM-inactive vs LOCALLY-inactive. A row upstream Kani disabled
+        # because CBMC could not run it is not something Kani DOES, so it sits
+        # outside the replacement BAR (never outside the historical
+        # DENOMINATOR). Anything WE disable stays inside the bar and blocks the
+        # gate — that is the anti-cheat, and it is why the frozen authority is
+        # keyed on the upstream reason text as well as the row identity.
+        key = (row["file"], row["harness"])
+        frozen_reason = UPSTREAM_INACTIVE.get(key)
+        current_reason = candidate.get("cfg_disabled_reason") or ""
+        upstream = frozen_reason is not None and frozen_reason == current_reason
         return {
             **base,
             "disposition": "inactive",
+            "inactive_origin": "upstream" if upstream else "local",
             "execution_credit": False,
             "proof_credit": False,
-            "reason": "cfg-disabled",
+            "reason": "cfg-disabled-upstream" if upstream else "cfg-disabled",
+            "upstream_reason": frozen_reason if upstream else None,
             "source_line": candidate["line"],
         }
 
@@ -529,6 +566,12 @@ def _subset_summary(
     ]
     active = [row for row in subset if row["disposition"] == "active"]
     inactive = [row for row in subset if row["disposition"] == "inactive"]
+    upstream_inactive = [
+        row for row in inactive if row.get("inactive_origin") == "upstream"
+    ]
+    local_inactive = [
+        row for row in inactive if row.get("inactive_origin") != "upstream"
+    ]
     inventory_rows = [
         {field: row[field] for field in ("expected", "file", "harness", "lane")}
         for row in subset
@@ -541,10 +584,29 @@ def _subset_summary(
         {field: row[field] for field in ("expected", "file", "harness", "lane")}
         for row in inactive
     ]
+    upstream_rows = [
+        {field: row[field] for field in ("expected", "file", "harness", "lane")}
+        for row in upstream_inactive
+    ]
+    local_rows = [
+        {field: row[field] for field in ("expected", "file", "harness", "lane")}
+        for row in local_inactive
+    ]
+    supersession: dict[str, int] = {}
+    for row in upstream_inactive:
+        label = row.get("upstream_reason") or "unattributed"
+        supersession[label] = supersession.get(label, 0) + 1
     return {
         "historical": len(subset),
         "active": len(active),
+        # The replacement BAR: what the incumbent actually does.
+        "bar": len(active),
         "inactive_zero_credit": len(inactive),
+        "upstream_inactive": len(upstream_inactive),
+        "local_inactive": len(local_inactive),
+        "supersession_candidates": dict(sorted(supersession.items())),
+        "upstream_inactive_row_sha256": _row_digest(upstream_rows),
+        "local_inactive_row_sha256": _row_digest(local_rows),
         "authority_row_sha256": authority_digest,
         "inventory_row_sha256": _row_digest(inventory_rows),
         "active_inventory_row_sha256": _row_digest(active_rows),

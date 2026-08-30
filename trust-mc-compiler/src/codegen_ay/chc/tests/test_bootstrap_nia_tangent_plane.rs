@@ -151,6 +151,7 @@ fn run_compiletest_parity_probe<'tcx>(
     let inline_cfg = crate::kani_middle::transform::inline::InlineConfig {
         max_depth: ctx.config.inline_depth,
         enabled: ctx.config.function_inlining,
+        preserve_block_on: true,
     };
     let mut inline_pass =
         crate::kani_middle::transform::inline::FunctionInlinePass::new(inline_cfg);

@@ -83,11 +83,27 @@ pub(crate) struct InlineConfig {
     pub max_depth: usize,
     /// Whether inlining is enabled.
     pub enabled: bool,
+    /// Keep every `block_on` call as a call boundary.
+    ///
+    /// The CHC lane needs the boundary: its `try_dispatch_call_block_on`
+    /// specializer rewrites the busy-poll loop into a single-poll `Ready` path,
+    /// and MIR-inlining the body first would leave it an unbounded self-loop
+    /// around `poll` that CHC cannot encode (#3955, #3988).
+    ///
+    /// The BMC lane has NO `block_on` handler at all. Preserving the boundary
+    /// there hands the call to the statement mini-inliner, which admits only
+    /// acyclic bodies — and `kani::block_on` IS a loop — so every `async fn`
+    /// harness bailed as an unsupported `Call terminator` with zero
+    /// obligations. Set to `false` for BMC: the poll loop is then an ordinary
+    /// loop of the harness body and the unroller cuts it under the unwind
+    /// bound with a loud unwinding assertion (`Poll::Pending` on the last
+    /// permitted poll FAILS; it is never silently pruned).
+    pub preserve_block_on: bool,
 }
 
 impl Default for InlineConfig {
     fn default() -> Self {
-        InlineConfig { max_depth: 10, enabled: true }
+        InlineConfig { max_depth: 10, enabled: true, preserve_block_on: true }
     }
 }
 
@@ -442,6 +458,18 @@ impl FunctionInlinePass {
             }
         }
 
+        // `block_on` is a call boundary ONLY for the CHC single-poll
+        // specializer (see `InlineConfig::preserve_block_on`). In BMC the body
+        // is inlined like any other user function so its busy-poll loop reaches
+        // the harness-level unroller instead of the DAG-only mini-inliner.
+        if Self::is_block_on_path(&fn_name) {
+            if self.config.preserve_block_on {
+                debug!("Not inlining block_on (CHC specializer boundary): {}", fn_name);
+                return false;
+            }
+            debug!("Inlining block_on (BMC: poll loop unrolled under the unwind bound): {}", fn_name);
+        }
+
         // Don't inline functions with special codegen handlers (#274)
         // These are handled in try_codegen_std_intrinsic and need to
         // be visible as function calls, not inlined match arms.
@@ -502,6 +530,17 @@ impl FunctionInlinePass {
         // For now, only inline simple user functions
         debug!("Candidate for inlining: {}", fn_name);
         true
+    }
+
+    /// Is `fn_name` any `block_on` — `kani::block_on` or a user-defined one?
+    ///
+    /// Part of #3955, Part of #3988: the CHC specializer validates the
+    /// poll→SwitchInt→backedge pattern of whatever body it is handed and falls
+    /// through to generic dispatch for non-matching bodies, so the name is the
+    /// only gate. `block_on_with_spawn` deliberately does NOT match: it drives
+    /// a scheduler, and the CHC lane has its own D3 dispatch for it.
+    fn is_block_on_path(fn_name: &str) -> bool {
+        fn_name.ends_with("::block_on") || fn_name == "block_on"
     }
 
     /// Check if a function has special codegen handling in try_codegen_std_intrinsic.
@@ -891,17 +930,6 @@ impl FunctionInlinePass {
                 debug!("Not inlining kani::mem predicate: {}", fn_name);
                 return true;
             }
-        }
-
-        // Part of #3955, Part of #3988: any `block_on` function — preserve for
-        // CHC block_on dispatch which rewrites the unbounded poll loop into a
-        // single-poll specialization. If inlined, the loop expands into MIR basic
-        // blocks that CHC encoding cannot handle (unbounded loop + coroutine sort
-        // mismatch). The CHC specializer validates the poll→SwitchInt→backedge
-        // pattern and falls through to generic dispatch for non-matching bodies.
-        if fn_name.ends_with("::block_on") || fn_name == "block_on" {
-            debug!("Not inlining block_on: {}", fn_name);
-            return true;
         }
 
         // Part of #4067: Rc::new / Arc::new — preserve for CHC codegen_rc_arc_new

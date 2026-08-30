@@ -608,6 +608,31 @@ pub(crate) fn format_result(
         // was exercised. INCONCLUSIVE says that without inventing a cause.
         style("INCONCLUSIVE (every check is unreachable — dead code, nothing exercised)").yellow()
     } else if !has_decided_check(properties)
+        && matches!(solver_unknown_reason, Some(SolverUnknownReason::SmtParseError))
+    {
+        // The solver REJECTED part of the emitted query as ill-formed and
+        // discarded it, so the harness was never decided AS EMITTED. That is an
+        // encoder defect — ours — not an undecided obligation: no `--ay-chc`
+        // and no bigger budget changes it (ay fail-closes on a discarded
+        // problem-contributing command even with unlimited memory), so the
+        // remedy the undecided arm below names would mislead. The
+        // `[AY:SMT_REJECTED:count=N]` line on stderr quotes the first rejection.
+        style(
+            "INCONCLUSIVE (solver rejected the emitted query as ill-formed — encoder defect; \
+             see [AY:SMT_REJECTED])",
+        )
+        .yellow()
+    } else if !has_decided_check(properties)
+        && matches!(solver_unknown_reason, Some(SolverUnknownReason::Memout))
+    {
+        // Budget, not capability: the unrolled query outgrew the solver's
+        // memory. Same fail-closed shape as the undecided arm, named honestly.
+        style(
+            "INCONCLUSIVE (solver ran out of memory — bounded query too large; try a smaller \
+             unwind bound or --ay-chc)",
+        )
+        .yellow()
+    } else if !has_decided_check(properties)
         && matches!(
             solver_unknown_reason,
             Some(SolverUnknownReason::UndecidedModel | SolverUnknownReason::Timeout)

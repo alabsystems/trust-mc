@@ -60,7 +60,7 @@ pub fn calls_va_widen() -> u64 {
 fn run_inline(tcx: rustc_middle::ty::TyCtxt<'_>, suffix: &str) -> (FunctionInlinePass, Body) {
     let instance = find_instance_by_suffix(tcx, suffix);
     let body = instance.body().expect("caller body");
-    let mut pass = FunctionInlinePass::new(InlineConfig { max_depth: 4, enabled: true });
+    let mut pass = FunctionInlinePass::new(InlineConfig { max_depth: 4, enabled: true, preserve_block_on: true });
     let (_changed, out) =
         pass.transform_with_body_provider(tcx, body, instance, |callee: Instance| callee.body());
     (pass, out)

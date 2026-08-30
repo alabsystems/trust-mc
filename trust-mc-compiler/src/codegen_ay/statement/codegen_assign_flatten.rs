@@ -213,6 +213,19 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if !((v0_fields == 0 && v1_fields == 1) || (v0_fields == 1 && v1_fields == 0)) {
             return false;
         }
+        // The flattened form stores `.0 = 1` for the payload arm and `0` for the
+        // empty arm, and every reader of it — the discriminant handler first —
+        // takes that literally as the MIR discriminant. That is `Option`'s
+        // layout (`None` = 0, `Some(T)` = 1) and nothing else: for `Poll<T>`
+        // (`Ready(T)` = 0, `Pending` = 1) it reported every `Ready` as
+        // `Pending`, the `SwitchInt` after each `.await` took the wrong arm, and
+        // the code after the await went UNREACHABLE — a harness whose assertion
+        // followed an `.await` was PROVED vacuously. Only `Option`-shaped enums
+        // may flatten; a payload-first enum keeps the datatype encoding, whose
+        // discriminant and `Downcast` readers map by payload arity.
+        if v0_fields != 0 {
+            return false;
+        }
 
         let variant_idx_val = variant_idx.to_index();
         let variant = &variants[variant_idx_val];

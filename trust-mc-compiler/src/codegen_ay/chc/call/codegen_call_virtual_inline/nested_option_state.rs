@@ -306,8 +306,10 @@ mod tests {
             else {
                 continue;
             };
-            let Some(callee_path) =
-                chc_ctx.resolve_callee_path(func).or_else(|| chc_ctx.resolve_fn_def_name(func))
+            // `func` belongs to `body`, not `chc_ctx.body` (#chc-inline-operand-locals).
+            let Some(callee_path) = chc_ctx
+                .resolve_callee_path_with_locals(func, body.locals())
+                .or_else(|| chc_ctx.resolve_fn_def_name_with_locals(func, body.locals()))
             else {
                 continue;
             };

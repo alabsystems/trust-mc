@@ -201,7 +201,16 @@ fn collect_stub_calls(call_names: &[String]) -> Vec<(String, StubKind)> {
 }
 
 fn apply_codegen_inline_pass(tcx: TyCtxt<'_>, instance: Instance, body: Body) -> Body {
-    let mut pass = FunctionInlinePass::new(InlineConfig::default());
+    apply_codegen_inline_pass_with_config(tcx, instance, body, InlineConfig::default())
+}
+
+fn apply_codegen_inline_pass_with_config(
+    tcx: TyCtxt<'_>,
+    instance: Instance,
+    body: Body,
+    config: InlineConfig,
+) -> Body {
+    let mut pass = FunctionInlinePass::new(config);
     let (_, body) = pass.transform_with_body_provider(tcx, body, instance, |callee_instance| {
         if !callee_instance.has_body() {
             return None;
@@ -491,14 +500,14 @@ fn test_inline_config_default() {
 
 #[test]
 fn test_inline_config_custom() {
-    let config = InlineConfig { max_depth: 5, enabled: false };
+    let config = InlineConfig { max_depth: 5, enabled: false, preserve_block_on: true };
     assert_eq!(config.max_depth, 5);
     assert!(!config.enabled);
 }
 
 #[test]
 fn test_function_inline_pass_new() {
-    let config = InlineConfig { max_depth: 20, enabled: true };
+    let config = InlineConfig { max_depth: 20, enabled: true, preserve_block_on: true };
     let pass = FunctionInlinePass::new(config);
     assert_eq!(pass.config.max_depth, 20);
     assert!(pass.config.enabled);
@@ -1012,6 +1021,40 @@ fn test_inline_pass_preserves_user_block_on_call_boundary() {
             "FunctionInlinePass should preserve user-defined block_on call for CHC specializer, \
              got {inlined_calls:?}"
         );
+    });
+}
+
+/// The BMC twin of the test above. BMC has no `block_on` handler: a preserved
+/// boundary lands in the DAG-only statement mini-inliner, which rejects the
+/// poll LOOP, so every `async fn` harness bailed as an unsupported `Call
+/// terminator` with zero obligations. With `preserve_block_on = false` the
+/// body is inlined and the harness owns the loop (unrolled later, fail-closed).
+#[test]
+fn test_inline_pass_inlines_block_on_when_boundary_not_preserved() {
+    with_test_tcx_for_source(USER_BLOCK_ON_SOURCE, |tcx| {
+        let instance = find_instance_by_suffix(tcx, "probe_manual_block_on");
+        let body = instance.body().expect("probe_manual_block_on should have a body");
+
+        let config = InlineConfig { preserve_block_on: false, ..InlineConfig::default() };
+        let inlined = apply_codegen_inline_pass_with_config(tcx, instance, body, config);
+        let inlined_calls = collect_call_names(&inlined);
+        assert!(
+            !inlined_calls.iter().any(|name| name.contains("block_on")),
+            "FunctionInlinePass must inline block_on when the boundary is not preserved, \
+             got {inlined_calls:?}"
+        );
+        // The busy-poll loop now belongs to the caller's CFG: a back-edge
+        // (a Goto/SwitchInt target at or before its own block) survives inlining.
+        let has_back_edge = inlined.blocks.iter().enumerate().any(|(bb, block)| {
+            match &block.terminator.kind {
+                TerminatorKind::Goto { target } => *target <= bb,
+                TerminatorKind::SwitchInt { targets, .. } => {
+                    targets.all_targets().iter().any(|t| *t <= bb)
+                }
+                _ => false,
+            }
+        });
+        assert!(has_back_edge, "the inlined poll loop should leave a back-edge in the caller");
     });
 }
 

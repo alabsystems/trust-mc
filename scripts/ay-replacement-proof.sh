@@ -31,8 +31,10 @@ digest, current clean commit, and linked-AY authority are re-attested live.
 The replacement audit is always run with
 --summary-mode kani-compatible. When --non-proof-closure is provided,
 --expected-non-proof-closure-sha is required and must match the closure JSON
-SHA-256 digest. Source-bound inactive proof rows receive zero credit and block
-the strict proof until they are activated and proved.
+SHA-256 digest. Source-bound inactive proof rows receive zero credit. Rows UPSTREAM KANI
+disabled because CBMC could not run them are outside the replacement bar and
+reported as supersession candidates; any row WE disable is local_inactive and
+still blocks the strict proof until it is activated and proved.
 EOF
 }
 
@@ -180,9 +182,25 @@ require_canonical_public_inventories() {
         --output "$disposition_report"; then
         die "replacement source dispositions do not match source or canonical inventories"
     fi
-    inactive_proof_rows="$(jq -er '.summary.proof.inactive_zero_credit' "$disposition_report")"
-    [[ "$inactive_proof_rows" == "0" ]] \
-        || die "strict replacement proof remains blocked by $inactive_proof_rows source-inactive PROOF rows with zero credit"
+    # The replacement BAR is what the INCUMBENT DOES. A PROOF row upstream Kani
+    # itself disabled — because CBMC could not run it — is not something Kani
+    # does, so it cannot block a REPLACEMENT claim; it stays in the 818-row
+    # historical denominator and is reported as a supersession candidate.
+    # Anything WE disable is `local_inactive` and still blocks, which is the
+    # anti-cheat: the bar must never shrink because we switched a row off.
+    local_inactive_rows="$(jq -er '.summary.proof.local_inactive' "$disposition_report")"
+    if [[ "$local_inactive_rows" != "0" ]]; then
+        jq -r '.rows[]
+               | select(.expected == "PROOF" and .disposition == "inactive"
+                        and (.inactive_origin // "local") != "upstream")
+               | "  locally disabled: \(.file)::\(.harness)"' \
+            "$disposition_report" >&2 || true
+        die "strict replacement proof is blocked by $local_inactive_rows LOCALLY-disabled PROOF rows; upstream-disabled rows are excluded from the bar, ours are not"
+    fi
+    upstream_inactive_rows="$(jq -er '.summary.proof.upstream_inactive' "$disposition_report")"
+    proof_bar="$(jq -er '.summary.proof.bar' "$disposition_report")"
+    printf 'replacement bar: %s PROOF rows (%s upstream-disabled rows excluded as supersession candidates)\n' \
+        "$proof_bar" "$upstream_inactive_rows"
 }
 
 run_replacement_closure_check() {

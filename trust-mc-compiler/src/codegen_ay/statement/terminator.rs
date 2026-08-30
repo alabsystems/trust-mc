@@ -238,8 +238,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         // Sound — its auto glue is exactly the benign field drops.
                         && !self.bmc_adt_auto_glue_all_fields_benign(ty, 0)
                 }) {
-                    self.ctx
-                        .unsupported_with_fallback("Drop_side_effects", "non-trivial drop skipped");
+                    // Name the dropped type: the demotion is otherwise
+                    // impossible to attribute from the log alone.
+                    let detail = match drop_ty {
+                        Some(ty) => format!("non-trivial drop skipped: {ty}"),
+                        None => String::from("non-trivial drop skipped"),
+                    };
+                    self.ctx.unsupported_with_fallback("Drop_side_effects", detail);
                 }
                 vec![(*target, None)]
             }
@@ -879,6 +884,41 @@ fn bmc_adt_drop_is_field_glue_only(ty: rustc_public::ty::Ty) -> bool {
     body.blocks.iter().all(|bb| !matches!(bb.terminator.kind, TerminatorKind::Call { .. }))
 }
 
+/// Is dropping this coroutine a benign no-op for BMC to skip?
+///
+/// `resolve_drop_in_place` on a coroutine type yields the coroutine's own
+/// state-machine drop (`coroutine_drop`): a `switchInt` on the state followed
+/// by `Drop` terminators for the locals live in that state. There is no user
+/// `Drop` impl to run — a coroutine cannot have one — so the glue is benign
+/// exactly when it `Call`s nothing (no `Drop::drop`, no un-modeled dealloc)
+/// and every dropped place is itself benign. Fail-closed on unresolved params
+/// (which would ICE the resolver, #3942) and on a missing shim body.
+///
+/// Without this every `async fn` harness was demoted: the proof macro's
+/// `kani::block_on(h())` drops the harness coroutine on return, and the
+/// `Drop` of a `{async fn body}` always fell to `Drop_side_effects`.
+fn bmc_coroutine_drop_is_benign(ty: rustc_public::ty::Ty, depth: usize) -> bool {
+    use rustc_public::mir::TerminatorKind;
+    if depth > 8 || bmc_ty_has_unresolved_params(ty) {
+        return false;
+    }
+    let shim = rustc_public::mir::mono::Instance::resolve_drop_in_place(ty);
+    if shim.is_empty_shim() {
+        return true;
+    }
+    let Some(body) = shim.body() else {
+        return false;
+    };
+    body.blocks.iter().all(|bb| match &bb.terminator.kind {
+        TerminatorKind::Call { .. } => false,
+        TerminatorKind::Drop { place, .. } => place
+            .ty(body.locals())
+            .ok()
+            .is_some_and(|dropped| bmc_drop_benign_rec(dropped, depth + 1)),
+        _ => true,
+    })
+}
+
 /// Detect unresolved generic params that would ICE `resolve_drop_in_place`
 /// (#3942 parity with the CHC drop pipeline).
 fn bmc_ty_has_unresolved_params(ty: rustc_public::ty::Ty) -> bool {
@@ -895,7 +935,8 @@ fn bmc_ty_has_unresolved_params(ty: rustc_public::ty::Ty) -> bool {
             fields.iter().any(|f| bmc_ty_has_unresolved_params(*f))
         }
         TyKind::RigidTy(RigidTy::Adt(_, ref args))
-        | TyKind::RigidTy(RigidTy::Closure(_, ref args)) => args.0.iter().any(|arg| match arg {
+        | TyKind::RigidTy(RigidTy::Closure(_, ref args))
+        | TyKind::RigidTy(RigidTy::Coroutine(_, ref args)) => args.0.iter().any(|arg| match arg {
             GenericArgKind::Type(arg_ty) => bmc_ty_has_unresolved_params(*arg_ty),
             GenericArgKind::Const(c) => matches!(c.kind(), TyConstKind::Param(_)),
             _ => false,
@@ -978,6 +1019,12 @@ fn bmc_drop_benign_rec(ty: rustc_public::ty::Ty, depth: usize) -> bool {
         // A closure env is benign iff every captured upvar is benign (covers the
         // contract check/replace closure that captures only `&mut self`).
         TyKind::RigidTy(RigidTy::Closure(_, args)) => bmc_closure_upvars_benign(&args, depth),
+
+        // A coroutine (`async` block / `async fn` body) has no destructor of its
+        // own; its glue is the compiler-generated state-machine drop that drops
+        // whichever locals are live in the suspended state. Benign iff that glue
+        // calls nothing and every place it drops is itself benign.
+        TyKind::RigidTy(RigidTy::Coroutine(..)) => bmc_coroutine_drop_is_benign(ty, depth),
 
         TyKind::RigidTy(RigidTy::Adt(def, args)) => {
             use rustc_public::ty::GenericArgKind;

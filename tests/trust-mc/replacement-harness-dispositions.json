@@ -6846,13 +6846,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_copy.rs",
       "harness": "copy",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 23
+      "source_line": 23,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -6863,13 +6865,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_copy.rs",
       "harness": "proxy",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 53
+      "source_line": 53,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -6880,13 +6884,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_lines.rs",
       "harness": "lines_inherent",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 18
+      "source_line": 18,
+      "upstream_reason": "requires memchr"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -6897,13 +6903,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
       "harness": "across_tasks",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 35
+      "source_line": 35,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -6914,13 +6922,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
       "harness": "disconnect",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 60
+      "source_line": 60,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -6931,13 +6941,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
       "harness": "disconnect_reader",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 85
+      "source_line": 85,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -6948,13 +6960,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
       "harness": "duplex_is_cooperative",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 130
+      "source_line": 130,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -6965,13 +6979,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
       "harness": "max_write_size",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 107
+      "source_line": 107,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -6982,13 +6998,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_mem_stream.rs",
       "harness": "ping_pong",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 17
+      "source_line": 17,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7059,13 +7077,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
       "harness": "read_line",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 21
+      "source_line": 21,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7076,13 +7096,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
       "harness": "read_line_fail",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 89
+      "source_line": 89,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7093,13 +7115,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
       "harness": "read_line_fail_and_utf8_fail",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 107
+      "source_line": 107,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7110,13 +7134,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
       "harness": "read_line_invalid_utf8",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 74
+      "source_line": 74,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7127,13 +7153,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_line.rs",
       "harness": "read_line_not_all_ready",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 45
+      "source_line": 45,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7174,13 +7202,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
       "harness": "read_to_string",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 20
+      "source_line": 20,
+      "upstream_reason": "CBMC takes more than 15 minutes"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7191,13 +7221,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
       "harness": "to_string_appends",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 68
+      "source_line": 68,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7208,13 +7240,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
       "harness": "to_string_does_not_truncate_on_io_error",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 49
+      "source_line": 49,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7225,13 +7259,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_to_string.rs",
       "harness": "to_string_does_not_truncate_on_utf8_error",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 32
+      "source_line": 32,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7242,13 +7278,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_until.rs",
       "harness": "read_until",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 19
+      "source_line": 19,
+      "upstream_reason": "requires memchr"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7259,13 +7297,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_until.rs",
       "harness": "read_until_fail",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 68
+      "source_line": 68,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7276,13 +7316,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read_until.rs",
       "harness": "read_until_not_all_ready",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 39
+      "source_line": 39,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7338,13 +7380,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_util_empty.rs",
       "harness": "empty_buf_reads_are_cooperative",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 34
+      "source_line": 34,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7355,13 +7399,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_util_empty.rs",
       "harness": "empty_read_is_cooperative",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 17
+      "source_line": 17,
+      "upstream_reason": "requires pthread_key_create"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7417,13 +7463,15 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio/io_write_all_buf.rs",
       "harness": "write_all_buf",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
+      "reason": "cfg-disabled-upstream",
       "required_features": [
         "full"
       ],
-      "source_line": 24
+      "source_line": 24,
+      "upstream_reason": "requires write"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7840,10 +7888,12 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio_stream/stream_stream_map.rs",
       "harness": "empty",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
-      "source_line": 36
+      "reason": "cfg-disabled-upstream",
+      "source_line": 36,
+      "upstream_reason": "requires syscall"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7854,10 +7904,12 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio_test/block_on.rs",
       "harness": "async_block",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
-      "source_line": 17
+      "reason": "cfg-disabled-upstream",
+      "source_line": 17,
+      "upstream_reason": "CBMC takes more than 15 minutes"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7868,10 +7920,12 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio_test/block_on.rs",
       "harness": "async_fn",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
-      "source_line": 28
+      "reason": "cfg-disabled-upstream",
+      "source_line": 28,
+      "upstream_reason": "CBMC takes more than 15 minutes"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7882,10 +7936,12 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
       "harness": "read1",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
-      "source_line": 18
+      "reason": "cfg-disabled-upstream",
+      "source_line": 18,
+      "upstream_reason": "CBMC takes more than 15 minutes"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7896,10 +7952,12 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
       "harness": "read_error",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
-      "source_line": 33
+      "reason": "cfg-disabled-upstream",
+      "source_line": 33,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7910,10 +7968,12 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
       "harness": "write1",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
-      "source_line": 56
+      "reason": "cfg-disabled-upstream",
+      "source_line": 56,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7924,10 +7984,12 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio_test/io.rs",
       "harness": "write_error",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
-      "source_line": 66
+      "reason": "cfg-disabled-upstream",
+      "source_line": 66,
+      "upstream_reason": "CBMC consumes more than 10 GB"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -7938,10 +8000,12 @@
       "expected": "PROOF",
       "file": "tests/slow/tokio-proofs/src/tokio_util/io_reader_stream.rs",
       "harness": "correct_behavior_on_errors",
+      "inactive_origin": "upstream",
       "lane": "tests/slow",
       "proof_credit": false,
-      "reason": "cfg-disabled",
-      "source_line": 49
+      "reason": "cfg-disabled-upstream",
+      "source_line": 49,
+      "upstream_reason": "CBMC takes more than 15 minutes"
     },
     {
       "cargo_dir": "tests/slow/tokio-proofs",
@@ -8626,29 +8690,48 @@
     "active_plan_row_sha256": "99135e7d4dfd91574c0b52dab69ea7f173656230b144f21b3036a65322e5a185",
     "historical_total": 818,
     "inactive_accounted": 32,
-    "inactive_plan_row_sha256": "6c0853d940694c8c34d892f15595e54e7f0035d6269bc46cfe56879d8f95d8ec",
+    "inactive_plan_row_sha256": "121c11bf7cd8d8192224544327701818d5ba6ecc8243e75982a6cd78d45cc5c5",
     "non_proof": {
       "active": 314,
       "active_inventory_row_sha256": "3da57fd2eeedc0988a612d0881dbcee62e30888bfd8e126a8535040d2f6d7aba",
       "authority_row_sha256": "4e47d2dac3feb0c6835b2566a98f47d1388970ec6b58098a91c3b33138f39bbf",
+      "bar": 314,
       "historical": 314,
       "inactive_inventory_row_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
       "inactive_zero_credit": 0,
-      "inventory_row_sha256": "3da57fd2eeedc0988a612d0881dbcee62e30888bfd8e126a8535040d2f6d7aba"
+      "inventory_row_sha256": "3da57fd2eeedc0988a612d0881dbcee62e30888bfd8e126a8535040d2f6d7aba",
+      "local_inactive": 0,
+      "local_inactive_row_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "supersession_candidates": {},
+      "upstream_inactive": 0,
+      "upstream_inactive_row_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
     },
-    "plan_row_sha256": "d614a9064652bb9d0e9aaeb188b0f3a887afdf943ff873a3c911db88813595fe",
+    "plan_row_sha256": "0a54b25651ca6b0da6ac98948b56dd29252a95afe8e1a24032a412f77f6b7e22",
     "proof": {
       "active": 472,
       "active_inventory_row_sha256": "defa243c94e1bebf832a984f53e67cf4a09c84a71a14a3cecdad1df4e837b8a6",
       "authority_row_sha256": "62ddf770d23c96f5d45875e381ba310f9e0374658b50885df0a07b7c48d3c9cf",
+      "bar": 472,
       "historical": 504,
       "inactive_inventory_row_sha256": "1a601974351f9c8f15a9711dfedfc751e0c4e060533ee6f3ad9e5d0360a1633b",
       "inactive_zero_credit": 32,
-      "inventory_row_sha256": "62ddf770d23c96f5d45875e381ba310f9e0374658b50885df0a07b7c48d3c9cf"
+      "inventory_row_sha256": "62ddf770d23c96f5d45875e381ba310f9e0374658b50885df0a07b7c48d3c9cf",
+      "local_inactive": 0,
+      "local_inactive_row_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "supersession_candidates": {
+        "CBMC consumes more than 10 GB": 12,
+        "CBMC takes more than 15 minutes": 5,
+        "requires memchr": 2,
+        "requires pthread_key_create": 11,
+        "requires syscall": 1,
+        "requires write": 1
+      },
+      "upstream_inactive": 32,
+      "upstream_inactive_row_sha256": "1a601974351f9c8f15a9711dfedfc751e0c4e060533ee6f3ad9e5d0360a1633b"
     },
     "resolution_counts": {
       "cargo-default-feature": 1,
-      "cfg-disabled": 32,
+      "cfg-disabled-upstream": 32,
       "exact": 740,
       "unique-qualified-alias": 45
     }

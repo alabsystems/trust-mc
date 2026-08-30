@@ -81,8 +81,29 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         );
                         return DerefProjectionResult::Unsupported;
                     }
-                    active_variant = Some(variant_idx.to_index());
-                    debug!("apply_post_deref: Downcast to variant {}", variant_idx.to_index());
+                    // An Option-like datatype is `[None_*, Some_*]` by PAYLOAD, not
+                    // by MIR variant order (`Poll::Ready(T)` is variant 0 but lives
+                    // in `Some_*`). A `Downcast` that is immediately FOLLOWED by a
+                    // `Field` can only be reading the payload constructor — the
+                    // fieldless one has no field 0 — so select it by arity, exactly.
+                    let positional = variant_idx.to_index();
+                    let next_is_field =
+                        matches!(projections.get(proj_idx + 1), Some(ProjectionElem::Field(..)));
+                    let option_like_payload_ctor = expr.sort().datatype_sort().and_then(|dt| {
+                        if dt.constructors.len() != 2 || !next_is_field {
+                            return None;
+                        }
+                        match (dt.constructors[0].fields.len(), dt.constructors[1].fields.len()) {
+                            (0, 1) => Some(1usize),
+                            (1, 0) => Some(0usize),
+                            _ => None,
+                        }
+                    });
+                    active_variant = Some(option_like_payload_ctor.unwrap_or(positional));
+                    debug!(
+                        "apply_post_deref: Downcast to variant {} (constructor {:?})",
+                        positional, active_variant
+                    );
                 }
                 ProjectionElem::Field(field, _ty) => {
                     // Part of #944: Handle transparent wrapper bv64 (NonNull/Unique).
@@ -102,6 +123,20 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             "apply_post_deref: Field {} on bv32 (ZST/marker) - returning unchanged",
                             field
                         );
+                        active_variant = None;
+                        continue;
+                    }
+                    // A coroutine root keeps MIR fields by NAME under `direct_fields`
+                    // / its variant views; positional selection on the root picked the
+                    // whole `direct_fields` view for `(*pinned).0` (an upvar read
+                    // through `Pin<&mut coroutine>`) and the query went ill-sorted.
+                    // Same call the non-deref walker makes.
+                    if let Some(selected) = crate::codegen_ay::types::coroutine_root_select(
+                        expr.clone(),
+                        active_variant,
+                        *field,
+                    ) {
+                        expr = selected;
                         active_variant = None;
                         continue;
                     }

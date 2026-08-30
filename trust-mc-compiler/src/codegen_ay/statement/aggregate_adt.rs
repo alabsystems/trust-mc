@@ -13,7 +13,7 @@
 //!
 //! Struct aggregate handling is in `aggregate_struct.rs`.
 
-use ay_bindings::Expr;
+use ay_bindings::{Expr, Sort};
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
@@ -343,6 +343,25 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // "ambiguous function declaration" with multiple Option instantiations.
             let some_name = crate::codegen_ay::names::option_some_constructor_name(adt_name);
             debug!("  Constructing Some variant '{}' with payload", some_name);
+            // A ZST payload (`Poll::Ready(())` — every `async fn` returning
+            // unit) is codegen'd as the Bool sentinel `true`, but the datatype
+            // declares the field as `Unit`; emitting `(Some_Poll_Unit true)`
+            // makes the solver discard the command and the harness comes back
+            // reason-unknown. Hand a `Unit` field its sole inhabitant (exact).
+            let payload = match sort
+                .datatype_sort()
+                .and_then(|dt| dt.constructors.iter().find(|c| c.name == some_name))
+                .and_then(|c| c.fields.first().map(|f| f.sort.clone()))
+            {
+                Some(want)
+                    if payload.sort() != &want
+                        && payload.sort().is_bool()
+                        && want.datatype_name() == Some("Unit") =>
+                {
+                    Expr::datatype_constructor("Unit", "Unit_mk", vec![], want)
+                }
+                _ => payload,
+            };
 
             // Debug: log ref_pointees for Option<&T> (#703).
             if let Operand::Copy(src_place) | Operand::Move(src_place) = &operands[0] {
@@ -517,6 +536,46 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // "ambiguous function declaration" with multiple Option instantiations.
         let constructor_name =
             crate::codegen_ay::names::scope_option_ctor(variant.name(), adt_name);
+        // Final well-typedness guard — the enum twin of the struct path's.
+        // The per-field coercion above keys on `infer_sort_from_ty`, which has
+        // no answer for a `()` payload, so `ExtData::None(())` (inside every
+        // `Context::from_waker`) was emitted as `(None_ExtData true)` against a
+        // declared `Unit` field: the solver rejected the WHOLE command and the
+        // harness came back reason-unknown. Reconcile each field against the
+        // constructor's declared sort: a `Unit` field takes its sole inhabitant
+        // (exact), a bitvector is width-coerced, anything else becomes a fresh
+        // unconstrained symbolic of the declared sort (a sound over-approximation
+        // that keeps the query well-typed instead of dropping it).
+        let declared: Vec<Sort> = sort
+            .datatype_sort()
+            .and_then(|dt| dt.constructors.iter().find(|c| c.name == constructor_name))
+            .map(|c| c.fields.iter().map(|f| f.sort.clone()).collect())
+            .unwrap_or_default();
+        let field_exprs: Vec<Expr> = field_exprs
+            .into_iter()
+            .enumerate()
+            .map(|(i, expr)| match declared.get(i) {
+                Some(want) if expr.sort() != want => {
+                    if want.datatype_name() == Some("Unit") {
+                        Expr::datatype_constructor("Unit", "Unit_mk", vec![], want.clone())
+                    } else if let (Some(w), true) = (want.bitvec_width(), expr.sort().is_bitvec()) {
+                        coerce_bitvec_width_safe(expr, w, SignExtension::ZeroExtend)
+                    } else {
+                        warn!(
+                            "enum '{}::{}' field {} sort {:?} != declared {:?}; havocking",
+                            adt_name,
+                            variant.name(),
+                            i,
+                            expr.sort(),
+                            want
+                        );
+                        let fresh = self.ctx.fresh_name("field_sort_mismatch");
+                        self.ctx.declare_var(&fresh, want.clone())
+                    }
+                }
+                _ => expr,
+            })
+            .collect();
         Some(Expr::datatype_constructor(adt_name, constructor_name, field_exprs, sort))
     }
 

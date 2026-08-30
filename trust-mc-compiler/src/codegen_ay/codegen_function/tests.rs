@@ -766,3 +766,112 @@ fn test_all_topo_probes_compile() {
         });
     }
 }
+
+// =========================================================================
+// codegen_function_with_body: BMC + `block_on` busy-poll loop
+// =========================================================================
+
+/// A verbatim copy of `kani::block_on` (library/trust-mc/src/futures.rs) —
+/// the `kani` crate is not linked into these unit-test crates — wrapped around
+/// an `async` block that carries a real obligation on a symbolic input.
+const BLOCK_ON_ASSERT_SOURCE: &str = r#"#![allow(dead_code)]
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, RawWaker, RawWakerVTable, Waker},
+};
+
+fn probe_block_on_assert(x: u32) {
+    block_on(async move {
+        assert!(x < 5);
+    })
+}
+
+pub fn block_on<T>(mut fut: impl Future<Output = T>) -> T {
+    let waker = unsafe { Waker::from_raw(NOOP_RAW_WAKER) };
+    let cx = &mut Context::from_waker(&waker);
+    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    loop {
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(res) => return res,
+            std::task::Poll::Pending => continue,
+        }
+    }
+}
+
+const NOOP_RAW_WAKER: RawWaker = {
+    unsafe fn clone_waker(_: *const ()) -> RawWaker { NOOP_RAW_WAKER }
+    unsafe fn noop(_: *const ()) {}
+    RawWaker::new(std::ptr::null(), &RawWakerVTable::new(clone_waker, noop, noop, noop))
+};
+"#;
+
+/// BMC mode must NOT leave `block_on` as an unsupported `Call terminator`.
+///
+/// Before the mode-aware inline gate, the MIR inline pass preserved every
+/// `block_on` (a CHC-only need), the DAG-only statement mini-inliner then
+/// rejected its poll LOOP, and the harness bailed with
+/// `unsupported_with_fallback("Call terminator")` and ZERO obligations — the
+/// `assert!` inside the awaited body never became a check. This pins the
+/// positive side: the body is inlined, the loop is unrolled, and the assert
+/// is an obligation of the harness.
+#[test]
+fn test_codegen_function_with_body_bmc_inlines_block_on_and_emits_awaited_assert() {
+    with_test_ay_ctx_for_source(BLOCK_ON_ASSERT_SOURCE, |ctx| {
+        let mut ctx = ctx;
+        ctx.config.use_chc = false;
+        ctx.config.unwind_depth = 2;
+        ctx.config.unwinding_assertions = true;
+        ctx.queries.set_args(crate::args::Arguments::default());
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_block_on_assert");
+        let body = instance.body().expect("body");
+        let name = instance.name();
+        ctx.set_current_fn(instance);
+
+        codegen_function_with_body(&mut ctx, instance, body, &name);
+
+        assert!(ctx.current_fn().is_none(), "BMC path should reset current_fn");
+        assert!(ctx.chc_vc.is_none(), "BMC path should not populate chc_vc");
+        let call_terminator_fallbacks = ctx
+            .unsupported_constructs
+            .get("Call terminator")
+            .map(|locations| locations.iter().filter(|l| l.contains("block_on")).count())
+            .unwrap_or(0);
+        assert_eq!(
+            call_terminator_fallbacks, 0,
+            "block_on must be inlined in BMC, not recorded as an unsupported Call terminator: {:?}",
+            ctx.unsupported_constructs
+        );
+        assert!(
+            ctx.bmc_vc.violations.iter().any(|v| matches!(
+                v.kind,
+                PropertyKind::Assertion | PropertyKind::Panic
+            )),
+            "the assert inside the awaited body must be an obligation of the harness, got {:?}",
+            ctx.bmc_vc.violations.iter().map(|v| v.kind).collect::<Vec<_>>()
+        );
+    });
+}
+
+/// The CHC twin: the boundary is kept for the single-poll specializer, so
+/// the inline pass must leave the `block_on` call in place. The CHC lane
+/// records nothing in `bmc_vc`; what this pins is that the flag flips with
+/// the mode (the inline-pass unit tests pin the flag itself).
+#[test]
+fn test_codegen_function_with_body_chc_keeps_block_on_boundary() {
+    with_test_ay_ctx_for_source(BLOCK_ON_ASSERT_SOURCE, |ctx| {
+        let mut ctx = ctx;
+        ctx.config.use_chc = true;
+        ctx.queries.set_args(crate::args::Arguments::default());
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_block_on_assert");
+        let body = instance.body().expect("body");
+        let name = instance.name();
+        ctx.set_current_fn(instance);
+
+        codegen_function_with_body(&mut ctx, instance, body, &name);
+
+        assert!(ctx.current_fn().is_none(), "CHC path should reset current_fn");
+        assert!(ctx.chc_vc.is_some(), "CHC mode should produce CHC verification conditions");
+        assert!(ctx.bmc_vc.violations.is_empty(), "CHC path must not record BMC violations");
+    });
+}

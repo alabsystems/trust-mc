@@ -63,9 +63,10 @@ echo "[soundness-gate] AY_TEST_TIMEOUT=${AY_TEST_TIMEOUT}"
 # exits instantly with "AY solver not found in PATH". compiletest's
 # `kani-verify-fail` accepts ANY nonzero exit as the expected failure, so the
 # run reports "ok" in 0.01s and this gate then reports all N files VACUOUS —
-# technically fail-closed, but indistinguishable from a real regression. Check
-# it up front and say so, so a missing PATH is never mistaken for a soundness
-# finding. `AY_BIN` does NOT satisfy this: it is read by the kani-domination
+# technically fail-closed, but indistinguishable from a real regression. A
+# different AY build is also not evidence about the pinned authority even when
+# its verdicts happen to match. Check both existence and the build commit up
+# front. `AY_BIN` does NOT satisfy this: it is read by the kani-domination
 # harness, not by the driver's backend resolution.
 if ! command -v ay >/dev/null 2>&1; then
     echo "[soundness-gate] ERROR: no \`ay\` on PATH — the driver would exit instantly on"
@@ -74,7 +75,35 @@ if ! command -v ay >/dev/null 2>&1; then
     echo "[soundness-gate]            PATH=\"\$PWD/../ay/target/release:\$PATH\" $0"
     exit 2
 fi
-echo "[soundness-gate] ay on PATH: $(command -v ay) ($(ay --version 2>/dev/null | head -1))"
+
+if ! expected_ay_pin="$(
+    "${AY_PYTHON_BIN:-python3}" "${ROOT_DIR}/scripts/ay_manifest_pin.py" \
+        --locked "${ROOT_DIR}"
+)"; then
+    echo "[soundness-gate] ERROR: cannot derive one lock-consistent pinned AY authority" >&2
+    exit 2
+fi
+if ! ay_attestation="$(
+    PYTHONPATH="${ROOT_DIR}/scripts${PYTHONPATH:+:${PYTHONPATH}}" \
+        "${AY_PYTHON_BIN:-python3}" - "${expected_ay_pin}" <<'PY'
+import sys
+
+from replacement_public_runner import ReplacementRunError, solver_attestation
+
+try:
+    record = solver_attestation("ay", sys.argv[1])
+except ReplacementRunError as error:
+    raise SystemExit(str(error)) from error
+
+version = record["version"].splitlines()[0]
+print(f'{record["path"]} ({version}; commit={record["commit"]})')
+PY
+)"; then
+    echo "[soundness-gate] ERROR: ay on PATH does not attest to pinned AY ${expected_ay_pin}" >&2
+    exit 2
+fi
+echo "[soundness-gate] pinned AY: ${expected_ay_pin}"
+echo "[soundness-gate] ay on PATH: ${ay_attestation}"
 echo ""
 
 # Build the verifier ONCE; per-file runs then use --skip-build. The ledgered

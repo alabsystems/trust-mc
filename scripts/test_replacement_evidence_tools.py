@@ -107,7 +107,7 @@ class ReplacementDispositionTests(unittest.TestCase):
             summary["resolution_counts"],
             {
                 "cargo-default-feature": 1,
-                "cfg-disabled": 32,
+                "cfg-disabled-upstream": 32,
                 "exact": 740,
                 "unique-qualified-alias": 45,
             },
@@ -115,13 +115,90 @@ class ReplacementDispositionTests(unittest.TestCase):
         self.assertEqual(summary["proof"]["historical"], 504)
         self.assertEqual(summary["proof"]["active"], 472)
         self.assertEqual(summary["proof"]["inactive_zero_credit"], 32)
+        # The BAR is what the incumbent does: all 32 inactive PROOF rows are
+        # upstream-disabled, none are ours, so none of them block the gate.
+        self.assertEqual(summary["proof"]["bar"], 472)
+        self.assertEqual(summary["proof"]["upstream_inactive"], 32)
+        self.assertEqual(summary["proof"]["local_inactive"], 0)
+        self.assertEqual(
+            sum(summary["proof"]["supersession_candidates"].values()), 32
+        )
         self.assertEqual(summary["non_proof"]["historical"], 314)
         self.assertEqual(summary["non_proof"]["active"], 314)
         self.assertEqual(summary["non_proof"]["inactive_zero_credit"], 0)
+        self.assertEqual(summary["non_proof"]["local_inactive"], 0)
         self.assertEqual(
             sum(row["executor"] == "cargo" for row in self.artifact["rows"]),
             98,
         )
+
+    def test_upstream_inactive_authority_is_bound_to_the_fork_commit(self) -> None:
+        """Exclusion is PROVED against the fork commit, not asserted from the tree."""
+        authority = json.loads(
+            (REPO_ROOT / "tests/trust-mc/replacement-upstream-inactive.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(len(authority["rows"]), 32)
+        self.assertTrue(authority["fork_commit"])
+        # Every excluded row must be an upstream CBMC limitation, not our own.
+        eligible = {
+            "CBMC consumes more than 10 GB",
+            "CBMC takes more than 15 minutes",
+            "requires pthread_key_create",
+            "requires memchr",
+            "requires syscall",
+            "requires write",
+        }
+        for row in authority["rows"]:
+            self.assertIn(row["reason"], eligible)
+            self.assertTrue(row["file"].startswith("tests/slow/tokio-proofs/"))
+
+    def test_the_bar_narrows_but_the_denominator_does_not(self) -> None:
+        summary = self.artifact["summary"]
+        # 818 historical rows remain the authority; only the BAR moves.
+        self.assertEqual(summary["historical_total"], 818)
+        self.assertEqual(
+            summary["proof"]["historical"] + summary["non_proof"]["historical"], 818
+        )
+        self.assertEqual(summary["proof"]["bar"], 472)
+        self.assertEqual(summary["proof"]["upstream_inactive"], 32)
+        self.assertEqual(summary["proof"]["local_inactive"], 0)
+        self.assertEqual(len(self.artifact["rows"]), 818)
+
+    def test_a_locally_disabled_proof_row_still_blocks_the_bar(self) -> None:
+        """THE ANTI-CHEAT. Disabling a row of our own must never shrink the bar,
+        even when its comment forges an upstream CBMC reason."""
+        rows = [dict(row) for row in self.artifact["rows"]]
+        victim = next(
+            row
+            for row in rows
+            if row["expected"] == "PROOF" and row["disposition"] == "active"
+        )
+        victim.update(
+            disposition="inactive",
+            inactive_origin="local",
+            reason="cfg-disabled",
+            execution_credit=False,
+            proof_credit=False,
+        )
+        summary = dispositions._subset_summary(rows, expected_proof=True, authority_digest="x")
+        self.assertEqual(summary["local_inactive"], 1)
+        self.assertEqual(summary["upstream_inactive"], 32)
+
+    def test_an_upstream_row_that_is_activated_moves_into_the_bar(self) -> None:
+        rows = [dict(row) for row in self.artifact["rows"]]
+        freed = next(
+            row
+            for row in rows
+            if row["disposition"] == "inactive"
+            and row.get("inactive_origin") == "upstream"
+        )
+        freed.update(disposition="active", inactive_origin=None, execution_credit=True)
+        summary = dispositions._subset_summary(rows, expected_proof=True, authority_digest="x")
+        self.assertEqual(summary["bar"], 473)
+        self.assertEqual(summary["upstream_inactive"], 31)
+        self.assertEqual(summary["local_inactive"], 0)
 
     def test_every_inactive_row_is_source_bound_cfg_disabled_zero_credit(self) -> None:
         inactive = [
@@ -130,7 +207,8 @@ class ReplacementDispositionTests(unittest.TestCase):
         self.assertEqual(len(inactive), 32)
         for row in inactive:
             self.assertEqual(row["expected"], "PROOF")
-            self.assertEqual(row["reason"], "cfg-disabled")
+            self.assertEqual(row["reason"], "cfg-disabled-upstream")
+            self.assertEqual(row["inactive_origin"], "upstream")
             self.assertIs(row["execution_credit"], False)
             self.assertIs(row["proof_credit"], False)
             source_line = (REPO_ROOT / row["file"]).read_text(encoding="utf-8").splitlines()[
@@ -315,7 +393,7 @@ class ReplacementDispositionTests(unittest.TestCase):
                         "metadata": {
                             "execution": {
                                 "state": "inactive_accounted",
-                                "details": "cfg-disabled",
+                                "details": row["reason"],
                             }
                         },
                     }
@@ -418,6 +496,52 @@ class ReplacementPublicRunnerTests(unittest.TestCase):
             report_dir=root,
             target_dir=root / "target",
         )
+
+    def test_solver_attestation_accepts_only_the_pinned_build_commit(self) -> None:
+        expected_pin = "0123456789abcdef0123456789abcdef01234567"
+        with tempfile.TemporaryDirectory() as raw:
+            solver = Path(raw) / "ay"
+            solver.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'ay 0.19.0' "
+                "'build.commit=0123456789abcdef0123456789abcdef01234567'\n",
+                encoding="utf-8",
+            )
+            solver.chmod(0o755)
+            with mock.patch.object(public_runner.shutil, "which", return_value=str(solver)):
+                attestation = public_runner.solver_attestation("ay", expected_pin)
+
+        self.assertEqual(attestation["path"], str(solver))
+        self.assertEqual(attestation["commit"], expected_pin)
+
+    def test_solver_attestation_rejects_a_different_or_unstamped_ay(self) -> None:
+        expected_pin = "0123456789abcdef0123456789abcdef01234567"
+        with tempfile.TemporaryDirectory() as raw:
+            solver = Path(raw) / "ay"
+            solver.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'ay 0.19.0' "
+                "'build.commit=ffffffffffffffffffffffffffffffffffffffff'\n",
+                encoding="utf-8",
+            )
+            solver.chmod(0o755)
+            with mock.patch.object(public_runner.shutil, "which", return_value=str(solver)):
+                with self.assertRaisesRegex(
+                    public_runner.ReplacementRunError,
+                    "does not match pinned AY",
+                ):
+                    public_runner.solver_attestation("ay", expected_pin)
+
+            solver.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'ay 0.19.0 without authority stamp'\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(public_runner.shutil, "which", return_value=str(solver)):
+                with self.assertRaisesRegex(
+                    public_runner.ReplacementRunError,
+                    "does not include a 7- to 40-character build commit",
+                ):
+                    public_runner.solver_attestation("ay", expected_pin)
 
     def test_invocations_preserve_current_driver_shapes_and_one_harness(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -751,8 +875,12 @@ class CanonicalAuthoritySurfaceTests(unittest.TestCase):
     def test_strict_proof_checks_source_dispositions_and_inactive_credit(self) -> None:
         script = (SCRIPTS / "ay-replacement-proof.sh").read_text(encoding="utf-8")
         self.assertIn("replacement_harness_dispositions.py", script)
-        self.assertIn(".summary.proof.inactive_zero_credit", script)
-        self.assertIn("source-inactive PROOF rows with zero credit", script)
+        # The gate keys on LOCALLY-disabled rows. Upstream-disabled rows are
+        # outside the bar; ours still block it.
+        self.assertIn(".summary.proof.local_inactive", script)
+        self.assertIn("upstream-disabled rows are excluded from the bar", script)
+        self.assertIn("LOCALLY-disabled PROOF rows", script)
+        self.assertIn("supersession candidates", script)
 
     def test_legacy_local_generator_cannot_validate_public_proof_inventory(self) -> None:
         run = subprocess.run(

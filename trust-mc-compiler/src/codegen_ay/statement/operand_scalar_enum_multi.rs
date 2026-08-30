@@ -47,6 +47,31 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         } else {
             self.extract_variant_fields(alloc, ty, &args, active_variant, active_idx)?
         };
+        // A zero-sized field is extracted as the Bool sentinel `true`, but the
+        // constructor may declare it as the `Unit` datatype (`ExtData::None(())`
+        // inside every `Context::from_waker`): emitting `(None_ExtData true)`
+        // against a `Unit` field makes the solver discard the whole command and
+        // the harness comes back reason-unknown. Hand a `Unit`-declared field
+        // its sole inhabitant instead — exact, a ZST carries no information.
+        let declared: Vec<ay_bindings::Sort> = dt_sort
+            .datatype_sort()
+            .and_then(|dt| dt.constructors.iter().find(|c| c.name == constructor_name))
+            .map(|c| c.fields.iter().map(|f| f.sort.clone()).collect())
+            .unwrap_or_default();
+        let field_exprs: Vec<Expr> = field_exprs
+            .into_iter()
+            .enumerate()
+            .map(|(i, expr)| match declared.get(i) {
+                Some(want)
+                    if expr.sort() != want
+                        && expr.sort().is_bool()
+                        && want.datatype_name() == Some("Unit") =>
+                {
+                    Expr::datatype_constructor("Unit", "Unit_mk", vec![], want.clone())
+                }
+                _ => expr,
+            })
+            .collect();
 
         debug!(
             "codegen_multi_variant_enum_from_alloc: {} variant={} ctor={} fields={}",

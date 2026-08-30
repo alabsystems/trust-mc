@@ -94,9 +94,16 @@ pub(crate) fn codegen_function_with_body(
     // eliminates more Call terminators).
     let mut inline_depth = ay_ctx.config.inline_depth;
     let stubbing_active = ay_ctx.queries.args().stubbing_enabled;
+    // An `async` harness (the proof macro wraps it in `kani::block_on`) spends
+    // the default budget on the executor's own shims (`Context::from_waker`,
+    // `Pin::new_unchecked`, `Pin::as_mut`, the outer coroutine `poll`) before
+    // the first `.await`'s inner `poll` is reached; whatever is left un-inlined
+    // falls to the statement mini-inliner, which cannot take a body with a
+    // loop. BMC only — CHC keeps `block_on` as a call boundary.
+    let async_harness = !ay_ctx.config.use_chc && body_calls_block_on(&body);
     if ay_ctx.config.function_inlining
         && inline_depth < 32
-        && (stubbing_active || needs_contract_inline_boost(&body))
+        && (stubbing_active || needs_contract_inline_boost(&body) || async_harness)
     {
         debug!(
             "AY codegen: boosting inline depth for contract-instrumented fn {} ({} -> 32)",
@@ -114,6 +121,9 @@ pub(crate) fn codegen_function_with_body(
     let mut inline_pass = FunctionInlinePass::new(InlineConfig {
         max_depth: inline_depth,
         enabled: ay_ctx.config.function_inlining,
+        // CHC keeps `block_on` as a boundary for its single-poll specializer;
+        // BMC inlines it so the busy-poll loop is unrolled with the harness.
+        preserve_block_on: ay_ctx.config.use_chc,
     });
     let (inlined, mut body) =
         inline_pass.transform_with_body_provider(ay_ctx.tcx, body, instance, |callee_instance| {
@@ -778,6 +788,27 @@ fn needs_contract_inline_boost(body: &rustc_public::mir::Body) -> bool {
         }
     }
     false
+}
+
+/// Does `body` call a `block_on` executor (`kani::block_on` or a user-defined
+/// twin)? That is the signature of an `async` harness: `#[kani::proof] async
+/// fn h()` expands to `fn h() { async fn h() {..} kani::block_on(h()) }`.
+fn body_calls_block_on(body: &rustc_public::mir::Body) -> bool {
+    body.blocks.iter().any(|bb| {
+        let TerminatorKind::Call { func, .. } = &bb.terminator.kind else {
+            return false;
+        };
+        let Ok(func_ty) = func.ty(body.locals()) else {
+            return false;
+        };
+        let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(fn_def, _)) =
+            func_ty.kind()
+        else {
+            return false;
+        };
+        let fn_name = fn_def.0.name();
+        fn_name == "block_on" || fn_name.ends_with("::block_on")
+    })
 }
 
 /// Compute a topological order for the reachable CFG (or detect cycles).

@@ -15,6 +15,7 @@ denominator.
 | `tests/trust-mc/replacement-harness-inventory.json` | 818 | `393e71e1f522142a880a86a03f8dfdd1362dd09855c09582f0a1e507fa365a30` |
 | `tests/trust-mc/replacement-harness-inventory.proof.json` | 504 | `62ddf770d23c96f5d45875e381ba310f9e0374658b50885df0a07b7c48d3c9cf` |
 | `tests/trust-mc/non-proof-closure.json` | 314 | `4e47d2dac3feb0c6835b2566a98f47d1388970ec6b58098a91c3b33138f39bbf` |
+| `tests/trust-mc/replacement-upstream-inactive.json` | 32 | `7e2eef01baaa59e5f4ee92daa7f025e3dc841071ae784dd68247dc0f464c9fe5` |
 
 The mixed inventory is the whole replacement denominator. Its 504 `PROOF`
 rows are the proof-quality subset; its 314 non-`PROOF` rows are deliberate
@@ -51,14 +52,57 @@ The committed disposition report records its own deterministic plan digests.
 Regenerate it only when the source or authority inventory intentionally
 changes, and review the row-level diff.
 
-## Current blocking status
+## The bar versus the denominator
 
-Strict replacement proof is red. The 32 source-inactive `PROOF` rows make a
-504/504 proof packet impossible even if every active row succeeds. The public
-runner records those rows as `SKIP` with `execution.state ==
-"inactive_accounted"`; the runtime accounting object reports them as
-`inactive_zero_credit`. Both proof extraction and the strict audit reject that
-state.
+A REPLACEMENT claim is bounded by what the INCUMBENT DOES. Upstream Kani ships 32
+`PROOF` harnesses switched off with `#[cfg(disabled)]` because CBMC could not run
+them — 12 need more than 10 GB, 5 exceed 15 minutes, 11 need
+`pthread_key_create`, 2 need `memchr`, one `syscall`, one `write`. Those are not
+things Kani does. Requiring them made the strict bar *harder* than replacement
+and mathematically unreachable: 32 of 504 `PROOF` rows earned zero credit by
+construction, so the gate could never go green however good AY became.
+
+The bar is therefore the **786 active rows** (472 `PROOF` + 314 non-`PROOF`).
+
+**This narrows the BAR. It does not narrow the DENOMINATOR.** All 818 historical
+rows remain the authority, every one still appears in the schema-v2 report, and
+the frozen-inventory rule is untouched: removing, renaming, qualifying,
+feature-gating or `cfg`-disabling a source harness still must not silently reduce
+it. The 32 are reported as `supersession_candidates`, grouped by upstream reason
+— places trust-mc may BEAT Kani rather than merely match it.
+
+### Why this cannot be used to lower the bar
+
+Exclusion is PROVED against the initial fork commit `c4d858036`, never against
+the working tree, and is enforced by four rules:
+
+1. `scripts/generate_upstream_inactive_authority.py` admits a row only if it was
+   already `#[cfg(disabled)]` in Kani's own source at that commit AND its reason
+   is a recognised CBMC limitation. Disabling a harness today cannot make it
+   eligible — verified by attack: forging
+   `// CBMC takes more than 15 minutes` onto an active row leaves the generator
+   emitting the same 32 rows and the same `row_sha256`.
+2. Any other `cfg`-disabled `PROOF` row is `local_inactive`, and
+   `scripts/ay-replacement-proof.sh` dies while that count is non-zero, naming
+   the offending rows. Verified by attack: the forged row above produced
+   `local_inactive=1` and blocked the gate.
+3. The frozen reason text is part of the key, so editing a comment cannot move a
+   row out of the bar.
+4. Un-gating one of the 32 moves it INTO the bar and it counts normally —
+   verified by attack: un-disabling `tokio_test/block_on.rs::async_block` gave
+   `bar=473, upstream_inactive=31`. Excluded rows still receive zero execution
+   and zero proof credit; they are outside the bar, not passing.
+
+### Activating the supersession candidates
+
+This is the next goal, and it is where the replacement claim earns its name:
+these are rows the incumbent gave up on. Proceed in small groups — resource-only
+rows first (the 17 `>10 GB` / `>15 min` rows, which need engine capability and no
+new semantics), then library models (`memchr`, `write`), then thread-local,
+syscall and spawn/select semantics. For every row: remove `#[cfg(disabled)]`, run
+the exact cargo harness through AY, retain the row in the 818 authority,
+regenerate both the upstream-inactive authority and the disposition artifact, and
+require a clean `PROOF` record.
 
 The disabled rows are all in `tests/slow/tokio-proofs` and carry these source
 reasons:

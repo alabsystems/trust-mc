@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "kani"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kani_core",
  "kani_macros",
@@ -1422,14 +1422,14 @@ dependencies = [
 
 [[package]]
 name = "kani_core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kani_macros",
 ]
 
 [[package]]
 name = "kani_macros"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "proc-macro-error2",
  "proc-macro2",
@@ -2347,7 +2347,7 @@ dependencies = [
 
 [[package]]
 name = "std"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kani",
 ]
@@ -2411,7 +2411,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -2735,7 +2735,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "home",
@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ay-bindings",
  "num-bigint",
@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-cov"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-driver"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "ay",

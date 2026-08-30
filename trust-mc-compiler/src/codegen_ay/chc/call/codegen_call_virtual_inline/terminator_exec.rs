@@ -449,7 +449,9 @@ fn execute_inline_call<'tcx, 'body>(
         // The sort guard keeps it conservative: if the translated constant does
         // not match the destination sort we fall through to the old fallback
         // rather than force a coercion the walker cannot verify.
-        if let Some(stub) = ctx.detect_stub(func)
+        // `func` is an operand of the INLINED body, so it must be resolved
+        // against `walk_ctx.locals`, not `ctx.body` (#chc-inline-operand-locals).
+        if let Some(stub) = ctx.detect_stub_with_locals(func, walk_ctx.locals)
             && let Some(result) = ctx.translate_mem_intrinsic_call(stub, func)
             && result.sort() == &dest_sort
         {

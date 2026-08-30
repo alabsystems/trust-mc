@@ -336,6 +336,59 @@ fn v5_conformance_requires_a_satisfied_cover() {
     assert!(!has_satisfied_cover(&[]), "no covers at all ⇒ conformance claim vacuous");
 }
 
+/// A query the solver REJECTED and a query it ran out of memory on are neither
+/// "no checks" nor "solver undecided — try --ay-chc". The first is our encoder
+/// defect and no budget or engine cures it; the second is a budget. Both keep
+/// their obligations listed UNDETERMINED, so they must be told apart from the
+/// undecided arm by the reason, not by the table shape — measured on the
+/// tokio-proofs `tokio_test::block_on` rows (2026-08-29), which printed the
+/// undecided remedy for 276 rejected commands.
+#[test]
+fn a_rejected_query_and_a_memout_name_their_own_cause() {
+    let undetermined = vec![make_property(CheckStatus::Undetermined)];
+    for properties in [&[][..], &undetermined[..]] {
+        let rejected = format_result(
+            properties,
+            VerificationStatus::Failure,
+            false,
+            FailedProperties::Other,
+            true,
+            ValidationStatus::Validated,
+            Some(SolverUnknownReason::SmtParseError),
+            HarnessFeasibility::Undetermined,
+        );
+        assert!(
+            rejected.contains("INCONCLUSIVE (solver rejected the emitted query as ill-formed"),
+            "SmtParseError must name the rejected query, got: {rejected}"
+        );
+        assert!(rejected.contains("[AY:SMT_REJECTED]"), "must point at the marker: {rejected}");
+        assert!(!rejected.contains("solver undecided"), "not an undecided obligation: {rejected}");
+        assert!(!rejected.contains("--ay-chc"), "no engine cures an ill-formed query: {rejected}");
+        assert!(!rejected.contains("(no checks)"), "the checks were emitted: {rejected}");
+
+        let memout = format_result(
+            properties,
+            VerificationStatus::Failure,
+            false,
+            FailedProperties::Other,
+            true,
+            ValidationStatus::Validated,
+            Some(SolverUnknownReason::Memout),
+            HarnessFeasibility::Undetermined,
+        );
+        assert!(
+            memout.contains("INCONCLUSIVE (solver ran out of memory"),
+            "Memout must name the budget, got: {memout}"
+        );
+        assert!(
+            !memout.contains("solver undecided"),
+            "a budget is not an undecided model: {memout}"
+        );
+        assert!(!memout.contains("(no checks)"), "the checks were emitted: {memout}");
+        assert!(!memout.contains("FAILED"), "nothing was refuted: {memout}");
+    }
+}
+
 /// An empty property list plus a solver reason does NOT always mean "we could
 /// not decide". `tests/expected/slice_c_str` pins `SolverError` together with
 /// `INCONCLUSIVE (no checks)`: there the solver fell over BEFORE there was

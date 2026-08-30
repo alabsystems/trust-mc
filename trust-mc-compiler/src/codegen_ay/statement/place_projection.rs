@@ -64,6 +64,48 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// the term we are holding really IS the erased representation (its sort
     /// matches), and no `Downcast` to a non-zero variant is in flight.
     ///
+    /// Constructor index of MIR variant `variant_idx` in an Option-like datatype.
+    ///
+    /// `codegen_option_like_enum` encodes every two-variant enum with one
+    /// payload variant and one fieldless variant as `[None_*, Some_*]` — by
+    /// PAYLOAD, not by MIR variant order. For `Option<T>` the two orders agree;
+    /// for `Poll<T>` (`Ready(T)` = variant 0, `Pending` = variant 1) they are
+    /// swapped, and a positional `Downcast(0)` selected the fieldless
+    /// constructor. Answers `None` for anything that is not that exact shape
+    /// (the caller keeps the positional index): the datatype must have exactly
+    /// two constructors of arity {0, 1} and the place's ADT exactly two
+    /// variants, so a genuine two-constructor enum with a different layout can
+    /// never be remapped by accident.
+    fn option_like_constructor_index(
+        &self,
+        place: &Place,
+        proj_idx: usize,
+        expr: &Expr,
+        variant_idx: rustc_public::ty::VariantIdx,
+    ) -> Option<usize> {
+        let dt = expr.sort().datatype_sort()?;
+        if dt.constructors.len() != 2 {
+            return None;
+        }
+        let (none_idx, some_idx) =
+            match (dt.constructors[0].fields.len(), dt.constructors[1].fields.len()) {
+                (0, 1) => (0usize, 1usize),
+                (1, 0) => (1, 0),
+                _ => return None,
+            };
+        let prefix = Place { local: place.local, projection: place.projection[..proj_idx].to_vec() };
+        let ty = prefix.ty(self.body.locals()).into_option()?;
+        let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() else {
+            return None;
+        };
+        let variants = def.variants();
+        if variants.len() != 2 {
+            return None;
+        }
+        let has_payload = !variants.get(variant_idx.to_index())?.fields().is_empty();
+        Some(if has_payload { some_idx } else { none_idx })
+    }
+
     /// Without this, `ManuallyDrop::into_inner` and `MaybeUninit::assume_init`
     /// failed closed here, left the assignment's LHS UNCONSTRAINED, and reported a
     /// FALSE assertion failure on safe code (#g4-erased-wrapper-payload).
@@ -487,7 +529,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             return None;
                         }
                     } else {
-                        let variant_index = variant_idx.to_index();
+                        // An Option-like enum is encoded as `[None_*, Some_*]` by
+                        // PAYLOAD, not by MIR variant order: `Poll::Ready(T)` is
+                        // variant 0 yet lives in the `Some_*` constructor (index 1).
+                        // Positional use of the MIR index selected the fieldless
+                        // constructor for every `Poll::Ready` payload read, so each
+                        // `.await` result was UNCONSTRAINED.
+                        let variant_index = self
+                            .option_like_constructor_index(place, proj_idx, &expr, *variant_idx)
+                            .unwrap_or_else(|| variant_idx.to_index());
                         if assert_downcast_variant_guards
                             && let Some(dt) = expr.sort().datatype_sort()
                             && let Some(cons) = dt.constructors.get(variant_index)

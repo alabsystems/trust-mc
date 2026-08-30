@@ -135,6 +135,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 );
                 return Some(Expr::bitvec_const(0, POINTER_WIDTH));
             }
+            // The Option-like encoding orders its constructors by PAYLOAD
+            // (`[None_*, Some_*]`), not by MIR variant, so the constructor-index
+            // chain below is wrong whenever the payload variant is variant 0:
+            // `Poll::Ready(v)` came back as discriminant 1, the `SwitchInt` took
+            // the `Pending` arm, and everything after an `.await` was UNREACHABLE
+            // — a harness whose only assertion follows an `.await` was proved
+            // VACUOUSLY (its broken twin too). Map by payload arity instead.
+            if let Some(result) = self.try_option_like_discriminant(dt, &dt_expr, place) {
+                return Some(result);
+            }
             // All datatype enums (2-variant and N-variant): use constructor-index
             // ITE chain. Previously the 2-variant case hardcoded empty→0/payload→1,
             // which was WRONG when the empty variant wasn't at index 0 (e.g.,
@@ -144,6 +154,52 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         None
+    }
+
+    /// Discriminant of an Option-like datatype value, keyed on the place's ADT.
+    ///
+    /// Applies only to the exact Option-like encoding — two constructors of
+    /// arity {0, 1} — over an ADT with exactly two variants, one of which has
+    /// fields. Returns the MIR variant index of the constructor the value is
+    /// in (32-bit, like `build_discriminant_ite_chain`). For `Option<T>` this
+    /// is the identity mapping the chain already computed; for `Poll<T>` and
+    /// any `enum E { WithPayload(T), Empty }` it is the swap the chain got
+    /// wrong. `None` for every other shape, so the caller falls through.
+    fn try_option_like_discriminant(
+        &self,
+        dt: &ay_bindings::DatatypeSort,
+        dt_expr: &Expr,
+        place: &Place,
+    ) -> Option<Expr> {
+        if dt.constructors.len() != 2 {
+            return None;
+        }
+        let (empty_ctor, payload_ctor) =
+            match (dt.constructors[0].fields.len(), dt.constructors[1].fields.len()) {
+                (0, 1) => (&dt.constructors[0], &dt.constructors[1]),
+                (1, 0) => (&dt.constructors[1], &dt.constructors[0]),
+                _ => return None,
+            };
+        let ty = place.ty(self.body.locals()).into_option()?;
+        let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() else {
+            return None;
+        };
+        let variants = def.variants();
+        if variants.len() != 2 {
+            return None;
+        }
+        let payload_idx = variants.iter().position(|v| !v.fields().is_empty())?;
+        let empty_idx = variants.iter().position(|v| v.fields().is_empty())?;
+        debug!(
+            "codegen_rvalue_discriminant: Option-like {} payload={} ({}) empty={} ({})",
+            dt.name, payload_idx, payload_ctor.name, empty_idx, empty_ctor.name
+        );
+        let is_payload = dt_expr.clone().is_constructor(&dt.name, &payload_ctor.name);
+        Some(Expr::ite(
+            is_payload,
+            Expr::bitvec_const(payload_idx as i128, 32),
+            Expr::bitvec_const(empty_idx as i128, 32),
+        ))
     }
 
     /// Extract discriminant from a bitvec-stored enum value.
@@ -308,6 +364,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         // Datatypes: extract discriminant using is_constructor
         if let SortInner::Datatype(dt) = place_expr.sort().inner() {
+            // Same payload-order correction as `try_env_discriminant`.
+            if let Some(result) = self.try_option_like_discriminant(dt, &place_expr, place) {
+                return Some(result);
+            }
             return Some(Self::build_discriminant_ite_chain(
                 &dt.name,
                 &dt.constructors,

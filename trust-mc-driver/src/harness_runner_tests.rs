@@ -289,6 +289,51 @@ fn test_legacy_chc_pdr_metadata_stays_diagnostic_even_with_full_artifacts() {
 }
 
 #[test]
+fn test_top_v1_transcript_accepts_bundle_v2_checked_report_without_alethe() {
+    let mut metadata = serde_json::json!({
+        "schema": "ay.chc-proof-transcript/v1",
+        "result": "safe",
+        "proof_status": "verified-invariant",
+        "accepted_as_proof": true,
+        "replay": {
+            "status": "replayable",
+            "sha256": digest('b')
+        },
+        "transcript": {
+            "status": "replayable",
+            "metadata_only": false,
+            "uri": "reports/trust_mc/chc-transcript.jsonl",
+            "sha256": digest('c')
+        },
+        "checked_report": {
+            "status": "checked",
+            "sha256": digest('d'),
+            "strict_cert": {
+                "schema": "ay.chc-obligation-strict-proof-bundle-cert/v2",
+                "schema_version": 2,
+                "proof_checker": "ay-proof::re_check_bundle_strict",
+                "proof_bundle_schema": "ay.proofbundle/v3",
+                "bundle_sha256": digest('e'),
+                "verdict": "verified"
+            }
+        }
+    });
+
+    let payload = trust_trust_mc_chc_pdr_evidence_payload(&metadata)
+        .expect("nested bundle-v2 evidence is opaque to the stable top-v1 contract");
+    assert_eq!(payload["schema"], "trust.trust_mc-chc-pdr-evidence.v1");
+    assert_eq!(payload["reasoning"], "Pdr");
+    assert_eq!(payload["transcript_sha256"], digest('c'));
+
+    metadata["schema"] = serde_json::Value::String("ay.chc-proof-transcript/v2".to_string());
+    assert_eq!(
+        trust_trust_mc_chc_pdr_evidence_payload(&metadata),
+        Err("unexpected_schema"),
+        "an unknown top-level transcript schema must still fail closed"
+    );
+}
+
+#[test]
 fn test_pdr_candidate_verdict_is_rejected_pending_fresh_private_replay() {
     let mut result = test_result(VerificationStatus::Success, FailedProperties::None);
     let obligation = trust_mc_core::MirDerivedChcPdrObligation::new(

@@ -26,6 +26,66 @@ fn native_chc_external_fallback_gate_accepts_inconclusive_paths() {
     assert!(!native_chc_error_allows_external_proof_fallback(&false_proof));
 }
 
+// ==================== Solver-named unknown reasons ====================
+// Verification Objective: an `unknown` that ay itself attributes — commands it
+// REJECTED, or a memory/time budget — is filed under that cause, never under
+// the "solver undecided" default. Lines below are verbatim ay 0.19.0 output on
+// tests/slow/tokio-proofs `tokio_test::block_on::async_block` (2026-08-29).
+
+#[test]
+fn rejected_commands_are_counted_and_the_first_is_quoted() {
+    let stdout = "(error \"line 2373 column 632: Sorts Uninterpreted(\"\"Vec_bv256\"\") and \
+                  Uninterpreted(\"\"Events\"\") are incompatible\")\n\
+                  (error \"line 2763 column 378: invalid constant: Condvar_mk requires 1 arguments, got 2\")\n\
+                  (error \"line 2961 column 165: unknown sort 'UnixStream'\")\n\
+                  (error \"unknown constant std::sync::OnceLock::<tokio::signal::registry::Globals>::get#f137::local_0_0\")\n\
+                  unknown\n";
+    let stderr = "c writing Alethe proof to /tmp/q.smt2.alethe on unsat\n\
+                  (:reason-unknown \"memout\")\n";
+    let (count, first) = smt_command_rejections(stdout, stderr);
+    assert_eq!(count, 4);
+    assert_eq!(
+        first.as_deref(),
+        Some(
+            "(error \"line 2373 column 632: Sorts Uninterpreted(\"\"Vec_bv256\"\") and \
+             Uninterpreted(\"\"Events\"\") are incompatible\")"
+        )
+    );
+    assert_eq!(solver_reason_unknown(stdout, stderr).as_deref(), Some("memout"));
+    assert_eq!(classify_reason_unknown("memout"), Some(SolverUnknownReason::Memout));
+}
+
+/// `(get-value ...)` after a decided `unsat` answers "model is not available";
+/// that is the solver declining a model query, not rejecting the problem.
+#[test]
+fn a_model_not_available_error_is_not_a_rejected_command() {
+    let stdout = "unsat\n(error \"line 26 column 73: model is not available\")\n";
+    assert_eq!(smt_command_rejections(stdout, ""), (0, None));
+    assert_eq!(solver_reason_unknown(stdout, ""), None);
+}
+
+/// Only the budget-bound reasons the solver names get their own bucket; an
+/// `incomplete` or a discarded-command refusal keeps the caller's default.
+#[test]
+fn only_budget_reasons_are_classified() {
+    assert_eq!(classify_reason_unknown("timeout"), Some(SolverUnknownReason::Timeout));
+    assert_eq!(classify_reason_unknown("incomplete"), None);
+    assert_eq!(classify_reason_unknown("a problem-contributing command was discarded"), None);
+    // Unquoted and `--stats`-style forms both parse.
+    assert_eq!(
+        solver_reason_unknown("", "(:reason-unknown incomplete)").as_deref(),
+        Some("incomplete")
+    );
+    assert_eq!(
+        solver_reason_unknown(
+            "",
+            "(:reason-unknown \"a problem-contributing command was discarded\")"
+        )
+        .as_deref(),
+        Some("a problem-contributing command was discarded")
+    );
+}
+
 // ==================== V0: SMT-LIB Export Filtering ====================
 // Verification Objective: exported SMT-LIB is consumable by AY even when UNSAT.
 // See #1921.

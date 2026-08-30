@@ -38,6 +38,27 @@ pub(crate) enum SolverUnknownReason {
     /// predicates are supported) and a predicate applied with an argument sort
     /// that disagrees with its declaration.
     ChcParseError,
+    /// ay REJECTED one or more commands of the emitted BMC SMT-LIB query —
+    /// `(error "line L column C: ...")` / `(error "unknown constant ...")` —
+    /// discarded them, and carried on. The BMC counterpart of
+    /// `ChcParseError`, and like it ALWAYS OUR BUG: the encoder wrote a query
+    /// the solver does not accept (an undeclared sort, two incompatible sorts
+    /// equated, a constructor applied with the wrong arity, a reference to a
+    /// constant whose own declaration was rejected).
+    ///
+    /// NOT budget-bound. ay fail-closes on this shape even with unlimited
+    /// memory — `(:reason-unknown "a problem-contributing command was
+    /// discarded")` — so the harness is never decided AS EMITTED however long
+    /// it runs. Measured on tests/slow/tokio-proofs
+    /// `tokio_test::block_on::{async_block,async_fn}` (2026-08-29): 276
+    /// rejected commands in a 14 MB query; `memout` at the default budget, the
+    /// discarded-command refusal after 142 s / 40 GB without one. Both rows
+    /// had been filed as `UndecidedModel` ("solver undecided — try --ay-chc"),
+    /// which is the opposite diagnosis.
+    SmtParseError,
+    /// ay answered `unknown` with `(:reason-unknown "memout")`: the query
+    /// exceeded the solver's memory budget. BUDGET-bound, like `Timeout`.
+    Memout,
     /// ay-chc synthesized an invariant model that FAILED its own clause
     /// verification, so the driver rejected the proof and fell back to UNKNOWN
     /// ("ay-chc false proof detected: ...").
@@ -62,6 +83,8 @@ impl SolverUnknownReason {
             Self::PreSolveDeadline => "PreSolveDeadline",
             Self::UndecidedModel => "UndecidedModel",
             Self::ChcParseError => "ChcParseError",
+            Self::SmtParseError => "SmtParseError",
+            Self::Memout => "Memout",
             Self::FalseProofRejected => "FalseProofRejected",
             Self::SolverError => "SolverError",
         }
@@ -191,6 +214,8 @@ mod tests {
             SolverUnknownReason::PreSolveDeadline.label(),
             SolverUnknownReason::UndecidedModel.label(),
             SolverUnknownReason::ChcParseError.label(),
+            SolverUnknownReason::SmtParseError.label(),
+            SolverUnknownReason::Memout.label(),
             SolverUnknownReason::FalseProofRejected.label(),
             SolverUnknownReason::SolverError.label(),
         ];

@@ -834,6 +834,28 @@ fn body_is_dag_inline_candidate(body: &rustc_public::mir::Body) -> bool {
     is_acyclic
 }
 
+/// Is this `Assert` terminator's condition a CONSTANT that contradicts
+/// `expected` — i.e. the assertion fails on every execution that reaches it?
+///
+/// Only a literal `bool` constant qualifies; anything symbolic, or anything
+/// this cannot read, answers `false` so the caller keeps the success edge
+/// (the conservative direction: an extra edge can only add a spurious cycle
+/// or path, never remove an obligation).
+fn assert_can_never_pass(cond: &Operand, expected: bool) -> bool {
+    use rustc_public::ty::{ConstantKind, RigidTy, TyKind};
+    let Operand::Constant(constant) = cond else {
+        return false;
+    };
+    let mir_const = &constant.const_;
+    if !matches!(mir_const.ty().kind(), TyKind::RigidTy(RigidTy::Bool)) {
+        return false;
+    }
+    let ConstantKind::Allocated(alloc) = mir_const.kind() else {
+        return false;
+    };
+    matches!(alloc.read_bool(), Ok(value) if value != expected)
+}
+
 fn inline_candidate_successors(body: &rustc_public::mir::Body) -> Option<Vec<Vec<usize>>> {
     if body.blocks.is_empty() {
         debug!("mini-inline: empty callee body");
@@ -845,6 +867,19 @@ fn inline_candidate_successors(body: &rustc_public::mir::Body) -> Option<Vec<Vec
     for (bb_idx, block) in body.blocks.iter().enumerate() {
         let mut succs = match &block.terminator.kind {
             TerminatorKind::Return | TerminatorKind::Unreachable => vec![],
+            // An assertion that can never pass has NO success edge. rustc emits
+            // exactly this shape for a coroutine's poison states —
+            // `assert(const false, "async fn resumed after completion") ->
+            // [success: SELF]` — a self-loop the CFG-only DFS read as a cycle,
+            // which made EVERY `<coroutine as Future>::poll` body a non-DAG and
+            // declined it. Dropping the dead edge is exact: the terminator's
+            // codegen still records the (path-guarded) violation, and nothing
+            // can flow past a failed assert.
+            TerminatorKind::Assert { cond, expected, .. }
+                if assert_can_never_pass(cond, *expected) =>
+            {
+                vec![]
+            }
             TerminatorKind::Goto { target }
             | TerminatorKind::Assert { target, .. }
             | TerminatorKind::Drop { target, .. } => vec![*target],
